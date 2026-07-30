@@ -4,10 +4,13 @@
 #include "cJSON.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include <string.h>
+#include <stdlib.h>
 
+static const char *TAG = "api_v1";
 #define FW_VERSION "0.1.0"
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
@@ -34,6 +37,12 @@ static esp_err_t status_get(httpd_req_t *req)
     return send_json(req, root);
 }
 
+static int rssi_desc_cmp(const void *a, const void *b)
+{
+    const wifi_ap_record_t *ra = a, *rb = b;
+    return (int)rb->rssi - (int)ra->rssi;
+}
+
 static esp_err_t wifi_scan_get(httpd_req_t *req)
 {
     wifi_scan_config_t scan_cfg = { 0 };
@@ -43,8 +52,18 @@ static esp_err_t wifi_scan_get(httpd_req_t *req)
         return ESP_OK;
     }
     uint16_t n = 20;
-    wifi_ap_record_t recs[20];
+    /* wifi_ap_record_t is 80+ bytes; keep it off the httpd task stack, which
+     * also has to have room for the cJSON tree below. */
+    wifi_ap_record_t *recs = calloc(n, sizeof(wifi_ap_record_t));
+    if (!recs) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
+        return ESP_OK;
+    }
     esp_wifi_scan_get_ap_records(&n, recs);
+
+    /* Sort strongest-first so the dedup pass below keeps the strongest
+     * instance of each SSID, and the output is sorted by RSSI as promised. */
+    qsort(recs, n, sizeof(wifi_ap_record_t), rssi_desc_cmp);
 
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(root, "networks");
@@ -59,6 +78,7 @@ static esp_err_t wifi_scan_get(httpd_req_t *req)
         cJSON_AddBoolToObject(o, "secure", recs[i].authmode != WIFI_AUTH_OPEN);
         cJSON_AddItemToArray(arr, o);
     }
+    free(recs);
     return send_json(req, root);
 }
 
@@ -71,9 +91,29 @@ static void apply_creds_cb(TimerHandle_t t)
 static esp_err_t wifi_post(httpd_req_t *req)
 {
     char body[256];
-    int len = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_OK; }
-    body[len] = '\0';
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return ESP_OK;
+    }
+    if (req->content_len > sizeof(body) - 1) {
+        /* esp_http_server's httpd_err_code_t has no 413 entry in this IDF
+         * version; set the status line/body manually. */
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
+        return ESP_OK;
+    }
+
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
 
     cJSON *json = cJSON_Parse(body);
     const cJSON *ssid = cJSON_GetObjectItem(json, "ssid");
@@ -96,7 +136,13 @@ static esp_err_t wifi_post(httpd_req_t *req)
 
     /* Switch to STA ~1.5s later so this response reaches the client first. */
     TimerHandle_t t = xTimerCreate("creds", pdMS_TO_TICKS(1500), pdFALSE, NULL, apply_creds_cb);
-    xTimerStart(t, 0);
+    if (t) {
+        xTimerStart(t, 0);
+    } else {
+        /* Creds are already saved via app_config_set_wifi above, so a
+         * reboot still picks them up even if we can't schedule the switch. */
+        ESP_LOGE(TAG, "failed to create creds-apply timer; will apply on next reboot");
+    }
     return ESP_OK;
 }
 

@@ -5,8 +5,11 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 #include <stdio.h>
 #include <string.h>
+
+ESP_EVENT_DEFINE_BASE(PLANTHUB_EVENT);
 
 static const char *TAG = "wifi_mgr";
 #define MAX_RETRIES 5
@@ -79,6 +82,15 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     }
 }
 
+/* Runs on the default event loop task, same as on_wifi_event above, so this
+ * and on_wifi_event can never touch s_fsm concurrently. */
+static void on_planthub_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == PLANTHUB_EVENT && id == PLANTHUB_EVENT_APPLY_CREDS) {
+        do_action(wifi_fsm_step(&s_fsm, WIFI_EV_NEW_CREDS));
+    }
+}
+
 esp_err_t wifi_manager_start(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -89,6 +101,7 @@ esp_err_t wifi_manager_start(void)
     ESP_ERROR_CHECK(esp_wifi_init(&init));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_wifi_event, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(PLANTHUB_EVENT, PLANTHUB_EVENT_APPLY_CREDS, on_planthub_event, NULL));
 
     wifi_fsm_init(&s_fsm, MAX_RETRIES);
     wifi_creds_t creds;
@@ -99,7 +112,10 @@ esp_err_t wifi_manager_start(void)
 
 void wifi_manager_apply_new_creds(void)
 {
-    do_action(wifi_fsm_step(&s_fsm, WIFI_EV_NEW_CREDS));
+    /* Safe to call from any task (e.g. a FreeRTOS timer callback on the
+     * timer daemon task): post onto the default event loop instead of
+     * touching s_fsm directly, so it's serialized with on_wifi_event. */
+    esp_event_post(PLANTHUB_EVENT, PLANTHUB_EVENT_APPLY_CREDS, NULL, 0, portMAX_DELAY);
 }
 
 bool wifi_manager_is_ap_mode(void)
