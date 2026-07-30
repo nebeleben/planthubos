@@ -1,9 +1,18 @@
 #include "webserver.h"
 #include "api_v1.h"
 #include "esp_log.h"
+#include "wifi_manager.h"
+#include "dns_hijack.h"
 
 static const char *TAG = "webserver";
 static httpd_handle_t s_server;
+
+static esp_err_t captive_redirect(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    return httpd_resp_send(req, NULL, 0);
+}
 
 /* Symbols created by EMBED_FILES ('.' and '-' become '_') */
 extern const uint8_t index_html_gz_start[] asm("_binary_index_html_gz_start");
@@ -49,6 +58,15 @@ esp_err_t webserver_start(void)
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &u));
     }
     api_v1_register(s_server);
+
+    if (wifi_manager_is_ap_mode()) {
+        static const httpd_uri_t fallback = {
+            .uri = "/*", .method = HTTP_GET, .handler = captive_redirect,
+        };
+        ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &fallback));
+        dns_hijack_start();
+    }
+
     ESP_LOGI(TAG, "HTTP server started");
     return ESP_OK;
 }

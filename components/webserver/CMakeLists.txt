@@ -4,7 +4,7 @@ if(NOT EXISTS "${DIST}/index.html.gz")
 endif()
 
 idf_component_register(
-    SRCS "webserver.c" "api_v1.c"
+    SRCS "webserver.c" "api_v1.c" "dns_hijack.c"
     INCLUDE_DIRS "include"
     REQUIRES esp_http_server esp_timer json wifi_manager app_config
     EMBED_FILES "${DIST}/index.html.gz" "${DIST}/app.js.gz" "${DIST}/app.css.gz"
