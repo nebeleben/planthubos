@@ -25,7 +25,11 @@ static esp_err_t captive_redirect(httpd_req_t *req)
 }
 
 /* Start/stop the DNS hijack task as the wifi driver actually enters/leaves
- * AP mode (covers boot AND later runtime fallback/recovery). */
+ * AP mode. This handler is registered (below, in webserver_start()) before
+ * wifi_manager_start() is ever called (see main.c's boot order), so it
+ * catches WIFI_EVENT_AP_START even on the very first boot into AP mode --
+ * no separate boot-time snapshot/catch-up is needed, and dns_hijack_start/
+ * stop are only ever called from here, always on the event-loop task. */
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base != WIFI_EVENT) return;
@@ -88,13 +92,9 @@ esp_err_t webserver_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &fallback));
 
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL));
-    if (wifi_manager_is_ap_mode()) {
-        /* Catch-up for the boot case: wifi_manager_start() runs before this
-         * handler is registered, so WIFI_EVENT_AP_START may already have
-         * fired. dns_hijack_start() is idempotent, so this is safe even if
-         * the event also lands. */
-        dns_hijack_start();
-    }
+    /* No boot-time catch-up call needed: wifi_manager_start() (and thus any
+     * esp_wifi_start()/WIFI_EVENT_AP_START) runs strictly after this handler
+     * is registered (see main.c), so AP mode cannot already be active here. */
 
     ESP_LOGI(TAG, "HTTP server started");
     return ESP_OK;

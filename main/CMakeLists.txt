@@ -1,1 +1,1 @@
-idf_component_register(SRCS "main.c" REQUIRES app_config wifi_manager webserver)
+idf_component_register(SRCS "main.c" REQUIRES app_config wifi_manager webserver esp_netif esp_event)

@@ -14,10 +14,16 @@ static const char *TAG = "dns_hijack";
 static TaskHandle_t s_task;
 static int s_sock = -1;
 
-/* dns_hijack_start() can race itself: the boot catch-up call in
- * webserver_start() (main task) and the WIFI_EVENT_AP_START handler
- * (default event-loop task) can both observe s_task == NULL and each spawn
- * a dns_task, leaking a task + bound socket. Make the guard atomic. */
+/* dns_hijack_start()/dns_hijack_stop() are only ever called from
+ * webserver.c's on_wifi_event(), which itself only ever runs on the default
+ * event-loop task in response to WIFI_EVENT_AP_START/AP_STOP. That makes
+ * every start/stop call inherently serialized -- there is no boot-time
+ * catch-up call from any other task anymore (see main.c's boot order: netif
+ * + event loop, then webserver_start() registers this handler, then
+ * wifi_manager_start() is the first thing that can ever fire AP_START).
+ * This atomic_flag is therefore belt-and-braces protection against future
+ * misuse (e.g. a second call site being added later), not a fix for a
+ * current race. */
 static atomic_flag s_starting = ATOMIC_FLAG_INIT;
 
 /* Walk the QNAME labels starting at offset 12, then skip QTYPE(2)+QCLASS(2).
@@ -97,18 +103,17 @@ static void dns_task(void *arg)
 
 void dns_hijack_start(void)
 {
-    /* atomic_flag_test_and_set() is the atomic check-and-set: only the
-     * first of two racing callers (boot catch-up vs. WIFI_EVENT_AP_START
-     * handler) gets past this and creates the task. */
+    /* Defensive guard only -- see the s_starting comment above for why this
+     * can't actually race in the current call graph. */
     if (atomic_flag_test_and_set(&s_starting)) return; /* already running/starting */
     xTaskCreate(dns_task, "dns_hijack", 3072, NULL, 5, &s_task);
 }
 
 void dns_hijack_stop(void)
 {
-    /* Only ever called from the event-loop task after WIFI_EVENT_AP_STOP,
-     * which cannot be in flight concurrently with the boot catch-up path,
-     * so this doesn't need its own atomic guard. */
+    /* Always called from the event-loop task, serialized with
+     * dns_hijack_start() by construction -- see the s_starting comment
+     * above. */
     if (!s_task) return;
     if (s_sock >= 0) {
         close(s_sock);

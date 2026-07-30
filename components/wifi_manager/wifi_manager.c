@@ -93,8 +93,10 @@ static void on_planthub_event(void *arg, esp_event_base_t base, int32_t id, void
 
 esp_err_t wifi_manager_start(void)
 {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    /* esp_netif_init() and esp_event_loop_create_default() are called by
+     * main() before webserver_start(), so that the webserver's
+     * WIFI_EVENT_AP_START/AP_STOP handler is registered before esp_wifi
+     * ever starts (see main.c). */
     s_sta_netif = esp_netif_create_default_wifi_sta();
     s_ap_netif = esp_netif_create_default_wifi_ap();
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
