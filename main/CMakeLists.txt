@@ -1,1 +1,1 @@
-idf_component_register(SRCS "main.c" REQUIRES app_config wifi_manager)
+idf_component_register(SRCS "main.c" REQUIRES app_config wifi_manager webserver)
