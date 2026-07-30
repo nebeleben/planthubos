@@ -5,3 +5,7 @@ CC="${CC:-cc}"
 $CC -Wall -Wextra -Werror -I../../components/app_config/include \
     test_creds_validate.c ../../components/app_config/creds_validate.c -o test_creds_validate
 ./test_creds_validate
+
+$CC -Wall -Wextra -Werror -I../../components/wifi_manager/include \
+    test_wifi_fsm.c ../../components/wifi_manager/wifi_fsm.c -o test_wifi_fsm
+./test_wifi_fsm
