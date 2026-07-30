@@ -3,6 +3,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
+#include <errno.h>
+#include <stdatomic.h>
 #include <string.h>
 
 static const char *TAG = "dns_hijack";
@@ -11,6 +13,12 @@ static const char *TAG = "dns_hijack";
 
 static TaskHandle_t s_task;
 static int s_sock = -1;
+
+/* dns_hijack_start() can race itself: the boot catch-up call in
+ * webserver_start() (main task) and the WIFI_EVENT_AP_START handler
+ * (default event-loop task) can both observe s_task == NULL and each spawn
+ * a dns_task, leaking a task + bound socket. Make the guard atomic. */
+static atomic_flag s_starting = ATOMIC_FLAG_INIT;
 
 /* Walk the QNAME labels starting at offset 12, then skip QTYPE(2)+QCLASS(2).
  * Returns the offset just past QCLASS (end of the question section) and
@@ -39,7 +47,15 @@ static void dns_task(void *arg)
         .sin_family = AF_INET, .sin_port = htons(DNS_PORT),
         .sin_addr.s_addr = htonl(INADDR_ANY),
     };
-    bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        ESP_LOGE(TAG, "bind :%d failed (errno=%d); aborting hijack task", DNS_PORT, errno);
+        close(sock);
+        s_sock = -1;
+        s_task = NULL;
+        atomic_flag_clear(&s_starting);
+        vTaskDelete(NULL);
+        return;
+    }
     ESP_LOGI(TAG, "DNS hijack listening on :53");
 
     uint8_t buf[512];
@@ -81,12 +97,18 @@ static void dns_task(void *arg)
 
 void dns_hijack_start(void)
 {
-    if (s_task) return; /* already running: guard against double-start */
+    /* atomic_flag_test_and_set() is the atomic check-and-set: only the
+     * first of two racing callers (boot catch-up vs. WIFI_EVENT_AP_START
+     * handler) gets past this and creates the task. */
+    if (atomic_flag_test_and_set(&s_starting)) return; /* already running/starting */
     xTaskCreate(dns_task, "dns_hijack", 3072, NULL, 5, &s_task);
 }
 
 void dns_hijack_stop(void)
 {
+    /* Only ever called from the event-loop task after WIFI_EVENT_AP_STOP,
+     * which cannot be in flight concurrently with the boot catch-up path,
+     * so this doesn't need its own atomic guard. */
     if (!s_task) return;
     if (s_sock >= 0) {
         close(s_sock);
@@ -94,5 +116,6 @@ void dns_hijack_stop(void)
     }
     vTaskDelete(s_task);
     s_task = NULL;
+    atomic_flag_clear(&s_starting);
     ESP_LOGI(TAG, "DNS hijack stopped");
 }
