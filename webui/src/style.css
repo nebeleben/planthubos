@@ -21,3 +21,8 @@ table.devices th, table.devices td { text-align: left; padding: 0.5rem 0.75rem; 
 .namef { display: flex; gap: 0.4rem; align-items: center; }
 .namef input { flex: 1; min-width: 8rem; }
 .mono { font-family: ui-monospace, monospace; font-size: 0.85rem; }
+.hist-controls { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; align-items: center; }
+.hist-controls select { padding: 0.35rem 0.5rem; }
+.hist-controls button { padding: 0.35rem 0.7rem; border: 1px solid #8886; background: none; border-radius: 6px; cursor: pointer; }
+.hist-controls button.active { background: #4a7c4a; color: #fff; border-color: #4a7c4a; }
+.chart { max-width: 100%; overflow-x: auto; }

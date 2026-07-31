@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'preact/hooks'
 import { DashboardTab } from './tabs/dashboard.jsx'
 import { DevicesTab } from './tabs/devices.jsx'
+import { HistoryTab } from './tabs/history.jsx'
 import { NetworkTab } from './tabs/network.jsx'
 
 const TABS = ['Dashboard', 'Devices', 'History', 'Config', 'Network']
@@ -42,6 +43,7 @@ export function App() {
       <main>
         {tab === 'Dashboard' ? <DashboardTab /> :
          tab === 'Devices' ? <DevicesTab /> :
+         tab === 'History' ? <HistoryTab /> :
          tab === 'Network' ? <NetworkTab /> :
          <Placeholder name={tab} />}
       </main>
