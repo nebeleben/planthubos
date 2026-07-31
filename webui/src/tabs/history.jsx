@@ -53,29 +53,42 @@ export function HistoryTab() {
   const [state, setState] = useState('loading') // loading | ready | unsynced | error
 
   useEffect(() => {
-    fetch('/api/v1/sensors')
+    const controller = new AbortController()
+    fetch('/api/v1/sensors', { signal: controller.signal })
       .then((r) => r.json())
       .then((d) => {
         setSensors(d.sensors)
         if (d.sensors.length > 0) setMac(d.sensors[0].mac)
         else setState('ready')
       })
-      .catch(() => setState('error'))
+      .catch((err) => { if (err.name !== 'AbortError') setState('error') })
+    return () => controller.abort()
   }, [])
 
   useEffect(() => {
     if (!mac) return
     setState('loading')
+    const controller = new AbortController()
     const r = RANGES[range]
-    fetch(`/api/v1/sensors/${mac.replaceAll(':', '')}/history?tier=${r.tier}`
-        + `&from=${Math.floor(Date.now() / 1000) - r.seconds}&to=${Math.floor(Date.now() / 1000)}`)
-      .then((res) => res.json())
-      .then((d) => {
+    ;(async () => {
+      try {
+        // The hub's own clock (epoch_s) is the authority its stored
+        // timestamps live on -- querying with the browser's clock would
+        // clip or empty the range under any skew, so fetch status first.
+        const st = await fetch('/api/v1/status', { signal: controller.signal }).then((res) => res.json())
+        if (!st.time_synced) { setState('unsynced'); return }
+        const to = st.epoch_s
+        const from = to - r.seconds
+        const d = await fetch(`/api/v1/sensors/${mac.replaceAll(':', '')}/history?tier=${r.tier}`
+            + `&from=${from}&to=${to}`, { signal: controller.signal }).then((res) => res.json())
         if (!d.synced) { setState('unsynced'); return }
         setPoints(d.points)
         setState('ready')
-      })
-      .catch(() => setState('error'))
+      } catch (err) {
+        if (err.name !== 'AbortError') setState('error')
+      }
+    })()
+    return () => controller.abort()
   }, [mac, range])
 
   return (
