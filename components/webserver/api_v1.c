@@ -1,6 +1,8 @@
 #include "api_v1.h"
 #include "app_config.h"
 #include "wifi_manager.h"
+#include "data_core.h"
+#include "sensors_json.h"
 #include "cJSON.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -11,7 +13,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "api_v1";
-#define FW_VERSION "0.1.0"
+#define FW_VERSION "0.2.0"
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -146,6 +148,18 @@ static esp_err_t wifi_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t sensors_get(httpd_req_t *req)
+{
+    static registry_t snap;   /* 16 entries is too big for the stack; guarded by httpd single-call-per-uri */
+    data_core_snapshot(&snap);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "sensors");
+    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
+        if (snap.sensors[i].in_use) cJSON_AddItemToArray(arr, sensor_json(&snap.sensors[i]));
+    }
+    return send_json(req, root);
+}
+
 void api_v1_register(httpd_handle_t server)
 {
     httpd_uri_t status = { .uri = "/api/v1/status", .method = HTTP_GET, .handler = status_get };
@@ -154,4 +168,6 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &scan));
     httpd_uri_t wifi = { .uri = "/api/v1/wifi", .method = HTTP_POST, .handler = wifi_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi));
+    httpd_uri_t sensors = { .uri = "/api/v1/sensors", .method = HTTP_GET, .handler = sensors_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensors));
 }

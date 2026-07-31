@@ -1,5 +1,6 @@
 #include "webserver.h"
 #include "api_v1.h"
+#include "sse.h"
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
@@ -85,6 +86,7 @@ esp_err_t webserver_start(void)
         ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &u));
     }
     api_v1_register(s_server);
+    sse_init(s_server);
 
     static const httpd_uri_t fallback = {
         .uri = "/*", .method = HTTP_GET, .handler = captive_redirect,
