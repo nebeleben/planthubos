@@ -1,11 +1,13 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+#include "esp_littlefs.h"
 #include "app_config.h"
 #include "wifi_manager.h"
 #include "webserver.h"
 #include "data_core.h"
 #include "ble_collector.h"
+#include "timekeeper.h"
 
 static const char *TAG = "planthub";
 
@@ -28,6 +30,16 @@ void app_main(void)
      * created and before webserver/wifi come up. */
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_vfs_littlefs_conf_t fs_conf = {
+        .base_path = "/storage",
+        .partition_label = "storage",
+        .format_if_mount_failed = true,
+        .dont_mount = false,
+    };
+    ESP_ERROR_CHECK(esp_vfs_littlefs_register(&fs_conf));
+    ESP_ERROR_CHECK(timekeeper_init("/storage"));
+
     ESP_ERROR_CHECK(data_core_init());
     ESP_ERROR_CHECK(webserver_start());
     ESP_ERROR_CHECK(wifi_manager_start());
