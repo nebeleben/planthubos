@@ -4,9 +4,21 @@
 
 /* On-disk format: sequence of 6-byte little-endian records (u16 boot_id, u32 offset). */
 
+/* Rewrite is a whole-file replace triggered every ~BOOTTAB_MAX/2 boots once
+ * the table fills. Writing straight over `path` with "wb" truncates it
+ * immediately, so a power loss mid-write loses previously-durable boot
+ * history. Instead write to a sibling temp file and rename() it over the
+ * real path: rename is atomic on both littlefs and host filesystems, so the
+ * real file is either the old complete table or the new complete table,
+ * never a partial one. The in-RAM table (already updated by the caller) is
+ * left untouched by failure here either way. */
 static int write_all(boottab_t *t, const char *path)
 {
-    FILE *f = fopen(path, "wb");
+    char tmp_path[160];
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    if (n < 0 || (size_t)n >= sizeof(tmp_path)) return -1;
+
+    FILE *f = fopen(tmp_path, "wb");
     if (!f) return -1;
     for (uint16_t i = 0; i < t->count; i++) {
         uint8_t rec[6] = {
@@ -14,9 +26,10 @@ static int write_all(boottab_t *t, const char *path)
             (uint8_t)(t->e[i].offset), (uint8_t)(t->e[i].offset >> 8),
             (uint8_t)(t->e[i].offset >> 16), (uint8_t)(t->e[i].offset >> 24),
         };
-        if (fwrite(rec, 1, 6, f) != 6) { fclose(f); return -1; }
+        if (fwrite(rec, 1, 6, f) != 6) { fclose(f); remove(tmp_path); return -1; }
     }
-    fclose(f);
+    if (fclose(f) != 0) { remove(tmp_path); return -1; }
+    if (rename(tmp_path, path) != 0) { remove(tmp_path); return -1; }
     return 0;
 }
 

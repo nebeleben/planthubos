@@ -32,6 +32,17 @@ static bool newer(uint16_t b1, uint32_t r1, uint16_t b2, uint32_t r2)
     return b1 != b2 ? b1 > b2 : r1 > r2;
 }
 
+/* littlefs's copy-on-write commit semantics are the primary defense against
+ * torn 16-byte record writes on-target; this check is belt-and-braces for
+ * other filesystems (host tests) and any residual corruption. A torn write
+ * can leave a slot with a non-empty boot_id but garbage rel_s, which would
+ * otherwise win the (boot_id, rel_s) newest-comparison and misplace the
+ * write cursor. */
+static bool rec_plausible(const storage_rec_t *r)
+{
+    return r->boot_id != EMPTY_BOOT && r->rel_s != 0xFFFFFFFFu && r->rel_s < 320000000u; /* ~10y uptime ceiling */
+}
+
 static cache_t *cache_get(const uint8_t mac[6], storage_tier_t tier)
 {
     cache_t *free_slot = NULL;
@@ -53,7 +64,7 @@ static uint32_t scan_next_idx(FILE *f, uint32_t cap)
     fseek(f, 0, SEEK_SET);
     for (uint32_t i = 0; i < cap; i++) {
         if (fread(&rec, 1, sizeof(rec), f) != sizeof(rec)) break;
-        if (rec.boot_id == EMPTY_BOOT) continue;
+        if (!rec_plausible(&rec)) continue;
         if (!any || newer(rec.boot_id, rec.rel_s, nb, nr)) {
             any = true; nb = rec.boot_id; nr = rec.rel_s; newest_idx = i;
         }
@@ -125,7 +136,7 @@ int storage_query(const char *base, const uint8_t mac[6], storage_tier_t tier,
         uint32_t i = (start + k) % cap;
         if (fseek(f, (long)i * REC_SZ, SEEK_SET) != 0) break;
         if (fread(&rec, 1, sizeof(rec), f) != sizeof(rec)) break;
-        if (rec.boot_id == EMPTY_BOOT) continue;
+        if (!rec_plausible(&rec)) continue;
         uint32_t epoch;
         if (!resolve(rctx, rec.boot_id, rec.rel_s, &epoch)) continue;
         if (epoch < from_epoch || epoch > to_epoch) continue;

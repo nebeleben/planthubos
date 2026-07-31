@@ -32,6 +32,14 @@ static void row(void *ctx, uint32_t epoch, const storage_rec_t *rec)
     r->epochs[r->n++] = epoch;
 }
 
+/* mirrors storage.c's private tier_path() naming scheme, for poking a raw
+ * ring file directly in the torn-write guard test below */
+static void raw_path(char *out, size_t n, const char *dir, const uint8_t mac[6])
+{
+    snprintf(out, n, "%s/%02X%02X%02X%02X%02X%02X_raw.bin", dir,
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
 int main(void)
 {
     char dir[] = "/tmp/planthub_storage_XXXXXX";
@@ -82,6 +90,33 @@ int main(void)
     assert(storage_query(dir, MAC, STORAGE_TIER_HOURLY, 0, 0xFFFFFFFFu, resolve, NULL, row, &rows) == STORAGE_HOURLY_CAP);
     for (int i = 1; i < rows.n; i++) assert(rows.epochs[i] > rows.epochs[i - 1]);
     assert(rows.epochs[rows.n - 1] == 2000000u + (STORAGE_HOURLY_CAP + 10) * 3600);
+
+    /* torn-write guard: a garbage 16-byte record (implausible rel_s) must
+     * not misdirect the write cursor and must be skipped on query, with the
+     * genuine records still emitted in order */
+    const uint8_t MAC2[6] = { 0xAA, 0xBB, 0xCC, 0x01, 0x02, 0x03 };
+    storage_rec_t g1 = mk(1, 100, 210);
+    assert(storage_append(dir, MAC2, STORAGE_TIER_RAW, &g1) == 0);
+
+    char raw_file[160];
+    raw_path(raw_file, sizeof(raw_file), dir, MAC2);
+    FILE *gf = fopen(raw_file, "r+b");
+    assert(gf != NULL);
+    uint8_t garbage[16];
+    memset(garbage, 0xAB, sizeof(garbage));
+    assert(fseek(gf, 5 * (long)sizeof(storage_rec_t), SEEK_SET) == 0);
+    assert(fwrite(garbage, 1, sizeof(garbage), gf) == sizeof(garbage));
+    fclose(gf);
+
+    storage_reset_cache();
+    storage_rec_t g2 = mk(1, 200, 220);
+    assert(storage_append(dir, MAC2, STORAGE_TIER_RAW, &g2) == 0);
+
+    rows.n = 0;
+    assert(storage_query(dir, MAC2, STORAGE_TIER_RAW, 0, 0xFFFFFFFFu, resolve, NULL, row, &rows) == 2);
+    assert(rows.n == 2);
+    assert(rows.epochs[0] == 1000100 && rows.epochs[1] == 1000200);
+    for (int i = 1; i < rows.n; i++) assert(rows.epochs[i] > rows.epochs[i - 1]);
 
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
