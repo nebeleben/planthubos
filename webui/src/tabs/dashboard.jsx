@@ -64,13 +64,16 @@ export function DashboardTab() {
 
     fetch('/api/v1/sensors')
       .then((r) => r.json())
-      .then((data) => {
+      .then(async (data) => {
         if (!alive) return
         const byMac = {}
         for (const s of data.sensors) byMac[s.mac] = s
         setSensors(byMac)
-        // hub reports uptime-based last_seen; use the freshest as "now"
-        setNowS(Math.max(0, ...data.sensors.map((s) => s.last_seen_s)))
+        // "now" should track the hub's own clock, not the browser's --
+        // fall back to the freshest sensor reading if status is unavailable.
+        const st = await fetch('/api/v1/status').then((r) => r.json()).catch(() => null)
+        if (!alive) return
+        setNowS(st ? st.uptime_s : Math.max(0, ...data.sensors.map((s) => s.last_seen_s)))
         setStatus('live')
 
         // Local 1s ticker so "Xs ago" keeps advancing for sensors that go
