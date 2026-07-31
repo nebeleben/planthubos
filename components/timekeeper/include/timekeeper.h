@@ -2,6 +2,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "esp_event.h"
+
+/* Posted (with a uint32_t epoch_s payload) from the SNTP sync callback,
+ * which runs on the lwip/tcpip task, onto the default event loop -- so the
+ * boottab write in timekeeper_set_epoch never stalls network I/O. */
+ESP_EVENT_DECLARE_BASE(PLANTHUB_TIME_EVENT);
+enum { TIME_EVENT_EPOCH_LEARNED };
 
 esp_err_t timekeeper_init(const char *base_path);
 uint16_t  timekeeper_boot_id(void);

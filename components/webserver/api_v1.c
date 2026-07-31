@@ -195,6 +195,10 @@ typedef struct {
     bool failed;
 } hist_ctx_t;
 
+/* Once c->failed is set we just return without sending further chunks; we
+ * don't abort the underlying storage_query scan early, but that scan is
+ * bounded (<=STORAGE_RAW_CAP == 2880 records) so letting it run to
+ * completion costs at most a bounded, harmless amount of wasted work. */
 static void hist_row(void *vctx, uint32_t epoch, const storage_rec_t *rec)
 {
     hist_ctx_t *c = vctx;
@@ -252,6 +256,11 @@ static esp_err_t history_get(httpd_req_t *req)
     if (synced) {
         hist_ctx_t ctx = { .req = req, .first = true, .failed = false };
         storage_query("/storage", mac, tier, from, to, resolve_shim, NULL, hist_row, &ctx);
+        /* A chunk send already failed (client/socket gone) -- don't send the
+         * trailing chunks over a dead connection, and return non-OK so
+         * esp_http_server closes the session instead of believing it's
+         * still alive. */
+        if (ctx.failed) return ESP_FAIL;
     }
     httpd_resp_sendstr_chunk(req, "]}");
     httpd_resp_sendstr_chunk(req, NULL);   /* end chunked response */

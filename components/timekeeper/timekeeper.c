@@ -14,6 +14,8 @@
 
 static const char *TAG = "timekeeper";
 
+ESP_EVENT_DEFINE_BASE(PLANTHUB_TIME_EVENT);
+
 static boottab_t s_tab;
 static char s_tab_path[64];
 static uint16_t s_boot_id;
@@ -23,9 +25,21 @@ static SemaphoreHandle_t s_mutex;
 
 static uint32_t uptime_s(void) { return (uint32_t)(esp_timer_get_time() / 1000000); }
 
+/* Runs on the lwip/tcpip task (SNTP uses udp_recv there). Do not do the
+ * boottab write here -- just post the epoch to the default event loop and
+ * let timekeeper_init's handler (running on the event loop task) call
+ * timekeeper_set_epoch, keeping any LittleFS I/O off the network task. */
 static void on_sntp_sync(struct timeval *tv)
 {
-    timekeeper_set_epoch((uint32_t)tv->tv_sec);
+    uint32_t epoch = (uint32_t)tv->tv_sec;
+    esp_err_t err = esp_event_post(PLANTHUB_TIME_EVENT, TIME_EVENT_EPOCH_LEARNED,
+                                    &epoch, sizeof(epoch), 0);
+    if (err != ESP_OK) ESP_LOGW(TAG, "failed to post epoch-learned event: %s", esp_err_to_name(err));
+}
+
+static void on_epoch_learned(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    timekeeper_set_epoch(*(uint32_t *)data);
 }
 
 static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -62,6 +76,8 @@ esp_err_t timekeeper_init(const char *base_path)
     if (err != ESP_OK) return err;
 
     ESP_LOGI(TAG, "boot_id=%u, boottab entries=%u", s_boot_id, s_tab.count);
+    err = esp_event_handler_register(PLANTHUB_TIME_EVENT, TIME_EVENT_EPOCH_LEARNED, on_epoch_learned, NULL);
+    if (err != ESP_OK) return err;
     return esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_got_ip, NULL);
 }
 
