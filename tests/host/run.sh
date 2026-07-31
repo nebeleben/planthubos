@@ -17,3 +17,7 @@ $CC -Wall -Wextra -Werror -I../../components/mibeacon/include \
 $CC -Wall -Wextra -Werror -I../../components/mibeacon/include -I../../components/data_core/include \
     test_registry.c ../../components/data_core/registry.c ../../components/mibeacon/mibeacon.c -o test_registry
 ./test_registry
+
+$CC -Wall -Wextra -Werror -I../../components/timekeeper/include \
+    test_boottab.c ../../components/timekeeper/boottab.c -o test_boottab
+./test_boottab
