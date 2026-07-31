@@ -26,8 +26,13 @@ static void start_sta(void)
     wifi_creds_t creds;
     if (!app_config_get_wifi(&creds)) return;
     wifi_config_t cfg = { 0 };
-    strlcpy((char *)cfg.sta.ssid, creds.ssid, sizeof(cfg.sta.ssid));
-    strlcpy((char *)cfg.sta.password, creds.password, sizeof(cfg.sta.password));
+    /* Not strlcpy: wifi_sta_config_t has no ssid_len field, so a full 32-byte
+     * SSID or 64-byte raw-hex PSK must land in the array without truncation
+     * or a forced NUL terminator. cfg is zero-initialized above, so an
+     * unterminated max-length array here is valid for STA config. strlen is
+     * guaranteed <= 32/64 by creds_validate() at store time. */
+    memcpy(cfg.sta.ssid, creds.ssid, strlen(creds.ssid));
+    memcpy(cfg.sta.password, creds.password, strlen(creds.password));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
     ESP_ERROR_CHECK(esp_wifi_start());

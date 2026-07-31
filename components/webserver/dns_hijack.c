@@ -69,6 +69,33 @@ static void dns_task(void *arg)
         struct sockaddr_in src;
         socklen_t slen = sizeof(src);
         int len = recvfrom(sock, buf, sizeof(buf) - 16, 0, (struct sockaddr *)&src, &slen);
+        if (len < 0) {
+            /* A persistent socket error (e.g. errno=EBADF/ENOTCONN in the
+             * window where dns_hijack_stop() has already closed s_sock on
+             * the event-loop task but hasn't yet reached vTaskDelete(s_task))
+             * must not busy-spin: this task runs at priority 5, and a tight
+             * loop here can starve IDLE and trip the task watchdog.
+             *
+             * Deliberately do NOT mirror the bind-failure cleanup here (no
+             * closing/clearing of s_sock/s_task/s_starting, no
+             * vTaskDelete(NULL)): dns_hijack_start()/stop() calls are
+             * serialized on the event-loop task, but this recv loop runs
+             * concurrently with a stop() that may already be in flight. If
+             * we cleared s_task to NULL and self-deleted here, stop()'s
+             * subsequent vTaskDelete(s_task) would read s_task as NULL,
+             * which means "delete the calling task" -- i.e. it would delete
+             * the *event-loop* task instead of being the intended no-op/
+             * cleanup, and s_starting could be left in an inconsistent
+             * state relative to stop()'s own clear. So instead we just log
+             * and back off with a short delay and retry: if a stop() is in
+             * progress, it remains free to vTaskDelete(s_task) out from
+             * under this delay at any time (FreeRTOS allows deleting a
+             * blocked/delayed task); if the error was transient, we simply
+             * try recvfrom again afterwards. */
+            ESP_LOGW(TAG, "recvfrom failed (errno=%d); backing off", errno);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         if (len < 12) continue;
 
         uint16_t qtype = 0;
