@@ -31,5 +31,6 @@ void app_main(void)
     ESP_ERROR_CHECK(data_core_init());
     ESP_ERROR_CHECK(webserver_start());
     ESP_ERROR_CHECK(wifi_manager_start());
-    ESP_ERROR_CHECK(ble_collector_start());
+    esp_err_t ble_err = ble_collector_start();
+    if (ble_err != ESP_OK) ESP_LOGE(TAG, "BLE collector failed to start (%s); running without BLE", esp_err_to_name(ble_err));
 }

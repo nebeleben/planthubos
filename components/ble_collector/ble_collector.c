@@ -41,6 +41,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (uuid != XIAOMI_SVC_UUID) return 0;
         mibeacon_t m;
         if (mibeacon_parse(fields.svc_data_uuid16 + 2, fields.svc_data_uuid16_len - 2, &m) == MIBEACON_OK) {
+            if (m.product_id != MIBEACON_PRODUCT_MIFLORA) return 0;
             data_core_submit(&m);
         }
         return 0;

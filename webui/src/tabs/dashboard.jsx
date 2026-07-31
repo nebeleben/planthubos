@@ -29,11 +29,43 @@ export function DashboardTab() {
   const [nowS, setNowS] = useState(0)
 
   useEffect(() => {
+    let alive = true
     let es
     let ticker
+    let retryTimer
+
+    // The hub's SSE endpoint caps at 2 clients and answers a 3rd with a
+    // plain HTTP 503, not a dropped connection -- and a non-200 response
+    // permanently closes the browser's EventSource with no auto-reconnect.
+    // Factored out so onerror can rebuild the connection from scratch.
+    function connect() {
+      es = new EventSource('/api/v1/events')
+      es.onopen = () => setReconnecting(false)
+      es.onmessage = (ev) => {
+        const s = JSON.parse(ev.data)
+        setSensors((prev) => ({ ...prev, [s.mac]: s }))
+        setNowS((prev) => Math.max(prev, s.last_seen_s))
+        setReconnecting(false)
+      }
+      es.onerror = () => {
+        setReconnecting(true)
+        if (es.readyState === EventSource.CLOSED) {
+          // Permanently closed (e.g. the 503 case above) -- EventSource
+          // won't retry on its own, so schedule a fresh connection.
+          es.close()
+          retryTimer = setTimeout(() => {
+            if (alive) connect()
+          }, 5000)
+        }
+        // Otherwise it's a transient drop; the browser is already retrying
+        // this same EventSource, so just leave the "reconnecting" banner up.
+      }
+    }
+
     fetch('/api/v1/sensors')
       .then((r) => r.json())
       .then((data) => {
+        if (!alive) return
         const byMac = {}
         for (const s of data.sensors) byMac[s.mac] = s
         setSensors(byMac)
@@ -45,22 +77,16 @@ export function DashboardTab() {
         // dark, instead of freezing at their last SSE message's last_seen_s.
         ticker = setInterval(() => setNowS((prev) => prev + 1), 1000)
 
-        es = new EventSource('/api/v1/events')
-        es.onopen = () => setReconnecting(false)
-        es.onmessage = (ev) => {
-          const s = JSON.parse(ev.data)
-          setSensors((prev) => ({ ...prev, [s.mac]: s }))
-          setNowS((prev) => Math.max(prev, s.last_seen_s))
-          setReconnecting(false)
-        }
-        // EventSource auto-reconnects on its own; don't blow away the
-        // already-rendered tiles, just flag that we're between connections.
-        es.onerror = () => setReconnecting(true)
+        connect()
       })
-      .catch(() => setStatus('error'))
+      .catch(() => {
+        if (alive) setStatus('error')
+      })
     return () => {
+      alive = false
       es && es.close()
       ticker && clearInterval(ticker)
+      retryTimer && clearTimeout(retryTimer)
     }
   }, [])
 

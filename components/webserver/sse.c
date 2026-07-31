@@ -62,6 +62,10 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
 {
     const uint8_t *mac = data;
     static registry_t snap;   /* only ever touched on the default event loop task */
+    /* static: this handler only ever runs on the single default event-loop
+     * task, which has just a 2304 B stack -- keep the 320 B message buffer
+     * off it. */
+    static char buf[320];
     data_core_snapshot(&snap);
     int idx = registry_find(&snap, mac);
     if (idx < 0) return;
@@ -69,7 +73,6 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
     char *json = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     if (!json) return;
-    char buf[320];
     int n = snprintf(buf, sizeof(buf), "data: %s\n\n", json);
     free(json);
     if (n > 0 && n < (int)sizeof(buf)) queue_send(strdup(buf));
@@ -86,6 +89,27 @@ static esp_err_t events_get(httpd_req_t *req)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     for (int i = 0; i < SSE_MAX_CLIENTS && slot < 0; i++)
         if (!s_clients[i]) slot = i;
+    if (slot < 0) {
+        /* No free slot -- but a client may already be dead (peer reset,
+         * cable pull) without us having noticed yet; keepalive alone can
+         * take up to ~45s to surface that via a failed heartbeat send.
+         * Peek each occupied socket for an already-visible close/error
+         * before giving up, so a reconnecting client doesn't have to wait
+         * out that window. events_get runs on the httpd task, same as the
+         * queued sender (send_all_work), so this can't race a concurrent
+         * send onto the same slot. */
+        for (int i = 0; i < SSE_MAX_CLIENTS && slot < 0; i++) {
+            int fd = httpd_req_to_sockfd(s_clients[i]);
+            if (fd < 0) continue;
+            char c;
+            int r = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (r == 0 || (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN)) {
+                httpd_req_async_handler_complete(s_clients[i]);
+                s_clients[i] = NULL;
+                slot = i;
+            }
+        }
+    }
     xSemaphoreGive(s_mutex);
     if (slot < 0) {
         /* esp_http_server's httpd_err_code_t has no 503 entry in this IDF
