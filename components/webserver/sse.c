@@ -5,7 +5,9 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "lwip/sockets.h"
 #include <string.h>
+#include <stdlib.h>
 
 static const char *TAG = "sse";
 #define SSE_MAX_CLIENTS 2
@@ -13,8 +15,15 @@ static const char *TAG = "sse";
 static httpd_req_t *s_clients[SSE_MAX_CLIENTS];
 static SemaphoreHandle_t s_mutex;
 static esp_timer_handle_t s_hb_timer;
+static httpd_handle_t s_server;
 
-/* Send to every connected client; drop clients whose socket errored. */
+/* Send to every connected client; drop clients whose socket errored. This
+ * only ever runs on the httpd task's own context (queued via
+ * httpd_queue_work below), so a stalled client blocking inside
+ * httpd_resp_send_chunk for up to send_wait_timeout never stalls the
+ * esp_timer task (heartbeat) or the default event-loop task (sensor
+ * updates) -- it can only ever delay the httpd task's own request queue,
+ * which is where such a wait belongs. */
 static void send_all(const char *buf, size_t len)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -26,6 +35,27 @@ static void send_all(const char *buf, size_t len)
         }
     }
     xSemaphoreGive(s_mutex);
+}
+
+/* httpd work-queue callback: takes ownership of the heap buffer produced by
+ * on_sensor_update()/heartbeat() and frees it once sent. */
+static void send_all_work(void *arg)
+{
+    char *buf = arg;
+    send_all(buf, strlen(buf));
+    free(buf);
+}
+
+/* Hand a heap-allocated, NUL-terminated message to the httpd task for
+ * sending. Frees buf itself on failure (e.g. queue full) so callers never
+ * have to. */
+static void queue_send(char *buf)
+{
+    if (!buf) return;
+    if (httpd_queue_work(s_server, send_all_work, buf) != ESP_OK) {
+        ESP_LOGW(TAG, "sse work queue full, dropping message");
+        free(buf);
+    }
 }
 
 static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -42,12 +72,12 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
     char buf[320];
     int n = snprintf(buf, sizeof(buf), "data: %s\n\n", json);
     free(json);
-    if (n > 0 && n < (int)sizeof(buf)) send_all(buf, n);
+    if (n > 0 && n < (int)sizeof(buf)) queue_send(strdup(buf));
 }
 
 static void heartbeat(void *arg)
 {
-    send_all(": hb\n\n", 6);
+    queue_send(strdup(": hb\n\n"));
 }
 
 static esp_err_t events_get(httpd_req_t *req)
@@ -58,7 +88,12 @@ static esp_err_t events_get(httpd_req_t *req)
         if (!s_clients[i]) slot = i;
     xSemaphoreGive(s_mutex);
     if (slot < 0) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sse client limit");
+        /* esp_http_server's httpd_err_code_t has no 503 entry in this IDF
+         * version; set the status line/body manually, same pattern as
+         * api_v1.c's 413 response. */
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"sse client limit\"}");
         return ESP_OK;
     }
 
@@ -72,6 +107,21 @@ static esp_err_t events_get(httpd_req_t *req)
     err = httpd_req_async_handler_begin(req, &async);
     if (err != ESP_OK) return err;
 
+    /* Without keepalive, a client that vanishes without a clean FIN (power
+     * loss, wifi drop) pins this slot until LWIP's default retransmit
+     * timeout, which is minutes -- far longer than our 2-slot budget can
+     * absorb. Probing keeps idle-dead peers detectable within
+     * ~30 + 5*3 = 45s, so the next heartbeat send (which calls
+     * httpd_resp_send_chunk on a now-broken socket) reaps the slot. */
+    int fd = httpd_req_to_sockfd(async);
+    if (fd >= 0) {
+        int one = 1, idle = 30, intvl = 5, cnt = 3;
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    }
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_clients[slot] = async;
     xSemaphoreGive(s_mutex);
@@ -81,6 +131,7 @@ static esp_err_t events_get(httpd_req_t *req)
 
 void sse_init(httpd_handle_t server)
 {
+    s_server = server;
     s_mutex = xSemaphoreCreateMutex();
     httpd_uri_t events = { .uri = "/api/v1/events", .method = HTTP_GET, .handler = events_get };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &events));

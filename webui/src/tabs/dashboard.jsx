@@ -25,10 +25,12 @@ function Tile({ s, nowS }) {
 export function DashboardTab() {
   const [sensors, setSensors] = useState({})   // keyed by mac
   const [status, setStatus] = useState('loading') // loading | live | error
+  const [reconnecting, setReconnecting] = useState(false)
   const [nowS, setNowS] = useState(0)
 
   useEffect(() => {
     let es
+    let ticker
     fetch('/api/v1/sensors')
       .then((r) => r.json())
       .then((data) => {
@@ -38,16 +40,28 @@ export function DashboardTab() {
         // hub reports uptime-based last_seen; use the freshest as "now"
         setNowS(Math.max(0, ...data.sensors.map((s) => s.last_seen_s)))
         setStatus('live')
+
+        // Local 1s ticker so "Xs ago" keeps advancing for sensors that go
+        // dark, instead of freezing at their last SSE message's last_seen_s.
+        ticker = setInterval(() => setNowS((prev) => prev + 1), 1000)
+
         es = new EventSource('/api/v1/events')
+        es.onopen = () => setReconnecting(false)
         es.onmessage = (ev) => {
           const s = JSON.parse(ev.data)
           setSensors((prev) => ({ ...prev, [s.mac]: s }))
           setNowS((prev) => Math.max(prev, s.last_seen_s))
+          setReconnecting(false)
         }
-        es.onerror = () => setStatus('error')
+        // EventSource auto-reconnects on its own; don't blow away the
+        // already-rendered tiles, just flag that we're between connections.
+        es.onerror = () => setReconnecting(true)
       })
       .catch(() => setStatus('error'))
-    return () => es && es.close()
+    return () => {
+      es && es.close()
+      ticker && clearInterval(ticker)
+    }
   }, [])
 
   const list = Object.values(sensors)
@@ -55,5 +69,10 @@ export function DashboardTab() {
   if (status === 'error') return <p class="error">Hub not reachable — retrying via SSE…</p>
   if (list.length === 0)
     return <p class="placeholder">No sensors found yet. MiFlora devices are discovered automatically — bring one in range.</p>
-  return <div class="tiles">{list.map((s) => <Tile key={s.mac} s={s} nowS={nowS} />)}</div>
+  return (
+    <div>
+      {reconnecting && <p class="banner">Reconnecting to hub…</p>}
+      <div class="tiles">{list.map((s) => <Tile key={s.mac} s={s} nowS={nowS} />)}</div>
+    </div>
+  )
 }
