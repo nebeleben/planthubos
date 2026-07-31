@@ -9,3 +9,7 @@ $CC -Wall -Wextra -Werror -I../../components/app_config/include \
 $CC -Wall -Wextra -Werror -I../../components/wifi_manager/include \
     test_wifi_fsm.c ../../components/wifi_manager/wifi_fsm.c -o test_wifi_fsm
 ./test_wifi_fsm
+
+$CC -Wall -Wextra -Werror -I../../components/mibeacon/include \
+    test_mibeacon.c ../../components/mibeacon/mibeacon.c -o test_mibeacon
+./test_mibeacon
