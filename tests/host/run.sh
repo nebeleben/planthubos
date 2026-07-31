@@ -29,3 +29,7 @@ $CC -Wall -Wextra -Werror -I../../components/storage/include \
 $CC -Wall -Wextra -Werror -I../../components/storage/include \
     test_hourly_agg.c ../../components/storage/hourly_agg.c -o test_hourly_agg
 ./test_hourly_agg
+
+$CC -Wall -Wextra -Werror -I../../components/claiming/include \
+    test_authtok.c ../../components/claiming/authtok.c -o test_authtok
+./test_authtok
