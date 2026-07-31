@@ -5,6 +5,7 @@
 #include "wifi_manager.h"
 #include "webserver.h"
 #include "data_core.h"
+#include "ble_collector.h"
 
 static const char *TAG = "planthub";
 
@@ -30,4 +31,5 @@ void app_main(void)
     ESP_ERROR_CHECK(data_core_init());
     ESP_ERROR_CHECK(webserver_start());
     ESP_ERROR_CHECK(wifi_manager_start());
+    ESP_ERROR_CHECK(ble_collector_start());
 }

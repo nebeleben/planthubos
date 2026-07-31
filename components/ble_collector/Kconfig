@@ -1,0 +1,17 @@
+menu "PlantHub BLE Collector"
+
+config PLANTHUB_BLE_SCAN_ITVL_MS
+    int "BLE scan interval (ms)"
+    default 200
+    help
+        Time between scan window starts. Larger interval = more airtime for WiFi.
+
+config PLANTHUB_BLE_SCAN_WINDOW_MS
+    int "BLE scan window (ms)"
+    default 60 if IDF_TARGET_ESP32C3
+    default 80
+    help
+        Active listen time per interval. C3 (single core, shared radio) defaults
+        lower to keep the web UI responsive (PlanV1 3.1).
+
+endmenu
