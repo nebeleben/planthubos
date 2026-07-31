@@ -83,7 +83,15 @@ static FILE *open_or_create(const char *path, uint32_t cap)
     long total = (long)cap * REC_SZ;
     for (long off = 0; off < total; off += (long)sizeof(block)) {
         long n = total - off < (long)sizeof(block) ? total - off : (long)sizeof(block);
-        if (fwrite(block, 1, (size_t)n, f) != (size_t)n) { fclose(f); return NULL; }
+        if (fwrite(block, 1, (size_t)n, f) != (size_t)n) {
+            /* Partial preallocation (e.g. ENOSPC): leaving the short file
+             * behind would make later appends fseek past EOF and create
+             * dead zero-filled slots, so remove it and let the caller retry
+             * from scratch. */
+            fclose(f);
+            remove(path);
+            return NULL;
+        }
     }
     return f;
 }

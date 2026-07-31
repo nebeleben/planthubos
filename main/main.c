@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_event.h"
@@ -32,19 +33,42 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    /* A storage/NVS failure here must not panic-reboot-loop the hub: that
+     * would brick WiFi onboarding (M1's core function) over a feature (M3
+     * history) that can degrade gracefully instead. So littlefs, timekeeper
+     * and sampler all get the same log-and-continue treatment as BLE below,
+     * rather than ESP_ERROR_CHECK. */
     esp_vfs_littlefs_conf_t fs_conf = {
         .base_path = "/storage",
         .partition_label = "storage",
         .format_if_mount_failed = true,
         .dont_mount = false,
     };
-    ESP_ERROR_CHECK(esp_vfs_littlefs_register(&fs_conf));
-    ESP_ERROR_CHECK(timekeeper_init("/storage"));
+    esp_err_t storage_err = esp_vfs_littlefs_register(&fs_conf);
+    bool storage_ok = storage_err == ESP_OK;
+    if (!storage_ok) ESP_LOGE(TAG, "littlefs mount failed (%s); running without on-device history", esp_err_to_name(storage_err));
+
+    /* timekeeper_init runs regardless of storage_ok: its boot counter lives
+     * in NVS (a separate partition, unaffected by a littlefs failure) and
+     * boottab_load already treats a missing/unreachable table file as an
+     * empty table, so on an unmounted /storage it just stays permanently
+     * unsynced (timekeeper_synced() == false) instead of failing outright. */
+    esp_err_t tk_err = timekeeper_init("/storage");
+    if (tk_err != ESP_OK) ESP_LOGE(TAG, "timekeeper_init failed (%s); time sync unavailable", esp_err_to_name(tk_err));
 
     ESP_ERROR_CHECK(data_core_init());
     ESP_ERROR_CHECK(webserver_start());
     ESP_ERROR_CHECK(wifi_manager_start());
     esp_err_t ble_err = ble_collector_start();
     if (ble_err != ESP_OK) ESP_LOGE(TAG, "BLE collector failed to start (%s); running without BLE", esp_err_to_name(ble_err));
-    ESP_ERROR_CHECK(sampler_start("/storage"));
+
+    /* Sampler appends to /storage every CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN
+     * minutes; starting it against a failed mount would just fail forever,
+     * so skip it outright rather than let it retry into the void. */
+    if (storage_ok) {
+        esp_err_t sampler_err = sampler_start("/storage");
+        if (sampler_err != ESP_OK) ESP_LOGE(TAG, "sampler_start failed (%s); running without history sampling", esp_err_to_name(sampler_err));
+    } else {
+        ESP_LOGW(TAG, "skipping sampler_start: storage unavailable");
+    }
 }
