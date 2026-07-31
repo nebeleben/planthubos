@@ -25,3 +25,7 @@ $CC -Wall -Wextra -Werror -I../../components/timekeeper/include \
 $CC -Wall -Wextra -Werror -I../../components/storage/include \
     test_storage.c ../../components/storage/storage.c -o test_storage
 ./test_storage
+
+$CC -Wall -Wextra -Werror -I../../components/storage/include \
+    test_hourly_agg.c ../../components/storage/hourly_agg.c -o test_hourly_agg
+./test_hourly_agg

@@ -1,4 +1,4 @@
 idf_component_register(
-    SRCS "storage.c"
+    SRCS "storage.c" "hourly_agg.c"
     INCLUDE_DIRS "include"
 )
