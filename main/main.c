@@ -4,6 +4,7 @@
 #include "esp_event.h"
 #include "esp_littlefs.h"
 #include "app_config.h"
+#include "claim.h"
 #include "wifi_manager.h"
 #include "webserver.h"
 #include "data_core.h"
@@ -16,6 +17,8 @@ static const char *TAG = "planthub";
 void app_main(void)
 {
     ESP_ERROR_CHECK(app_config_init());
+    ESP_ERROR_CHECK(claim_init());
+    factory_reset_button_start();
     char name[16];
     app_config_hub_name(name);
     ESP_LOGI(TAG, "PlantHub booting as %s", name);
