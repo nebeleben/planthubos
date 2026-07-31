@@ -21,3 +21,7 @@ $CC -Wall -Wextra -Werror -I../../components/mibeacon/include -I../../components
 $CC -Wall -Wextra -Werror -I../../components/timekeeper/include \
     test_boottab.c ../../components/timekeeper/boottab.c -o test_boottab
 ./test_boottab
+
+$CC -Wall -Wextra -Werror -I../../components/storage/include \
+    test_storage.c ../../components/storage/storage.c -o test_storage
+./test_storage
