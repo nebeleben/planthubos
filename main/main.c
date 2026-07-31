@@ -4,6 +4,7 @@
 #include "app_config.h"
 #include "wifi_manager.h"
 #include "webserver.h"
+#include "data_core.h"
 
 static const char *TAG = "planthub";
 
@@ -19,9 +20,14 @@ void app_main(void)
      * must in turn be registered before wifi_manager_start() ever calls
      * esp_wifi_start() -- otherwise a first-boot-into-AP WIFI_EVENT_AP_START
      * could fire with no listener and the captive portal's DNS hijack would
-     * never start. Hence: netif/event-loop, then webserver, then wifi. */
+     * never start. Hence: netif/event-loop, then webserver, then wifi.
+     *
+     * data_core_init() only needs the default event loop (it posts
+     * PLANTHUB_DATA_EVENT on it) so it slots in right after the loop is
+     * created and before webserver/wifi come up. */
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(data_core_init());
     ESP_ERROR_CHECK(webserver_start());
     ESP_ERROR_CHECK(wifi_manager_start());
 }
