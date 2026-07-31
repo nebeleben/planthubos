@@ -3,6 +3,8 @@
 #include "wifi_manager.h"
 #include "data_core.h"
 #include "sensors_json.h"
+#include "storage.h"
+#include "timekeeper.h"
 #include "cJSON.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -13,7 +15,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "api_v1";
-#define FW_VERSION "0.2.0"
+#define FW_VERSION "0.3.0"
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -36,6 +38,8 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "ap_mode", wifi_manager_is_ap_mode());
     cJSON_AddStringToObject(root, "ip", ip);
     cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
+    cJSON_AddBoolToObject(root, "time_synced", timekeeper_synced());
+    cJSON_AddNumberToObject(root, "epoch_s", timekeeper_now());
     return send_json(req, root);
 }
 
@@ -160,6 +164,143 @@ static esp_err_t sensors_get(httpd_req_t *req)
     return send_json(req, root);
 }
 
+/* Parse 12 uppercase/lowercase hex chars into mac[6]; returns false on malformed input. */
+static bool parse_mac12(const char *s, uint8_t mac[6])
+{
+    for (int i = 0; i < 6; i++) {
+        unsigned hi, lo;
+        char a = s[i * 2], b = s[i * 2 + 1];
+        if (a >= '0' && a <= '9') hi = a - '0';
+        else if (a >= 'A' && a <= 'F') hi = a - 'A' + 10;
+        else if (a >= 'a' && a <= 'f') hi = a - 'a' + 10;
+        else return false;
+        if (b >= '0' && b <= '9') lo = b - '0';
+        else if (b >= 'A' && b <= 'F') lo = b - 'A' + 10;
+        else if (b >= 'a' && b <= 'f') lo = b - 'a' + 10;
+        else return false;
+        mac[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return s[12] == '\0' || s[12] == '/';
+}
+
+static bool resolve_shim(void *rctx, uint16_t boot_id, uint32_t rel_s, uint32_t *epoch)
+{
+    (void)rctx;
+    return timekeeper_resolve(boot_id, rel_s, epoch);
+}
+
+typedef struct {
+    httpd_req_t *req;
+    bool first;
+    bool failed;
+} hist_ctx_t;
+
+static void hist_row(void *vctx, uint32_t epoch, const storage_rec_t *rec)
+{
+    hist_ctx_t *c = vctx;
+    if (c->failed) return;
+    char line[128];
+    int n = snprintf(line, sizeof(line), "%s[%lu,", c->first ? "" : ",", (unsigned long)epoch);
+    c->first = false;
+    #define APPEND_NUM(cond, fmt, val) \
+        n += (cond) ? snprintf(line + n, sizeof(line) - n, fmt, val) : snprintf(line + n, sizeof(line) - n, "null")
+    APPEND_NUM(rec->temp_dc != STORAGE_TEMP_NONE, "%.1f", rec->temp_dc / 10.0);
+    n += snprintf(line + n, sizeof(line) - n, ",");
+    APPEND_NUM(rec->moisture_pct != STORAGE_U8_NONE, "%u", rec->moisture_pct);
+    n += snprintf(line + n, sizeof(line) - n, ",");
+    APPEND_NUM(rec->lux != STORAGE_LUX_NONE, "%lu", (unsigned long)rec->lux);
+    n += snprintf(line + n, sizeof(line) - n, ",");
+    APPEND_NUM(rec->conductivity_us != STORAGE_U16_NONE, "%u", rec->conductivity_us);
+    n += snprintf(line + n, sizeof(line) - n, "]");
+    #undef APPEND_NUM
+    if (n >= (int)sizeof(line) || httpd_resp_sendstr_chunk(c->req, line) != ESP_OK)
+        c->failed = true;
+}
+
+static esp_err_t history_get(httpd_req_t *req)
+{
+    /* URI: /api/v1/sensors/{MAC12}/history */
+    const char *macs = req->uri + strlen("/api/v1/sensors/");
+    uint8_t mac[6];
+    if (!parse_mac12(macs, mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
+        return ESP_OK;
+    }
+    if (!strstr(req->uri, "/history")) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+        return ESP_OK;
+    }
+
+    char query[96] = "", val[16];
+    httpd_req_get_url_query_str(req, query, sizeof(query));
+    storage_tier_t tier = STORAGE_TIER_RAW;
+    if (httpd_query_key_value(query, "tier", val, sizeof(val)) == ESP_OK && strcmp(val, "hourly") == 0)
+        tier = STORAGE_TIER_HOURLY;
+
+    uint32_t now = timekeeper_now();
+    uint32_t to = now, from = now > 86400 ? now - 86400 : 0;
+    if (httpd_query_key_value(query, "to", val, sizeof(val)) == ESP_OK) to = (uint32_t)strtoul(val, NULL, 10);
+    if (httpd_query_key_value(query, "from", val, sizeof(val)) == ESP_OK) from = (uint32_t)strtoul(val, NULL, 10);
+
+    httpd_resp_set_type(req, "application/json");
+    bool synced = timekeeper_synced();
+    char head[64];
+    snprintf(head, sizeof(head), "{\"tier\":\"%s\",\"synced\":%s,\"points\":[",
+             tier == STORAGE_TIER_RAW ? "raw" : "hourly", synced ? "true" : "false");
+    httpd_resp_sendstr_chunk(req, head);
+
+    if (synced) {
+        hist_ctx_t ctx = { .req = req, .first = true, .failed = false };
+        storage_query("/storage", mac, tier, from, to, resolve_shim, NULL, hist_row, &ctx);
+    }
+    httpd_resp_sendstr_chunk(req, "]}");
+    httpd_resp_sendstr_chunk(req, NULL);   /* end chunked response */
+    return ESP_OK;
+}
+
+static esp_err_t sensor_post(httpd_req_t *req)
+{
+    /* URI: /api/v1/sensors/{MAC12} */
+    uint8_t mac[6];
+    if (!parse_mac12(req->uri + strlen("/api/v1/sensors/"), mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
+        return ESP_OK;
+    }
+    char body[128];
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_OK; }
+    body[len] = '\0';
+    cJSON *json = cJSON_Parse(body);
+    const cJSON *name = cJSON_GetObjectItem(json, "name");
+    esp_err_t err = cJSON_IsString(name) ? app_config_set_sensor_name(mac, name->valuestring)
+                                         : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(json);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid name");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t time_post(httpd_req_t *req)
+{
+    char body[64];
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_OK; }
+    body[len] = '\0';
+    cJSON *json = cJSON_Parse(body);
+    const cJSON *epoch = cJSON_GetObjectItem(json, "epoch_s");
+    bool ok = cJSON_IsNumber(epoch) && epoch->valuedouble > 1e9 && epoch->valuedouble < 4e9;
+    if (ok) timekeeper_set_epoch((uint32_t)epoch->valuedouble);
+    cJSON_Delete(json);
+    if (!ok) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid epoch"); return ESP_OK; }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 void api_v1_register(httpd_handle_t server)
 {
     httpd_uri_t status = { .uri = "/api/v1/status", .method = HTTP_GET, .handler = status_get };
@@ -170,4 +311,10 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi));
     httpd_uri_t sensors = { .uri = "/api/v1/sensors", .method = HTTP_GET, .handler = sensors_get };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensors));
+    httpd_uri_t history = { .uri = "/api/v1/sensors/*", .method = HTTP_GET, .handler = history_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &history));
+    httpd_uri_t rename = { .uri = "/api/v1/sensors/*", .method = HTTP_POST, .handler = sensor_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rename));
+    httpd_uri_t timep = { .uri = "/api/v1/time", .method = HTTP_POST, .handler = time_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &timep));
 }

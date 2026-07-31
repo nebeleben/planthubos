@@ -1,4 +1,5 @@
 #include "sensors_json.h"
+#include "app_config.h"
 #include <stdio.h>
 
 cJSON *sensor_json(const sensor_entry_t *e)
@@ -8,7 +9,9 @@ cJSON *sensor_json(const sensor_entry_t *e)
              e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "mac", mac);
-    cJSON_AddNullToObject(o, "name");   /* display names arrive in M3 */
+    char name[33];
+    if (app_config_get_sensor_name(e->mac, name)) cJSON_AddStringToObject(o, "name", name);
+    else cJSON_AddNullToObject(o, "name");
     if (e->latest.has_temp) cJSON_AddNumberToObject(o, "temp", e->latest.temp_dc / 10.0);
     else cJSON_AddNullToObject(o, "temp");
     if (e->latest.has_moisture) cJSON_AddNumberToObject(o, "moisture", e->latest.moisture_pct);

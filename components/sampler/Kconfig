@@ -1,0 +1,8 @@
+menu "PlantHub Sampler"
+
+config PLANTHUB_SAMPLE_INTERVAL_MIN
+    int "History sample interval (minutes)"
+    range 1 60
+    default 15
+
+endmenu

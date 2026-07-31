@@ -8,6 +8,7 @@
 #include "data_core.h"
 #include "ble_collector.h"
 #include "timekeeper.h"
+#include "sampler.h"
 
 static const char *TAG = "planthub";
 
@@ -45,4 +46,5 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_manager_start());
     esp_err_t ble_err = ble_collector_start();
     if (ble_err != ESP_OK) ESP_LOGE(TAG, "BLE collector failed to start (%s); running without BLE", esp_err_to_name(ble_err));
+    ESP_ERROR_CHECK(sampler_start("/storage"));
 }
