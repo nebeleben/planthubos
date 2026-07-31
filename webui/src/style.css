@@ -7,3 +7,11 @@ body { margin: 0; }
 .app nav button.active { background: #4a7c4a; color: #fff; border-color: #4a7c4a; }
 .app main { padding: 1rem; }
 .placeholder { opacity: 0.6; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1rem; }
+.tile { border: 1px solid #8884; border-radius: 10px; padding: 0.9rem 1rem; }
+.tile h3 { margin: 0 0 0.6rem; font-size: 1rem; word-break: break-all; }
+.tile .readings { display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem 0.8rem; }
+.tile .val { font-size: 1.3rem; font-weight: 600; margin-right: 0.3rem; }
+.tile .unit { opacity: 0.6; font-size: 0.8rem; }
+.tile .seen { margin: 0.6rem 0 0; opacity: 0.55; font-size: 0.8rem; }
+.error { color: #c0504d; }

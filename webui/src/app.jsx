@@ -1,4 +1,5 @@
 import { useState } from 'preact/hooks'
+import { DashboardTab } from './tabs/dashboard.jsx'
 import { NetworkTab } from './tabs/network.jsx'
 
 const TABS = ['Dashboard', 'Devices', 'History', 'Config', 'Network']
@@ -22,7 +23,9 @@ export function App() {
         </nav>
       </header>
       <main>
-        {tab === 'Network' ? <NetworkTab /> : <Placeholder name={tab} />}
+        {tab === 'Dashboard' ? <DashboardTab /> :
+         tab === 'Network' ? <NetworkTab /> :
+         <Placeholder name={tab} />}
       </main>
     </div>
   )
