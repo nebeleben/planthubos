@@ -6,6 +6,7 @@
 #include "storage.h"
 #include "timekeeper.h"
 #include "claim.h"
+#include "ota_post.h"
 #include "cJSON.h"
 #include "esp_littlefs.h"
 #include "esp_system.h"
@@ -30,7 +31,7 @@ static esp_err_t send_json(httpd_req_t *req, cJSON *root)
     return err;
 }
 
-static esp_err_t send_401(httpd_req_t *req)
+esp_err_t api_send_401(httpd_req_t *req)
 {
     httpd_resp_set_status(req, "401 Unauthorized");
     httpd_resp_set_type(req, "application/json");
@@ -38,7 +39,7 @@ static esp_err_t send_401(httpd_req_t *req)
     return ESP_OK;
 }
 
-static bool auth_ok(httpd_req_t *req)
+bool api_auth_ok(httpd_req_t *req)
 {
     if (!claim_is_claimed()) return true;
     char hdr[96];
@@ -123,7 +124,7 @@ static void apply_creds_cb(TimerHandle_t t)
 
 static esp_err_t wifi_post(httpd_req_t *req)
 {
-    if (claim_is_claimed() && !wifi_manager_is_ap_mode() && !auth_ok(req)) return send_401(req);
+    if (claim_is_claimed() && !wifi_manager_is_ap_mode() && !api_auth_ok(req)) return api_send_401(req);
 
     char body[256];
     if (req->content_len == 0) {
@@ -298,7 +299,7 @@ static esp_err_t history_get(httpd_req_t *req)
 
 static esp_err_t sensor_post(httpd_req_t *req)
 {
-    if (!auth_ok(req)) return send_401(req);
+    if (!api_auth_ok(req)) return api_send_401(req);
 
     /* URI: /api/v1/sensors/{MAC12} */
     uint8_t mac[6];
@@ -403,7 +404,7 @@ static esp_err_t claim_post(httpd_req_t *req)
 
 static esp_err_t unclaim_post(httpd_req_t *req)
 {
-    if (!auth_ok(req)) return send_401(req);
+    if (!api_auth_ok(req)) return api_send_401(req);
     if (claim_reset() != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "unclaim failed");
         return ESP_OK;
@@ -433,4 +434,6 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &claimu));
     httpd_uri_t unclaimu = { .uri = "/api/v1/unclaim", .method = HTTP_POST, .handler = unclaim_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &unclaimu));
+    httpd_uri_t ota = { .uri = "/api/v1/ota", .method = HTTP_POST, .handler = ota_post_handler };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota));
 }
