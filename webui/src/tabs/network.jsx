@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'preact/hooks'
+import { authHeaders } from '../lib/auth.js'
 
 export function NetworkTab() {
   const [networks, setNetworks] = useState(null)
   const [ssid, setSsid] = useState('')
   const [password, setPassword] = useState('')
-  const [state, setState] = useState('idle') // idle | scanning | joining | sent | error
+  const [state, setState] = useState('idle') // idle | scanning | joining | sent | error | unauth
 
   async function scan() {
     setState('scanning')
@@ -26,10 +27,11 @@ export function NetworkTab() {
     try {
       const res = await fetch('/api/v1/wifi', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ ssid, password }),
       })
-      setState(res.ok ? 'sent' : 'error')
+      if (res.ok) setState('sent')
+      else setState(res.status === 401 ? 'unauth' : 'error')
     } catch {
       setState('error')
     }
@@ -77,6 +79,7 @@ export function NetworkTab() {
           {state === 'joining' ? 'Sending…' : 'Join'}
         </button>
       </form>
+      {state === 'unauth' && <p class="error">unauthorized — set the hub key in Config</p>}
       {state === 'error' && <p class="error">Request failed — is the hub reachable?</p>}
     </div>
   )
