@@ -6,6 +6,7 @@
 #include "esp_random.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
@@ -19,6 +20,7 @@ static const char *TAG = "claim";
 
 static bool s_claimed;
 static uint8_t s_hash[32];
+static SemaphoreHandle_t s_mutex;
 
 static esp_err_t store_hash(const uint8_t hash[32])
 {
@@ -37,6 +39,9 @@ static esp_err_t store_hash(const uint8_t hash[32])
 
 esp_err_t claim_init(void)
 {
+    s_mutex = xSemaphoreCreateMutex();
+    if (!s_mutex) return ESP_ERR_NO_MEM;
+
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return ESP_OK;  /* fresh NVS = unclaimed */
     size_t len = sizeof(s_hash);
@@ -46,51 +51,83 @@ esp_err_t claim_init(void)
     return ESP_OK;
 }
 
+/* Lock-free: s_claimed is a single bool word, so a torn read is not possible.
+ * The only race is reading a stale "claimed" just before/after an in-flight
+ * claim_reset() flips it. A stale-true read just means a caller proceeds to
+ * claim_verify(), which re-checks s_claimed under the mutex and fails closed
+ * if the reset has since landed; a stale-false read on a claim just-in-
+ * progress can't happen since claim_generate() only ever transitions
+ * false->true once and nothing else can be racing it (claim is one-shot). */
 bool claim_is_claimed(void) { return s_claimed; }
 
 esp_err_t claim_generate(char secret_hex[65])
 {
-    if (s_claimed) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_claimed) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
     uint8_t secret[32], hash[32];
     esp_fill_random(secret, sizeof(secret));
-    if (mbedtls_sha256(secret, sizeof(secret), hash, 0) != 0) return ESP_FAIL;
+    if (mbedtls_sha256(secret, sizeof(secret), hash, 0) != 0) {
+        xSemaphoreGive(s_mutex);
+        memset(secret, 0, sizeof(secret));
+        return ESP_FAIL;
+    }
     esp_err_t err = store_hash(hash);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        xSemaphoreGive(s_mutex);
+        memset(secret, 0, sizeof(secret));
+        return err;
+    }
     memcpy(s_hash, hash, 32);
     s_claimed = true;
+    xSemaphoreGive(s_mutex);
     authtok_hex_encode(secret, secret_hex);
+    memset(secret, 0, sizeof(secret));
     ESP_LOGI(TAG, "hub claimed");
     return ESP_OK;
 }
 
 bool claim_verify(const char *secret_hex)
 {
-    if (!s_claimed || !secret_hex) return false;
+    if (!secret_hex) return false;
     uint8_t secret[32], hash[32];
     if (!authtok_hex_decode(secret_hex, secret)) return false;
-    if (mbedtls_sha256(secret, sizeof(secret), hash, 0) != 0) return false;
-    return authtok_ct_equal(hash, s_hash);
+    if (mbedtls_sha256(secret, sizeof(secret), hash, 0) != 0) {
+        memset(secret, 0, sizeof(secret));
+        return false;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool ok = s_claimed && authtok_ct_equal(hash, s_hash);
+    xSemaphoreGive(s_mutex);
+    memset(secret, 0, sizeof(secret));
+    return ok;
 }
 
 esp_err_t claim_reset(void)
 {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
     esp_err_t err = store_hash(NULL);
     if (err == ESP_OK) {
         s_claimed = false;
         memset(s_hash, 0, sizeof(s_hash));
         ESP_LOGI(TAG, "claim reset");
     }
+    xSemaphoreGive(s_mutex);
     return err;
 }
 
 static void reset_button_task(void *arg)
 {
     int held_ms = 0;
+    bool fired = false;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(100));
         if (gpio_get_level(RESET_GPIO) == 0) {
             held_ms += 100;
-            if (held_ms == RESET_HOLD_MS) {
+            if (held_ms >= RESET_HOLD_MS && !fired) {
+                fired = true;
                 ESP_LOGW(TAG, "factory reset: clearing claim + wifi, restarting");
                 claim_reset();
                 app_config_clear_wifi();
@@ -98,6 +135,7 @@ static void reset_button_task(void *arg)
             }
         } else {
             held_ms = 0;
+            fired = false;
         }
     }
 }

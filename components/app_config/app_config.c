@@ -3,10 +3,35 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_mac.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <stdio.h>
 #include <string.h>
 
 #define NS "planthub"
+
+typedef struct {
+    bool used;          /* entry populated (name may still be "absent") */
+    uint8_t mac[6];
+    char name[33];      /* "" = known absent */
+} name_cache_t;
+
+static name_cache_t s_names[16];
+static SemaphoreHandle_t s_name_mutex;
+
+static name_cache_t *name_cache_find(const uint8_t mac[6], bool take_free)
+{
+    name_cache_t *free_e = NULL;
+    for (int i = 0; i < 16; i++) {
+        if (s_names[i].used && memcmp(s_names[i].mac, mac, 6) == 0) return &s_names[i];
+        if (!s_names[i].used && !free_e) free_e = &s_names[i];
+    }
+    if (!take_free || !free_e) return NULL;
+    free_e->used = true;
+    memcpy(free_e->mac, mac, 6);
+    free_e->name[0] = '\0';
+    return free_e;
+}
 
 esp_err_t app_config_init(void)
 {
@@ -15,7 +40,10 @@ esp_err_t app_config_init(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
-    return err;
+    if (err != ESP_OK) return err;
+    s_name_mutex = xSemaphoreCreateMutex();
+    if (!s_name_mutex) return ESP_ERR_NO_MEM;
+    return ESP_OK;
 }
 
 bool app_config_get_wifi(wifi_creds_t *out)
@@ -79,17 +107,41 @@ esp_err_t app_config_set_sensor_name(const uint8_t mac[6], const char *name)
     err = name[0] ? nvs_set_str(h, key, name) : nvs_erase_key(h, key);
     if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) err = nvs_commit(h);
     nvs_close(h);
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_name_mutex, portMAX_DELAY);
+        name_cache_t *ce = name_cache_find(mac, true);
+        if (ce) strlcpy(ce->name, name, sizeof(ce->name));
+        xSemaphoreGive(s_name_mutex);
+    }
     return err;
 }
 
 bool app_config_get_sensor_name(const uint8_t mac[6], char out[33])
 {
-    char key[16];
+    xSemaphoreTake(s_name_mutex, portMAX_DELAY);
+    name_cache_t *e = name_cache_find(mac, false);
+    if (e) {
+        bool present = e->name[0] != '\0';
+        if (present) memcpy(out, e->name, 33);
+        xSemaphoreGive(s_name_mutex);
+        return present;
+    }
+    xSemaphoreGive(s_name_mutex);
+
+    /* NVS miss path (first lookup for this mac) — do NVS outside the lock */
+    char key[16], name[33] = "";
     name_key(key, mac);
     nvs_handle_t h;
-    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return false;
-    size_t len = 33;
-    bool ok = nvs_get_str(h, key, out, &len) == ESP_OK && out[0] != '\0';
-    nvs_close(h);
-    return ok;
+    bool present = false;
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof(name);
+        present = nvs_get_str(h, key, name, &len) == ESP_OK && name[0] != '\0';
+        nvs_close(h);
+    }
+    xSemaphoreTake(s_name_mutex, portMAX_DELAY);
+    name_cache_t *ce = name_cache_find(mac, true);
+    if (ce) memcpy(ce->name, name, 33);
+    xSemaphoreGive(s_name_mutex);
+    if (present) memcpy(out, name, 33);
+    return present;
 }

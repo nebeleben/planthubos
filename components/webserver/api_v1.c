@@ -5,7 +5,10 @@
 #include "sensors_json.h"
 #include "storage.h"
 #include "timekeeper.h"
+#include "claim.h"
 #include "cJSON.h"
+#include "esp_littlefs.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
@@ -15,7 +18,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "api_v1";
-#define FW_VERSION "0.3.0"
+#define FW_VERSION "0.4.0"
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -25,6 +28,23 @@ static esp_err_t send_json(httpd_req_t *req, cJSON *root)
     esp_err_t err = httpd_resp_sendstr(req, body);
     free(body);
     return err;
+}
+
+static esp_err_t send_401(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
+    return ESP_OK;
+}
+
+static bool auth_ok(httpd_req_t *req)
+{
+    if (!claim_is_claimed()) return true;
+    char hdr[96];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) != ESP_OK) return false;
+    if (strncmp(hdr, "Bearer ", 7) != 0) return false;
+    return claim_verify(hdr + 7);
 }
 
 static esp_err_t status_get(httpd_req_t *req)
@@ -40,6 +60,13 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
     cJSON_AddBoolToObject(root, "time_synced", timekeeper_synced());
     cJSON_AddNumberToObject(root, "epoch_s", timekeeper_now());
+    cJSON_AddBoolToObject(root, "claimed", claim_is_claimed());
+    size_t fs_total = 0, fs_used = 0;
+    if (esp_littlefs_info("storage", &fs_total, &fs_used) == ESP_OK) {
+        cJSON_AddNumberToObject(root, "fs_total", fs_total);
+        cJSON_AddNumberToObject(root, "fs_used", fs_used);
+    }
+    cJSON_AddNumberToObject(root, "heap_free", esp_get_free_heap_size());
     return send_json(req, root);
 }
 
@@ -96,6 +123,8 @@ static void apply_creds_cb(TimerHandle_t t)
 
 static esp_err_t wifi_post(httpd_req_t *req)
 {
+    if (claim_is_claimed() && !wifi_manager_is_ap_mode() && !auth_ok(req)) return send_401(req);
+
     char body[256];
     if (req->content_len == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
@@ -269,6 +298,8 @@ static esp_err_t history_get(httpd_req_t *req)
 
 static esp_err_t sensor_post(httpd_req_t *req)
 {
+    if (!auth_ok(req)) return send_401(req);
+
     /* URI: /api/v1/sensors/{MAC12} */
     uint8_t mac[6];
     if (!parse_mac12(req->uri + strlen("/api/v1/sensors/"), mac)) {
@@ -276,9 +307,29 @@ static esp_err_t sensor_post(httpd_req_t *req)
         return ESP_OK;
     }
     char body[128];
-    int len = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_OK; }
-    body[len] = '\0';
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return ESP_OK;
+    }
+    if (req->content_len > sizeof(body) - 1) {
+        /* esp_http_server's httpd_err_code_t has no 413 entry in this IDF
+         * version; set the status line/body manually. */
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
+        return ESP_OK;
+    }
+
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
     cJSON *json = cJSON_Parse(body);
     const cJSON *name = cJSON_GetObjectItem(json, "name");
     esp_err_t err = cJSON_IsString(name) ? app_config_set_sensor_name(mac, name->valuestring)
@@ -296,15 +347,67 @@ static esp_err_t sensor_post(httpd_req_t *req)
 static esp_err_t time_post(httpd_req_t *req)
 {
     char body[64];
-    int len = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (len <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body"); return ESP_OK; }
-    body[len] = '\0';
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return ESP_OK;
+    }
+    if (req->content_len > sizeof(body) - 1) {
+        /* esp_http_server's httpd_err_code_t has no 413 entry in this IDF
+         * version; set the status line/body manually. */
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
+        return ESP_OK;
+    }
+
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
     cJSON *json = cJSON_Parse(body);
     const cJSON *epoch = cJSON_GetObjectItem(json, "epoch_s");
     bool ok = cJSON_IsNumber(epoch) && epoch->valuedouble > 1e9 && epoch->valuedouble < 4e9;
     if (ok) timekeeper_set_epoch((uint32_t)epoch->valuedouble);
     cJSON_Delete(json);
     if (!ok) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid epoch"); return ESP_OK; }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t claim_post(httpd_req_t *req)
+{
+    char secret[65];
+    esp_err_t err = claim_generate(secret);
+    if (err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"already claimed\"}");
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "claim failed");
+        return ESP_OK;
+    }
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "secret", secret);
+    memset(secret, 0, sizeof(secret));
+    return send_json(req, root);
+}
+
+static esp_err_t unclaim_post(httpd_req_t *req)
+{
+    if (!auth_ok(req)) return send_401(req);
+    if (claim_reset() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "unclaim failed");
+        return ESP_OK;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
@@ -326,4 +429,8 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rename));
     httpd_uri_t timep = { .uri = "/api/v1/time", .method = HTTP_POST, .handler = time_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &timep));
+    httpd_uri_t claimu = { .uri = "/api/v1/claim", .method = HTTP_POST, .handler = claim_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &claimu));
+    httpd_uri_t unclaimu = { .uri = "/api/v1/unclaim", .method = HTTP_POST, .handler = unclaim_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &unclaimu));
 }
