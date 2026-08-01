@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'preact/hooks'
+import { authHeaders } from '../lib/auth.js'
 
 function Row({ s, onSaved }) {
   const [name, setName] = useState(s.name || '')
-  const [state, setState] = useState('idle') // idle | saving | saved | error
+  const [state, setState] = useState('idle') // idle | saving | saved | error | unauth
 
   async function save(e) {
     e.preventDefault()
@@ -10,11 +11,11 @@ function Row({ s, onSaved }) {
     try {
       const res = await fetch(`/api/v1/sensors/${s.mac.replaceAll(':', '')}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ name }),
       })
-      setState(res.ok ? 'saved' : 'error')
-      if (res.ok) onSaved(s.mac, name)
+      if (res.ok) { setState('saved'); onSaved(s.mac, name) }
+      else setState(res.status === 401 ? 'unauth' : 'error')
     } catch {
       setState('error')
     }
@@ -30,6 +31,7 @@ function Row({ s, onSaved }) {
             {state === 'saving' ? '…' : state === 'saved' ? '✓' : 'Save'}
           </button>
           {state === 'error' && <span class="error">failed</span>}
+          {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
         </form>
       </td>
       <td class="mono">{s.mac}</td>

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks'
+import { ConfigTab } from './tabs/config.jsx'
 import { DashboardTab } from './tabs/dashboard.jsx'
 import { DevicesTab } from './tabs/devices.jsx'
 import { HistoryTab } from './tabs/history.jsx'
@@ -44,6 +45,7 @@ export function App() {
         {tab === 'Dashboard' ? <DashboardTab /> :
          tab === 'Devices' ? <DevicesTab /> :
          tab === 'History' ? <HistoryTab /> :
+         tab === 'Config' ? <ConfigTab /> :
          tab === 'Network' ? <NetworkTab /> :
          <Placeholder name={tab} />}
       </main>

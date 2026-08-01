@@ -26,3 +26,11 @@ table.devices th, table.devices td { text-align: left; padding: 0.5rem 0.75rem; 
 .hist-controls button { padding: 0.35rem 0.7rem; border: 1px solid #8886; background: none; border-radius: 6px; cursor: pointer; }
 .hist-controls button.active { background: #4a7c4a; color: #fff; border-color: #4a7c4a; }
 .chart { max-width: 100%; overflow-x: auto; }
+.config h2 { font-size: 1.05rem; margin: 1.2rem 0 0.5rem; }
+table.kv td { padding: 0.25rem 0.9rem 0.25rem 0; opacity: 0.9; }
+table.kv td:first-child { opacity: 0.6; }
+.secretbox code { display: block; word-break: break-all; margin-top: 0.4rem; font-size: 0.85rem; }
+.keyrow { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; }
+.keyrow input { flex: 1; max-width: 30rem; }
+.hint { opacity: 0.65; font-size: 0.9rem; }
+progress { width: 100%; max-width: 30rem; }
