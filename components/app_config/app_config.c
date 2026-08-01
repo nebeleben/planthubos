@@ -139,8 +139,18 @@ bool app_config_get_sensor_name(const uint8_t mac[6], char out[33])
         nvs_close(h);
     }
     xSemaphoreTake(s_name_mutex, portMAX_DELAY);
-    name_cache_t *ce = name_cache_find(mac, true);
-    if (ce) memcpy(ce->name, name, 33);
+    /* A concurrent app_config_set_sensor_name() may have populated this mac
+     * while we were reading NVS above (outside the lock). If so, its value
+     * is fresher than what we just read — leave the entry alone and return
+     * that value instead of clobbering it with our stale NVS read. */
+    name_cache_t *ce = name_cache_find(mac, false);
+    if (ce) {
+        present = ce->name[0] != '\0';
+        if (present) memcpy(name, ce->name, 33);
+    } else {
+        ce = name_cache_find(mac, true);
+        if (ce) memcpy(ce->name, name, 33);
+    }
     xSemaphoreGive(s_name_mutex);
     if (present) memcpy(out, name, 33);
     return present;

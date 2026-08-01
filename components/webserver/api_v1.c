@@ -396,10 +396,18 @@ static esp_err_t claim_post(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "claim failed");
         return ESP_OK;
     }
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "secret", secret);
+    /* Bypass cJSON/send_json here: both would leave an un-scrubbed copy of
+     * the one-time secret sitting in heap memory (cJSON's strdup'd string
+     * and send_json's cJSON_PrintUnformatted buffer), and this is the
+     * highest-value secret in the system. Format and send it directly so
+     * the only copies are stack-local and can be zeroed below. */
+    char body[96];
+    snprintf(body, sizeof(body), "{\"secret\":\"%s\"}", secret);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, body);   /* copies to the socket synchronously before returning */
+    memset(body, 0, sizeof(body));
     memset(secret, 0, sizeof(secret));
-    return send_json(req, root);
+    return ESP_OK;
 }
 
 static esp_err_t unclaim_post(httpd_req_t *req)
