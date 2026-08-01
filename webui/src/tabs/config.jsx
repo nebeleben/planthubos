@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'preact/hooks'
+import { useEffect, useRef, useState } from 'preact/hooks'
 import { getKey, setKey, authHeaders } from '../lib/auth.js'
 
 function fmtBytes(n) {
@@ -22,6 +22,7 @@ export function ConfigTab() {
   const [busy, setBusy] = useState('')           // '' | claim | unclaim | ota
   const [otaMsg, setOtaMsg] = useState('')
   const [otaPct, setOtaPct] = useState(null)
+  const xhrRef = useRef(null)
 
   function refresh() {
     fetch('/api/v1/status')
@@ -61,21 +62,31 @@ export function ConfigTab() {
 
   function doOta(e) {
     const file = e.currentTarget.files[0]
+    e.currentTarget.value = ''                // allow re-selecting the same file after a failure
     if (!file) return
     setBusy('ota'); setOtaMsg(''); setOtaPct(0)
     const xhr = new XMLHttpRequest()          // XHR for upload progress
+    xhrRef.current = xhr
     xhr.open('POST', '/api/v1/ota')
+    xhr.timeout = 120000
     const key = getKey()
     if (key) xhr.setRequestHeader('Authorization', `Bearer ${key}`)
     xhr.upload.onprogress = (ev) => ev.lengthComputable && setOtaPct(Math.round(100 * ev.loaded / ev.total))
     xhr.onload = () => {
+      xhrRef.current = null
       setBusy('')
       if (xhr.status === 200) setOtaMsg('Update accepted — hub is rebooting. Reload this page in ~20 s.')
       else if (xhr.status === 401) setOtaMsg('Unauthorized — set the hub key above.')
       else setOtaMsg(`Update failed (${xhr.status}).`)
     }
-    xhr.onerror = () => { setBusy(''); setOtaMsg('Upload failed — hub not reachable.') }
+    xhr.onerror = () => { xhrRef.current = null; setBusy(''); setOtaMsg('Upload failed — hub not reachable.') }
+    xhr.ontimeout = () => { xhrRef.current = null; setBusy(''); setOtaMsg('Upload timed out.') }
+    xhr.onabort = () => { xhrRef.current = null; setBusy(''); setOtaMsg('Upload cancelled.') }
     xhr.send(file)
+  }
+
+  function cancelOta() {
+    xhrRef.current?.abort()
   }
 
   if (error) return <p class="error">Hub not reachable.</p>
@@ -128,7 +139,12 @@ export function ConfigTab() {
       <p>
         <input type="file" accept=".bin" onChange={doOta} disabled={busy === 'ota'} />
       </p>
-      {otaPct != null && busy === 'ota' && <progress max="100" value={otaPct} />}
+      {otaPct != null && busy === 'ota' && (
+        <p>
+          <progress max="100" value={otaPct} />
+          <button onClick={cancelOta}>Cancel</button>
+        </p>
+      )}
       {otaMsg && <p class="hint">{otaMsg}</p>}
     </div>
   )
