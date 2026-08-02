@@ -34,6 +34,16 @@ static SemaphoreHandle_t s_send_lock;   /* serializes espnow_link_send/broadcast
 static SemaphoreHandle_t s_send_done;   /* signalled by the ESP-NOW send callback */
 static volatile esp_now_send_status_t s_last_status;
 
+/* Ticket numbers used to attribute a send completion to the call that
+ * issued it. s_send_lock serializes send_blocking() callers, so tickets are
+ * handed out in strict issue order; ESP-NOW/Wi-Fi TX is itself serial, so
+ * on_send() completions fire in that same order, one per issued send. That
+ * lets a caller confirm "the completion I just received really is for the
+ * send I issued" instead of blindly trusting whatever s_last_status holds --
+ * see the comment in send_blocking() for the race this closes. */
+static volatile uint32_t s_send_issue_seq;
+static volatile uint32_t s_send_complete_seq;
+
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
     /* Runs on the WiFi driver task: decode RSSI and hand off immediately.
@@ -48,6 +58,7 @@ static void on_send(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
     (void)mac_addr;
     s_last_status = status;
+    s_send_complete_seq++;   /* claim the next ticket, in strict completion order */
     xSemaphoreGive(s_send_done);
 }
 
@@ -143,14 +154,36 @@ static esp_err_t send_blocking(const uint8_t *mac, const uint8_t *data, size_t l
 
     /* Clear any stale completion (e.g. from a prior call that timed out
      * just before its callback finally fired) so we don't read a leftover
-     * status for this send. */
+     * status for this send. This alone isn't enough: it only guards
+     * against a late completion that arrives BEFORE esp_now_send() below.
+     * A previous call's completion can just as easily land DURING this
+     * call's own wait -- e.g. call A times out and returns, call B starts
+     * and is waiting on s_send_done, and only then does A's late completion
+     * finally fire, giving B's semaphore with A's status. Without a way to
+     * tell those apart, B would misattribute A's outcome to itself (this
+     * is reachable from pairing_node_resync_channel(), where it could
+     * persist the wrong "reachable" channel). The ticket check below closes
+     * that gap: my_ticket is this call's position in issue order, and
+     * s_send_complete_seq only reaches my_ticket once THIS call's own
+     * completion has fired, since completions arrive in the same order
+     * sends are issued. A's late completion, if it's what woke us, bumps
+     * s_send_complete_seq to A's (earlier) ticket, which mismatches ours. */
     xSemaphoreTake(s_send_done, 0);
+    uint32_t my_ticket = ++s_send_issue_seq;
 
     esp_err_t err = esp_now_send(mac, data, len);
     if (err == ESP_OK) {
-        if (xSemaphoreTake(s_send_done, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (xSemaphoreTake(s_send_done, pdMS_TO_TICKS(200)) == pdTRUE &&
+            s_send_complete_seq == my_ticket) {
             err = (s_last_status == ESP_NOW_SEND_SUCCESS) ? ESP_OK : ESP_FAIL;
         } else {
+            /* Timed out, or woken by a stale completion that belongs to an
+             * earlier, already-abandoned call. Either way we don't actually
+             * know this send's outcome, so report it as a failure/timeout
+             * rather than risk claiming someone else's status as our own.
+             * (This call's real completion, if it eventually arrives, will
+             * just be drained as a stale signal by a future call's own
+             * xSemaphoreTake(s_send_done, 0) above.) */
             err = ESP_ERR_TIMEOUT;
         }
     }

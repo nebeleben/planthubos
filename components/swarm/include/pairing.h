@@ -27,9 +27,12 @@ typedef enum {
 /* --- Hub side --- */
 
 /* Opens a pairing window for `seconds`. The first valid PAIR_REQ seen while
- * open is adopted (LMK generated, node stored, ESP-NOW peer added, PAIR_ACK
- * sent back); the window then closes immediately so at most one node joins
- * per window. Starts this component's hub pairing task on first call. */
+ * open starts an adoption attempt (LMK generated, node stored, ESP-NOW peer
+ * added, PAIR_ACK sent back); at most one attempt runs at a time, and the
+ * window closes only once an attempt fully succeeds, so a failure partway
+ * through (NVS, peer table, send) doesn't silently burn the rest of the
+ * window -- the same or another node can still retry before it expires.
+ * Starts this component's hub pairing task on first call. */
 void pairing_open_window(uint32_t seconds);
 
 bool pairing_window_open(void);

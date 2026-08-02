@@ -37,9 +37,10 @@ typedef struct {
     uint32_t nonce;
 } pending_adopt_t;
 
-static SemaphoreHandle_t s_window_lock;   /* guards s_window_open / s_window_deadline_us */
+static SemaphoreHandle_t s_window_lock;   /* guards s_window_open / s_window_deadline_us / s_adopt_in_progress */
 static volatile bool s_window_open;
 static int64_t s_window_deadline_us;
+static volatile bool s_adopt_in_progress; /* an adoption is queued/running; blocks a 2nd PAIR_REQ */
 
 static QueueHandle_t s_adopt_queue;       /* depth 1: one pending adoption at a time */
 static TaskHandle_t s_hub_task;
@@ -61,6 +62,7 @@ void pairing_open_window(uint32_t seconds)
     xSemaphoreTake(s_window_lock, portMAX_DELAY);
     s_window_deadline_us = esp_timer_get_time() + (int64_t)seconds * 1000000;
     s_window_open = true;
+    s_adopt_in_progress = false; /* defensive: a fresh window always starts idle */
     xSemaphoreGive(s_window_lock);
 
     ESP_LOGI(TAG, "pairing window open for %" PRIu32 "s", seconds);
@@ -100,47 +102,63 @@ static void hub_task(void *arg)
     for (;;) {
         if (xQueueReceive(s_adopt_queue, &item, portMAX_DELAY) != pdTRUE) continue;
 
-        uint8_t lmk[SWARM_LMK_LEN];
-        esp_fill_random(lmk, sizeof(lmk));
+        bool adopted = false;
 
-        esp_err_t err = swarm_store_add_node(item.mac, lmk);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "adopt " MACSTR ": swarm_store_add_node failed: %s",
-                     MAC2STR(item.mac), esp_err_to_name(err));
-            continue;
-        }
+        do {
+            uint8_t lmk[SWARM_LMK_LEN];
+            esp_fill_random(lmk, sizeof(lmk));
 
-        uint8_t channel = espnow_link_channel();
-        err = espnow_link_add_peer(item.mac, lmk, 0);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "adopt " MACSTR ": espnow_link_add_peer failed: %s",
-                     MAC2STR(item.mac), esp_err_to_name(err));
-            continue;
-        }
+            esp_err_t err = swarm_store_add_node(item.mac, lmk);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "adopt " MACSTR ": swarm_store_add_node failed: %s",
+                         MAC2STR(item.mac), esp_err_to_name(err));
+                break;
+            }
 
-        swarm_pair_ack_t ack = {
-            .version = SWARM_PROTO_VERSION,
-            .type = SWARM_MSG_PAIR_ACK,
-            .channel = channel,
-            .nonce = item.nonce,
-        };
-        memcpy(ack.lmk, lmk, sizeof(lmk));
+            uint8_t channel = espnow_link_channel();
+            err = espnow_link_add_peer(item.mac, lmk, 0);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "adopt " MACSTR ": espnow_link_add_peer failed: %s",
+                         MAC2STR(item.mac), esp_err_to_name(err));
+                break;
+            }
 
-        uint8_t buf[sizeof(ack)];
-        size_t n = swarm_encode_pair_ack(&ack, buf, sizeof(buf));
-        if (n == 0) {
-            ESP_LOGE(TAG, "adopt " MACSTR ": failed to encode PAIR_ACK", MAC2STR(item.mac));
-            continue;
-        }
+            swarm_pair_ack_t ack = {
+                .version = SWARM_PROTO_VERSION,
+                .type = SWARM_MSG_PAIR_ACK,
+                .channel = channel,
+                .nonce = item.nonce,
+            };
+            memcpy(ack.lmk, lmk, sizeof(lmk));
 
-        err = espnow_link_send(item.mac, buf, n);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "adopt " MACSTR ": PAIR_ACK send failed: %s",
-                     MAC2STR(item.mac), esp_err_to_name(err));
-            continue;
-        }
+            uint8_t buf[sizeof(ack)];
+            size_t n = swarm_encode_pair_ack(&ack, buf, sizeof(buf));
+            if (n == 0) {
+                ESP_LOGE(TAG, "adopt " MACSTR ": failed to encode PAIR_ACK", MAC2STR(item.mac));
+                break;
+            }
 
-        ESP_LOGI(TAG, "adopted node " MACSTR " on channel %u", MAC2STR(item.mac), channel);
+            err = espnow_link_send(item.mac, buf, n);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "adopt " MACSTR ": PAIR_ACK send failed: %s",
+                         MAC2STR(item.mac), esp_err_to_name(err));
+                break;
+            }
+
+            adopted = true;
+            ESP_LOGI(TAG, "adopted node " MACSTR " on channel %u", MAC2STR(item.mac), channel);
+        } while (0);
+
+        /* Either outcome: this attempt is no longer "in progress", so a
+         * fresh PAIR_REQ can be queued. Only close the window on full
+         * success -- a failure at any step (NVS, peer table, PAIR_ACK send)
+         * leaves the window open so the same node, or another one, can
+         * still retry within the remaining time instead of the whole
+         * window being silently burned by one glitch. */
+        xSemaphoreTake(s_window_lock, portMAX_DELAY);
+        s_adopt_in_progress = false;
+        if (adopted) s_window_open = false;
+        xSemaphoreGive(s_window_lock);
     }
 }
 
@@ -264,17 +282,28 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
         swarm_pair_req_t req;
         if (!swarm_decode_pair_req(data, (size_t)len, &req)) return;
 
+        /* At most one adoption in flight at a time (one node per window).
+         * The window itself is NOT closed here anymore -- only once
+         * hub_task() reports a fully successful adoption (store + peer +
+         * PAIR_ACK all OK) does the window close; a failed attempt clears
+         * s_adopt_in_progress instead so the window stays usable for a
+         * retry until it naturally expires. */
+        xSemaphoreTake(s_window_lock, portMAX_DELAY);
+        bool busy = s_adopt_in_progress;
+        if (!busy) s_adopt_in_progress = true;
+        xSemaphoreGive(s_window_lock);
+        if (busy) return;
+
         pending_adopt_t item;
         memcpy(item.mac, src, 6);
         item.nonce = req.nonce;
 
-        /* Close the window the instant we hand off an adoption so a
-         * bystander can't join the same window (one node per window). If
-         * the queue is already full (an adoption is already pending), drop
-         * this one — the requester will simply retry on a future window. */
-        if (s_adopt_queue && xQueueSend(s_adopt_queue, &item, 0) == pdTRUE) {
+        if (!s_adopt_queue || xQueueSend(s_adopt_queue, &item, 0) != pdTRUE) {
+            /* Could not hand off to hub_task (queue missing, or somehow
+             * already full despite the in-progress guard): release the
+             * guard so a later PAIR_REQ in this window can try again. */
             xSemaphoreTake(s_window_lock, portMAX_DELAY);
-            s_window_open = false;
+            s_adopt_in_progress = false;
             xSemaphoreGive(s_window_lock);
         }
         return;
@@ -285,6 +314,16 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
 
         swarm_pair_ack_t ack;
         if (!swarm_decode_pair_ack(data, (size_t)len, &ack)) return;
+
+        /* Accepted risk: this ack is matched to our request by nonce alone,
+         * and the nonce was just broadcast in clear as part of our own
+         * PAIR_REQ. Any hostile device in radio range during the window
+         * could race the real hub and win by replying first with a bogus
+         * LMK. That's the same trust tier as the cleartext LMK the hub
+         * sends back here — the mitigation is procedural, not
+         * cryptographic: the window is short-lived and only ever open
+         * because a human operator deliberately started it, so the
+         * exposure for such a race is small and operator-visible. */
 
         /* Short, non-blocking-ish lock: the node task only ever holds this
          * for a couple of instructions, so a small timeout here cannot
@@ -330,6 +369,19 @@ esp_err_t pairing_node_resync_channel(void)
             ESP_LOGI(TAG, "resync: hub reachable on channel %u", ch);
             return ESP_OK;
         }
+    }
+
+    /* Nothing answered on any of the 13 channels: don't leave the radio
+     * parked wherever the sweep happened to stop (channel 13). Restore the
+     * last known-good channel so this node keeps listening where the hub
+     * was last confirmed, rather than somewhere arbitrary, until the next
+     * resync attempt. */
+    esp_err_t restore_err = espnow_link_set_channel(hub_ch);
+    if (restore_err != ESP_OK) {
+        ESP_LOGW(TAG, "resync: failed to restore last-known channel %u: %s",
+                 hub_ch, esp_err_to_name(restore_err));
+    } else {
+        ESP_LOGI(TAG, "resync: restored last-known channel %u after failed sweep", hub_ch);
     }
 
     ESP_LOGW(TAG, "resync: hub not reachable on any channel");
