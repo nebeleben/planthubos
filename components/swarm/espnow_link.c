@@ -186,6 +186,21 @@ static esp_err_t send_blocking(const uint8_t *mac, const uint8_t *data, size_t l
              * xSemaphoreTake(s_send_done, 0) above.) */
             err = ESP_ERR_TIMEOUT;
         }
+    } else {
+        /* esp_now_send() itself failed synchronously (e.g. NOT_FOUND for an
+         * unknown/evicted peer, NO_MEM, NOT_INIT): the frame was never
+         * handed to the driver, so no on_send() completion will EVER fire
+         * for my_ticket. Roll the ticket back rather than leave it
+         * "claimed" -- otherwise s_send_issue_seq stays permanently ahead
+         * of s_send_complete_seq and every future send's ticket check would
+         * mismatch forever, reporting ESP_ERR_TIMEOUT even on sends that
+         * genuinely succeed. This rollback is race-free precisely because a
+         * synchronously-failed send was never queued to the driver: there
+         * is no in-flight completion for this ticket that could land
+         * between the decrement and us releasing s_send_lock below, so
+         * nothing can confuse a later call's ticket with this abandoned
+         * one. Do not "simplify" this away. */
+        --s_send_issue_seq;
     }
 
     xSemaphoreGive(s_send_lock);
