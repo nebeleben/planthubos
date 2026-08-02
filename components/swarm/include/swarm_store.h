@@ -4,7 +4,18 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define SWARM_MAX_NODES 8  /* was 4 in M5a */
+/* Hardware ceiling, not a design choice: ESP-NOW hard-caps ENCRYPTED peers at
+ * ESP_NOW_MAX_ENCRYPT_PEER_NUM (6, per esp_now.h) regardless of chip/IDF
+ * config. Every adopted node's peer gets upgraded to encrypted right after
+ * PAIR_ACK (see pairing.c's hub_task()), so a 7th or 8th adoption would
+ * always fail at that upgrade step -- raising this past 6 would advertise a
+ * cap the radio can never actually honour. See espnow_link.c for the
+ * compile-time assert tying this to that constant so the two can never
+ * silently drift apart again. (An earlier draft of this task set this to 8;
+ * corrected before any device was ever flashed with that shape -- the only
+ * migration path that matters in practice is the M5a 89-byte one, which
+ * this change does not affect.) */
+#define SWARM_MAX_NODES 6
 
 /* On-disk format of the persisted node table (KEY_NODES blob). Bump this
  * and add a migration branch in swarm_store.c's load whenever the layout

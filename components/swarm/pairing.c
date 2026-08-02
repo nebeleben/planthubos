@@ -668,6 +668,18 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
         swarm_pong_t pong;
         if (!swarm_decode_pong(data, (size_t)len, &pong)) return;
 
+        /* Nonce alone is not enough: PONG is a broadcast, so any device in
+         * range during a resync attempt could reply with a guessed/replayed
+         * nonce (the same accepted-risk trust tier as PAIR_ACK -- see above
+         * -- but this check is cheap and narrows it further at no cost).
+         * swarm_store_hub() is a short, bounded, allocation-free RAM-cache
+         * read (no NVS touched), same reasoning already applied to every
+         * other swarm_store access made from this receive-callback path, so
+         * it's safe to call here. A PONG whose source isn't the hub this
+         * node is actually paired to is never accepted, regardless of nonce. */
+        uint8_t hub_mac[6];
+        if (!swarm_store_hub(hub_mac, NULL, NULL) || memcmp(src, hub_mac, 6) != 0) return;
+
         if (!s_resync_lock || xSemaphoreTake(s_resync_lock, pdMS_TO_TICKS(5)) != pdTRUE) return;
         bool match = s_resync_waiting && (pong.nonce == s_resync_nonce);
         xSemaphoreGive(s_resync_lock);

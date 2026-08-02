@@ -83,7 +83,7 @@ static esp_err_t erase_key(const char *key)
  * place if that's what's stored.
  *
  * M5a accepted this blob on exact-length match only, and raising
- * SWARM_MAX_NODES from 4 to 8 changes that length (a longer fixed-size
+ * SWARM_MAX_NODES from 4 to 6 changes that length (a longer fixed-size
  * array), so the naive "wrong length -> treat as absent" fallback that
  * already existed here for corrupt/foreign data would, without this
  * function, also silently discard every already-paired node's table on

@@ -20,6 +20,17 @@
 
 static const char *TAG = "espnow_link";
 
+/* SWARM_MAX_NODES (swarm_store.h) must never exceed ESP-NOW's own encrypted-
+ * peer cap: every adopted node's peer gets upgraded to encrypted right after
+ * PAIR_ACK (see pairing.c's hub_task()), so a node cap above this hardware
+ * ceiling would advertise adoptions that can never actually succeed. Tying
+ * the two together at compile time means a future bump of one without the
+ * other fails the build instead of silently reproducing that bug. */
+_Static_assert(SWARM_MAX_NODES <= ESP_NOW_MAX_ENCRYPT_PEER_NUM,
+               "SWARM_MAX_NODES exceeds ESP_NOW_MAX_ENCRYPT_PEER_NUM: adoption beyond "
+               "the hardware's encrypted-peer cap would always fail at the encrypted-peer "
+               "upgrade in pairing.c's hub_task()");
+
 /* ESP-NOW primary master key. This is NOT a secret: the PMK only encrypts
  * the per-peer LMK inside ESP-NOW's internal peer table on this device; it
  * is never transmitted and provides no protection against an attacker who

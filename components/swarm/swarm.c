@@ -26,6 +26,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -346,10 +347,81 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
     }
 }
 
+/* ---------------- Node side: RAM-only backlog for undelivered readings ----------------
+ *
+ * A node that can't currently reach the hub (hub rebooting, brief outage)
+ * would otherwise simply lose whatever it was sending right then -- this
+ * ring rides out exactly that, for a bounded amount of history. It is
+ * DELIBERATELY RAM-only and lost on node reboot: it exists to survive a
+ * *hub* outage, not to be a durable store of its own, and every reading in
+ * it is already sitting in the live registry too (data_core_snapshot() can
+ * always rebuild "current" state), so a node reboot loses only the backlog
+ * of already-superseded history, never the current reading. Owned
+ * exclusively by forward_task() below -- nothing else ever reads or writes
+ * it, so it needs no lock. */
+#define SWARM_NODE_BUFFER_LEN 32
+
+typedef struct {
+    swarm_reading_t r;
+    int64_t         captured_us;  /* esp_timer_get_time() when last (re)buffered;
+                                    * age_s is recomputed from this at transmit time */
+} buffered_reading_t;
+
+static buffered_reading_t s_buf[SWARM_NODE_BUFFER_LEN];
+static int                s_buf_head;     /* index of the oldest entry */
+static int                s_buf_count;    /* number of valid entries, 0..SWARM_NODE_BUFFER_LEN */
+static uint32_t           s_buf_dropped;  /* running count of oldest-entries evicted because the ring was full */
+
+/* Buffers a reading that just failed to send. When full, the oldest entry is
+ * evicted to make room -- logged at debug with a running counter, per the
+ * brief, rather than silently discarding without any trace. */
+static void buffer_push(const swarm_reading_t *r, int64_t now_us)
+{
+    if (s_buf_count == SWARM_NODE_BUFFER_LEN) {
+        s_buf_dropped++;
+        ESP_LOGD(TAG, "reading buffer full (%d), dropping oldest for " MACSTR
+                      " (dropped=%" PRIu32 " total)",
+                 SWARM_NODE_BUFFER_LEN, MAC2STR(s_buf[s_buf_head].r.mac), s_buf_dropped);
+        /* Overwrite the oldest slot in place, then advance head: that slot
+         * becomes the newest entry and the next one becomes the new oldest --
+         * count stays at SWARM_NODE_BUFFER_LEN throughout. */
+        s_buf[s_buf_head].r = *r;
+        s_buf[s_buf_head].captured_us = now_us;
+        s_buf_head = (s_buf_head + 1) % SWARM_NODE_BUFFER_LEN;
+    } else {
+        int idx = (s_buf_head + s_buf_count) % SWARM_NODE_BUFFER_LEN;
+        s_buf[idx].r = *r;
+        s_buf[idx].captured_us = now_us;
+        s_buf_count++;
+    }
+}
+
+/* Pops the oldest buffered reading, if any. Does NOT recompute age_s -- the
+ * caller does that at transmit time, since "now" is only meaningful right
+ * before the send actually happens. */
+static bool buffer_pop(buffered_reading_t *out)
+{
+    if (s_buf_count == 0) return false;
+    *out = s_buf[s_buf_head];
+    s_buf_head = (s_buf_head + 1) % SWARM_NODE_BUFFER_LEN;
+    s_buf_count--;
+    return true;
+}
+
 /* Owns every espnow_link_send() the node makes for readings, so a slow or
  * unreachable radio never stalls the default event-loop task (same
  * reasoning as sse.c's httpd_queue_work). On repeated failures, triggers a
- * channel resync rather than silently dropping forever. */
+ * channel resync rather than silently dropping forever.
+ *
+ * Buffering: a reading that fails to send (live or a backlog retry) goes
+ * into the RAM ring above rather than being dropped outright. A live
+ * reading is always preferred over the backlog when both are available --
+ * checked fresh at the top of every loop iteration, non-blocking -- so a
+ * long backlog (up to SWARM_NODE_BUFFER_LEN entries deep after an outage)
+ * never delays current data: at most one buffered reading is sent per live
+ * reading interval, draining gradually rather than in one blocking burst.
+ * This all runs on this dedicated task, never on the ESP-NOW receive
+ * callback (WiFi driver task), per the project-wide rule. */
 static void forward_task(void *arg)
 {
     (void)arg;
@@ -362,7 +434,37 @@ static void forward_task(void *arg)
     bool first_delivered = false;
 
     for (;;) {
-        if (xQueueReceive(s_fwd_queue, &r, portMAX_DELAY) != pdTRUE) continue;
+        bool have_reading = xQueueReceive(s_fwd_queue, &r, 0) == pdTRUE;
+
+        if (!have_reading) {
+            buffered_reading_t br;
+            if (buffer_pop(&br)) {
+                r = br.r;
+                /* age_s is recomputed here, at transmit time, not at the
+                 * moment it was (re)buffered -- the whole point of
+                 * buffering is riding out an outage of unknown length, so
+                 * the hub must see how stale this reading actually is right
+                 * now. r.age_s already carries whatever age had accumulated
+                 * before this buffering, so this ADDS the additional wait,
+                 * compounding correctly across repeated buffer/retry
+                 * cycles. Clamped rather than left to wrap past UINT16_MAX
+                 * (~18h) -- data_core's own DATA_CORE_MAX_AGE_S (30 min)
+                 * will drop it hub-side long before that matters anyway. */
+                int64_t extra_us = esp_timer_get_time() - br.captured_us;
+                uint32_t extra_s = (extra_us > 0) ? (uint32_t)(extra_us / 1000000) : 0;
+                uint32_t total_s = (uint32_t)r.age_s + extra_s;
+                r.age_s = (total_s > UINT16_MAX) ? UINT16_MAX : (uint16_t)total_s;
+                have_reading = true;
+            } else {
+                /* Nothing live, nothing buffered: block until a live
+                 * reading arrives. Draining is only ever driven by this
+                 * task noticing the buffer is non-empty, never a timer, so
+                 * there is nothing else useful to do while both are empty. */
+                if (xQueueReceive(s_fwd_queue, &r, portMAX_DELAY) != pdTRUE) continue;
+                have_reading = true;
+            }
+        }
+        if (!have_reading) continue;
 
         uint8_t buf[sizeof(r)];
         size_t n = swarm_encode_reading(&r, buf, sizeof(buf));
@@ -380,6 +482,9 @@ static void forward_task(void *arg)
 
         consec_fail++;
         ESP_LOGW(TAG, "reading send failed (%s), consecutive=%d", esp_err_to_name(err), consec_fail);
+        /* Buffer whatever just failed -- live or a backlog entry that failed
+         * again on retry -- rather than dropping it. */
+        buffer_push(&r, esp_timer_get_time());
         if (consec_fail >= SWARM_FWD_FAIL_THRESHOLD) {
             esp_err_t rerr = pairing_node_resync_channel();
             ESP_LOGI(TAG, "resync after %d consecutive failures: %s",
