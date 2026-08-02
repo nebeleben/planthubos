@@ -11,6 +11,7 @@
 
 #include "esp_now.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -199,7 +200,24 @@ esp_err_t espnow_link_init(espnow_rx_cb_t cb)
 
     /* Re-add whatever peer(s) this device already knows about, so a reboot
      * doesn't require re-pairing. Best-effort: a failure here just means
-     * the peer gets re-added lazily on next successful pairing/ping. */
+     * the peer gets re-added lazily on next successful pairing/ping.
+     *
+     * Project-wide invariant (mirrors main.c's boot branch): UNSET and
+     * MAIN both mean "this device acts as a hub" -- an already-onboarded
+     * hub from before M5a existed keeps role UNSET forever (M1-M4 byte-
+     * for-byte preservation means it never has a reason to explicitly
+     * become MAIN), so ONLY NODE is ever special-cased. A bug here that
+     * checked `== SWARM_ROLE_MAIN` instead of `!= SWARM_ROLE_NODE` meant
+     * this branch never ran on a real (UNSET) hub: it booted with zero
+     * node peers registered, could not decrypt the node's encrypted
+     * unicast readings, and ESP-NOW silently dropped every one of them
+     * before reaching our receive callback at all -- while the node's own
+     * send still reported success (it got a MAC ack; the hub's driver
+     * discarded the frame at the crypto layer, invisibly, afterward).
+     * Confirmed on real hardware: forwarding worked immediately after
+     * pairing (hub_task() adds the peer live, at runtime) but never
+     * survived a hub reboot until this was fixed to check the right
+     * condition. Do not "simplify" this back to == SWARM_ROLE_MAIN. */
     swarm_role_t role = swarm_store_role();
     if (role == SWARM_ROLE_NODE) {
         uint8_t hub_mac[6], hub_lmk[SWARM_LMK_LEN], hub_ch;
@@ -207,19 +225,27 @@ esp_err_t espnow_link_init(espnow_rx_cb_t cb)
             esp_err_t peer_err = espnow_link_add_peer(hub_mac, hub_lmk, 0);
             if (peer_err != ESP_OK) {
                 ESP_LOGW(TAG, "failed to re-add stored hub peer: %s", esp_err_to_name(peer_err));
+            } else {
+                ESP_LOGI(TAG, "restored hub peer " MACSTR " at boot", MAC2STR(hub_mac));
             }
         }
-    } else if (role == SWARM_ROLE_MAIN) {
+    } else {
         int n = swarm_store_node_count();
+        int restored = 0;
         for (int i = 0; i < n; i++) {
             uint8_t mac[6], lmk[SWARM_LMK_LEN];
             if (swarm_store_node_at(i, mac, lmk)) {
                 esp_err_t peer_err = espnow_link_add_peer(mac, lmk, 0);
                 if (peer_err != ESP_OK) {
-                    ESP_LOGW(TAG, "failed to re-add stored node peer: %s", esp_err_to_name(peer_err));
+                    ESP_LOGW(TAG, "failed to re-add stored node peer " MACSTR ": %s",
+                             MAC2STR(mac), esp_err_to_name(peer_err));
+                } else {
+                    ESP_LOGI(TAG, "restored node peer " MACSTR, MAC2STR(mac));
+                    restored++;
                 }
             }
         }
+        ESP_LOGI(TAG, "restored %d/%d node peer(s) at boot", restored, n);
     }
 
     return ESP_OK;
