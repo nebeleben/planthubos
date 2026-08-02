@@ -33,3 +33,7 @@ $CC -Wall -Wextra -Werror -I../../components/storage/include \
 $CC -Wall -Wextra -Werror -I../../components/claiming/include \
     test_authtok.c ../../components/claiming/authtok.c -o test_authtok
 ./test_authtok
+
+$CC -Wall -Wextra -Werror -I../../components/swarm/include \
+    test_swarm_frame.c ../../components/swarm/swarm_frame.c -o test_swarm_frame
+./test_swarm_frame
