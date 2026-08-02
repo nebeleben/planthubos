@@ -148,9 +148,24 @@ static void hub_task(void *arg)
 
         do {
             uint8_t channel = espnow_link_channel();
-            esp_err_t err = espnow_link_add_peer(item.mac, lmk, 0);
+
+            /* PAIR_ACK carries the LMK itself, so it MUST go out
+             * UNENCRYPTED -- the node cannot possibly hold the key yet,
+             * since delivering that key is the entire point of this
+             * frame. swarm_frame.h documents PAIR_ACK as "Hub -> node,
+             * unicast, plaintext" for exactly this reason: do NOT
+             * "harden" this by adding the peer encrypted before sending,
+             * that breaks pairing outright. Confirmed on real hardware:
+             * an encrypted-before-send ack got ESP_FAIL (ESP_NOW_SEND_FAIL)
+             * on every attempt, because a peer that doesn't have the LMK
+             * cannot decrypt -- and therefore cannot 802.11-ack -- a frame
+             * that was encrypted with it. So: add the peer unencrypted
+             * first, send, and only once that plaintext send is confirmed
+             * delivered do we know the node has the key and it's safe to
+             * upgrade the peer to encrypted on our own side. */
+            esp_err_t err = espnow_link_add_peer(item.mac, NULL, 0);
             if (err != ESP_OK) {
-                ESP_LOGW(TAG, "adopt " MACSTR ": espnow_link_add_peer failed: %s",
+                ESP_LOGW(TAG, "adopt " MACSTR ": espnow_link_add_peer (plaintext) failed: %s",
                          MAC2STR(item.mac), esp_err_to_name(err));
                 break;
             }
@@ -189,6 +204,21 @@ static void hub_task(void *arg)
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "adopt " MACSTR ": PAIR_ACK send failed: %s",
                          MAC2STR(item.mac), esp_err_to_name(err));
+                break;
+            }
+
+            /* The node just accepted (and 802.11-acked) a plaintext frame
+             * containing the LMK, so it now has the key too -- safe to
+             * upgrade this peer to encrypted on our side. espnow_link_add_peer()
+             * calls esp_now_mod_peer() in place when the peer already
+             * exists (verified against this IDF's esp_now.h: esp_now_mod_peer()
+             * is available), so this is the same call as above, just with
+             * a non-NULL lmk this time -- no del+re-add needed. */
+            err = espnow_link_add_peer(item.mac, lmk, 0);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "adopt " MACSTR ": failed to upgrade peer to encrypted (%s); removing peer",
+                         MAC2STR(item.mac), esp_err_to_name(err));
+                espnow_link_remove_peer(item.mac);
                 break;
             }
 
@@ -415,8 +445,11 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
         /* Observability: cheap (one log call, no NVS/flash, no send), so
          * safe to leave on the receive-callback path. Confirms the node's
          * receiver heard an ack at all, and separates "no ack heard" from
-         * "ack heard but for someone else's/an earlier request". */
-        ESP_LOGI(TAG, "PAIR_ACK from " MACSTR " nonce=%s", MAC2STR(src), match ? "match" : "MISMATCH");
+         * "ack heard but for someone else's/an earlier request" -- logging
+         * both nonces on a mismatch is what actually distinguishes those
+         * two cases from the console instead of just saying "MISMATCH". */
+        ESP_LOGI(TAG, "PAIR_ACK from " MACSTR " nonce=%s (ours=0x%08" PRIx32 " theirs=0x%08" PRIx32 ")",
+                 MAC2STR(src), match ? "match" : "MISMATCH", s_node_nonce, ack.nonce);
         if (match) {
             s_node_ack = ack;
             memcpy(s_node_ack_mac, src, 6);
