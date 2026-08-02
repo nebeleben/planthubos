@@ -1,8 +1,9 @@
 /* Wires espnow_link + pairing + swarm_store to data_core: the hub ingests
- * node-forwarded readings through data_core_submit() (the same door the
- * local BLE collector uses), and a node forwards its own locally-heard
- * readings by subscribing to the existing PLANTHUB_DATA_EVENT. Neither
- * data_core nor ble_collector need any changes for this to work.
+ * node-forwarded readings through data_core_submit_from() (the same door
+ * the local BLE collector uses, via data_core_submit()/data_core_submit_from()),
+ * and a node forwards its own locally-heard readings by subscribing to the
+ * existing PLANTHUB_DATA_EVENT. Neither data_core nor ble_collector need
+ * any further changes for this to work.
  */
 #include "swarm.h"
 #include "swarm_store.h"
@@ -80,14 +81,15 @@ static void record_stat(const uint8_t src[6], int rssi)
  * locally heard one, so storage, history, SSE and integrations need no
  * changes.
  *
- * data_core_submit() safety: verified against components/data_core/data_core.c.
- * It takes s_mutex with portMAX_DELAY, but the only things ever done under
- * that lock (here and in data_core_snapshot()) are registry_update()/memcpy
+ * data_core_submit_from() safety: verified against
+ * components/data_core/data_core.c. It takes s_mutex with portMAX_DELAY,
+ * but the only things ever done under that lock (here and in
+ * data_core_snapshot()) are registry_find()/registry_update_from()/memcpy
  * -- a short, bounded, allocation-free critical section with no further
  * blocking calls inside it -- so contention is bounded to microseconds, not
  * indefinite. The event it posts afterwards uses esp_event_post(..., 0),
  * i.e. it never blocks even if the event queue is full (the post is simply
- * dropped). So data_core_submit() is safe to call directly from the
+ * dropped). So data_core_submit_from() is safe to call directly from the
  * ESP-NOW receive callback (WiFi driver task); no deferral to another task
  * is needed for this path. */
 static void ingest_reading(const uint8_t src[6], const swarm_reading_t *r, int rssi)
@@ -102,7 +104,11 @@ static void ingest_reading(const uint8_t src[6], const swarm_reading_t *r, int r
     if (r->battery_pct != 0xFF)       { m.battery_pct = r->battery_pct; m.has_battery = true; }
     if (r->lux != 0xFFFFFFFFu)        { m.lux = r->lux; m.has_lux = true; }
     if (r->conductivity_us != 0xFFFF) { m.conductivity_us = r->conductivity_us; m.has_conductivity = true; }
-    data_core_submit(&m);
+    /* Attribute to the relaying node, using the node's own rssi/age_s from
+     * the reading (not the ESP-NOW link rssi passed to this function,
+     * which is the hub's signal to the node, not the node's signal to the
+     * sensor). */
+    data_core_submit_from(&m, src, r->rssi, r->age_s);
     record_stat(src, rssi);
 }
 

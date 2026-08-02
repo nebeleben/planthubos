@@ -42,7 +42,12 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         mibeacon_t m;
         if (mibeacon_parse(fields.svc_data_uuid16 + 2, fields.svc_data_uuid16_len - 2, &m) == MIBEACON_OK) {
             if (m.product_id != MIBEACON_PRODUCT_MIFLORA) return 0;
-            data_core_submit(&m);
+            /* Direct reception: no relaying node, just heard (age_s = 0).
+             * event->disc.rssi is the advertisement's RSSI in dBm (127 if
+             * unavailable per NimBLE's ble_gap.h), passed straight through
+             * so direct readings carry signal strength too, same as
+             * node-relayed ones. */
+            data_core_submit_from(&m, NULL, event->disc.rssi, 0);
         }
         return 0;
     }
