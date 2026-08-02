@@ -20,3 +20,13 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 # previous app on the next reboot, so a bootable-but-broken update
 # cannot strand the hub without a serial cable.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# This repo's hardware targets Switzerland, where channels 12-13 are legal
+# and in real use (e.g. Fritz!Box routers) -- the IDF default "01"
+# (world-safe) restricts a node's pairing/resync sweep to channels 1-11
+# and would silently and permanently fail to pair against a hub whose
+# router sits on 12 or 13. Downstream/public builds for other regions MUST
+# set their own regulatory domain here (see swarm's Kconfig,
+# PLANTHUB_WIFI_COUNTRY) -- shipping "CH" outside Switzerland is a
+# regulatory violation.
+CONFIG_PLANTHUB_WIFI_COUNTRY="CH"

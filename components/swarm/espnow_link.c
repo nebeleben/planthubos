@@ -133,6 +133,34 @@ esp_err_t espnow_link_init(espnow_rx_cb_t cb)
         ESP_LOGI(TAG, "wifi power save disabled for ESP-NOW");
     }
 
+    /* The regulatory domain gates which channels a node may sweep during
+     * pairing/resync (espnow_link_set_channel()) and which channel a
+     * hub's WiFi association may land on. The IDF default, "01" (world
+     * safe), restricts BOTH roles to channels 1-11 -- found on real
+     * hardware to be a silent, permanent pairing failure for a user whose
+     * router happens to land on channel 12 or 13 (legal and used by
+     * Fritz!Box routers in, e.g., Switzerland): the node's sweep simply
+     * can never reach the hub's channel, forever, with no error visible
+     * anywhere except a WARN buried in the sweep loop. CONFIG_PLANTHUB_WIFI_COUNTRY
+     * (see swarm's Kconfig) controls this for both roles uniformly, set
+     * here right next to the PS_NONE call so neither role can forget it.
+     * `true` enables 802.11d, so an associated hub still adopts whatever
+     * country its AP advertises rather than being pinned to the
+     * compile-time default regardless of where it actually associates. */
+    esp_err_t cc_err = esp_wifi_set_country_code(CONFIG_PLANTHUB_WIFI_COUNTRY, true);
+    if (cc_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_country_code(%s) failed: %s -- channels 12-13 may be unavailable",
+                 CONFIG_PLANTHUB_WIFI_COUNTRY, esp_err_to_name(cc_err));
+    } else {
+        wifi_country_t country;
+        if (esp_wifi_get_country(&country) == ESP_OK) {
+            ESP_LOGI(TAG, "wifi country set to %s, usable channels %u-%u",
+                     CONFIG_PLANTHUB_WIFI_COUNTRY, country.schan, country.schan + country.nchan - 1);
+        } else {
+            ESP_LOGI(TAG, "wifi country set to %s", CONFIG_PLANTHUB_WIFI_COUNTRY);
+        }
+    }
+
     err = esp_now_register_recv_cb(on_recv);
     if (err != ESP_OK) return err;
 

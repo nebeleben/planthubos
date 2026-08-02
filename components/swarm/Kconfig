@@ -1,0 +1,20 @@
+menu "PlantHub Swarm"
+
+config PLANTHUB_WIFI_COUNTRY
+    string "WiFi regulatory domain / country code"
+    default "01"
+    help
+        The regulatory domain determines which channels a node may sweep
+        during pairing/resync, and which channel a main hub's WiFi
+        association is allowed to sit on. "01" is the IDF's world-safe
+        default and restricts operation to channels 1-11. An actual ISO
+        country code for a region that permits channels 12-13 (most of
+        the EU, including Switzerland) enables them -- without this, a
+        node can never find a hub whose router happens to land on
+        channel 12 or 13, a silent and permanent pairing failure.
+
+        WARNING: setting a country code for a region these devices do
+        not actually operate in is a regulatory violation. Only set this
+        to a code that matches where the hardware will really be used.
+
+endmenu

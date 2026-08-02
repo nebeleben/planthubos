@@ -326,6 +326,15 @@ static void node_task(void *arg)
      * means fewer full 1..13 sweeps fit in the same timeout_s -- no
      * separate count needs to change to match. */
     const TickType_t dwell_ticks = pdMS_TO_TICKS(500);
+    /* A channel outside the configured regulatory domain (see
+     * CONFIG_PLANTHUB_WIFI_COUNTRY, applied in espnow_link_init()) fails
+     * set_channel() on EVERY sweep, forever -- e.g. 12-13 under the IDF's
+     * world-safe "01" default. Once, at WARN, is a useful signal that
+     * something is regionally restricted; repeating it every ~6.5s for
+     * the life of a search (up to 120s = ~18 sweeps) is just noise, so
+     * only the first sweep logs at WARN and every later one drops to
+     * DEBUG. */
+    bool first_sweep = true;
 
     while (esp_timer_get_time() < deadline_us) {
         uint32_t nonce = esp_random();
@@ -337,7 +346,11 @@ static void node_task(void *arg)
         for (uint8_t ch = 1; ch <= 13 && esp_timer_get_time() < deadline_us; ch++) {
             esp_err_t cherr = espnow_link_set_channel(ch);
             if (cherr != ESP_OK) {
-                ESP_LOGW(TAG, "sweep: set_channel(%u) failed: %s", ch, esp_err_to_name(cherr));
+                if (first_sweep) {
+                    ESP_LOGW(TAG, "sweep: set_channel(%u) failed: %s", ch, esp_err_to_name(cherr));
+                } else {
+                    ESP_LOGD(TAG, "sweep: set_channel(%u) failed: %s", ch, esp_err_to_name(cherr));
+                }
                 continue;
             }
             ESP_LOGD(TAG, "sweep: dwelling on channel %u", ch);
@@ -378,6 +391,7 @@ static void node_task(void *arg)
                 return;
             }
         }
+        first_sweep = false;
     }
 
     ESP_LOGW(TAG, "pairing timed out after %" PRIu32 "s", args.timeout_s);
