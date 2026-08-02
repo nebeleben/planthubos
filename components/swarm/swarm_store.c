@@ -21,12 +21,30 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t mac[6];
     uint8_t lmk[SWARM_LMK_LEN];
+    char    name[SWARM_NODE_NAME_LEN + 1];  /* "" = unset */
 } node_entry_t;
 
 typedef struct __attribute__((packed)) {
+    uint8_t format;
     uint8_t count;
     node_entry_t n[SWARM_MAX_NODES];
 } nodes_blob_t;
+
+/* M5a's on-disk layout: no format byte, no name, and a hard cap of 4. A
+ * blob with exactly this length is the migration trigger -- see
+ * load_nodes_blob() below. Kept private to this translation unit; nothing
+ * outside the migration path should ever see this shape again. */
+#define SWARM_STORE_V0_MAX_NODES 4
+
+typedef struct __attribute__((packed)) {
+    uint8_t mac[6];
+    uint8_t lmk[SWARM_LMK_LEN];
+} node_entry_v0_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t count;
+    node_entry_v0_t n[SWARM_STORE_V0_MAX_NODES];
+} nodes_blob_v0_t;
 
 static SemaphoreHandle_t s_mutex;
 static swarm_role_t s_role;
@@ -58,6 +76,117 @@ static esp_err_t erase_key(const char *key)
     return err;
 }
 
+/* Loads the KEY_NODES blob into *out, migrating an M5a-format blob in
+ * place if that's what's stored.
+ *
+ * M5a accepted this blob on exact-length match only, and raising
+ * SWARM_MAX_NODES from 4 to 8 changes that length (a longer fixed-size
+ * array), so the naive "wrong length -> treat as absent" fallback that
+ * already existed here for corrupt/foreign data would, without this
+ * function, also silently discard every already-paired node's table on
+ * the very first boot after this upgrade. Three cases, decided purely by
+ * the blob's on-disk LENGTH (an M5a blob carries no format byte to key
+ * off instead):
+ *
+ *   1. Length == sizeof(nodes_blob_t) (current format): read it and check
+ *      the leading format byte. A match is loaded as-is. A MISMATCH means
+ *      some future format bumped this again without a migration branch
+ *      landing here yet, or on-flash corruption -- either way the layout
+ *      cannot be trusted, so it is discarded (loudly) rather than risk
+ *      misreading node MACs/LMKs from a different shape as real ones.
+ *   2. Length == sizeof(nodes_blob_v0_t) (M5a's exact shape, no format
+ *      byte): read with the OLD parser, copy every entry across (name
+ *      left empty -- M5a had no names), and immediately persist the
+ *      result in the new format. This is the migration: a device
+ *      carrying an M5a blob keeps its pairing, gains an empty name per
+ *      node, and never has to re-pair.
+ *   3. Anything else (including "key absent", the fresh-install case):
+ *      start with an empty table. This matches M5a's own behaviour for a
+ *      blob it didn't recognise.
+ *
+ * out is fully populated with a sane default (format=SWARM_STORE_FORMAT,
+ * count=0, no entries) before any of the above, so every return path
+ * leaves *out valid even on read/parse failure. */
+static void load_nodes_blob(nvs_handle_t h, nodes_blob_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->format = SWARM_STORE_FORMAT;
+
+    size_t len = 0;
+    esp_err_t err = nvs_get_blob(h, KEY_NODES, NULL, &len);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;  /* fresh install: no node table yet */
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "nodes blob length query failed: %s; starting with an empty node table",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    if (len == sizeof(nodes_blob_t)) {
+        nodes_blob_t blob;
+        size_t rlen = sizeof(blob);
+        if (nvs_get_blob(h, KEY_NODES, &blob, &rlen) != ESP_OK || rlen != sizeof(blob)) {
+            ESP_LOGW(TAG, "nodes blob read failed at its expected current-format length; "
+                          "starting with an empty node table");
+            return;
+        }
+        if (blob.format != SWARM_STORE_FORMAT) {
+            ESP_LOGE(TAG, "nodes blob has unknown format byte %u (expected %u) at the "
+                          "current-format length -- DISCARDING it rather than trusting an "
+                          "unrecognised layout; every paired node is lost until re-paired",
+                     blob.format, (unsigned)SWARM_STORE_FORMAT);
+            return;
+        }
+        if (blob.count > SWARM_MAX_NODES) blob.count = SWARM_MAX_NODES;  /* defensive */
+        *out = blob;
+        return;
+    }
+
+    if (len == sizeof(nodes_blob_v0_t)) {
+        nodes_blob_v0_t old;
+        size_t rlen = sizeof(old);
+        if (nvs_get_blob(h, KEY_NODES, &old, &rlen) != ESP_OK || rlen != sizeof(old)) {
+            ESP_LOGW(TAG, "M5a-format nodes blob read failed; starting with an empty node table");
+            return;
+        }
+        uint8_t n = old.count;
+        if (n > SWARM_STORE_V0_MAX_NODES) n = SWARM_STORE_V0_MAX_NODES;  /* defensive: M5a's own cap */
+        if (n > SWARM_MAX_NODES) n = SWARM_MAX_NODES;
+        ESP_LOGW(TAG, "migrating M5a-format node table (%u node(s)) to format %u",
+                 n, (unsigned)SWARM_STORE_FORMAT);
+
+        nodes_blob_t migrated;
+        memset(&migrated, 0, sizeof(migrated));
+        migrated.format = SWARM_STORE_FORMAT;
+        migrated.count = n;
+        for (uint8_t i = 0; i < n; i++) {
+            memcpy(migrated.n[i].mac, old.n[i].mac, 6);
+            memcpy(migrated.n[i].lmk, old.n[i].lmk, SWARM_LMK_LEN);
+            /* migrated.n[i].name stays "" -- M5a had no names to carry over */
+        }
+
+        esp_err_t werr = write_blob(KEY_NODES, &migrated, sizeof(migrated));
+        if (werr != ESP_OK) {
+            /* Keep the migrated data in RAM for this boot even though the
+             * flash write failed -- the alternative is losing the
+             * pairing THIS boot despite having just proven we could read
+             * it, which is strictly worse. The next successful write
+             * (a rename, a forget, a fresh pairing) persists it. */
+            ESP_LOGE(TAG, "failed to persist migrated node table: %s (kept in RAM for this "
+                          "boot only; will retry on the next write)", esp_err_to_name(werr));
+        } else {
+            ESP_LOGI(TAG, "node table migration complete, %u node(s) preserved", n);
+        }
+        *out = migrated;
+        return;
+    }
+
+    ESP_LOGW(TAG, "nodes blob has unrecognised length %d (expected %d for the current format or "
+                  "%d for M5a); starting with an empty node table",
+             (int)len, (int)sizeof(nodes_blob_t), (int)sizeof(nodes_blob_v0_t));
+}
+
 esp_err_t swarm_store_init(void)
 {
     s_mutex = xSemaphoreCreateMutex();
@@ -67,6 +196,7 @@ esp_err_t swarm_store_init(void)
     s_hub_set = false;
     memset(&s_hub, 0, sizeof(s_hub));
     memset(&s_nodes, 0, sizeof(s_nodes));
+    s_nodes.format = SWARM_STORE_FORMAT;
     s_pair_failed = false;
 
     nvs_handle_t h;
@@ -86,11 +216,7 @@ esp_err_t swarm_store_init(void)
     s_hub_set = nvs_get_blob(h, KEY_HUB, &s_hub, &hub_len) == ESP_OK && hub_len == sizeof(s_hub);
     if (!s_hub_set) memset(&s_hub, 0, sizeof(s_hub));
 
-    size_t nodes_len = sizeof(s_nodes);
-    if (nvs_get_blob(h, KEY_NODES, &s_nodes, &nodes_len) != ESP_OK || nodes_len != sizeof(s_nodes)) {
-        memset(&s_nodes, 0, sizeof(s_nodes));
-    }
-    if (s_nodes.count > SWARM_MAX_NODES) s_nodes.count = SWARM_MAX_NODES;  /* defensive */
+    load_nodes_blob(h, &s_nodes);
 
     uint8_t pfail_byte;
     s_pair_failed = nvs_get_u8(h, KEY_PFAIL, &pfail_byte) == ESP_OK && pfail_byte != 0;
@@ -210,6 +336,7 @@ esp_err_t swarm_store_add_node(const uint8_t mac[6], const uint8_t lmk[SWARM_LMK
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
     nodes_blob_t blob = s_nodes;
+    blob.format = SWARM_STORE_FORMAT;
     int idx = -1;
     for (int i = 0; i < blob.count; i++) {
         if (memcmp(blob.n[i].mac, mac, 6) == 0) { idx = i; break; }
@@ -220,9 +347,78 @@ esp_err_t swarm_store_add_node(const uint8_t mac[6], const uint8_t lmk[SWARM_LMK
             return ESP_ERR_NO_MEM;
         }
         idx = blob.count++;
+        memset(&blob.n[idx], 0, sizeof(blob.n[idx]));  /* fresh slot: no name yet */
     }
     memcpy(blob.n[idx].mac, mac, 6);
     memcpy(blob.n[idx].lmk, lmk, SWARM_LMK_LEN);
+    /* name is deliberately left as-is: re-adopting an already-known MAC
+     * (see pairing.c's find_stored_lmk()/idempotent re-ack) must not wipe
+     * an operator-assigned name out from under them. */
+
+    esp_err_t err = write_blob(KEY_NODES, &blob, sizeof(blob));
+    if (err == ESP_OK) s_nodes = blob;
+    xSemaphoreGive(s_mutex);
+    return err;
+}
+
+esp_err_t swarm_store_set_node_name(const uint8_t mac[6], const char *name)
+{
+    if (!mac) return ESP_ERR_INVALID_ARG;
+    size_t len = name ? strlen(name) : 0;
+    if (len > SWARM_NODE_NAME_LEN) return ESP_ERR_INVALID_SIZE;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    nodes_blob_t blob = s_nodes;
+    blob.format = SWARM_STORE_FORMAT;
+    int idx = -1;
+    for (int i = 0; i < blob.count; i++) {
+        if (memcmp(blob.n[i].mac, mac, 6) == 0) { idx = i; break; }
+    }
+    if (idx < 0) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_NOT_FOUND;
+    }
+    memset(blob.n[idx].name, 0, sizeof(blob.n[idx].name));
+    if (len) memcpy(blob.n[idx].name, name, len);  /* len == 0 clears */
+
+    esp_err_t err = write_blob(KEY_NODES, &blob, sizeof(blob));
+    if (err == ESP_OK) s_nodes = blob;
+    xSemaphoreGive(s_mutex);
+    return err;
+}
+
+bool swarm_store_node_name(const uint8_t mac[6], char out[SWARM_NODE_NAME_LEN + 1])
+{
+    if (!mac || !out) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int idx = -1;
+    for (int i = 0; i < s_nodes.count; i++) {
+        if (memcmp(s_nodes.n[i].mac, mac, 6) == 0) { idx = i; break; }
+    }
+    bool found = idx >= 0;
+    if (found) memcpy(out, s_nodes.n[idx].name, sizeof(s_nodes.n[idx].name));
+    xSemaphoreGive(s_mutex);
+    return found;
+}
+
+esp_err_t swarm_store_forget_node(const uint8_t mac[6])
+{
+    if (!mac) return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    nodes_blob_t blob = s_nodes;
+    blob.format = SWARM_STORE_FORMAT;
+    int idx = -1;
+    for (int i = 0; i < blob.count; i++) {
+        if (memcmp(blob.n[i].mac, mac, 6) == 0) { idx = i; break; }
+    }
+    if (idx < 0) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_NOT_FOUND;
+    }
+    for (int i = idx; i < blob.count - 1; i++) blob.n[i] = blob.n[i + 1];
+    blob.count--;
+    memset(&blob.n[blob.count], 0, sizeof(blob.n[blob.count]));  /* clear the vacated tail slot */
 
     esp_err_t err = write_blob(KEY_NODES, &blob, sizeof(blob));
     if (err == ESP_OK) s_nodes = blob;
@@ -234,7 +430,10 @@ esp_err_t swarm_store_clear_nodes(void)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     esp_err_t err = erase_key(KEY_NODES);
-    if (err == ESP_OK) memset(&s_nodes, 0, sizeof(s_nodes));
+    if (err == ESP_OK) {
+        memset(&s_nodes, 0, sizeof(s_nodes));
+        s_nodes.format = SWARM_STORE_FORMAT;
+    }
     xSemaphoreGive(s_mutex);
     return err;
 }

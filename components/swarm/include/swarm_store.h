@@ -4,7 +4,21 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define SWARM_MAX_NODES 4  /* M5a; raised in M5b */
+#define SWARM_MAX_NODES 8  /* was 4 in M5a */
+
+/* On-disk format of the persisted node table (KEY_NODES blob). Bump this
+ * and add a migration branch in swarm_store.c's load whenever the layout
+ * changes again -- M5a accepted a stored blob on exact-length match only,
+ * which is why simply raising SWARM_MAX_NODES here would otherwise have
+ * silently wiped every already-paired node's table on upgrade (a longer
+ * fixed-size array changes the blob's length). See swarm_store.c for the
+ * migration that reads an M5a-format blob (no format byte, exact old
+ * length) with the old parser and rewrites it in this format. */
+#define SWARM_STORE_FORMAT 1
+
+/* Node display name: up to this many bytes, NUL-terminated in the buffer
+ * callers pass to swarm_store_node_name(). Empty means unset. */
+#define SWARM_NODE_NAME_LEN 24
 
 typedef enum {
     SWARM_ROLE_UNSET = 0,
@@ -25,11 +39,29 @@ esp_err_t swarm_store_set_hub(const uint8_t mac[6], const uint8_t lmk[SWARM_LMK_
 esp_err_t swarm_store_set_channel(uint8_t channel);
 esp_err_t swarm_store_clear_hub(void);
 
-/* Hub side: paired nodes (single node in M5a; table grows in M5b). */
+/* Hub side: paired nodes (single node in M5a; table grows to SWARM_MAX_NODES
+ * in M5b). */
 int swarm_store_node_count(void);
 bool swarm_store_node_at(int idx, uint8_t mac_out[6], uint8_t lmk_out[SWARM_LMK_LEN]);
 esp_err_t swarm_store_add_node(const uint8_t mac[6], const uint8_t lmk[SWARM_LMK_LEN]);
 esp_err_t swarm_store_clear_nodes(void);
+
+/* Hub side: operator-assigned node name, stored alongside the node's table
+ * entry. name may be NULL or "" to clear it; anything longer than
+ * SWARM_NODE_NAME_LEN bytes is rejected with ESP_ERR_INVALID_SIZE.
+ * ESP_ERR_NOT_FOUND if mac isn't in the table. */
+esp_err_t swarm_store_set_node_name(const uint8_t mac[6], const char *name);
+
+/* Fills out (a buffer of at least SWARM_NODE_NAME_LEN+1 bytes) with the
+ * node's stored name, NUL-terminated -- "" when unset. Returns false only
+ * when mac isn't in the table at all (out is left untouched in that case). */
+bool swarm_store_node_name(const uint8_t mac[6], char out[SWARM_NODE_NAME_LEN + 1]);
+
+/* Removes mac from the persisted node table (compacting the array). The
+ * caller is responsible for also removing the corresponding ESP-NOW peer
+ * (espnow_link_remove_peer()) -- this function only touches swarm_store's
+ * own state. ESP_ERR_NOT_FOUND if mac isn't in the table. */
+esp_err_t swarm_store_forget_node(const uint8_t mac[6]);
 
 /* Node side: true once a pairing search (pairing_node_start(), driven by
  * swarm_start_node_search()) has run to completion and failed/timed out.
