@@ -4,6 +4,7 @@ import { DashboardTab } from './tabs/dashboard.jsx'
 import { DevicesTab } from './tabs/devices.jsx'
 import { HistoryTab } from './tabs/history.jsx'
 import { NetworkTab } from './tabs/network.jsx'
+import { RoleTab } from './tabs/role.jsx'
 
 const TABS = ['Dashboard', 'Devices', 'History', 'Config', 'Network']
 
@@ -13,11 +14,17 @@ function Placeholder({ name }) {
 
 export function App() {
   const [tab, setTab] = useState('Dashboard')
+  // Optimistically 'main' so an existing hub (the overwhelmingly common
+  // case) renders its tabs immediately instead of flashing a loading state
+  // -- only a device that has never chosen a role (fresh out of the box)
+  // ever flips this to 'unset' once /api/v1/status answers.
+  const [role, setRole] = useState('main')
 
-  useEffect(() => {
+  function refreshRole() {
     fetch('/api/v1/status')
       .then((r) => r.json())
       .then((st) => {
+        setRole(st.role || 'main')   // pre-M5a hubs have no "role" field
         if (!st.time_synced) {
           fetch('/api/v1/time', {
             method: 'POST',
@@ -27,7 +34,20 @@ export function App() {
         }
       })
       .catch(() => {})
-  }, [])
+  }
+
+  useEffect(() => { refreshRole() }, [])
+
+  if (role === 'unset') {
+    return (
+      <RoleTab
+        onMainChosen={() => {
+          setTab('Network')
+          refreshRole()
+        }}
+      />
+    )
+  }
 
   return (
     <div class="app">

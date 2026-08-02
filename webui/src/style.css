@@ -34,3 +34,11 @@ table.kv td:first-child { opacity: 0.6; }
 .keyrow input { flex: 1; max-width: 30rem; }
 .hint { opacity: 0.65; font-size: 0.9rem; }
 progress { width: 100%; max-width: 30rem; }
+.role-screen { max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+.role-screen h1 { font-size: 1.3rem; margin: 0 0 1rem; }
+.role-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+.role-card { border: 1px solid #8884; border-radius: 10px; padding: 1rem 1.1rem; }
+.role-card h2 { margin: 0 0 0.5rem; font-size: 1.05rem; }
+.role-card p { margin: 0 0 0.7rem; }
+.role-card button { width: 100%; padding: 0.5rem 0.8rem; border: 1px solid #4a7c4a; background: #4a7c4a; color: #fff; border-radius: 6px; cursor: pointer; font-size: 0.95rem; }
+.role-card button:disabled { opacity: 0.6; cursor: default; }

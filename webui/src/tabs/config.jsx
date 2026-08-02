@@ -14,15 +14,27 @@ function fmtUptime(s) {
   return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`
 }
 
+function fmtAgo(lastSeenS, nowS) {
+  if (lastSeenS == null || nowS == null) return '–'
+  const d = Math.max(0, nowS - lastSeenS)
+  if (d < 90) return `${d}s ago`
+  if (d < 5400) return `${Math.round(d / 60)}m ago`
+  return `${Math.round(d / 3600)}h ago`
+}
+
 export function ConfigTab() {
   const [st, setSt] = useState(null)
   const [error, setError] = useState(false)
   const [secret, setSecret] = useState(null)     // freshly generated, shown once
   const [keyInput, setKeyInput] = useState(getKey())
-  const [busy, setBusy] = useState('')           // '' | claim | unclaim | ota
+  const [busy, setBusy] = useState('')           // '' | claim | unclaim | ota | pair
   const [otaMsg, setOtaMsg] = useState('')
   const [otaPct, setOtaPct] = useState(null)
   const xhrRef = useRef(null)
+  const [nodes, setNodes] = useState(null)
+  const [pairSecondsLeft, setPairSecondsLeft] = useState(0)
+  const pairTickRef = useRef(null)
+  const nodesPollRef = useRef(null)
 
   function refresh() {
     fetch('/api/v1/status')
@@ -31,6 +43,51 @@ export function ConfigTab() {
       .catch(() => setError(true))
   }
   useEffect(() => { refresh() }, [])
+
+  function refreshNodes() {
+    fetch('/api/v1/nodes')
+      .then((r) => r.json())
+      .then((d) => setNodes(d.nodes || []))
+      .catch(() => {})
+  }
+  // Nodes section is main-hub only; fetch once we know this device isn't a node.
+  useEffect(() => {
+    if (st && st.role !== 'node') refreshNodes()
+  }, [st?.role])
+  useEffect(() => () => {
+    clearInterval(pairTickRef.current)
+    clearInterval(nodesPollRef.current)
+  }, [])
+
+  async function doAddNode() {
+    setBusy('pair')
+    try {
+      const res = await fetch('/api/v1/nodes/pair', { method: 'POST', headers: authHeaders() })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && data.ok) {
+        const seconds = data.window_s || 120
+        setPairSecondsLeft(seconds)
+        clearInterval(pairTickRef.current)
+        pairTickRef.current = setInterval(() => {
+          setPairSecondsLeft((s) => {
+            if (s <= 1) {
+              clearInterval(pairTickRef.current)
+              clearInterval(nodesPollRef.current)
+              refreshNodes()
+              return 0
+            }
+            return s - 1
+          })
+        }, 1000)
+        refreshNodes()
+        clearInterval(nodesPollRef.current)
+        nodesPollRef.current = setInterval(refreshNodes, 5000)
+      } else {
+        alert(res.status === 401 ? 'unauthorized — wrong key' : (data.error || 'pairing failed'))
+      }
+    } catch { alert('hub not reachable') }
+    setBusy('')
+  }
 
   async function doClaim() {
     setBusy('claim')
@@ -146,6 +203,39 @@ export function ConfigTab() {
         </p>
       )}
       {otaMsg && <p class="hint">{otaMsg}</p>}
+
+      {st.role !== 'node' && (
+        <div>
+          <h2>Nodes</h2>
+          <table class="devices">
+            <thead>
+              <tr><th>MAC</th><th>Last seen</th><th>Frames</th><th>RSSI</th></tr>
+            </thead>
+            <tbody>
+              {(nodes || []).map((n) => (
+                <tr key={n.mac}>
+                  <td class="mono">{n.mac}</td>
+                  <td>{fmtAgo(n.last_seen_s, st.uptime_s)}</td>
+                  <td>{n.frames_rx}</td>
+                  <td>{n.rssi} dBm</td>
+                </tr>
+              ))}
+              {nodes && nodes.length === 0 && (
+                <tr><td colspan={4} class="hint">No nodes paired yet.</td></tr>
+              )}
+            </tbody>
+          </table>
+          {pairSecondsLeft > 0 ? (
+            <p class="hint">Pairing open — put the node into pairing mode now ({pairSecondsLeft}s left).</p>
+          ) : (
+            <p>
+              <button onClick={doAddNode} disabled={busy === 'pair'}>
+                {busy === 'pair' ? 'Opening…' : 'Add node'}
+              </button>
+            </p>
+          )}
+        </div>
+      )}
     </div>
   )
 }
