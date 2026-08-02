@@ -106,10 +106,50 @@ static void ingest_reading(const uint8_t src[6], const swarm_reading_t *r, int r
     record_stat(src, rssi);
 }
 
+/* True if mac is in swarm_store's persisted node table -- the same set
+ * espnow_link_init() restores as ESP-NOW peers at boot. swarm_store's
+ * table is a mutex-guarded RAM cache (see swarm_store.c), so this is a
+ * short, bounded, allocation-free lookup over at most SWARM_MAX_NODES
+ * entries: safe to call directly from the ESP-NOW receive callback, same
+ * reasoning as every other swarm_store/s_stats_mutex access already made
+ * from this path. No NVS/flash touched here. */
+static bool is_paired_node(const uint8_t mac[6])
+{
+    int n = swarm_store_node_count();
+    for (int i = 0; i < n; i++) {
+        uint8_t stored[6];
+        if (swarm_store_node_at(i, stored, NULL) && memcmp(stored, mac, 6) == 0) return true;
+    }
+    return false;
+}
+
 static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, int rssi)
 {
     int type = swarm_frame_type(data, (size_t)len);
     if (type == SWARM_MSG_READING) {
+        /* PlanV1 3.3 promises "unpaired frames are dropped, so a neighbour
+         * cannot inject readings" -- ESP-NOW hands this callback ANY
+         * unencrypted frame from ANY MAC in range, paired or not, so that
+         * promise has to be enforced here explicitly rather than assumed.
+         * Without this check, any device broadcasting a well-formed
+         * SWARM_MSG_READING could inject arbitrary (sensor MAC, values)
+         * straight into data_core -> registry -> SSE/sampler/history,
+         * no pairing window or claim key required. PAIR_REQ is
+         * deliberately NOT gated this way -- that path is only ever live
+         * during an operator-opened window and is pairing_handle_frame's
+         * job to police. */
+        if (!is_paired_node(src_mac)) {
+            /* Rate-limited: a noisy or hostile neighbour repeatedly
+             * broadcasting garbage READING frames must not be able to
+             * flood the console via this path. */
+            static int64_t s_last_drop_log_us;
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - s_last_drop_log_us > 5000000) {
+                ESP_LOGD(TAG, "dropping READING from unpaired " MACSTR, MAC2STR(src_mac));
+                s_last_drop_log_us = now_us;
+            }
+            return;
+        }
         swarm_reading_t r;
         if (swarm_decode_reading(data, (size_t)len, &r)) ingest_reading(src_mac, &r, rssi);
         return;

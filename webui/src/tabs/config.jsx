@@ -89,6 +89,19 @@ export function ConfigTab() {
     setBusy('')
   }
 
+  // The hub's role_change_ok() gate requires either AP mode (this
+  // device's own setup network) or a valid claim key. A pair-failed node
+  // that still holds WiFi credentials rejoins as a normal STA, so it's
+  // never in AP mode -- and if it's also unclaimed (the common case for a
+  // node), no key typed here can ever satisfy that gate over the network;
+  // recovery needs physical access instead. `claimed` distinguishes what
+  // we can: a genuinely claimed hub really does just need the right key.
+  function role401Message(claimed) {
+    return claimed
+      ? 'Unauthorized — wrong key.'
+      : "Can't do this remotely — this device already rejoined your WiFi, and changing its role now requires physical access. Hold the BOOT button for 10 seconds to factory-reset it back to the setup portal."
+  }
+
   async function doRetryPairing() {
     setBusy('retry')
     try {
@@ -96,7 +109,7 @@ export function ConfigTab() {
       if (res.ok) {
         alert('Retrying — this device will restart and search for your hub again.')
       } else {
-        alert(res.status === 401 ? 'unauthorized — wrong key' : 'retry failed')
+        alert(res.status === 401 ? role401Message(st.claimed) : 'retry failed')
       }
     } catch { alert('hub not reachable') }
     setBusy('')
@@ -114,7 +127,7 @@ export function ConfigTab() {
       if (res.ok) {
         alert('Switching to main hub — this device will restart.')
       } else {
-        alert(res.status === 401 ? 'unauthorized — wrong key' : 'switch failed')
+        alert(res.status === 401 ? role401Message(st.claimed) : 'switch failed')
       }
     } catch { alert('hub not reachable') }
     setBusy('')

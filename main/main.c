@@ -85,7 +85,17 @@ void app_main(void)
          * no STA/AP management -- radio-only wifi so ESP-NOW can run, plus
          * BLE collection (started below, common to both roles). */
         esp_err_t nerr = swarm_start_node();
-        if (nerr != ESP_OK) ESP_LOGE(TAG, "node start failed (%s)", esp_err_to_name(nerr));
+        if (nerr != ESP_OK) {
+            /* Without this fallback a device that fails here is completely
+             * inert: no webserver, no wifi_manager, no ESP-NOW -- silent
+             * and unreachable except via the 10s factory-reset button.
+             * Same portal fallback as the search branch just below. */
+            ESP_LOGE(TAG, "node start failed (%s); falling back to the portal so the user can recover",
+                     esp_err_to_name(nerr));
+            ESP_ERROR_CHECK(webserver_start());
+            ota_rollback_guard_start();
+            ESP_ERROR_CHECK(wifi_manager_start());
+        }
     } else if (node_should_search) {
         /* Radio-only, same as the paired-node branch above -- no
          * webserver/wifi_manager while actively sweeping, since pairing
