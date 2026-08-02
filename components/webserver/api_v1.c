@@ -52,20 +52,27 @@ bool api_auth_ok(httpd_req_t *req)
     return claim_verify(hdr + 7);
 }
 
-/* Gate for POST /api/v1/role and POST /api/v1/pair/retry. A role flip (or a
- * node's pairing retry) must not be forceable over the LAN against an
- * already-onboarded, running hub: once node pairing actually works, that
- * would let anyone on the network flip a claimed-or-not hub to node role
- * and have a rogue ESP-NOW peer silently adopt it, hijacking all future
- * sensor data. But requiring a claim key outright would also break the
- * legitimate flow, since a device choosing its role for the first time (or
- * a node retrying pairing) is never claimed. So: allow while this device
- * is in its own AP/portal (physical/local proximity to a fresh device's
- * own access point -- the same trust boundary onboarding already relies
- * on), or when the caller holds a valid claim key regardless of mode. */
+/* Gate for POST /api/v1/role and POST /api/v1/pair/retry.
+ *
+ * Deliberately NOT the uniform "unclaimed = open" posture every other
+ * mutating endpoint in this file uses (api_auth_ok() alone, which returns
+ * true whenever the hub is unclaimed): role selection is inherently an
+ * onboarding-time, physically-present action, so requiring AP mode covers
+ * every legitimate path -- a fresh device's own portal, or a node sitting
+ * in its post-failure retry portal. A claimed, already-onboarded hub can
+ * additionally be converted with its key. There is no legitimate remote,
+ * unauthenticated reason to change a running hub's role. Unlike other
+ * unclaimed-open endpoints, a role flip is stealthy and persistent: the
+ * device leaves the network entirely and can then be silently adopted by
+ * any ESP-NOW peer in range, with recovery needing physical access to the
+ * factory-reset button. That asymmetry is why this one endpoint is
+ * deliberately stricter -- do not "harmonise" it back to plain
+ * api_auth_ok(), which is true on an unclaimed hub regardless of AP mode
+ * and would make this check a no-op against exactly the LAN-remote flip
+ * it exists to block. */
 static bool role_change_ok(httpd_req_t *req)
 {
-    return wifi_manager_is_ap_mode() || api_auth_ok(req);
+    return wifi_manager_is_ap_mode() || (claim_is_claimed() && api_auth_ok(req));
 }
 
 static const char *role_str(swarm_role_t r)
