@@ -84,7 +84,10 @@ void pairing_open_window(uint32_t seconds)
     s_adopt_in_progress = false; /* defensive: a fresh window always starts idle */
     xSemaphoreGive(s_window_lock);
 
-    ESP_LOGI(TAG, "pairing window open for %" PRIu32 "s", seconds);
+    /* Logging the channel here makes a hub/node channel mismatch visible
+     * at a glance in the console instead of having to infer it from
+     * separate hub and node logs. */
+    ESP_LOGI(TAG, "pairing window open for %" PRIu32 "s on channel %u", seconds, espnow_link_channel());
 }
 
 bool pairing_window_open(void)
@@ -177,6 +180,12 @@ static void hub_task(void *arg)
              * first means a slow or failed persist can no longer cost the
              * node a heard ack. */
             err = espnow_link_send(item.mac, buf, n);
+            /* Observability: this handshake is otherwise invisible on the
+             * console, which cost real diagnostic time tracking down a
+             * one-sided pairing defect. Log every attempt's outcome, not
+             * just failures. */
+            ESP_LOGI(TAG, "PAIR_ACK -> " MACSTR " channel=%u result=%s",
+                     MAC2STR(item.mac), channel, esp_err_to_name(err));
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "adopt " MACSTR ": PAIR_ACK send failed: %s",
                          MAC2STR(item.mac), esp_err_to_name(err));
@@ -287,6 +296,7 @@ static void node_task(void *arg)
                 ESP_LOGW(TAG, "sweep: set_channel(%u) failed: %s", ch, esp_err_to_name(cherr));
                 continue;
             }
+            ESP_LOGD(TAG, "sweep: dwelling on channel %u", ch);
 
             swarm_pair_req_t req = {
                 .version = SWARM_PROTO_VERSION,
@@ -342,7 +352,14 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
     int type = swarm_frame_type(data, (size_t)len);
 
     if (type == SWARM_MSG_PAIR_REQ) {
-        if (!pairing_window_open()) return;
+        bool win_open = pairing_window_open();
+        /* Observability: this is the single most useful line for
+         * diagnosing a one-sided pairing -- it proves the hub's receiver
+         * actually heard the request at all, and whether the window was
+         * open for it. Cheap (one log call, no NVS/flash, no send), so
+         * safe to leave on the receive-callback path. */
+        ESP_LOGI(TAG, "PAIR_REQ from " MACSTR " (window %s)", MAC2STR(src), win_open ? "open" : "closed");
+        if (!win_open) return;
 
         swarm_pair_req_t req;
         if (!swarm_decode_pair_req(data, (size_t)len, &req)) return;
@@ -395,6 +412,11 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
          * simply continues to the next channel/sweep and retries. */
         if (!s_node_lock || xSemaphoreTake(s_node_lock, pdMS_TO_TICKS(5)) != pdTRUE) return;
         bool match = (ack.nonce == s_node_nonce);
+        /* Observability: cheap (one log call, no NVS/flash, no send), so
+         * safe to leave on the receive-callback path. Confirms the node's
+         * receiver heard an ack at all, and separates "no ack heard" from
+         * "ack heard but for someone else's/an earlier request". */
+        ESP_LOGI(TAG, "PAIR_ACK from " MACSTR " nonce=%s", MAC2STR(src), match ? "match" : "MISMATCH");
         if (match) {
             s_node_ack = ack;
             memcpy(s_node_ack_mac, src, 6);

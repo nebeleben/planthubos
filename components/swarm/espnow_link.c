@@ -104,6 +104,35 @@ esp_err_t espnow_link_init(espnow_rx_cb_t cb)
     esp_err_t err = esp_now_init();
     if (err != ESP_OK) return err;
 
+    /* WiFi's default power-save mode (WIFI_PS_MIN_MODEM) lets an associated
+     * station's receiver sleep between AP beacons. That's fine for a normal
+     * WiFi client, but ESP-NOW frames arrive on their own schedule,
+     * independent of beacons, and are silently dropped while the receiver
+     * is asleep -- the single most common ESP-NOW + WiFi coexistence bug.
+     * It fit the observed evidence exactly: the hub (an associated STA)
+     * caught exactly one PAIR_REQ and missed every retry from the node's
+     * subsequent sweeps, and would have gone on dropping most node
+     * readings the same way once "paired". Every device that participates
+     * in the swarm -- hub or node -- must keep its receiver on for as long
+     * as ESP-NOW is active, called once here so both roles get it
+     * uniformly and nobody has to remember it per call site. The cost is
+     * higher idle draw: acceptable because the main hub is mains-powered,
+     * and a node is never associated to any AP at all (so this is a
+     * no-op for beacon-sleep purposes there, but harmless and kept
+     * uniform anyway).
+     * NOTE for M7 (battery-powered nodes): a duty-cycled node that
+     * deliberately sleeps between wake windows must ensure PS is off (or
+     * gets re-disabled) for the entire time it's awake and expecting
+     * ESP-NOW traffic -- this one-time call does not survive a light/deep
+     * sleep cycle and must be revisited then. */
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ps_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(WIFI_PS_NONE) failed: %s -- ESP-NOW frames may be dropped while the radio sleeps",
+                 esp_err_to_name(ps_err));
+    } else {
+        ESP_LOGI(TAG, "wifi power save disabled for ESP-NOW");
+    }
+
     err = esp_now_register_recv_cb(on_recv);
     if (err != ESP_OK) return err;
 

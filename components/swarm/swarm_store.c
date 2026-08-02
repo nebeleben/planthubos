@@ -96,7 +96,12 @@ esp_err_t swarm_store_init(void)
     s_pair_failed = nvs_get_u8(h, KEY_PFAIL, &pfail_byte) == ESP_OK && pfail_byte != 0;
 
     nvs_close(h);
-    ESP_LOGI(TAG, "role=%d hub_paired=%d nodes=%d pair_failed=%d", s_role, s_hub_set, s_nodes.count, s_pair_failed);
+    /* hub_channel logged unconditionally (0 when !hub_paired) so a stored
+     * channel is visible at a glance at every boot, not just inferred from
+     * a separate pairing-time log line -- makes a hub/node channel
+     * mismatch obvious in the console. */
+    ESP_LOGI(TAG, "role=%d hub_paired=%d hub_channel=%u nodes=%d pair_failed=%d",
+             s_role, s_hub_set, s_hub.channel, s_nodes.count, s_pair_failed);
     return ESP_OK;
 }
 
