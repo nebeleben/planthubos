@@ -9,6 +9,7 @@
 #include "ota_post.h"
 #include "cJSON.h"
 #include "esp_littlefs.h"
+#include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -19,7 +20,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "api_v1";
-#define FW_VERSION "0.4.0"
+#define FW_VERSION "0.4.1"
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -68,6 +69,8 @@ static esp_err_t status_get(httpd_req_t *req)
         cJSON_AddNumberToObject(root, "fs_used", fs_used);
     }
     cJSON_AddNumberToObject(root, "heap_free", esp_get_free_heap_size());
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running) cJSON_AddStringToObject(root, "partition", running->label);
     return send_json(req, root);
 }
 

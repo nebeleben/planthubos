@@ -1,14 +1,46 @@
 #include "ota_post.h"
 #include "api_v1.h"
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include <string.h>
 
 static const char *TAG = "ota";
 
 static void restart_cb(void *arg) { esp_restart(); }
+
+/* Rollback guard ---------------------------------------------------------
+ * With CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE an OTA'd image boots in
+ * PENDING_VERIFY and is reverted on the next reboot unless it confirms
+ * itself. "Healthy" here means the hub is reachable again -- either it
+ * rejoined the LAN or it fell back to the onboarding AP -- because a
+ * reachable hub can always be updated again, while an unreachable one is
+ * exactly the brick this guard exists to undo. */
+static void mark_valid_cb(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    ESP_LOGW(TAG, "network up, image confirmed (rollback cancelled): %s", esp_err_to_name(err));
+    esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_AP_START, mark_valid_cb);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, mark_valid_cb);
+}
+
+void ota_rollback_guard_start(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) return;
+    if (state != ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGI(TAG, "running from %s, no rollback pending", running->label);
+        return;
+    }
+    ESP_LOGW(TAG, "running from %s pending verify; confirming once the network is up", running->label);
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, mark_valid_cb, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, mark_valid_cb, NULL));
+}
 
 static void send_err_json(httpd_req_t *req, const char *status, const char *msg)
 {
@@ -51,7 +83,13 @@ esp_err_t ota_post_handler(httpd_req_t *req)
         if ((err = esp_ota_write(ota, buf, n)) != ESP_OK) {
             ESP_LOGE(TAG, "esp_ota_write: %s", esp_err_to_name(err));
             esp_ota_abort(ota);
-            send_err_json(req, "500 Internal Server Error", "flash write failed");
+            /* esp_ota_write checks the image header magic on the first chunk, so
+             * uploading a non-firmware file lands here rather than at esp_ota_end
+             * -- report that as a bad image, not as a flash failure. */
+            if (err == ESP_ERR_OTA_VALIDATE_FAILED)
+                send_err_json(req, "400 Bad Request", "invalid image");
+            else
+                send_err_json(req, "500 Internal Server Error", "flash write failed");
             return ESP_OK;
         }
         remaining -= n;

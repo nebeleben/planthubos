@@ -75,6 +75,11 @@ esp_err_t webserver_start(void)
     cfg.max_uri_handlers = 20;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 8192; /* wifi_scan_get's records buffer + cJSON work no longer fit in 4K */
+    /* Without this, abandoned sockets (phone walks away from the portal, tab
+     * closed uncleanly) hold the pool until lwIP times them out and accept()
+     * fails with ENFILE meanwhile -- observed on hardware as the portal simply
+     * refusing to load for ~45 s. Purge the least-recently-used one instead. */
+    cfg.lru_purge_enable = true;
     esp_err_t err = httpd_start(&s_server, &cfg);
     if (err != ESP_OK) return err;
 

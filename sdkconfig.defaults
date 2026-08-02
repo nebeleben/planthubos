@@ -14,3 +14,9 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 # default event-loop task; IDF recommends >=4KB stack for VFS file I/O,
 # above the 2304B default.
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# An OTA image must confirm itself once the network is up (see
+# ota_rollback_guard_start); otherwise the bootloader reverts to the
+# previous app on the next reboot, so a bootable-but-broken update
+# cannot strand the hub without a serial cable.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
