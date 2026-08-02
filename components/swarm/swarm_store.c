@@ -70,7 +70,14 @@ esp_err_t swarm_store_init(void)
     if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return ESP_OK;  /* fresh NVS = defaults */
 
     uint8_t role_byte;
-    if (nvs_get_u8(h, KEY_ROLE, &role_byte) == ESP_OK) s_role = (swarm_role_t)role_byte;
+    if (nvs_get_u8(h, KEY_ROLE, &role_byte) == ESP_OK) {
+        if (role_byte == SWARM_ROLE_UNSET || role_byte == SWARM_ROLE_MAIN || role_byte == SWARM_ROLE_NODE) {
+            s_role = (swarm_role_t)role_byte;
+        } else {
+            ESP_LOGW(TAG, "invalid stored role byte %u; defaulting to UNSET", role_byte);
+            s_role = SWARM_ROLE_UNSET;
+        }
+    }
 
     size_t hub_len = sizeof(s_hub);
     s_hub_set = nvs_get_blob(h, KEY_HUB, &s_hub, &hub_len) == ESP_OK && hub_len == sizeof(s_hub);

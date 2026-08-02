@@ -57,4 +57,10 @@ size_t swarm_encode_pair_ack(const swarm_pair_ack_t *in, uint8_t *out, size_t ca
 { return encode_from(in, sizeof(*in), out, cap); }
 
 size_t swarm_encode_reading(const swarm_reading_t *in, uint8_t *out, size_t cap)
-{ return encode_from(in, sizeof(*in), out, cap); }
+{
+    size_t n = encode_from(in, sizeof(*in), out, cap);
+    /* _pad is reserved; always zero it on the wire regardless of what the
+     * caller left in the struct (decoders intentionally ignore this byte). */
+    if (n) out[offsetof(swarm_reading_t, _pad)] = 0;
+    return n;
+}

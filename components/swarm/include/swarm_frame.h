@@ -44,7 +44,8 @@ typedef struct __attribute__((packed)) {
     uint16_t conductivity_us;
     int8_t   rssi;           /* node's RSSI to the sensor (best-node input) */
     uint16_t age_s;          /* seconds since the node heard it */
-    uint8_t  _pad;           /* keeps the struct a round 23 bytes; must be 0 */
+    uint8_t  _pad;           /* keeps the struct a round 23 bytes; reserved:
+                                encoders zero it, decoders ignore it */
 } swarm_reading_t;
 
 int  swarm_frame_type(const uint8_t *buf, size_t len);
