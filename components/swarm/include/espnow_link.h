@@ -36,6 +36,14 @@ esp_err_t espnow_link_init(espnow_rx_cb_t cb);
  * exists. */
 esp_err_t espnow_link_add_peer(const uint8_t mac[6], const uint8_t *lmk, uint8_t channel);
 
+/* Removes a peer added via espnow_link_add_peer(). Used when a hub's
+ * PAIR_ACK was sent successfully but the follow-up NVS persist failed --
+ * removing the peer keeps this device's live ESP-NOW state from disagreeing
+ * with what's (not) on flash. ESP_ERR_ESPNOW_NOT_FOUND if no such peer
+ * exists is not treated specially; callers that don't care can ignore the
+ * return value. */
+esp_err_t espnow_link_remove_peer(const uint8_t mac[6]);
+
 /* Blocks until the ESP-NOW send callback reports the outcome of this frame
  * or 200 ms elapse, whichever comes first. Returns ESP_OK only when the
  * callback reported ESP_NOW_SEND_SUCCESS. Must not be called from the

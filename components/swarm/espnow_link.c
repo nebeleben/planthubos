@@ -80,6 +80,12 @@ esp_err_t espnow_link_add_peer(const uint8_t mac[6], const uint8_t *lmk, uint8_t
     return esp_now_add_peer(&peer);
 }
 
+esp_err_t espnow_link_remove_peer(const uint8_t mac[6])
+{
+    if (!mac) return ESP_ERR_INVALID_ARG;
+    return esp_now_del_peer(mac);
+}
+
 esp_err_t espnow_link_init(espnow_rx_cb_t cb)
 {
     if (!cb) return ESP_ERR_INVALID_ARG;

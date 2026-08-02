@@ -246,9 +246,9 @@ export function ConfigTab() {
               {(nodes || []).map((n) => (
                 <tr key={n.mac}>
                   <td class="mono">{n.mac}</td>
-                  <td>{fmtAgo(n.last_seen_s, st.uptime_s)}</td>
+                  <td>{n.last_seen_s != null ? fmtAgo(n.last_seen_s, st.uptime_s) : 'never'}</td>
                   <td>{n.frames_rx}</td>
-                  <td>{n.rssi} dBm</td>
+                  <td>{n.rssi != null ? `${n.rssi} dBm` : '–'}</td>
                 </tr>
               ))}
               {nodes && nodes.length === 0 && (

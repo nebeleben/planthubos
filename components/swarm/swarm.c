@@ -149,17 +149,37 @@ int swarm_node_list_json(char *buf, size_t cap)
 
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(root, "nodes");
-    for (int i = 0; i < SWARM_MAX_NODES; i++) {
-        if (!snap[i].in_use) continue;
-        char mac[18];
-        snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 snap[i].mac[0], snap[i].mac[1], snap[i].mac[2],
-                 snap[i].mac[3], snap[i].mac[4], snap[i].mac[5]);
+
+    /* The definitive node list is swarm_store's PERSISTENT node table --
+     * every adopted node lives there and survives a reboot. s_stats above
+     * is only ever populated when a frame is actually received, so an
+     * adopted node that hasn't transmitted (or hasn't been heard) yet
+     * since this boot would previously be missing here entirely, even
+     * though GET /api/v1/status already reported "paired":true for it --
+     * a contradiction that made a one-sided-pairing defect look like a
+     * hub-side bug when it wasn't. Merge in s_stats where available and
+     * report null for last_seen_s/rssi (a real, meaningful "never heard"
+     * value) and 0 for frames_rx (a real, meaningful count) otherwise. */
+    int n_nodes = swarm_store_node_count();
+    for (int i = 0; i < n_nodes; i++) {
+        uint8_t mac[6];
+        if (!swarm_store_node_at(i, mac, NULL)) continue;
+
+        const node_stat_t *stat = NULL;
+        for (int j = 0; j < SWARM_MAX_NODES; j++) {
+            if (snap[j].in_use && memcmp(snap[j].mac, mac, 6) == 0) { stat = &snap[j]; break; }
+        }
+
+        char macstr[18];
+        snprintf(macstr, sizeof(macstr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "mac", mac);
-        cJSON_AddNumberToObject(o, "last_seen_s", snap[i].last_seen_s);
-        cJSON_AddNumberToObject(o, "frames_rx", snap[i].frames_rx);
-        cJSON_AddNumberToObject(o, "rssi", snap[i].rssi);
+        cJSON_AddStringToObject(o, "mac", macstr);
+        if (stat) cJSON_AddNumberToObject(o, "last_seen_s", stat->last_seen_s);
+        else cJSON_AddNullToObject(o, "last_seen_s");
+        cJSON_AddNumberToObject(o, "frames_rx", stat ? stat->frames_rx : 0);
+        if (stat) cJSON_AddNumberToObject(o, "rssi", stat->rssi);
+        else cJSON_AddNullToObject(o, "rssi");
         cJSON_AddItemToArray(arr, o);
     }
     cJSON_AddNumberToObject(root, "frames_rx_total", total);
@@ -268,6 +288,46 @@ static void forward_task(void *arg)
     }
 }
 
+/* Brings up WiFi far enough for ESP-NOW without ever joining any network:
+ * no STA/AP netif (ESP-NOW operates directly on the WiFi MAC layer and
+ * needs no IP netif -- the upstream esp-now example brings WiFi up the
+ * same way) and no esp_wifi_connect() call, ever -- this device is simply
+ * never associated to any AP, which is also what keeps
+ * espnow_link_set_channel() free to hop channels for pairing/resync.
+ *
+ * WIFI_STORAGE_RAM + an explicit empty STA config matter for a reason that
+ * only showed up on real hardware: wifi_manager's start_sta() (used when
+ * this same device was previously a hub) calls esp_wifi_set_config() with
+ * the driver's default WIFI_STORAGE_FLASH, which makes the WiFi driver
+ * itself -- independently of app_config's own separate copy of the
+ * credentials -- persist that STA config into its own flash-backed NVS
+ * blob and auto-reload it on every esp_wifi_init(). Left alone, that meant
+ * esp_wifi_start() here picked the old SSID/password back up and kept
+ * trying to associate ("Haven't to connect to a suitable AP now!" every
+ * ~300ms), fighting the pairing sweep's channel hops the whole time.
+ * Switching to RAM storage and clearing the driver's live STA config (a
+ * volatile, this-boot-only change) stops it -- app_config's own stored
+ * credentials are never touched here, so they still work if this device
+ * is later switched back to a main hub. */
+static esp_err_t radio_only_wifi_start(void)
+{
+    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_wifi_init(&init);
+    if (err != ESP_OK) return err;
+
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK) return err;
+
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) return err;
+
+    wifi_config_t empty_cfg = { 0 };
+    err = esp_wifi_set_config(WIFI_IF_STA, &empty_cfg);
+    if (err != ESP_OK) return err;
+
+    return esp_wifi_start();
+}
+
 esp_err_t swarm_start_node(void)
 {
     /* The LMK isn't needed here: espnow_link_init() below re-adds the
@@ -280,19 +340,7 @@ esp_err_t swarm_start_node(void)
     }
     memcpy(s_hub_mac, hub_mac, 6);
 
-    /* Radio-only WiFi: ESP-NOW operates directly on the WiFi MAC layer and
-     * needs no IP netif (the upstream esp-now example brings up WiFi the
-     * same way), so unlike wifi_manager_start() this never creates a
-     * STA/AP netif, never touches app_config's WiFi credentials and never
-     * calls esp_wifi_connect() -- this device is simply never associated to
-     * any AP, which is also what keeps espnow_link_set_channel() free to
-     * hop channels below and during resync. */
-    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
-    esp_err_t err = esp_wifi_init(&init);
-    if (err != ESP_OK) return err;
-    err = esp_wifi_set_mode(WIFI_MODE_STA);
-    if (err != ESP_OK) return err;
-    err = esp_wifi_start();
+    esp_err_t err = radio_only_wifi_start();
     if (err != ESP_OK) return err;
 
     err = espnow_link_init(node_rx_cb);
@@ -349,12 +397,7 @@ esp_err_t swarm_start_node_search(void)
      * no stored hub yet -- it's actively looking for one, so there is no
      * channel to restore and node_rx_cb (which just forwards to
      * pairing_handle_frame) is exactly what's needed to receive PAIR_ACK. */
-    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
-    esp_err_t err = esp_wifi_init(&init);
-    if (err != ESP_OK) return err;
-    err = esp_wifi_set_mode(WIFI_MODE_STA);
-    if (err != ESP_OK) return err;
-    err = esp_wifi_start();
+    esp_err_t err = radio_only_wifi_start();
     if (err != ESP_OK) return err;
 
     err = espnow_link_init(node_rx_cb);

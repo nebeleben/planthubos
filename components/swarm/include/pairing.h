@@ -26,12 +26,20 @@ typedef enum {
 
 /* --- Hub side --- */
 
-/* Opens a pairing window for `seconds`. The first valid PAIR_REQ seen while
- * open starts an adoption attempt (LMK generated, node stored, ESP-NOW peer
- * added, PAIR_ACK sent back); at most one attempt runs at a time, and the
- * window closes only once an attempt fully succeeds, so a failure partway
- * through (NVS, peer table, send) doesn't silently burn the rest of the
- * window -- the same or another node can still retry before it expires.
+/* Opens a pairing window for the full `seconds` duration -- it is NEVER
+ * closed early, including on a successful adoption. Every valid PAIR_REQ
+ * seen while open starts an adoption attempt (ESP-NOW peer added, PAIR_ACK
+ * sent, then persisted -- see hub_task() in pairing.c for the exact order
+ * and why); at most one attempt runs at a time (the s_adopt_in_progress
+ * guard). Adoption is idempotent per MAC: a PAIR_REQ from a MAC already in
+ * swarm_store's node table reuses the STORED LMK and just re-sends
+ * PAIR_ACK rather than generating a new key, which matters because a node
+ * whose first PAIR_ACK never arrived (radio noise, a slow persist, bad
+ * luck) keeps sweeping and re-requesting with the SAME already-adopted
+ * MAC -- generating a fresh key on that retry would desync it from the
+ * key the hub already committed to flash. Leaving the window open for its
+ * full duration (rather than closing on the first success) is what lets
+ * that retry actually reach the hub instead of being silently ignored.
  * Starts this component's hub pairing task on first call. */
 void pairing_open_window(uint32_t seconds);
 
@@ -48,12 +56,20 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
 
 /* --- Node side --- */
 
-/* Starts a task that sweeps channels 1..13 (~300 ms dwell each), broadcasting
- * a fresh PAIR_REQ at the start of every full sweep, until a PAIR_ACK with a
- * matching nonce arrives (-> PAIR_OK, hub stored, ESP-NOW peer added) or
- * `timeout_s` elapses (-> PAIR_FAILED). Returns an error only if the task
- * could not be created (e.g. one is already running); the outcome of the
- * search itself is read via pairing_node_state(). */
+/* Starts a task that sweeps channels 1..13 (~500 ms dwell each -- widened
+ * from an original 300 ms on real-hardware evidence that a hub's PAIR_ACK,
+ * which waits behind a synchronous NVS commit, could arrive after a 300 ms
+ * dwell had already moved the node to the next channel; the hub now sends
+ * before persisting, but the wider dwell is kept as a second, independent
+ * margin against a slow/busy channel), broadcasting a fresh PAIR_REQ at the
+ * start of every full sweep, until a PAIR_ACK with a matching nonce arrives
+ * (-> PAIR_OK, hub stored, ESP-NOW peer added) or `timeout_s` elapses
+ * (-> PAIR_FAILED). The sweep is bounded purely by wall-clock `timeout_s`
+ * (not a fixed sweep/channel count), so a wider dwell simply means fewer
+ * full sweeps fit in the same timeout, with no separate count to keep in
+ * sync. Returns an error only if the task could not be created (e.g. one
+ * is already running); the outcome of the search itself is read via
+ * pairing_node_state(). */
 esp_err_t pairing_node_start(uint32_t timeout_s);
 
 pairing_state_t pairing_node_state(void);

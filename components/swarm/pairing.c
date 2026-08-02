@@ -111,6 +111,24 @@ uint32_t pairing_window_remaining_s(void)
     return remaining_us > 0 ? (uint32_t)(remaining_us / 1000000) : 0;
 }
 
+/* Looks up `mac` in swarm_store's persisted node table. Returns true and
+ * fills lmk_out if found. Used to make adoption idempotent: a node whose
+ * first PAIR_ACK never arrived keeps sweeping and re-sending PAIR_REQ from
+ * the SAME MAC it was already adopted under, and it must be re-acked with
+ * that same stored key, never a freshly generated one -- a new key here
+ * would desync it from the key already committed to flash. */
+static bool find_stored_lmk(const uint8_t mac[6], uint8_t lmk_out[SWARM_LMK_LEN])
+{
+    int n = swarm_store_node_count();
+    for (int i = 0; i < n; i++) {
+        uint8_t stored_mac[6];
+        if (swarm_store_node_at(i, stored_mac, lmk_out) && memcmp(stored_mac, mac, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Runs on its own task, never on the WiFi task: safe to touch NVS and to
  * call the blocking espnow_link_send(). */
 static void hub_task(void *arg)
@@ -121,21 +139,13 @@ static void hub_task(void *arg)
     for (;;) {
         if (xQueueReceive(s_adopt_queue, &item, portMAX_DELAY) != pdTRUE) continue;
 
-        bool adopted = false;
+        uint8_t lmk[SWARM_LMK_LEN];
+        bool already_adopted = find_stored_lmk(item.mac, lmk);
+        if (!already_adopted) esp_fill_random(lmk, sizeof(lmk));
 
         do {
-            uint8_t lmk[SWARM_LMK_LEN];
-            esp_fill_random(lmk, sizeof(lmk));
-
-            esp_err_t err = swarm_store_add_node(item.mac, lmk);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "adopt " MACSTR ": swarm_store_add_node failed: %s",
-                         MAC2STR(item.mac), esp_err_to_name(err));
-                break;
-            }
-
             uint8_t channel = espnow_link_channel();
-            err = espnow_link_add_peer(item.mac, lmk, 0);
+            esp_err_t err = espnow_link_add_peer(item.mac, lmk, 0);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "adopt " MACSTR ": espnow_link_add_peer failed: %s",
                          MAC2STR(item.mac), esp_err_to_name(err));
@@ -157,6 +167,15 @@ static void hub_task(void *arg)
                 break;
             }
 
+            /* Send BEFORE persisting: swarm_store_add_node() below is a
+             * synchronous, multi-millisecond NVS/flash commit, and on real
+             * hardware that latency was observed to exceed the node's
+             * per-channel sweep dwell -- delaying the ack behind it meant
+             * the node had already hopped to the next channel by the time
+             * the ack would have gone out, producing a one-sided pairing
+             * (hub adopted + persisted, node never heard back). Sending
+             * first means a slow or failed persist can no longer cost the
+             * node a heard ack. */
             err = espnow_link_send(item.mac, buf, n);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "adopt " MACSTR ": PAIR_ACK send failed: %s",
@@ -164,19 +183,38 @@ static void hub_task(void *arg)
                 break;
             }
 
-            adopted = true;
-            ESP_LOGI(TAG, "adopted node " MACSTR " on channel %u", MAC2STR(item.mac), channel);
+            if (already_adopted) {
+                ESP_LOGI(TAG, "re-acked already-adopted node " MACSTR " on channel %u",
+                         MAC2STR(item.mac), channel);
+            } else {
+                err = swarm_store_add_node(item.mac, lmk);
+                if (err != ESP_OK) {
+                    /* The node now has a working ESP-NOW peer and just
+                     * heard an ack for a key we failed to remember. If we
+                     * left the peer in place, this device would think
+                     * it isn't paired (swarm_store says so) while the
+                     * node thinks it is -- silently disagreeing about the
+                     * key. Remove the peer so both sides are consistently
+                     * "not paired"; the node will keep sweeping and this
+                     * PAIR_REQ will simply be retried as a fresh, non-
+                     * idempotent attempt next time. */
+                    ESP_LOGE(TAG, "adopt " MACSTR ": swarm_store_add_node failed (%s); removing peer",
+                             MAC2STR(item.mac), esp_err_to_name(err));
+                    espnow_link_remove_peer(item.mac);
+                    break;
+                }
+                ESP_LOGI(TAG, "adopted node " MACSTR " on channel %u", MAC2STR(item.mac), channel);
+            }
         } while (0);
 
-        /* Either outcome: this attempt is no longer "in progress", so a
-         * fresh PAIR_REQ can be queued. Only close the window on full
-         * success -- a failure at any step (NVS, peer table, PAIR_ACK send)
-         * leaves the window open so the same node, or another one, can
-         * still retry within the remaining time instead of the whole
-         * window being silently burned by one glitch. */
+        /* This attempt is no longer "in progress", so a fresh PAIR_REQ
+         * (from this node retrying, or another one) can be queued. The
+         * window is never closed here, on success or failure -- it stays
+         * open for its full configured duration (see pairing_open_window())
+         * so a node that doesn't hear this ack can keep retrying instead
+         * of finding the window gone by the time it sweeps back around. */
         xSemaphoreTake(s_window_lock, portMAX_DELAY);
         s_adopt_in_progress = false;
-        if (adopted) s_window_open = false;
         xSemaphoreGive(s_window_lock);
     }
 }
@@ -226,7 +264,15 @@ static void node_task(void *arg)
 {
     node_task_args_t args = *(node_task_args_t *)arg;
     int64_t deadline_us = esp_timer_get_time() + (int64_t)args.timeout_s * 1000000;
-    const TickType_t dwell_ticks = pdMS_TO_TICKS(300);
+    /* Widened from 300ms: on real hardware, a hub's PAIR_ACK (queued behind
+     * a synchronous NVS commit in the old ordering) could arrive after a
+     * 300ms dwell had already moved the sweep to the next channel. The hub
+     * now sends before persisting (see hub_task()), but the wider dwell
+     * stays as an independent margin. The sweep is bounded by deadline_us
+     * above, not a fixed channel/sweep count, so widening this simply
+     * means fewer full 1..13 sweeps fit in the same timeout_s -- no
+     * separate count needs to change to match. */
+    const TickType_t dwell_ticks = pdMS_TO_TICKS(500);
 
     while (esp_timer_get_time() < deadline_us) {
         uint32_t nonce = esp_random();
@@ -301,12 +347,11 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
         swarm_pair_req_t req;
         if (!swarm_decode_pair_req(data, (size_t)len, &req)) return;
 
-        /* At most one adoption in flight at a time (one node per window).
-         * The window itself is NOT closed here anymore -- only once
-         * hub_task() reports a fully successful adoption (store + peer +
-         * PAIR_ACK all OK) does the window close; a failed attempt clears
-         * s_adopt_in_progress instead so the window stays usable for a
-         * retry until it naturally expires. */
+        /* At most one adoption in flight at a time. The window is never
+         * closed here (or anywhere on a successful adoption -- see
+         * hub_task()): it stays open for its full configured duration so a
+         * node whose PAIR_ACK gets lost can retry within the same window
+         * instead of finding it already gone. */
         xSemaphoreTake(s_window_lock, portMAX_DELAY);
         bool busy = s_adopt_in_progress;
         if (!busy) s_adopt_in_progress = true;
