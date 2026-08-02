@@ -144,20 +144,41 @@ esp_err_t espnow_link_init(espnow_rx_cb_t cb)
      * anywhere except a WARN buried in the sweep loop. CONFIG_PLANTHUB_WIFI_COUNTRY
      * (see swarm's Kconfig) controls this for both roles uniformly, set
      * here right next to the PS_NONE call so neither role can forget it.
-     * `true` enables 802.11d, so an associated hub still adopts whatever
-     * country its AP advertises rather than being pinned to the
-     * compile-time default regardless of where it actually associates. */
-    esp_err_t cc_err = esp_wifi_set_country_code(CONFIG_PLANTHUB_WIFI_COUNTRY, true);
+     *
+     * ieee80211d_enabled is FALSE, not true -- confirmed on real hardware
+     * that `true` (802.11d, AUTO country policy) broke node->hub unicast
+     * sends outright: EVERY espnow_link_send() failed with ESP_FAIL, on
+     * every channel including the one both sides were confirmed to share.
+     * Under AUTO policy a station is expected to LEARN its operating
+     * country from its associated AP's beacons; a node never associates to
+     * any AP, so it has nothing to learn from, and channels it hasn't
+     * "learned" as TX-legal can be left passive-scan-only -- receive-only,
+     * no transmit -- which matches the observed symptom exactly. Passing
+     * `false` makes the configured country authoritative (MANUAL policy)
+     * instead, so every channel 1..13 the code sets is immediately usable
+     * for TX regardless of association state. This does mean the hub no
+     * longer auto-adopts a differently-configured AP's advertised country;
+     * that trade-off is accepted because a broken node radio is strictly
+     * worse than a hub that trusts its own compile-time region setting. */
+    esp_err_t cc_err = esp_wifi_set_country_code(CONFIG_PLANTHUB_WIFI_COUNTRY, false);
     if (cc_err != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_set_country_code(%s) failed: %s -- channels 12-13 may be unavailable",
                  CONFIG_PLANTHUB_WIFI_COUNTRY, esp_err_to_name(cc_err));
     } else {
+        /* esp_wifi_set_country_code() can move the radio's current channel
+         * as a side effect -- log it here so that's visible, and so a
+         * caller that needs a specific channel (e.g. swarm_start_node()
+         * restoring its stored hub channel) knows to (re-)apply it AFTER
+         * this call, not before. */
+        uint8_t cur_ch = 0;
+        wifi_second_chan_t second;
+        esp_wifi_get_channel(&cur_ch, &second);
         wifi_country_t country;
         if (esp_wifi_get_country(&country) == ESP_OK) {
-            ESP_LOGI(TAG, "wifi country set to %s, usable channels %u-%u",
-                     CONFIG_PLANTHUB_WIFI_COUNTRY, country.schan, country.schan + country.nchan - 1);
+            ESP_LOGI(TAG, "wifi country set to %s, usable channels %u-%u, current channel %u",
+                     CONFIG_PLANTHUB_WIFI_COUNTRY, country.schan, country.schan + country.nchan - 1, cur_ch);
         } else {
-            ESP_LOGI(TAG, "wifi country set to %s", CONFIG_PLANTHUB_WIFI_COUNTRY);
+            ESP_LOGI(TAG, "wifi country set to %s, current channel %u", CONFIG_PLANTHUB_WIFI_COUNTRY, cur_ch);
         }
     }
 

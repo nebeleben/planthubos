@@ -264,6 +264,11 @@ static void forward_task(void *arg)
     (void)arg;
     swarm_reading_t r;
     int consec_fail = 0;
+    /* One-shot: a working node->hub link is otherwise only inferable from
+     * the hub side (frames_rx climbing in GET /api/v1/nodes) -- this makes
+     * it positively visible on the node's own console the first time it
+     * actually happens. */
+    bool first_delivered = false;
 
     for (;;) {
         if (xQueueReceive(s_fwd_queue, &r, portMAX_DELAY) != pdTRUE) continue;
@@ -275,6 +280,10 @@ static void forward_task(void *arg)
         esp_err_t err = espnow_link_send(s_hub_mac, buf, n);
         if (err == ESP_OK) {
             consec_fail = 0;
+            if (!first_delivered) {
+                first_delivered = true;
+                ESP_LOGI(TAG, "first reading delivered to hub");
+            }
             continue;
         }
 
@@ -374,12 +383,28 @@ esp_err_t swarm_start_node(void)
     esp_err_t err = radio_only_wifi_start();
     if (err != ESP_OK) return err;
 
+    /* Order matters: espnow_link_init() below sets the regulatory domain
+     * (esp_wifi_set_country_code()), which can move the radio's current
+     * channel as a side effect (see the comment there). The stored hub
+     * channel is restored AFTER espnow_link_init() returns, precisely so
+     * that restore is the last word on which channel the radio ends up
+     * on -- do not reorder these two calls. */
     err = espnow_link_init(node_rx_cb);
     if (err != ESP_OK) return err;
 
     err = espnow_link_set_channel(hub_ch);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "failed to restore channel %u: %s", hub_ch, esp_err_to_name(err));
+    }
+    /* Defensive re-assert: confirm the restore actually landed rather than
+     * assuming it did. Should be a no-op given the ordering above, but
+     * costs nothing to verify and self-correct if some other side effect
+     * (country config or otherwise) ever moves the channel again. */
+    uint8_t actual_ch = espnow_link_channel();
+    if (actual_ch != hub_ch) {
+        ESP_LOGW(TAG, "channel mismatch after restore: stored=%u actual=%u, retrying", hub_ch, actual_ch);
+        espnow_link_set_channel(hub_ch);
+        actual_ch = espnow_link_channel();
     }
 
     s_fwd_queue = xQueueCreate(SWARM_FWD_QUEUE_LEN, sizeof(swarm_reading_t));
@@ -392,7 +417,8 @@ esp_err_t swarm_start_node(void)
     err = esp_event_handler_register(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE, on_sensor_update, NULL);
     if (err != ESP_OK) return err;
 
-    ESP_LOGI(TAG, "node started: hub=" MACSTR " channel=%u", MAC2STR(hub_mac), hub_ch);
+    ESP_LOGI(TAG, "node started: hub=" MACSTR " stored_channel=%u actual_channel=%u",
+             MAC2STR(hub_mac), hub_ch, actual_ch);
     return ESP_OK;
 }
 
