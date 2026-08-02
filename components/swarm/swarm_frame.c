@@ -12,8 +12,8 @@ static size_t expected_len(int type)
     case SWARM_MSG_PAIR_REQ: return sizeof(swarm_pair_req_t);
     case SWARM_MSG_PAIR_ACK: return sizeof(swarm_pair_ack_t);
     case SWARM_MSG_READING:  return sizeof(swarm_reading_t);
-    case SWARM_MSG_PING:
-    case SWARM_MSG_PONG:     return 2;
+    case SWARM_MSG_PING:     return sizeof(swarm_ping_t);
+    case SWARM_MSG_PONG:     return sizeof(swarm_pong_t);
     default:                 return 0;
     }
 }
@@ -43,6 +43,12 @@ bool swarm_decode_pair_ack(const uint8_t *buf, size_t len, swarm_pair_ack_t *out
 bool swarm_decode_reading(const uint8_t *buf, size_t len, swarm_reading_t *out)
 { return decode_into(buf, len, SWARM_MSG_READING, out, sizeof(*out)); }
 
+bool swarm_decode_ping(const uint8_t *buf, size_t len, swarm_ping_t *out)
+{ return decode_into(buf, len, SWARM_MSG_PING, out, sizeof(*out)); }
+
+bool swarm_decode_pong(const uint8_t *buf, size_t len, swarm_pong_t *out)
+{ return decode_into(buf, len, SWARM_MSG_PONG, out, sizeof(*out)); }
+
 static size_t encode_from(const void *in, size_t sz, uint8_t *out, size_t cap)
 {
     if (!out || cap < sz) return 0;
@@ -64,3 +70,9 @@ size_t swarm_encode_reading(const swarm_reading_t *in, uint8_t *out, size_t cap)
     if (n) out[offsetof(swarm_reading_t, _pad)] = 0;
     return n;
 }
+
+size_t swarm_encode_ping(const swarm_ping_t *in, uint8_t *out, size_t cap)
+{ return encode_from(in, sizeof(*in), out, cap); }
+
+size_t swarm_encode_pong(const swarm_pong_t *in, uint8_t *out, size_t cap)
+{ return encode_from(in, sizeof(*in), out, cap); }

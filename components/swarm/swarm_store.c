@@ -9,6 +9,7 @@ static const char *TAG = "swarm_store";
 #define NS "planthub"
 #define KEY_ROLE  "role"
 #define KEY_HUB   "sw_hub"
+#define KEY_HUBCC "sw_hubcc"
 #define KEY_NODES "sw_nodes"
 #define KEY_PFAIL "sw_pfail"
 
@@ -50,6 +51,8 @@ static SemaphoreHandle_t s_mutex;
 static swarm_role_t s_role;
 static bool s_hub_set;
 static hub_blob_t s_hub;
+static bool s_hub_cc_set;
+static char s_hub_cc[3];
 static nodes_blob_t s_nodes;
 static bool s_pair_failed;
 
@@ -195,6 +198,8 @@ esp_err_t swarm_store_init(void)
     s_role = SWARM_ROLE_UNSET;
     s_hub_set = false;
     memset(&s_hub, 0, sizeof(s_hub));
+    s_hub_cc_set = false;
+    memset(s_hub_cc, 0, sizeof(s_hub_cc));
     memset(&s_nodes, 0, sizeof(s_nodes));
     s_nodes.format = SWARM_STORE_FORMAT;
     s_pair_failed = false;
@@ -216,6 +221,15 @@ esp_err_t swarm_store_init(void)
     s_hub_set = nvs_get_blob(h, KEY_HUB, &s_hub, &hub_len) == ESP_OK && hub_len == sizeof(s_hub);
     if (!s_hub_set) memset(&s_hub, 0, sizeof(s_hub));
 
+    /* Own key, deliberately separate from KEY_HUB -- see swarm_store.h.
+     * Absent (ESP_ERR_NVS_NOT_FOUND, e.g. this device paired under
+     * protocol v1, or was factory-reset) just means "nothing learned
+     * yet"; s_hub_cc_set stays false and callers fall back to the
+     * compile-time default. */
+    size_t cc_len = sizeof(s_hub_cc);
+    s_hub_cc_set = nvs_get_blob(h, KEY_HUBCC, s_hub_cc, &cc_len) == ESP_OK && cc_len == sizeof(s_hub_cc);
+    if (!s_hub_cc_set) memset(s_hub_cc, 0, sizeof(s_hub_cc));
+
     load_nodes_blob(h, &s_nodes);
 
     uint8_t pfail_byte;
@@ -226,8 +240,9 @@ esp_err_t swarm_store_init(void)
      * channel is visible at a glance at every boot, not just inferred from
      * a separate pairing-time log line -- makes a hub/node channel
      * mismatch obvious in the console. */
-    ESP_LOGI(TAG, "role=%d hub_paired=%d hub_channel=%u nodes=%d pair_failed=%d",
-             s_role, s_hub_set, s_hub.channel, s_nodes.count, s_pair_failed);
+    ESP_LOGI(TAG, "role=%d hub_paired=%d hub_channel=%u hub_country=%s nodes=%d pair_failed=%d",
+             s_role, s_hub_set, s_hub.channel, s_hub_cc_set ? s_hub_cc : "(default)",
+             s_nodes.count, s_pair_failed);
     return ESP_OK;
 }
 
@@ -299,13 +314,46 @@ esp_err_t swarm_store_set_channel(uint8_t channel)
     return err;
 }
 
+bool swarm_store_hub_country(char out[3])
+{
+    if (!out) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool ok = s_hub_cc_set;
+    if (ok) memcpy(out, s_hub_cc, sizeof(s_hub_cc));
+    xSemaphoreGive(s_mutex);
+    return ok;
+}
+
+esp_err_t swarm_store_set_hub_country(const char cc[3])
+{
+    if (!cc) return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    esp_err_t err = write_blob(KEY_HUBCC, cc, 3);
+    if (err == ESP_OK) {
+        memcpy(s_hub_cc, cc, sizeof(s_hub_cc));
+        s_hub_cc_set = true;
+    }
+    xSemaphoreGive(s_mutex);
+    return err;
+}
+
 esp_err_t swarm_store_clear_hub(void)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     esp_err_t err = erase_key(KEY_HUB);
+    /* Best-effort, same reasoning as swarm_store_reset_all(): the country
+     * is meaningless once unpaired from the hub that reported it, so clear
+     * it too, but don't let a failure here mask the hub-blob erase result
+     * above (the more important of the two). */
+    esp_err_t cc_err = erase_key(KEY_HUBCC);
     if (err == ESP_OK) {
         s_hub_set = false;
         memset(&s_hub, 0, sizeof(s_hub));
+    }
+    if (cc_err == ESP_OK) {
+        s_hub_cc_set = false;
+        memset(s_hub_cc, 0, sizeof(s_hub_cc));
     }
     xSemaphoreGive(s_mutex);
     return err;

@@ -43,11 +43,19 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (mibeacon_parse(fields.svc_data_uuid16 + 2, fields.svc_data_uuid16_len - 2, &m) == MIBEACON_OK) {
             if (m.product_id != MIBEACON_PRODUCT_MIFLORA) return 0;
             /* Direct reception: no relaying node, just heard (age_s = 0).
-             * event->disc.rssi is the advertisement's RSSI in dBm (127 if
-             * unavailable per NimBLE's ble_gap.h), passed straight through
-             * so direct readings carry signal strength too, same as
-             * node-relayed ones. */
-            data_core_submit_from(&m, NULL, event->disc.rssi, 0);
+             * event->disc.rssi is the advertisement's RSSI in dBm, EXCEPT
+             * NimBLE uses 127 as its "RSSI unavailable" sentinel (see
+             * ble_gap.h) -- a raw int8_t value that would otherwise read as
+             * an implausibly strong signal (+127 dBm) rather than "unknown".
+             * Since M5b, this rssi feeds registry_update_from()'s
+             * "strongest rssi wins" attribution (best_rssi), so passing
+             * 127 through unfiltered would let a reading with genuinely no
+             * signal information ever recorded outrank every real
+             * measurement, including a legitimate node relay. Map it to 0
+             * instead, the same "unknown" value data_core_submit()'s
+             * wrapper already uses for callers with no RSSI at all. */
+            int8_t rssi = (event->disc.rssi == 127) ? 0 : event->disc.rssi;
+            data_core_submit_from(&m, NULL, rssi, 0);
         }
         return 0;
     }

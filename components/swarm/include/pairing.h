@@ -26,6 +26,15 @@ typedef enum {
 
 /* --- Hub side --- */
 
+/* Brings up the SWARM_MSG_PING -> SWARM_MSG_PONG responder used for
+ * node-side liveness/resync (pairing_node_resync_channel()). Unlike
+ * pairing_open_window(), this is NOT gated behind an operator opening a
+ * pairing window -- a node may probe for the hub at any time, so
+ * swarm_start_main() calls this once, unconditionally, right after
+ * espnow_link_init(). Idempotent; safe to call more than once. Returns an
+ * error only if the responder task/queue could not be created. */
+esp_err_t pairing_hub_init(void);
+
 /* Opens a pairing window for the full `seconds` duration -- it is NEVER
  * closed early, including on a successful adoption. Every valid PAIR_REQ
  * seen while open starts an adoption attempt (ESP-NOW peer added, PAIR_ACK
@@ -74,11 +83,19 @@ esp_err_t pairing_node_start(uint32_t timeout_s);
 
 pairing_state_t pairing_node_state(void);
 
-/* Node-side channel recovery: sweeps channels 1..13 sending SWARM_MSG_PING
- * to the stored hub MAC (blocking on espnow_link_send per channel) and
- * persists the first channel a send succeeds on via swarm_store_set_channel().
- * Blocking; call from a task, never from the espnow_rx_cb_t receive
- * callback. Returns ESP_ERR_NOT_FOUND if no channel got a delivered send,
- * ESP_ERR_INVALID_STATE if this node has no stored hub. Intended to be
- * called by the reading-upload path after N consecutive send failures. */
+/* Node-side channel recovery: sweeps channels 1..13, on each sending a
+ * SWARM_MSG_PING (blocking on espnow_link_send) to the stored hub MAC and
+ * then waiting briefly for a matching SWARM_MSG_PONG (nonce-matched, same
+ * as PAIR_ACK). Persists the first channel that gets an actual PONG via
+ * swarm_store_set_channel() -- NOT merely the first channel whose PING was
+ * MAC-acked. That distinction is the whole point: M5a's version trusted a
+ * delivered PING (send() returning ESP_OK) as proof the hub was reachable,
+ * but a MAC-layer ack only proves the hub's RADIO received the frame --
+ * ESP-NOW itself can still silently discard it (unknown peer, undecryptable
+ * LMK mismatch) before the hub's application layer ever sees it. Only a
+ * PONG proves the round trip actually happened. Blocking; call from a
+ * task, never from the espnow_rx_cb_t receive callback. Returns
+ * ESP_ERR_NOT_FOUND if no channel got a PONG, ESP_ERR_INVALID_STATE if
+ * this node has no stored hub. Intended to be called by the
+ * reading-upload path after N consecutive send failures. */
 esp_err_t pairing_node_resync_channel(void);

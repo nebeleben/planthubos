@@ -196,6 +196,19 @@ esp_err_t swarm_start_main(void)
     esp_err_t err = espnow_link_init(hub_rx_cb);
     if (err != ESP_OK) return err;
 
+    /* Brings up the SWARM_MSG_PONG responder unconditionally, not only
+     * once an operator opens a pairing window -- a node may call
+     * pairing_node_resync_channel() (real liveness check, protocol v2) at
+     * any time, independent of pairing state, so the responder must
+     * already exist by then. Failure here is logged but not fatal to
+     * bringing the hub up: forwarding/ingest still work without it, only
+     * node-side resync liveness confirmation would silently never succeed. */
+    err = pairing_hub_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "pairing_hub_init failed: %s -- PING liveness probes will go unanswered",
+                 esp_err_to_name(err));
+    }
+
     ESP_LOGI(TAG, "swarm (main) started on channel %u", espnow_link_channel());
     return ESP_OK;
 }
@@ -300,7 +313,8 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
     data_core_snapshot(&snap);
     int idx = registry_find(&snap, mac);
     if (idx < 0) return;
-    const mibeacon_t *m = &snap.sensors[idx].latest;
+    const sensor_entry_t *se = &snap.sensors[idx];
+    const mibeacon_t *m = &se->latest;
 
     swarm_reading_t r = {
         .version = SWARM_PROTO_VERSION,
@@ -311,7 +325,17 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
         .battery_pct = m->has_battery ? m->battery_pct : 0xFF,
         .lux = m->has_lux ? m->lux : 0xFFFFFFFFu,
         .conductivity_us = m->has_conductivity ? m->conductivity_us : 0xFFFF,
-        .rssi = 0,   /* BLE RSSI is not stashed anywhere in the collector/registry in M5a */
+        /* This node's own BLE signal to the sensor -- Task 1 (M5b) added
+         * best_rssi to sensor_entry_t precisely so this is available here.
+         * On a node, data_core_submit_from() is only ever called locally
+         * with via_node == NULL (ble_collector hears the sensor directly,
+         * same as on a hub), so best_rssi IS this node's own reading of
+         * it, never another node's -- there is no node-to-node relaying in
+         * M5b. This is the hub's "strongest RSSI wins" attribution input
+         * (registry_update_from()); reporting a hardcoded 0 here (as M5a
+         * did, before best_rssi existed) made every node's contribution
+         * look identically weak and left that attribution inert. */
+        .rssi = se->best_rssi,
         .age_s = 0,  /* just heard */
         ._pad = 0,
     };
@@ -458,6 +482,30 @@ esp_err_t swarm_start_node(void)
      * on -- do not reorder these two calls. */
     err = espnow_link_init(node_rx_cb);
     if (err != ESP_OK) return err;
+
+    /* Country inheritance (PlanV1 3.3): espnow_link_init() just set the
+     * regulatory domain to the compile-time CONFIG_PLANTHUB_WIFI_COUNTRY
+     * default. If this node has previously learned a different country
+     * from the hub's PAIR_ACK (protocol v2+), re-apply THAT here instead --
+     * every boot, not just the one right after pairing -- so a resync's
+     * channel sweep (pairing_node_resync_channel(), below this in the
+     * boot sequence via forward_task()) can actually reach channels 12-13
+     * if the hub's domain allows them, rather than silently reverting to
+     * the compile-time default on every restart. Absent (this node paired
+     * under v1, or was factory-reset) just means "nothing to reapply" --
+     * the compile-time default espnow_link_init() already set stands, same
+     * as a pre-v2 node. Same MANUAL policy reasoning as pairing.c: this
+     * device never associates, so ieee80211d_enabled stays false always. */
+    char hub_cc[3];
+    if (swarm_store_hub_country(hub_cc)) {
+        esp_err_t cc_err = esp_wifi_set_country_code(hub_cc, false);
+        if (cc_err != ESP_OK) {
+            ESP_LOGW(TAG, "failed to reapply learned hub country %s: %s",
+                     hub_cc, esp_err_to_name(cc_err));
+        } else {
+            ESP_LOGI(TAG, "reapplied learned hub country %s", hub_cc);
+        }
+    }
 
     err = espnow_link_set_channel(hub_ch);
     if (err != ESP_OK) {

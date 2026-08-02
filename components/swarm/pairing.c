@@ -20,6 +20,7 @@
 #include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -46,6 +47,74 @@ static QueueHandle_t s_adopt_queue;       /* depth 1: one pending adoption at a 
 static TaskHandle_t s_hub_task;
 
 static void hub_task(void *arg);
+
+/* ---------------- Hub side: PONG responder (liveness) ---------------- */
+
+/* Answering a PING is unrelated to adoption (no window gating, no
+ * idempotent-MAC bookkeeping, no NVS write at all) and must be available
+ * from the moment this device starts acting as a hub, not only once an
+ * operator has opened a pairing window -- unlike s_adopt_queue/hub_task
+ * above, so it gets its own small queue/task rather than sharing those. */
+typedef struct {
+    uint8_t  mac[6];   /* the pinging node, for logging only */
+    uint32_t nonce;
+} pending_pong_t;
+
+#define PONG_QUEUE_LEN 4
+
+static QueueHandle_t s_pong_queue;
+static TaskHandle_t s_pong_task;
+
+static void pong_task(void *arg)
+{
+    (void)arg;
+    pending_pong_t item;
+    for (;;) {
+        if (xQueueReceive(s_pong_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+
+        swarm_pong_t pong = {
+            .version = SWARM_PROTO_VERSION,
+            .type = SWARM_MSG_PONG,
+            .nonce = item.nonce,
+        };
+        uint8_t buf[sizeof(pong)];
+        size_t n = swarm_encode_pong(&pong, buf, sizeof(buf));
+        if (n == 0) {
+            ESP_LOGE(TAG, "PONG for " MACSTR " (nonce=0x%08" PRIx32 "): failed to encode",
+                     MAC2STR(item.mac), item.nonce);
+            continue;
+        }
+
+        /* BROADCAST, not unicast -- same reason as PAIR_ACK (see hub_task()
+         * above): a node mid-resync may be probing a channel its AP
+         * association has no bearing on, and is never associated to begin
+         * with, so a unicast reply from this AP-associated hub is exactly
+         * as unreliable as a unicast PAIR_ACK would be. The requesting
+         * node matches this reply to its own PING purely by nonce, same
+         * pattern as PAIR_ACK/PAIR_REQ. */
+        esp_err_t err = espnow_link_broadcast(buf, n);
+        ESP_LOGI(TAG, "PONG -> broadcast (ping from " MACSTR ", nonce=0x%08" PRIx32 ") result=%s",
+                 MAC2STR(item.mac), item.nonce, esp_err_to_name(err));
+    }
+}
+
+/* Idempotent; safe to call more than once. Must be called before any PING
+ * can be answered -- swarm_start_main() calls this right after
+ * espnow_link_init() so the responder exists from hub boot onward,
+ * independent of whether/when a pairing window is ever opened. */
+esp_err_t pairing_hub_init(void)
+{
+    if (s_pong_task) return ESP_OK;
+    if (!s_pong_queue) s_pong_queue = xQueueCreate(PONG_QUEUE_LEN, sizeof(pending_pong_t));
+    if (!s_pong_queue) return ESP_ERR_NO_MEM;
+    BaseType_t ok = xTaskCreate(pong_task, "pairing_pong", 3072, NULL, 5, &s_pong_task);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "pairing_hub_init: xTaskCreate(pairing_pong) failed");
+        s_pong_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
 
 /* Returns false if the hub task (or its supporting primitives) could not be
  * created. Checking this matters: if xTaskCreate() silently failed here, a
@@ -175,6 +244,28 @@ static void hub_task(void *arg)
             };
             memcpy(ack.lmk, lmk, sizeof(lmk));
 
+            /* Country inheritance (PlanV1 3.3): the hub is associated to
+             * an AP, so ITS radio may legitimately end up on a country
+             * different from (or more specific than) whatever this
+             * firmware was compiled with -- esp_wifi_get_country() reads
+             * back whatever is actually in effect right now. This does
+             * NOT change how the hub configures its own radio (that stays
+             * exactly as espnow_link_init() already sets it, compile-time
+             * CONFIG_PLANTHUB_WIFI_COUNTRY, manual policy, unchanged by
+             * this task); only what gets reported to the node is
+             * "learned". A read failure is not fatal to pairing -- an
+             * empty country just means the node keeps its own compile-time
+             * default, exactly as if this were a pre-v2 hub. */
+            wifi_country_t country;
+            if (esp_wifi_get_country(&country) == ESP_OK) {
+                memcpy(ack.country, country.cc, sizeof(ack.country));
+            } else {
+                ESP_LOGW(TAG, "adopt " MACSTR ": esp_wifi_get_country failed; PAIR_ACK will "
+                              "carry no country (node keeps its compile-time default)",
+                         MAC2STR(item.mac));
+                memset(ack.country, 0, sizeof(ack.country));
+            }
+
             uint8_t buf[sizeof(ack)];
             size_t n = swarm_encode_pair_ack(&ack, buf, sizeof(buf));
             if (n == 0) {
@@ -282,6 +373,17 @@ static uint32_t s_node_nonce;
 static swarm_pair_ack_t s_node_ack;
 static uint8_t s_node_ack_mac[6];
 
+/* Node-side resync state: separate from s_node_lock/s_node_ack_sem above on
+ * purpose. Those belong to the initial pairing sweep (pairing_node_start()),
+ * whose task has already exited (PAIR_OK/PAIR_FAILED, vTaskDelete()'d) by
+ * the time resync ever runs; conflating the two would mean a resync's PONG
+ * wait racing against state a dead task last touched. */
+static SemaphoreHandle_t s_resync_lock;      /* guards s_resync_nonce / s_resync_waiting */
+static SemaphoreHandle_t s_resync_pong_sem;  /* signalled by pairing_handle_frame on a matching PONG */
+static volatile bool     s_resync_waiting;   /* true only while a resync attempt is between
+                                                 sending its PING and giving up on this channel */
+static uint32_t          s_resync_nonce;
+
 typedef struct {
     uint32_t timeout_s;
 } node_task_args_t;
@@ -375,6 +477,40 @@ static void node_task(void *arg)
                 ack = s_node_ack;
                 memcpy(hub_mac, s_node_ack_mac, 6);
                 xSemaphoreGive(s_node_lock);
+
+                /* Country inheritance (PlanV1 3.3): apply the hub's
+                 * reported regulatory domain BEFORE persisting/using the
+                 * channel it also sent -- so subsequent channel operations
+                 * (the peer add and channel restore just below, and any
+                 * future resync sweep) already run under the right
+                 * domain, not the compile-time default, if the two
+                 * differ. MANUAL policy (ieee80211d_enabled = false) is
+                 * non-negotiable here, same as espnow_link_init(): this
+                 * device never associates to any AP, and letting AUTO
+                 * policy on disabled its transmitter outright on real
+                 * hardware (see espnow_link.c). ack.country may be empty
+                 * (hub's esp_wifi_get_country() failed, or a hypothetical
+                 * pre-v2 hub) -- in that case, do nothing and keep
+                 * whatever country this device already has (its own
+                 * compile-time default, or one learned at an earlier
+                 * pairing). */
+                if (ack.country[0] != '\0') {
+                    esp_err_t cc_err = esp_wifi_set_country_code(ack.country, false);
+                    if (cc_err != ESP_OK) {
+                        ESP_LOGW(TAG, "esp_wifi_set_country_code(%s) failed: %s",
+                                 ack.country, esp_err_to_name(cc_err));
+                    } else {
+                        esp_err_t cc_store_err = swarm_store_set_hub_country(ack.country);
+                        if (cc_store_err != ESP_OK) {
+                            ESP_LOGW(TAG, "swarm_store_set_hub_country(%s) failed: %s "
+                                          "(country applied for this boot only, will not "
+                                          "survive a reboot)",
+                                     ack.country, esp_err_to_name(cc_store_err));
+                        } else {
+                            ESP_LOGI(TAG, "adopted hub country %s", ack.country);
+                        }
+                    }
+                }
 
                 esp_err_t serr = swarm_store_set_hub(hub_mac, ack.lmk, ack.channel);
                 if (serr == ESP_OK) {
@@ -498,15 +634,69 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
         return;
     }
 
-    /* Anything else (READING, PING, PONG, garbage) is not a pairing frame. */
+    if (type == SWARM_MSG_PING) {
+        /* Hub side only: a node (any node, not just one currently
+         * resyncing -- there is no window/state gate here, deliberately,
+         * since liveness must be answerable at any time) is asking
+         * whether this hub is actually reachable at the application
+         * layer. Decode, then hand off to pong_task() via a short,
+         * non-blocking queue send -- this function must never call
+         * espnow_link_broadcast() itself (see the threading note at the
+         * top of this file). A missing/full queue (pairing_hub_init()
+         * never called, or a burst of pings) just means this one PING
+         * goes unanswered; the node will simply try the next channel. */
+        swarm_ping_t ping;
+        if (!swarm_decode_ping(data, (size_t)len, &ping)) return;
+
+        pending_pong_t item;
+        memcpy(item.mac, src, 6);
+        item.nonce = ping.nonce;
+        if (!s_pong_queue || xQueueSend(s_pong_queue, &item, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "PING from " MACSTR ": no pong responder available, dropping",
+                     MAC2STR(src));
+        }
+        return;
+    }
+
+    if (type == SWARM_MSG_PONG) {
+        /* Node side only, and only meaningful while
+         * pairing_node_resync_channel() is actively waiting on this exact
+         * nonce -- s_resync_waiting is false the rest of the time
+         * (including the entire initial pairing sweep above, which uses
+         * its own separate state), so a PONG arriving outside a resync
+         * attempt is simply ignored. */
+        swarm_pong_t pong;
+        if (!swarm_decode_pong(data, (size_t)len, &pong)) return;
+
+        if (!s_resync_lock || xSemaphoreTake(s_resync_lock, pdMS_TO_TICKS(5)) != pdTRUE) return;
+        bool match = s_resync_waiting && (pong.nonce == s_resync_nonce);
+        xSemaphoreGive(s_resync_lock);
+
+        if (match) xSemaphoreGive(s_resync_pong_sem);
+        return;
+    }
+
+    /* Anything else (READING, garbage) is not a pairing frame. */
 }
 
 /* ---------------- Node-side channel resync ---------------- */
+
+/* How long to wait for a PONG after a PING was handed to the radio
+ * successfully. Generous relative to the hub's turnaround (decode + a
+ * non-blocking queue send + pong_task waking and broadcasting -- all of
+ * which should complete in well under a millisecond of CPU time), to
+ * absorb real-world scheduling jitter on both ends without materially
+ * slowing a 13-channel sweep (worst case adds under 4s total). */
+#define RESYNC_PONG_TIMEOUT_MS 300
 
 esp_err_t pairing_node_resync_channel(void)
 {
     uint8_t hub_mac[6], hub_lmk[SWARM_LMK_LEN], hub_ch;
     if (!swarm_store_hub(hub_mac, hub_lmk, &hub_ch)) return ESP_ERR_INVALID_STATE;
+
+    if (!s_resync_lock) s_resync_lock = xSemaphoreCreateMutex();
+    if (!s_resync_pong_sem) s_resync_pong_sem = xSemaphoreCreateBinary();
+    if (!s_resync_lock || !s_resync_pong_sem) return ESP_ERR_NO_MEM;
 
     for (uint8_t ch = 1; ch <= 13; ch++) {
         esp_err_t cherr = espnow_link_set_channel(ch);
@@ -515,16 +705,46 @@ esp_err_t pairing_node_resync_channel(void)
             continue;
         }
 
-        uint8_t ping[2] = { SWARM_PROTO_VERSION, SWARM_MSG_PING };
-        esp_err_t serr = espnow_link_send(hub_mac, ping, sizeof(ping));
+        uint32_t nonce = esp_random();
+        xSemaphoreTake(s_resync_lock, portMAX_DELAY);
+        s_resync_nonce = nonce;
+        s_resync_waiting = true;
+        xSemaphoreGive(s_resync_lock);
+        xSemaphoreTake(s_resync_pong_sem, 0);  /* drop any stale signal */
+
+        swarm_ping_t ping = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_PING, .nonce = nonce };
+        uint8_t buf[sizeof(ping)];
+        size_t n = swarm_encode_ping(&ping, buf, sizeof(buf));
+        esp_err_t serr = n ? espnow_link_send(hub_mac, buf, n) : ESP_FAIL;
+
+        /* A delivered PING (serr == ESP_OK) only proves the hub's RADIO
+         * MAC-acked the frame -- M5a trusted exactly that and was wrong to:
+         * on real hardware, the hub's ESP-NOW layer can still silently
+         * discard a frame after the MAC ack (unknown peer, undecryptable)
+         * before its application layer ever sees it. So still wait for the
+         * PONG even though the send "succeeded" -- that wait is the actual
+         * liveness proof, not this esp_err_t. */
+        bool got_pong = false;
         if (serr == ESP_OK) {
+            got_pong = xSemaphoreTake(s_resync_pong_sem, pdMS_TO_TICKS(RESYNC_PONG_TIMEOUT_MS)) == pdTRUE;
+        }
+
+        xSemaphoreTake(s_resync_lock, portMAX_DELAY);
+        s_resync_waiting = false;
+        xSemaphoreGive(s_resync_lock);
+
+        if (got_pong) {
             esp_err_t store_err = swarm_store_set_channel(ch);
             if (store_err != ESP_OK) {
                 ESP_LOGW(TAG, "resync: swarm_store_set_channel(%u) failed: %s",
                          ch, esp_err_to_name(store_err));
             }
-            ESP_LOGI(TAG, "resync: hub reachable on channel %u", ch);
+            ESP_LOGI(TAG, "resync: hub reachable on channel %u (pong confirmed)", ch);
             return ESP_OK;
+        }
+        if (serr == ESP_OK) {
+            ESP_LOGD(TAG, "resync: channel %u PING was mac-acked but no PONG arrived "
+                          "(radio reachable, application layer was not) -- trying the next channel", ch);
         }
     }
 

@@ -39,6 +39,24 @@ esp_err_t swarm_store_set_hub(const uint8_t mac[6], const uint8_t lmk[SWARM_LMK_
 esp_err_t swarm_store_set_channel(uint8_t channel);
 esp_err_t swarm_store_clear_hub(void);
 
+/* Node side: the regulatory-domain country the hub reported in its most
+ * recent PAIR_ACK (protocol v2+, PlanV1 3.3 country inheritance), applied
+ * via esp_wifi_set_country_code() before any channel sweep and persisted
+ * here so a reboot doesn't lose it -- falling back to the compile-time
+ * default would silently re-restrict a node back to channels 1-11
+ * mid-deployment. Stored under its own NVS key, deliberately NOT folded
+ * into the hub blob above: that keeps the hub blob's on-disk layout
+ * byte-for-byte unchanged, so a device already paired under protocol v1
+ * keeps that pairing across the upgrade instead of needing a migration of
+ * its own (contrast the node table's migration in swarm_store.c, needed
+ * precisely because SWARM_MAX_NODES changed that blob's length).
+ * swarm_store_hub_country() returns false (out untouched) when nothing
+ * has been learned yet -- a node that has never paired under v2, or one
+ * that was just factory-reset, then keeps the compile-time default
+ * (CONFIG_PLANTHUB_WIFI_COUNTRY). */
+bool swarm_store_hub_country(char out[3]);
+esp_err_t swarm_store_set_hub_country(const char cc[3]);
+
 /* Hub side: paired nodes (single node in M5a; table grows to SWARM_MAX_NODES
  * in M5b). */
 int swarm_store_node_count(void);
