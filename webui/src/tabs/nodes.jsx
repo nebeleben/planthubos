@@ -83,10 +83,21 @@ export function NodesTab() {
   const pairTickRef = useRef(null)
   const nodesPollRef = useRef(null)
 
+  // Called both awaited (initial load, via Promise.all below, which still
+  // needs to see a real failure to set the error state) and fire-and-forget
+  // (the pairing countdown and 5s node-list poll, neither of which has
+  // anywhere to send a rejection) -- the trailing catch is silent so a
+  // transient failure during the pairing window (exactly when the hub is
+  // busiest) never surfaces as an unhandled rejection from those uncaught
+  // call sites. AbortError (unmount) is swallowed here too, same as
+  // app.jsx's refreshRole(); the initial-load effect's own catch below only
+  // ever sees the /api/v1/status half now, and still filters AbortError the
+  // same way.
   function refreshNodes(signal) {
     return fetch('/api/v1/nodes', { signal })
       .then((r) => r.json())
       .then((d) => { setNodes(d.nodes || []); setTotal(d.frames_rx_total ?? null) })
+      .catch(() => {})
   }
 
   useEffect(() => {

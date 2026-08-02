@@ -86,6 +86,42 @@ int main(void)
     /* the old wrapper still behaves exactly as before */
     assert(registry_update(&ra, &x2, 21) == 0);
 
+    /* --- registry_clear_attribution (M5b: forgetting a node) --- */
+    registry_t rc;
+    registry_init(&rc);
+    uint8_t nodeC[6] = { 0xAA,0,0,0,0,10 }, nodeD[6] = { 0xBB,0,0,0,0,20 };
+
+    /* two sensors attributed to nodeC, one to nodeD */
+    mibeacon_t c1 = mk(0x21, 1, 100), c2 = mk(0x22, 1, 100), d1 = mk(0x23, 1, 100);
+    assert(registry_update_from(&rc, &c1, 10, nodeC, -50) == 1);
+    assert(registry_update_from(&rc, &c2, 10, nodeC, -55) == 1);
+    assert(registry_update_from(&rc, &d1, 10, nodeD, -60) == 1);
+    int ic1 = registry_find(&rc, c1.mac), ic2 = registry_find(&rc, c2.mac), id1 = registry_find(&rc, d1.mac);
+    assert(rc.sensors[ic1].via_node_valid && rc.sensors[ic2].via_node_valid && rc.sensors[id1].via_node_valid);
+
+    /* clearing nodeC affects exactly its two entries */
+    assert(registry_clear_attribution(&rc, nodeC) == 2);
+    assert(!rc.sensors[ic1].via_node_valid);
+    assert(memcmp(rc.sensors[ic1].via_node, (uint8_t[6]){0}, 6) == 0);
+    assert(rc.sensors[ic1].best_rssi == 0);
+    assert(!rc.sensors[ic2].via_node_valid);
+    assert(memcmp(rc.sensors[ic2].via_node, (uint8_t[6]){0}, 6) == 0);
+    assert(rc.sensors[ic2].best_rssi == 0);
+
+    /* nodeD's entry is untouched */
+    assert(rc.sensors[id1].via_node_valid && memcmp(rc.sensors[id1].via_node, nodeD, 6) == 0);
+    assert(rc.sensors[id1].best_rssi == -60);
+
+    /* clearing an already-cleared/unknown node is a no-op */
+    assert(registry_clear_attribution(&rc, nodeC) == 0);
+
+    /* a subsequent reading re-attributes normally, exactly as if the entry
+     * had never been attributed at all */
+    mibeacon_t c1b = mk(0x21, 2, 110);
+    assert(registry_update_from(&rc, &c1b, 30, nodeD, -45) == 1);
+    assert(rc.sensors[ic1].via_node_valid && memcmp(rc.sensors[ic1].via_node, nodeD, 6) == 0);
+    assert(rc.sensors[ic1].best_rssi == -45);
+
     printf("test_registry: OK\n");
     return 0;
 }

@@ -49,3 +49,15 @@ int swarm_node_list_json(char *buf, size_t cap);
 /* Hub: total SWARM_MSG_READING frames ingested from nodes since boot
  * (verification aid; also the "frames_rx_total" field of the JSON above). */
 uint32_t swarm_frames_rx(void);
+
+/* Hub: called when a node is forgotten (api_v1.c's DELETE handler) -- clears
+ * that MAC's per-node RAM stats slot (frames_rx/last_seen_s/rssi), if it has
+ * one, under the same mutex record_stat() uses. Without this, a forgotten
+ * node's slot stays "in_use" for the rest of this boot: once all
+ * SWARM_MAX_NODES slots have ever been occupied, a replacement node paired
+ * later can never get one of its own, and GET /api/v1/nodes would show it
+ * stuck at frames_rx=0/last_seen_s=null forever even as
+ * frames_rx_total keeps climbing. A no-op if the node never transmitted (no
+ * slot to clear). Called only from the forget HTTP handler's task -- never
+ * from the ESP-NOW receive callback, which only ever calls record_stat(). */
+void swarm_forget_node_stats(const uint8_t mac[6]);

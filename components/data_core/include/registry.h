@@ -50,3 +50,17 @@ int  registry_update(registry_t *r, const mibeacon_t *m, uint32_t now_s);
 
 int  registry_find(const registry_t *r, const uint8_t mac[6]);
 int  registry_count(const registry_t *r);
+
+/* Forgetting a node (see swarm_store_forget_node()) must forget it fully:
+ * without this, every sensor entry currently attributed to node_mac keeps
+ * reporting it as the "via" source forever, since is_paired_node()
+ * (swarm.c) rejects that MAC's frames from ever reaching
+ * registry_update_from() again -- nothing else could ever re-attribute it.
+ * Clears via_node_valid (and zeroes via_node/best_rssi) for every entry
+ * currently attributed to node_mac; entries attributed to a direct hub
+ * reception or to a different node are untouched. attributed_s is left as
+ * the value the entry had before this cleared -- it records when
+ * attribution last CHANGED, and clearing to "no attribution" isn't a
+ * new source claiming the sensor, just this one being taken away.
+ * Returns the number of entries cleared. */
+int  registry_clear_attribution(registry_t *r, const uint8_t node_mac[6]);

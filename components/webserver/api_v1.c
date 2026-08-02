@@ -580,6 +580,16 @@ static esp_err_t node_forget_delete(httpd_req_t *req)
         return ESP_OK;
     }
 
+    /* Forgetting must fully forget: otherwise this node's RAM stats slot
+     * stays occupied for the rest of the boot (blocking a later replacement
+     * node from ever getting one, once all slots have been used) and every
+     * sensor it last relayed keeps reporting it as "via" forever, since
+     * is_paired_node() (swarm.c) will reject its frames from now on and
+     * nothing else can ever re-attribute them. Both are in-RAM-only, no
+     * NVS/flash and no send, so doing this here on the httpd task is safe. */
+    swarm_forget_node_stats(mac);
+    data_core_clear_node_attribution(mac);
+
     /* Best-effort: the security-relevant half is already done above --
      * hub_rx_cb's is_paired_node() (swarm.c) rejects a forgotten node's
      * READING frames regardless of whether the ESP-NOW peer table itself

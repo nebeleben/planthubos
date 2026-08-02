@@ -84,3 +84,18 @@ int registry_update(registry_t *r, const mibeacon_t *m, uint32_t now_s)
 {
     return registry_update_from(r, m, now_s, NULL, 0);
 }
+
+int registry_clear_attribution(registry_t *r, const uint8_t node_mac[6])
+{
+    int n = 0;
+    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
+        sensor_entry_t *e = &r->sensors[i];
+        if (!e->in_use || !e->via_node_valid) continue;
+        if (memcmp(e->via_node, node_mac, 6) != 0) continue;
+        e->via_node_valid = false;
+        memset(e->via_node, 0, 6);
+        e->best_rssi = 0;
+        n++;
+    }
+    return n;
+}

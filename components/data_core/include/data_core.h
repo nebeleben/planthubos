@@ -37,3 +37,13 @@ void data_core_submit_from(const mibeacon_t *m, const uint8_t via_node[6],
  * age_s = 0 (just heard). */
 void      data_core_submit(const mibeacon_t *m);
 void      data_core_snapshot(registry_t *out);
+
+/* Forgetting a node must fully forget it: clears via-node attribution (see
+ * registry_clear_attribution()) for every sensor currently attributed to
+ * node_mac, under the same mutex every other registry access here uses.
+ * Called from the forget HTTP handler's task (api_v1.c), never from the
+ * ESP-NOW receive callback -- registry_clear_attribution() itself is a
+ * short, bounded, allocation-free scan, same as registry_update_from(), so
+ * this follows the exact locking pattern data_core_submit_from() and
+ * data_core_snapshot() already use. */
+void      data_core_clear_node_attribution(const uint8_t node_mac[6]);

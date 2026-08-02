@@ -294,6 +294,24 @@ uint32_t swarm_frames_rx(void)
     return n;
 }
 
+/* Called from the forget HTTP handler's task (api_v1.c) only -- NOT from
+ * hub_rx_cb/record_stat's path, so this adds nothing new that's reachable
+ * from the ESP-NOW receive callback. Same short, bounded, allocation-free
+ * scan over at most SWARM_MAX_NODES entries as record_stat(), under the
+ * same mutex. */
+void swarm_forget_node_stats(const uint8_t mac[6])
+{
+    if (!s_stats_mutex) return;
+    xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
+    for (int i = 0; i < SWARM_MAX_NODES; i++) {
+        if (s_stats[i].in_use && memcmp(s_stats[i].mac, mac, 6) == 0) {
+            memset(&s_stats[i], 0, sizeof(s_stats[i]));
+            break;
+        }
+    }
+    xSemaphoreGive(s_stats_mutex);
+}
+
 /* ---------------- Node side: forwarding ---------------- */
 
 #define SWARM_FWD_QUEUE_LEN     8

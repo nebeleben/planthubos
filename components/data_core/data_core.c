@@ -79,3 +79,14 @@ void data_core_snapshot(registry_t *out)
     memcpy(out, &s_registry, sizeof(*out));
     xSemaphoreGive(s_mutex);
 }
+
+void data_core_clear_node_attribution(const uint8_t node_mac[6])
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = registry_clear_attribution(&s_registry, node_mac);
+    xSemaphoreGive(s_mutex);
+    if (n > 0) {
+        ESP_LOGI(TAG, "cleared via-node attribution for " MACSTR_FMT " on %d sensor(s)",
+                 MAC_ARG(node_mac), n);
+    }
+}
