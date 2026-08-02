@@ -12,6 +12,7 @@
 #include "data_core.h"
 #include "registry.h"
 #include "mibeacon.h"
+#include "app_config.h"
 
 #include "cJSON.h"
 #include "esp_log.h"
@@ -289,11 +290,30 @@ static void forward_task(void *arg)
 }
 
 /* Brings up WiFi far enough for ESP-NOW without ever joining any network:
- * no STA/AP netif (ESP-NOW operates directly on the WiFi MAC layer and
- * needs no IP netif -- the upstream esp-now example brings WiFi up the
- * same way) and no esp_wifi_connect() call, ever -- this device is simply
- * never associated to any AP, which is also what keeps
- * espnow_link_set_channel() free to hop channels for pairing/resync.
+ * no esp_wifi_connect() call, ever -- this device is simply never
+ * associated to any AP, which is what keeps espnow_link_set_channel()
+ * free to hop channels for pairing/resync. No STA/AP netif either (ESP-NOW
+ * operates directly on the WiFi MAC layer and needs no IP netif -- the
+ * upstream esp-now example brings WiFi up the same way, and this held up
+ * fine on real hardware for plain STA mode; nothing here requires a netif
+ * for APSTA either since the softAP configured below is a decoy with no
+ * IP-level function).
+ *
+ * WIFI_MODE_APSTA, not plain STA: confirmed on real hardware that a
+ * unicast ESP-NOW frame from an AP-associated hub (the main hub is a
+ * normal WiFi STA) gets silently filtered -- and never MAC-acked -- by an
+ * unassociated node's radio. That's the well-known ESP-NOW + WiFi
+ * mixed-mode coexistence trap, and Espressif's documented workaround for a
+ * device that must exchange ESP-NOW frames with an AP-associated peer is
+ * exactly this: bring the receiving side up in APSTA. (The handshake
+ * itself was additionally fixed to use broadcast for PAIR_ACK, which
+ * sidesteps this for that one frame regardless -- see pairing.c's
+ * hub_task() -- but APSTA is also what should make the steady-state
+ * node->hub unicast DATA frames reliable after pairing.) The softAP is a
+ * throwaway: hidden (ssid_hidden) and configured for zero stations
+ * (max_connection = 0), so it neither clutters the air nor accepts
+ * anyone. Do NOT apply any of this to the hub -- its STA association must
+ * keep working exactly as it does today; this function is node-only.
  *
  * WIFI_STORAGE_RAM + an explicit empty STA config matter for a reason that
  * only showed up on real hardware: wifi_manager's start_sta() (used when
@@ -318,11 +338,22 @@ static esp_err_t radio_only_wifi_start(void)
     err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
     if (err != ESP_OK) return err;
 
-    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) return err;
 
     wifi_config_t empty_cfg = { 0 };
     err = esp_wifi_set_config(WIFI_IF_STA, &empty_cfg);
+    if (err != ESP_OK) return err;
+
+    char name[16];
+    app_config_hub_name(name);
+    wifi_config_t ap_cfg = { 0 };
+    strlcpy((char *)ap_cfg.ap.ssid, name, sizeof(ap_cfg.ap.ssid));
+    ap_cfg.ap.ssid_len = strlen(name);
+    ap_cfg.ap.ssid_hidden = 1;
+    ap_cfg.ap.max_connection = 0;
+    ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
     if (err != ESP_OK) return err;
 
     return esp_wifi_start();

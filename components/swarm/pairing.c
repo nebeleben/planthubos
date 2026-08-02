@@ -153,16 +153,13 @@ static void hub_task(void *arg)
              * UNENCRYPTED -- the node cannot possibly hold the key yet,
              * since delivering that key is the entire point of this
              * frame. swarm_frame.h documents PAIR_ACK as "Hub -> node,
-             * unicast, plaintext" for exactly this reason: do NOT
-             * "harden" this by adding the peer encrypted before sending,
-             * that breaks pairing outright. Confirmed on real hardware:
-             * an encrypted-before-send ack got ESP_FAIL (ESP_NOW_SEND_FAIL)
-             * on every attempt, because a peer that doesn't have the LMK
-             * cannot decrypt -- and therefore cannot 802.11-ack -- a frame
-             * that was encrypted with it. So: add the peer unencrypted
-             * first, send, and only once that plaintext send is confirmed
-             * delivered do we know the node has the key and it's safe to
-             * upgrade the peer to encrypted on our own side. */
+             * unicast, plaintext"; do NOT "harden" this by adding the peer
+             * encrypted before sending, that breaks pairing outright (a
+             * peer without the LMK cannot decrypt a frame encrypted with
+             * it). Add the peer unencrypted first regardless of how the
+             * ack itself is transmitted below, since the encrypted upgrade
+             * further down is still what the steady-state unicast DATA
+             * frames use once this node is paired. */
             esp_err_t err = espnow_link_add_peer(item.mac, NULL, 0);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "adopt " MACSTR ": espnow_link_add_peer (plaintext) failed: %s",
@@ -185,33 +182,50 @@ static void hub_task(void *arg)
                 break;
             }
 
-            /* Send BEFORE persisting: swarm_store_add_node() below is a
-             * synchronous, multi-millisecond NVS/flash commit, and on real
-             * hardware that latency was observed to exceed the node's
-             * per-channel sweep dwell -- delaying the ack behind it meant
-             * the node had already hopped to the next channel by the time
-             * the ack would have gone out, producing a one-sided pairing
-             * (hub adopted + persisted, node never heard back). Sending
-             * first means a slow or failed persist can no longer cost the
-             * node a heard ack. */
-            err = espnow_link_send(item.mac, buf, n);
+            /* Send BEFORE persisting (unchanged reasoning: swarm_store_add_node()
+             * below is a synchronous, multi-millisecond NVS/flash commit that
+             * must not delay the ack past the node's sweep dwell).
+             *
+             * BROADCAST, not unicast, and this is the actual fix for the
+             * one-sided pairing: on real hardware, a unicast PAIR_ACK got
+             * ESP_FAIL (ESP_NOW_SEND_FAIL, i.e. no 802.11 MAC ack) on every
+             * attempt even though both sides were confirmed on the same
+             * channel and the plaintext/timing fixes above were already in
+             * place. Root cause is the well-known ESP-NOW + WiFi mixed-mode
+             * trap: the hub is an associated STA (its frames carry its AP's
+             * BSSID) while the node is unassociated, and an unassociated
+             * receiver's radio filters out -- and therefore never MAC-acks
+             * -- a unicast frame tagged with a BSSID it isn't part of.
+             * Broadcasting removes the MAC-ack dependency entirely (ESP-NOW
+             * broadcasts are never acked, so there is no ESP_NOW_SEND_FAIL
+             * to get). This is not a security regression: the ack was
+             * already plaintext by design, the nonce it echoes was already
+             * broadcast in clear as part of PAIR_REQ, and the node already
+             * accepts an ack purely by nonce match (see pairing_handle_frame()) --
+             * broadcasting the reply doesn't expose anything a unicast send
+             * didn't already. */
+            err = espnow_link_broadcast(buf, n);
             /* Observability: this handshake is otherwise invisible on the
              * console, which cost real diagnostic time tracking down a
              * one-sided pairing defect. Log every attempt's outcome, not
-             * just failures. */
-            ESP_LOGI(TAG, "PAIR_ACK -> " MACSTR " channel=%u result=%s",
+             * just failures. espnow_link_broadcast()'s result already
+             * reflects "handed to the radio", not a MAC ack (broadcasts
+             * have none) -- exactly the success criterion we want here. */
+            ESP_LOGI(TAG, "PAIR_ACK -> broadcast (intended for " MACSTR ") channel=%u result=%s",
                      MAC2STR(item.mac), channel, esp_err_to_name(err));
             if (err != ESP_OK) {
-                ESP_LOGW(TAG, "adopt " MACSTR ": PAIR_ACK send failed: %s",
+                ESP_LOGW(TAG, "adopt " MACSTR ": PAIR_ACK broadcast failed: %s",
                          MAC2STR(item.mac), esp_err_to_name(err));
                 break;
             }
 
-            /* The node just accepted (and 802.11-acked) a plaintext frame
-             * containing the LMK, so it now has the key too -- safe to
-             * upgrade this peer to encrypted on our side. espnow_link_add_peer()
-             * calls esp_now_mod_peer() in place when the peer already
-             * exists (verified against this IDF's esp_now.h: esp_now_mod_peer()
+            /* The node's sweep dwells long enough to have heard this
+             * broadcast (or will on its next sweep, since the window stays
+             * open), so it now has the key too -- safe to upgrade this
+             * peer to encrypted on our side for the unicast DATA frames it
+             * will send once paired. espnow_link_add_peer() calls
+             * esp_now_mod_peer() in place when the peer already exists
+             * (verified against this IDF's esp_now.h: esp_now_mod_peer()
              * is available), so this is the same call as above, just with
              * a non-NULL lmk this time -- no del+re-add needed. */
             err = espnow_link_add_peer(item.mac, lmk, 0);
@@ -425,6 +439,16 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
 
         swarm_pair_ack_t ack;
         if (!swarm_decode_pair_ack(data, (size_t)len, &ack)) return;
+
+        /* The hub now sends this as an ESP-NOW BROADCAST (see hub_task()'s
+         * comment for why: a unicast ack from an AP-associated hub gets
+         * silently filtered -- and never MAC-acked -- by an unassociated
+         * node's radio). That requires no special handling here: `src` is
+         * always the actual sender's MAC from the ESP-NOW receive metadata
+         * (info->src_addr in espnow_link.c's on_recv, passed through
+         * unchanged), regardless of whether the frame was addressed to us
+         * unicast or to the broadcast address, and matching purely on
+         * nonce (below) never assumed unicast addressing to begin with. */
 
         /* Accepted risk: this ack is matched to our request by nonce alone,
          * and the nonce was just broadcast in clear as part of our own

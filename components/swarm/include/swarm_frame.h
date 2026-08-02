@@ -22,7 +22,14 @@ typedef struct __attribute__((packed)) {
     uint32_t nonce;      /* echoed in the ack so a node ignores stale replies */
 } swarm_pair_req_t;
 
-/* Hub -> node, unicast, plaintext (see the LMK note in the plan/README). */
+/* Hub -> broadcast, plaintext (see the LMK note in the plan/README).
+ * Broadcast, not unicast: an ESP-NOW unicast frame from an AP-associated
+ * hub is silently filtered -- and never MAC-acked, i.e. always reports
+ * ESP_NOW_SEND_FAIL -- by an unassociated node's radio (confirmed on real
+ * hardware; see pairing.c's hub_task()). Broadcasting removes that MAC-ack
+ * dependency entirely and is not a security regression: this frame is
+ * plaintext by design regardless of addressing, and the node accepts it
+ * purely by nonce match against its own just-broadcast PAIR_REQ. */
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
