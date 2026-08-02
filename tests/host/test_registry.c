@@ -53,6 +53,39 @@ int main(void)
     assert(registry_update(&r, &overflow, 210) == -1);
     assert(registry_find(&r, overflow.mac) == -1);
 
+    /* --- attribution (M5b) --- */
+    registry_t ra;
+    registry_init(&ra);
+    uint8_t nodeA[6] = { 0xAA,0,0,0,0,1 }, nodeB[6] = { 0xBB,0,0,0,0,2 };
+    mibeacon_t x = mk(0x10, 1, 200);
+
+    /* first sighting via node A at -70 */
+    assert(registry_update_from(&ra, &x, 10, nodeA, -70) == 1);
+    int i = registry_find(&ra, x.mac);
+    assert(ra.sensors[i].via_node_valid && memcmp(ra.sensors[i].via_node, nodeA, 6) == 0);
+    assert(ra.sensors[i].best_rssi == -70);
+
+    /* same frame via node B, STRONGER -> B takes over, still a duplicate */
+    assert(registry_update_from(&ra, &x, 11, nodeB, -40) == 0);
+    assert(memcmp(ra.sensors[i].via_node, nodeB, 6) == 0 && ra.sensors[i].best_rssi == -40);
+
+    /* same frame via node A again, WEAKER -> B keeps it */
+    assert(registry_update_from(&ra, &x, 12, nodeA, -80) == 0);
+    assert(memcmp(ra.sensors[i].via_node, nodeB, 6) == 0 && ra.sensors[i].best_rssi == -40);
+
+    /* the hub hearing it directly always wins over any relay */
+    assert(registry_update_from(&ra, &x, 13, NULL, 0) == 0);
+    assert(!ra.sensors[i].via_node_valid);
+
+    /* a NEW frame re-opens attribution: node A reports it first */
+    mibeacon_t x2 = mk(0x10, 2, 210);
+    assert(registry_update_from(&ra, &x2, 20, nodeA, -75) == 1);
+    assert(ra.sensors[i].via_node_valid && memcmp(ra.sensors[i].via_node, nodeA, 6) == 0);
+    assert(ra.sensors[i].best_rssi == -75);
+
+    /* the old wrapper still behaves exactly as before */
+    assert(registry_update(&ra, &x2, 21) == 0);
+
     printf("test_registry: OK\n");
     return 0;
 }
