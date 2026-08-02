@@ -72,7 +72,13 @@ static const static_asset_t ASSETS[] = {
 esp_err_t webserver_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 24;
+    /* M5b Task 6 (node rename/forget) brought the registered total to 21
+     * (3 static assets + 16 in api_v1_register() + 1 SSE + 1 captive-portal
+     * fallback) against the old cap of 24 -- close enough that the brief
+     * calls for raising it now rather than waiting for the next handler to
+     * trip ESP_ERR_NO_MEM at httpd_register_uri_handler(). Raised with
+     * headroom for further growth, not just to clear today's count. */
+    cfg.max_uri_handlers = 32;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 8192; /* wifi_scan_get's records buffer + cJSON work no longer fit in 4K */
     /* Without this, abandoned sockets (phone walks away from the portal, tab

@@ -10,6 +10,7 @@
 #include "swarm.h"
 #include "swarm_store.h"
 #include "pairing.h"
+#include "espnow_link.h"
 #include "cJSON.h"
 #include "esp_littlefs.h"
 #include "esp_ota_ops.h"
@@ -23,7 +24,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "api_v1";
-#define FW_VERSION "0.5.0"
+#define FW_VERSION "0.6.0"
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -469,7 +470,12 @@ static esp_err_t unclaim_post(httpd_req_t *req)
 
 static esp_err_t nodes_get(httpd_req_t *req)
 {
-    char buf[512];
+    /* Sized for SWARM_MAX_NODES (6) entries, each now carrying a name (up to
+     * SWARM_NODE_NAME_LEN=24 bytes) and a "buffered" field alongside
+     * mac/last_seen_s/frames_rx/rssi -- ~140 bytes/entry worst case, well
+     * under this with room to spare. 512 (the pre-M5b size) is no longer
+     * enough since the name/buffered fields were added. */
+    char buf[1536];
     int n = swarm_node_list_json(buf, sizeof(buf));
     if (n < 0) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nodes list failed");
@@ -486,6 +492,106 @@ static esp_err_t nodes_pair_post(httpd_req_t *req)
     pairing_open_window(120);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true,\"window_s\":120}");
+    return ESP_OK;
+}
+
+/* POST /api/v1/nodes/{MAC12} body {"name":"..."} -- rename (empty clears).
+ * Registered AFTER nodes_pair_post's exact "/api/v1/nodes/pair" route (see
+ * api_v1_register()) so that reserved path keeps matching first; only a
+ * request whose path segment isn't "pair" ever reaches this wildcard
+ * handler, since httpd_find_uri_handler() returns the first registered
+ * match in order (esp_http_server, httpd_uri.c). */
+static esp_err_t node_rename_post(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    uint8_t mac[6];
+    if (!parse_mac12(req->uri + strlen("/api/v1/nodes/"), mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
+        return ESP_OK;
+    }
+
+    char body[64];
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return ESP_OK;
+    }
+    if (req->content_len > sizeof(body) - 1) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(body);
+    const cJSON *name = cJSON_GetObjectItem(json, "name");
+    esp_err_t err = cJSON_IsString(name) ? swarm_store_set_node_name(mac, name->valuestring)
+                                         : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(json);
+
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown node");
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid name");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* DELETE /api/v1/nodes/{MAC12} -- forget: removes the node from
+ * swarm_store's persisted table AND removes the corresponding ESP-NOW peer,
+ * so a forgotten node cannot keep sending encrypted frames this hub would
+ * otherwise still decrypt. Chose DELETE over a POST .../forget alias: it
+ * needs no reserved-path precedence trick (a different method never
+ * collides with nodes_pair_post's POST-only route on the same URI space,
+ * regardless of registration order), and HTTP_DELETE is available in this
+ * IDF's httpd_method_t (esp_http_server.h / http_parser.h). */
+static esp_err_t node_forget_delete(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    uint8_t mac[6];
+    if (!parse_mac12(req->uri + strlen("/api/v1/nodes/"), mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
+        return ESP_OK;
+    }
+
+    esp_err_t err = swarm_store_forget_node(mac);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown node");
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "forget failed");
+        return ESP_OK;
+    }
+
+    /* Best-effort: the security-relevant half is already done above --
+     * hub_rx_cb's is_paired_node() (swarm.c) rejects a forgotten node's
+     * READING frames regardless of whether the ESP-NOW peer table itself
+     * still has a stale entry -- so a failure here is logged, not fatal to
+     * the request. */
+    esp_err_t peer_err = espnow_link_remove_peer(mac);
+    if (peer_err != ESP_OK) {
+        ESP_LOGW(TAG, "forget: espnow_link_remove_peer failed: %s", esp_err_to_name(peer_err));
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
@@ -610,6 +716,12 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &nodes));
     httpd_uri_t nodes_pair = { .uri = "/api/v1/nodes/pair", .method = HTTP_POST, .handler = nodes_pair_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &nodes_pair));
+    /* Registered AFTER nodes_pair above so that exact "/api/v1/nodes/pair"
+     * route keeps winning (see node_rename_post()'s comment). */
+    httpd_uri_t node_rename = { .uri = "/api/v1/nodes/*", .method = HTTP_POST, .handler = node_rename_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &node_rename));
+    httpd_uri_t node_forget = { .uri = "/api/v1/nodes/*", .method = HTTP_DELETE, .handler = node_forget_delete };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &node_forget));
     httpd_uri_t role = { .uri = "/api/v1/role", .method = HTTP_POST, .handler = role_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &role));
     httpd_uri_t pair_retry = { .uri = "/api/v1/pair/retry", .method = HTTP_POST, .handler = pair_retry_post };

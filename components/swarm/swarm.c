@@ -257,11 +257,22 @@ int swarm_node_list_json(char *buf, size_t cap)
                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         cJSON *o = cJSON_CreateObject();
         cJSON_AddStringToObject(o, "mac", macstr);
+        char name[SWARM_NODE_NAME_LEN + 1];
+        if (swarm_store_node_name(mac, name) && name[0] != '\0') cJSON_AddStringToObject(o, "name", name);
+        else cJSON_AddNullToObject(o, "name");
         if (stat) cJSON_AddNumberToObject(o, "last_seen_s", stat->last_seen_s);
         else cJSON_AddNullToObject(o, "last_seen_s");
         cJSON_AddNumberToObject(o, "frames_rx", stat ? stat->frames_rx : 0);
         if (stat) cJSON_AddNumberToObject(o, "rssi", stat->rssi);
         else cJSON_AddNullToObject(o, "rssi");
+        /* "buffered": Task 5's RAM ring (swarm.c's forward_task) tracks a
+         * NODE's own undelivered-reading backlog, but that state lives only
+         * on the node itself -- there is no wire message carrying a
+         * backlog depth back to the hub (would need its own protocol
+         * extension, out of scope for M5b). This is therefore honestly
+         * null, not a best-effort guess, for every entry until such a
+         * message exists. */
+        cJSON_AddNullToObject(o, "buffered");
         cJSON_AddItemToArray(arr, o);
     }
     cJSON_AddNumberToObject(root, "frames_rx_total", total);
