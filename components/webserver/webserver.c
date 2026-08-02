@@ -72,7 +72,7 @@ static const static_asset_t ASSETS[] = {
 esp_err_t webserver_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 20;
+    cfg.max_uri_handlers = 24;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 8192; /* wifi_scan_get's records buffer + cJSON work no longer fit in 4K */
     /* Without this, abandoned sockets (phone walks away from the portal, tab

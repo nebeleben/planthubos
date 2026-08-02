@@ -12,6 +12,8 @@
 #include "timekeeper.h"
 #include "sampler.h"
 #include "ota_post.h"
+#include "swarm.h"
+#include "swarm_store.h"
 
 static const char *TAG = "planthub";
 
@@ -61,20 +63,50 @@ void app_main(void)
     if (tk_err != ESP_OK) ESP_LOGE(TAG, "timekeeper_init failed (%s); time sync unavailable", esp_err_to_name(tk_err));
 
     ESP_ERROR_CHECK(data_core_init());
-    ESP_ERROR_CHECK(webserver_start());
-    /* Before wifi starts, so the guard sees the very first AP_START/GOT_IP. */
-    ota_rollback_guard_start();
-    ESP_ERROR_CHECK(wifi_manager_start());
+
+    /* swarm_store_init() loads role + paired-peer state from NVS into RAM;
+     * it must run before the role branch below decides how to boot. A
+     * device that has never chosen a role reads back SWARM_ROLE_UNSET and
+     * falls into the exact M1-M4 path (portal -> wifi -> hub) below,
+     * unchanged -- this is the byte-for-byte-with-today requirement for
+     * ROLE_UNSET and ROLE_MAIN. */
+    ESP_ERROR_CHECK(swarm_store_init());
+    swarm_role_t role = swarm_store_role();
+    bool node_ready = (role == SWARM_ROLE_NODE) && swarm_store_hub(NULL, NULL, NULL);
+
+    if (node_ready) {
+        /* Node, already paired to a hub: no web server, no storage sampler,
+         * no STA/AP management -- radio-only wifi so ESP-NOW can run, plus
+         * BLE collection (started below, common to both roles). */
+        esp_err_t nerr = swarm_start_node();
+        if (nerr != ESP_OK) ESP_LOGE(TAG, "node start failed (%s)", esp_err_to_name(nerr));
+    } else {
+        ESP_ERROR_CHECK(webserver_start());
+        /* Before wifi starts, so the guard sees the very first AP_START/GOT_IP. */
+        ota_rollback_guard_start();
+        ESP_ERROR_CHECK(wifi_manager_start());
+        if (role != SWARM_ROLE_NODE) {
+            /* ROLE_UNSET or ROLE_MAIN: this is today's hub, with
+             * swarm_start_main() as the only addition. An unpaired
+             * ROLE_NODE falls into this same portal branch above (so the
+             * user can see status and retry pairing) but must not itself
+             * act as a hub, hence the guard here. */
+            esp_err_t serr = swarm_start_main();
+            if (serr != ESP_OK) ESP_LOGE(TAG, "swarm (main) start failed (%s)", esp_err_to_name(serr));
+        }
+    }
+
     esp_err_t ble_err = ble_collector_start();
     if (ble_err != ESP_OK) ESP_LOGE(TAG, "BLE collector failed to start (%s); running without BLE", esp_err_to_name(ble_err));
 
     /* Sampler appends to /storage every CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN
      * minutes; starting it against a failed mount would just fail forever,
-     * so skip it outright rather than let it retry into the void. */
-    if (storage_ok) {
+     * so skip it outright rather than let it retry into the void. Also
+     * hub-only: a node keeps no local history to sample. */
+    if (storage_ok && role != SWARM_ROLE_NODE) {
         esp_err_t sampler_err = sampler_start("/storage");
         if (sampler_err != ESP_OK) ESP_LOGE(TAG, "sampler_start failed (%s); running without history sampling", esp_err_to_name(sampler_err));
-    } else {
+    } else if (!storage_ok) {
         ESP_LOGW(TAG, "skipping sampler_start: storage unavailable");
     }
 }

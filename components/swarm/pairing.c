@@ -47,17 +47,36 @@ static TaskHandle_t s_hub_task;
 
 static void hub_task(void *arg);
 
-static void ensure_hub_task(void)
+/* Returns false if the hub task (or its supporting primitives) could not be
+ * created. Checking this matters: if xTaskCreate() silently failed here, a
+ * PAIR_REQ accepted into s_adopt_queue by pairing_handle_frame() would sit
+ * there forever with nothing to drain it, leaving s_adopt_in_progress stuck
+ * true and pairing permanently impossible until reboot. So the caller must
+ * refuse to open a window rather than open one nothing can service. */
+static bool ensure_hub_task(void)
 {
-    if (s_hub_task) return;
+    if (s_hub_task) return true;
     if (!s_window_lock) s_window_lock = xSemaphoreCreateMutex();
     if (!s_adopt_queue) s_adopt_queue = xQueueCreate(1, sizeof(pending_adopt_t));
-    xTaskCreate(hub_task, "pairing_hub", 4096, NULL, 5, &s_hub_task);
+    if (!s_window_lock || !s_adopt_queue) {
+        ESP_LOGE(TAG, "ensure_hub_task: failed to allocate window lock/adopt queue");
+        return false;
+    }
+    BaseType_t ok = xTaskCreate(hub_task, "pairing_hub", 4096, NULL, 5, &s_hub_task);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "ensure_hub_task: xTaskCreate(pairing_hub) failed");
+        s_hub_task = NULL;
+        return false;
+    }
+    return true;
 }
 
 void pairing_open_window(uint32_t seconds)
 {
-    ensure_hub_task();
+    if (!ensure_hub_task()) {
+        ESP_LOGE(TAG, "pairing_open_window: hub task unavailable, window NOT opened");
+        return;
+    }
 
     xSemaphoreTake(s_window_lock, portMAX_DELAY);
     s_window_deadline_us = esp_timer_get_time() + (int64_t)seconds * 1000000;

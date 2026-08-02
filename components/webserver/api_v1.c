@@ -7,6 +7,9 @@
 #include "timekeeper.h"
 #include "claim.h"
 #include "ota_post.h"
+#include "swarm.h"
+#include "swarm_store.h"
+#include "pairing.h"
 #include "cJSON.h"
 #include "esp_littlefs.h"
 #include "esp_ota_ops.h"
@@ -20,7 +23,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "api_v1";
-#define FW_VERSION "0.4.1"
+#define FW_VERSION "0.5.0"
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -49,11 +52,21 @@ bool api_auth_ok(httpd_req_t *req)
     return claim_verify(hdr + 7);
 }
 
+static const char *role_str(swarm_role_t r)
+{
+    switch (r) {
+    case SWARM_ROLE_MAIN: return "main";
+    case SWARM_ROLE_NODE: return "node";
+    default:              return "unset";
+    }
+}
+
 static esp_err_t status_get(httpd_req_t *req)
 {
     char name[16], ip[16];
     app_config_hub_name(name);
     wifi_manager_get_ip(ip);
+    swarm_role_t role = swarm_store_role();
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "name", name);
     cJSON_AddStringToObject(root, "version", FW_VERSION);
@@ -63,6 +76,11 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "time_synced", timekeeper_synced());
     cJSON_AddNumberToObject(root, "epoch_s", timekeeper_now());
     cJSON_AddBoolToObject(root, "claimed", claim_is_claimed());
+    cJSON_AddStringToObject(root, "role", role_str(role));
+    /* Node: paired to a hub. Unset/main: has at least one node paired to it. */
+    bool paired = (role == SWARM_ROLE_NODE) ? swarm_store_hub(NULL, NULL, NULL)
+                                             : swarm_store_node_count() > 0;
+    cJSON_AddBoolToObject(root, "paired", paired);
     size_t fs_total = 0, fs_used = 0;
     if (esp_littlefs_info("storage", &fs_total, &fs_used) == ESP_OK) {
         cJSON_AddNumberToObject(root, "fs_total", fs_total);
@@ -425,6 +443,95 @@ static esp_err_t unclaim_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t nodes_get(httpd_req_t *req)
+{
+    char buf[512];
+    int n = swarm_node_list_json(buf, sizeof(buf));
+    if (n < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nodes list failed");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t nodes_pair_post(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+    pairing_open_window(120);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"window_s\":120}");
+    return ESP_OK;
+}
+
+/* Fires ~1.5s after the response for a role change to "node" goes out, same
+ * "let the client see the response first" pattern as wifi_post's
+ * apply_creds_cb. A role switch to node fundamentally changes the boot path
+ * (radio-only wifi, no webserver at all once paired) so it is applied via a
+ * clean reboot rather than trying to tear down webserver/wifi_manager live. */
+static void role_restart_cb(TimerHandle_t t)
+{
+    xTimerDelete(t, 0);
+    esp_restart();
+}
+
+static esp_err_t role_post(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    char body[64];
+    if (req->content_len == 0 || req->content_len > sizeof(body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(body);
+    const cJSON *role_j = cJSON_GetObjectItem(json, "role");
+    swarm_role_t new_role = SWARM_ROLE_UNSET;
+    bool valid = cJSON_IsString(role_j);
+    if (valid) {
+        if (strcmp(role_j->valuestring, "main") == 0) new_role = SWARM_ROLE_MAIN;
+        else if (strcmp(role_j->valuestring, "node") == 0) new_role = SWARM_ROLE_NODE;
+        else valid = false;
+    }
+    cJSON_Delete(json);
+    if (!valid) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid role");
+        return ESP_OK;
+    }
+
+    if (swarm_store_set_role(new_role) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "role persist failed");
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"restart_required\":true}");
+
+    if (new_role == SWARM_ROLE_NODE) {
+        TimerHandle_t t = xTimerCreate("role_restart", pdMS_TO_TICKS(1500), pdFALSE, NULL, role_restart_cb);
+        if (t) {
+            xTimerStart(t, 0);
+        } else {
+            /* Role is already persisted above, so a manual power cycle
+             * still picks it up even if we can't schedule the restart. */
+            ESP_LOGE(TAG, "failed to create role-restart timer; reboot manually to apply");
+        }
+    }
+    return ESP_OK;
+}
+
 void api_v1_register(httpd_handle_t server)
 {
     httpd_uri_t status = { .uri = "/api/v1/status", .method = HTTP_GET, .handler = status_get };
@@ -447,4 +554,10 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &unclaimu));
     httpd_uri_t ota = { .uri = "/api/v1/ota", .method = HTTP_POST, .handler = ota_post_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota));
+    httpd_uri_t nodes = { .uri = "/api/v1/nodes", .method = HTTP_GET, .handler = nodes_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &nodes));
+    httpd_uri_t nodes_pair = { .uri = "/api/v1/nodes/pair", .method = HTTP_POST, .handler = nodes_pair_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &nodes_pair));
+    httpd_uri_t role = { .uri = "/api/v1/role", .method = HTTP_POST, .handler = role_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &role));
 }
