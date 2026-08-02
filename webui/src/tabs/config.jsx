@@ -27,7 +27,7 @@ export function ConfigTab() {
   const [error, setError] = useState(false)
   const [secret, setSecret] = useState(null)     // freshly generated, shown once
   const [keyInput, setKeyInput] = useState(getKey())
-  const [busy, setBusy] = useState('')           // '' | claim | unclaim | ota | pair
+  const [busy, setBusy] = useState('')           // '' | claim | unclaim | ota | pair | retry | switch
   const [otaMsg, setOtaMsg] = useState('')
   const [otaPct, setOtaPct] = useState(null)
   const xhrRef = useRef(null)
@@ -84,6 +84,37 @@ export function ConfigTab() {
         nodesPollRef.current = setInterval(refreshNodes, 5000)
       } else {
         alert(res.status === 401 ? 'unauthorized — wrong key' : (data.error || 'pairing failed'))
+      }
+    } catch { alert('hub not reachable') }
+    setBusy('')
+  }
+
+  async function doRetryPairing() {
+    setBusy('retry')
+    try {
+      const res = await fetch('/api/v1/pair/retry', { method: 'POST', headers: authHeaders() })
+      if (res.ok) {
+        alert('Retrying — this device will restart and search for your hub again.')
+      } else {
+        alert(res.status === 401 ? 'unauthorized — wrong key' : 'retry failed')
+      }
+    } catch { alert('hub not reachable') }
+    setBusy('')
+  }
+
+  async function doSwitchToMain() {
+    if (!confirm('Switch this device back to a main hub? It will restart.')) return
+    setBusy('switch')
+    try {
+      const res = await fetch('/api/v1/role', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ role: 'main' }),
+      })
+      if (res.ok) {
+        alert('Switching to main hub — this device will restart.')
+      } else {
+        alert(res.status === 401 ? 'unauthorized — wrong key' : 'switch failed')
       }
     } catch { alert('hub not reachable') }
     setBusy('')
@@ -234,6 +265,28 @@ export function ConfigTab() {
               </button>
             </p>
           )}
+        </div>
+      )}
+
+      {st.role === 'node' && (
+        <div>
+          <h2>Node</h2>
+          {st.pair_failed && (
+            <p class="error">
+              Pairing failed — make sure the main hub's pairing window is open, then Retry.
+            </p>
+          )}
+          <p>
+            {st.pair_failed && (
+              <button onClick={doRetryPairing} disabled={busy === 'retry'}>
+                {busy === 'retry' ? 'Retrying…' : 'Retry pairing'}
+              </button>
+            )}
+            {' '}
+            <button onClick={doSwitchToMain} disabled={busy === 'switch'}>
+              {busy === 'switch' ? 'Switching…' : 'Switch back to main hub'}
+            </button>
+          </p>
         </div>
       )}
     </div>

@@ -28,6 +28,19 @@ esp_err_t swarm_start_main(void);
  * the normal portal instead in that case. */
 esp_err_t swarm_start_node(void);
 
+/* Node (role NODE, NOT yet paired, and swarm_store_pair_failed() is false):
+ * brings up the same radio-only WiFi + ESP-NOW as swarm_start_node(), then
+ * actively searches for a hub via pairing_node_start(). A watcher task
+ * (started internally) reboots this device once the search resolves --
+ * clearing the pair-failed flag and restarting on success (comes back up
+ * as a paired node via swarm_start_node()), or setting the flag and
+ * restarting on failure/timeout (comes back up in the normal portal so a
+ * human can see the failure and retry via POST /api/v1/pair/retry).
+ * Callers must check swarm_store_pair_failed() themselves first and run
+ * the portal directly instead when it's already set -- this function does
+ * not check it, so it never owns that decision. */
+esp_err_t swarm_start_node_search(void);
+
 /* Hub: writes the GET /api/v1/nodes response body into buf (NUL-terminated
  * on success). Returns the number of bytes written (excluding the NUL), or
  * -1 if buf was too small or JSON construction failed. */

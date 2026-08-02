@@ -10,6 +10,7 @@ static const char *TAG = "swarm_store";
 #define KEY_ROLE  "role"
 #define KEY_HUB   "sw_hub"
 #define KEY_NODES "sw_nodes"
+#define KEY_PFAIL "sw_pfail"
 
 typedef struct __attribute__((packed)) {
     uint8_t mac[6];
@@ -32,6 +33,7 @@ static swarm_role_t s_role;
 static bool s_hub_set;
 static hub_blob_t s_hub;
 static nodes_blob_t s_nodes;
+static bool s_pair_failed;
 
 static esp_err_t write_blob(const char *key, const void *data, size_t len)
 {
@@ -65,6 +67,7 @@ esp_err_t swarm_store_init(void)
     s_hub_set = false;
     memset(&s_hub, 0, sizeof(s_hub));
     memset(&s_nodes, 0, sizeof(s_nodes));
+    s_pair_failed = false;
 
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return ESP_OK;  /* fresh NVS = defaults */
@@ -89,8 +92,11 @@ esp_err_t swarm_store_init(void)
     }
     if (s_nodes.count > SWARM_MAX_NODES) s_nodes.count = SWARM_MAX_NODES;  /* defensive */
 
+    uint8_t pfail_byte;
+    s_pair_failed = nvs_get_u8(h, KEY_PFAIL, &pfail_byte) == ESP_OK && pfail_byte != 0;
+
     nvs_close(h);
-    ESP_LOGI(TAG, "role=%d hub_paired=%d nodes=%d", s_role, s_hub_set, s_nodes.count);
+    ESP_LOGI(TAG, "role=%d hub_paired=%d nodes=%d pair_failed=%d", s_role, s_hub_set, s_nodes.count, s_pair_failed);
     return ESP_OK;
 }
 
@@ -225,5 +231,44 @@ esp_err_t swarm_store_clear_nodes(void)
     esp_err_t err = erase_key(KEY_NODES);
     if (err == ESP_OK) memset(&s_nodes, 0, sizeof(s_nodes));
     xSemaphoreGive(s_mutex);
+    return err;
+}
+
+bool swarm_store_pair_failed(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool f = s_pair_failed;
+    xSemaphoreGive(s_mutex);
+    return f;
+}
+
+esp_err_t swarm_store_set_pair_failed(bool failed)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, KEY_PFAIL, failed ? 1 : 0);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err == ESP_OK) s_pair_failed = failed;
+    xSemaphoreGive(s_mutex);
+    return err;
+}
+
+esp_err_t swarm_store_reset_all(void)
+{
+    /* Best-effort across all four: keep going and report the first failure
+     * rather than bailing out partway and leaving some cleared and some
+     * not -- a factory reset should end up as close to fully-clean as
+     * possible even if one NVS write hiccups. */
+    esp_err_t err = swarm_store_set_role(SWARM_ROLE_UNSET);
+    esp_err_t e2 = swarm_store_clear_hub();
+    esp_err_t e3 = swarm_store_clear_nodes();
+    esp_err_t e4 = swarm_store_set_pair_failed(false);
+    if (err == ESP_OK) err = e2;
+    if (err == ESP_OK) err = e3;
+    if (err == ESP_OK) err = e4;
     return err;
 }

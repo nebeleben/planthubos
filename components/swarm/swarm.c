@@ -16,6 +16,7 @@
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -313,5 +314,60 @@ esp_err_t swarm_start_node(void)
     if (err != ESP_OK) return err;
 
     ESP_LOGI(TAG, "node started: hub=" MACSTR " channel=%u", MAC2STR(hub_mac), hub_ch);
+    return ESP_OK;
+}
+
+/* ---------------- Node side: searching for a hub (unpaired) ---------------- */
+
+#define SWARM_PAIR_SEARCH_TIMEOUT_S 120
+
+/* Polls pairing_node_state() rather than blocking on a semaphore signalled
+ * by pairing_node_start()'s own task: that task's only externally-visible
+ * outcome is this polled state (see pairing.h), so a small poll loop is
+ * the simplest correct way to notice PAIR_OK/PAIR_FAILED and act on it. */
+static void pair_watch_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        pairing_state_t st = pairing_node_state();
+        if (st == PAIR_OK) {
+            ESP_LOGI(TAG, "pairing succeeded; clearing pair-failed flag and rebooting as a paired node");
+            swarm_store_set_pair_failed(false);
+            esp_restart();
+        } else if (st == PAIR_FAILED) {
+            ESP_LOGW(TAG, "pairing failed/timed out; marking pair-failed and rebooting into the portal");
+            swarm_store_set_pair_failed(true);
+            esp_restart();
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+esp_err_t swarm_start_node_search(void)
+{
+    /* Same radio-only bring-up as swarm_start_node(), but this device has
+     * no stored hub yet -- it's actively looking for one, so there is no
+     * channel to restore and node_rx_cb (which just forwards to
+     * pairing_handle_frame) is exactly what's needed to receive PAIR_ACK. */
+    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_wifi_init(&init);
+    if (err != ESP_OK) return err;
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) return err;
+    err = esp_wifi_start();
+    if (err != ESP_OK) return err;
+
+    err = espnow_link_init(node_rx_cb);
+    if (err != ESP_OK) return err;
+
+    err = pairing_node_start(SWARM_PAIR_SEARCH_TIMEOUT_S);
+    if (err != ESP_OK) return err;
+
+    if (xTaskCreate(pair_watch_task, "swarm_pairwatch", 3072, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create pair-watch task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "searching for a hub (up to %ds)...", SWARM_PAIR_SEARCH_TIMEOUT_S);
     return ESP_OK;
 }

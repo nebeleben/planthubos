@@ -24,7 +24,15 @@ export function App() {
     fetch('/api/v1/status')
       .then((r) => r.json())
       .then((st) => {
-        setRole(st.role || 'main')   // pre-M5a hubs have no "role" field
+        const r = st.role || 'main'   // pre-M5a hubs have no "role" field
+        setRole(r)
+        // An unpaired node reaching the webui at all means it's sitting in
+        // its portal after a failed pairing attempt (a paired node runs no
+        // web server, and a searching one hasn't set up webserver either)
+        // -- Dashboard/Devices/History are all empty and pointless there,
+        // so land the user straight on the Config tab, where the retry /
+        // switch-back-to-main controls live.
+        if (r === 'node' && !st.paired) setTab('Config')
         if (!st.time_synced) {
           fetch('/api/v1/time', {
             method: 'POST',

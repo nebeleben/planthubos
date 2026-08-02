@@ -1,6 +1,7 @@
 #include "claim.h"
 #include "authtok.h"
 #include "app_config.h"
+#include "swarm_store.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -128,9 +129,17 @@ static void reset_button_task(void *arg)
             held_ms += 100;
             if (held_ms >= RESET_HOLD_MS && !fired) {
                 fired = true;
-                ESP_LOGW(TAG, "factory reset: clearing claim + wifi, restarting");
+                ESP_LOGW(TAG, "factory reset: clearing claim + wifi + swarm role/pairing, restarting");
                 claim_reset();
                 app_config_clear_wifi();
+                /* A paired node runs no web server at all -- without this,
+                 * the physical button would be its only recovery path, and
+                 * even that wouldn't work, since role/hub/node state lived
+                 * on untouched and it would just pair right back on
+                 * reboot. Clearing swarm state here returns any role
+                 * (main, node, or a node stuck in the pair-failed portal)
+                 * to a fresh ROLE_UNSET device. */
+                swarm_store_reset_all();
                 esp_restart();
             }
         } else {

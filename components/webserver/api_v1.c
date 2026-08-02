@@ -52,6 +52,22 @@ bool api_auth_ok(httpd_req_t *req)
     return claim_verify(hdr + 7);
 }
 
+/* Gate for POST /api/v1/role and POST /api/v1/pair/retry. A role flip (or a
+ * node's pairing retry) must not be forceable over the LAN against an
+ * already-onboarded, running hub: once node pairing actually works, that
+ * would let anyone on the network flip a claimed-or-not hub to node role
+ * and have a rogue ESP-NOW peer silently adopt it, hijacking all future
+ * sensor data. But requiring a claim key outright would also break the
+ * legitimate flow, since a device choosing its role for the first time (or
+ * a node retrying pairing) is never claimed. So: allow while this device
+ * is in its own AP/portal (physical/local proximity to a fresh device's
+ * own access point -- the same trust boundary onboarding already relies
+ * on), or when the caller holds a valid claim key regardless of mode. */
+static bool role_change_ok(httpd_req_t *req)
+{
+    return wifi_manager_is_ap_mode() || api_auth_ok(req);
+}
+
 static const char *role_str(swarm_role_t r)
 {
     switch (r) {
@@ -81,6 +97,7 @@ static esp_err_t status_get(httpd_req_t *req)
     bool paired = (role == SWARM_ROLE_NODE) ? swarm_store_hub(NULL, NULL, NULL)
                                              : swarm_store_node_count() > 0;
     cJSON_AddBoolToObject(root, "paired", paired);
+    cJSON_AddBoolToObject(root, "pair_failed", swarm_store_pair_failed());
     size_t fs_total = 0, fs_used = 0;
     if (esp_littlefs_info("storage", &fs_total, &fs_used) == ESP_OK) {
         cJSON_AddNumberToObject(root, "fs_total", fs_total);
@@ -465,20 +482,47 @@ static esp_err_t nodes_pair_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* Fires ~1.5s after the response for a role change to "node" goes out, same
- * "let the client see the response first" pattern as wifi_post's
- * apply_creds_cb. A role switch to node fundamentally changes the boot path
- * (radio-only wifi, no webserver at all once paired) so it is applied via a
- * clean reboot rather than trying to tear down webserver/wifi_manager live. */
-static void role_restart_cb(TimerHandle_t t)
+/* Fires ~1.5s after the response for a role change to "node" (or a pairing
+ * retry) goes out, same "let the client see the response first" pattern as
+ * wifi_post's apply_creds_cb. Both cases fundamentally change the boot path
+ * (radio-only wifi while searching/paired, no webserver at all once
+ * paired), so they're applied via a clean reboot rather than trying to
+ * tear down webserver/wifi_manager live. */
+static void delayed_restart_cb(TimerHandle_t t)
 {
     xTimerDelete(t, 0);
     esp_restart();
 }
 
+static void schedule_restart(const char *timer_name)
+{
+    TimerHandle_t t = xTimerCreate(timer_name, pdMS_TO_TICKS(1500), pdFALSE, NULL, delayed_restart_cb);
+    if (t) {
+        xTimerStart(t, 0);
+    } else {
+        /* Whatever state change the caller made is already persisted, so a
+         * manual power cycle still picks it up even if we can't schedule
+         * the restart. */
+        ESP_LOGE(TAG, "failed to create %s timer; reboot manually to apply", timer_name);
+    }
+}
+
+static esp_err_t pair_retry_post(httpd_req_t *req)
+{
+    if (!role_change_ok(req)) return api_send_401(req);
+    if (swarm_store_set_pair_failed(false) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "retry failed");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"restart_required\":true}");
+    schedule_restart("pair_retry");
+    return ESP_OK;
+}
+
 static esp_err_t role_post(httpd_req_t *req)
 {
-    if (!api_auth_ok(req)) return api_send_401(req);
+    if (!role_change_ok(req)) return api_send_401(req);
 
     char body[64];
     if (req->content_len == 0 || req->content_len > sizeof(body) - 1) {
@@ -511,6 +555,7 @@ static esp_err_t role_post(httpd_req_t *req)
         return ESP_OK;
     }
 
+    swarm_role_t old_role = swarm_store_role();
     if (swarm_store_set_role(new_role) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "role persist failed");
         return ESP_OK;
@@ -519,16 +564,16 @@ static esp_err_t role_post(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true,\"restart_required\":true}");
 
-    if (new_role == SWARM_ROLE_NODE) {
-        TimerHandle_t t = xTimerCreate("role_restart", pdMS_TO_TICKS(1500), pdFALSE, NULL, role_restart_cb);
-        if (t) {
-            xTimerStart(t, 0);
-        } else {
-            /* Role is already persisted above, so a manual power cycle
-             * still picks it up even if we can't schedule the restart. */
-            ESP_LOGE(TAG, "failed to create role-restart timer; reboot manually to apply");
-        }
-    }
+    /* UNSET and MAIN both already run the exact same live boot path (see
+     * main.c), so a transition between only those two needs no restart --
+     * that's what lets onboarding's "choose main hub" drop straight into
+     * the Network tab with no reboot. But any transition touching NODE on
+     * either side -- becoming one, or recovering from one via the Config
+     * tab's "switch back to main hub" button on an unpaired node sitting
+     * in its own portal -- changes what's actually running (webserver +
+     * wifi_manager + swarm_start_main vs. radio-only ESP-NOW) and needs a
+     * clean reboot to take effect. */
+    if (new_role == SWARM_ROLE_NODE || old_role == SWARM_ROLE_NODE) schedule_restart("role_restart");
     return ESP_OK;
 }
 
@@ -560,4 +605,6 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &nodes_pair));
     httpd_uri_t role = { .uri = "/api/v1/role", .method = HTTP_POST, .handler = role_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &role));
+    httpd_uri_t pair_retry = { .uri = "/api/v1/pair/retry", .method = HTTP_POST, .handler = pair_retry_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &pair_retry));
 }

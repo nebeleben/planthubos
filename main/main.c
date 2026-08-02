@@ -72,14 +72,35 @@ void app_main(void)
      * ROLE_UNSET and ROLE_MAIN. */
     ESP_ERROR_CHECK(swarm_store_init());
     swarm_role_t role = swarm_store_role();
-    bool node_ready = (role == SWARM_ROLE_NODE) && swarm_store_hub(NULL, NULL, NULL);
+    bool node_paired = (role == SWARM_ROLE_NODE) && swarm_store_hub(NULL, NULL, NULL);
+    /* Unpaired node, no pairing failure on record yet: actively search for
+     * a hub instead of sitting in a portal nobody asked to see -- this is
+     * the reconciliation between task-5 ("unpaired node runs the portal")
+     * and task-6 ("choosing node sweeps for a hub"): search first, and
+     * only fall back to the portal once a search has actually failed. */
+    bool node_should_search = (role == SWARM_ROLE_NODE) && !node_paired && !swarm_store_pair_failed();
 
-    if (node_ready) {
+    if (node_paired) {
         /* Node, already paired to a hub: no web server, no storage sampler,
          * no STA/AP management -- radio-only wifi so ESP-NOW can run, plus
          * BLE collection (started below, common to both roles). */
         esp_err_t nerr = swarm_start_node();
         if (nerr != ESP_OK) ESP_LOGE(TAG, "node start failed (%s)", esp_err_to_name(nerr));
+    } else if (node_should_search) {
+        /* Radio-only, same as the paired-node branch above -- no
+         * webserver/wifi_manager while actively sweeping, since pairing
+         * needs to hop channels freely and a portal would fight it for the
+         * radio. A watcher task (started inside) reboots this device once
+         * the search resolves, landing either in the paired branch above
+         * (success) or the portal branch below (failure, via the
+         * persisted pair-failed flag). */
+        esp_err_t serr = swarm_start_node_search();
+        if (serr != ESP_OK) {
+            ESP_LOGE(TAG, "node search failed to start (%s); falling back to the portal", esp_err_to_name(serr));
+            ESP_ERROR_CHECK(webserver_start());
+            ota_rollback_guard_start();
+            ESP_ERROR_CHECK(wifi_manager_start());
+        }
     } else {
         ESP_ERROR_CHECK(webserver_start());
         /* Before wifi starts, so the guard sees the very first AP_START/GOT_IP. */
@@ -87,13 +108,14 @@ void app_main(void)
         ESP_ERROR_CHECK(wifi_manager_start());
         if (role != SWARM_ROLE_NODE) {
             /* ROLE_UNSET or ROLE_MAIN: this is today's hub, with
-             * swarm_start_main() as the only addition. An unpaired
-             * ROLE_NODE falls into this same portal branch above (so the
-             * user can see status and retry pairing) but must not itself
-             * act as a hub, hence the guard here. */
+             * swarm_start_main() as the only addition. */
             esp_err_t serr = swarm_start_main();
             if (serr != ESP_OK) ESP_LOGE(TAG, "swarm (main) start failed (%s)", esp_err_to_name(serr));
         }
+        /* role == NODE only reaches here when swarm_store_pair_failed() is
+         * true: the portal is shown so the user can see what happened and
+         * retry via POST /api/v1/pair/retry. Do not sweep in this state --
+         * the portal owns the radio/channel. */
     }
 
     esp_err_t ble_err = ble_collector_start();

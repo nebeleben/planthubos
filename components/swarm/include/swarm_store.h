@@ -30,3 +30,19 @@ int swarm_store_node_count(void);
 bool swarm_store_node_at(int idx, uint8_t mac_out[6], uint8_t lmk_out[SWARM_LMK_LEN]);
 esp_err_t swarm_store_add_node(const uint8_t mac[6], const uint8_t lmk[SWARM_LMK_LEN]);
 esp_err_t swarm_store_clear_nodes(void);
+
+/* Node side: true once a pairing search (pairing_node_start(), driven by
+ * swarm_start_node_search()) has run to completion and failed/timed out.
+ * An unpaired node checks this at boot to decide whether to actively sweep
+ * for a hub again (flag clear) or sit in the portal so a human can see the
+ * failure and retry via POST /api/v1/pair/retry (flag set). Cleared on a
+ * successful pairing and by a factory reset. */
+bool      swarm_store_pair_failed(void);
+esp_err_t swarm_store_set_pair_failed(bool failed);
+
+/* Factory reset: returns this device to a fresh, role-unset state --
+ * clears role, the stored hub peer, the node table and the pair-failed
+ * flag. Used by claim.c's physical reset button so a node (which may run
+ * no web server at all once paired) is always recoverable without
+ * reflashing. */
+esp_err_t swarm_store_reset_all(void);
