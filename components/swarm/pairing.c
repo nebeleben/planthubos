@@ -259,6 +259,20 @@ static void hub_task(void *arg)
             wifi_country_t country;
             if (esp_wifi_get_country(&country) == ESP_OK) {
                 memcpy(ack.country, country.cc, sizeof(ack.country));
+                /* country.cc is NOT a NUL-terminated 2-letter code: IDF
+                 * defines it as a 3-byte array whose third octet is the
+                 * 802.11d "environment" character ('O'=outdoor, 'I'=indoor,
+                 * 'X'=non-country-specific, ' '=either) -- e.g. Switzerland
+                 * reads back as {'C','H','O'} or {'C','H',' '}, never
+                 * {'C','H','\0'}. Force the NUL here so this frame's
+                 * ack.country is always a proper 2-char C string: the node
+                 * passes it straight to esp_wifi_set_country_code() as a
+                 * const char *, %s's it into logs, and persists it, so a raw
+                 * copy is an out-of-bounds read past this 3-byte buffer on
+                 * every one of those uses, and would additionally persist
+                 * "CH " instead of "CH". Do NOT "restore" the plain memcpy
+                 * above to also cover this byte -- that's the bug. */
+                ack.country[2] = '\0';
             } else {
                 ESP_LOGW(TAG, "adopt " MACSTR ": esp_wifi_get_country failed; PAIR_ACK will "
                               "carry no country (node keeps its compile-time default)",
@@ -494,7 +508,37 @@ static void node_task(void *arg)
                  * whatever country this device already has (its own
                  * compile-time default, or one learned at an earlier
                  * pairing). */
-                if (ack.country[0] != '\0') {
+                bool country_present = ack.country[0] != '\0';
+                bool country_valid = country_present;
+                if (country_present) {
+                    /* Never trust the wire shape: on real hardware this
+                     * field was found to arrive without the hub's intended
+                     * NUL termination (see hub_task()'s comment on
+                     * esp_wifi_get_country() -- its third octet is IDF's
+                     * 802.11d environment character, not a terminator), and
+                     * this path went unexercised until the very next
+                     * pairing after that bug was introduced, since existing
+                     * boards were migrated rather than re-paired. Validate
+                     * before doing anything with it: require the two
+                     * country-code characters to be alphanumeric, then force
+                     * the NUL ourselves regardless of what the hub actually
+                     * sent. A frame that fails validation is ignored outright
+                     * -- this node keeps its compile-time default rather
+                     * than applying/persisting garbage or reading past this
+                     * 3-byte array. */
+                    char c0 = ack.country[0], c1 = ack.country[1];
+                    bool alnum0 = (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || (c0 >= '0' && c0 <= '9');
+                    bool alnum1 = (c1 >= 'A' && c1 <= 'Z') || (c1 >= 'a' && c1 <= 'z') || (c1 >= '0' && c1 <= '9');
+                    if (!alnum0 || !alnum1) {
+                        ESP_LOGW(TAG, "PAIR_ACK country (bytes 0x%02x 0x%02x) is not alphanumeric; "
+                                      "ignoring, keeping compile-time default",
+                                 (unsigned)c0, (unsigned)c1);
+                        country_valid = false;
+                    } else {
+                        ack.country[2] = '\0';
+                    }
+                }
+                if (country_valid) {
                     esp_err_t cc_err = esp_wifi_set_country_code(ack.country, false);
                     if (cc_err != ESP_OK) {
                         ESP_LOGW(TAG, "esp_wifi_set_country_code(%s) failed: %s",

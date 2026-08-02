@@ -34,7 +34,12 @@ function Row({ n, nowS, onSaved, onForgotten }) {
   }
 
   async function forget() {
-    if (!confirm(`Forget node ${n.name || n.mac}? It will need to be re-paired before it can send readings again.`)) return
+    if (!confirm(
+      `Forget node ${n.name || n.mac}? The node itself will keep believing it is paired: the hub ` +
+      `will silently drop its readings after radio-acking them, so the node sees "successful" sends ` +
+      `and never triggers a resync on its own. To actually recover it, someone must physically hold ` +
+      `the node's BOOT button for 10 seconds to force it back into pairing mode.`
+    )) return
     setForgetting(true)
     try {
       const res = await fetch(`/api/v1/nodes/${n.mac.replaceAll(':', '')}`, {

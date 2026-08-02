@@ -47,8 +47,21 @@ int main(void)
     assert(swarm_decode_pair_req(buf, n, &rq_out) && rq_out.nonce == 0xDEADBEEF);
 
     swarm_pair_ack_t ak = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_PAIR_ACK,
-                            .channel = 6, .nonce = 0xDEADBEEF, .country = "CH" };
+                            .channel = 6, .nonce = 0xDEADBEEF };
     for (int i = 0; i < SWARM_LMK_LEN; i++) ak.lmk[i] = (uint8_t)(i * 3 + 1);
+    /* Mirror what the hub actually puts in ack.country, not the convenient
+     * pre-terminated shape it never produces on the wire: IDF's
+     * wifi_country_t.cc is NOT NUL-terminated -- its third octet is the
+     * 802.11d "environment" character ('O'/'I'/'X'/' '), so a real
+     * esp_wifi_get_country() read-back for Switzerland comes back as
+     * {'C','H','O'}, never {'C','H','\0'}. This is exactly the shape that
+     * went unexercised until the very next real pairing (existing boards
+     * were migrated, not re-paired) and turned into an out-of-bounds read on
+     * the node. pairing.c's hub_task() forces ack.country[2] = '\0' right
+     * after its memcpy specifically so this never reaches the wire -- mirror
+     * that same fix here rather than asserting the un-terminated raw shape. */
+    memcpy(ak.country, "CH", 2);
+    ak.country[2] = '\0';
     n = swarm_encode_pair_ack(&ak, buf, sizeof(buf));
     assert(n == sizeof(ak));
     swarm_pair_ack_t ak_out;
@@ -57,9 +70,11 @@ int main(void)
     assert(memcmp(ak_out.lmk, ak.lmk, SWARM_LMK_LEN) == 0);
     assert(memcmp(ak_out.country, "CH", 3) == 0);
 
-    /* the world-safe "01" default round-trips too (third byte is the NUL,
-     * not a third country-code character -- see swarm_frame.h) */
-    memcpy(ak.country, "01", 3);
+    /* the world-safe "01" default, same story: NUL-terminate before encoding,
+     * same as hub_task() does, rather than assuming the raw country-code
+     * bytes already end in NUL. */
+    memcpy(ak.country, "01", 2);
+    ak.country[2] = '\0';
     n = swarm_encode_pair_ack(&ak, buf, sizeof(buf));
     assert(swarm_decode_pair_ack(buf, n, &ak_out));
     assert(memcmp(ak_out.country, "01", 3) == 0);

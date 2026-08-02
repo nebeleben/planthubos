@@ -36,14 +36,27 @@ typedef struct __attribute__((packed)) {
     uint8_t  channel;    /* the hub's current wifi channel, 1..13 */
     uint8_t  lmk[SWARM_LMK_LEN];
     uint32_t nonce;
-    char     country[3]; /* hub's effective regulatory domain (esp_wifi_get_country(),
-                             2 chars + NUL, e.g. "CH", or "01" for world-safe) --
-                             PlanV1 3.3 country inheritance. The hub is associated
-                             and may legitimately use 802.11d for its OWN radio, but
-                             this field only ever carries whatever it reads back, never
+    char     country[3]; /* hub's effective regulatory domain: intended shape is
+                             2 chars + NUL, e.g. "CH", or "01" for world-safe --
+                             PlanV1 3.3 country inheritance. IMPORTANT: IDF's
+                             wifi_country_t.cc (what pairing.c's hub_task() reads
+                             this from via esp_wifi_get_country()) is NOT
+                             NUL-terminated -- its third octet is the 802.11d
+                             "environment" character ('O'/'I'/'X'/' '). hub_task()
+                             forces country[2]='\0' after copying specifically so
+                             THIS wire field is always a proper C string; do not
+                             assume every producer/consumer of this struct gets
+                             that for free, and never remove that forced NUL. A
+                             receiver still must not trust it blindly (see
+                             pairing.c node-side PAIR_ACK handling, which validates
+                             country[0]/[1] as alphanumeric and re-forces the NUL
+                             itself before use). The hub is associated and may
+                             legitimately use 802.11d for its OWN radio, but this
+                             field only ever carries whatever it reads back, never
                              a value the node is allowed to derive itself: the node
-                             must never enable 802.11d (it never associates, and doing
-                             so disabled its transmitter outright -- see espnow_link.c). */
+                             must never enable 802.11d (it never associates, and
+                             doing so disabled its transmitter outright -- see
+                             espnow_link.c). */
 } swarm_pair_ack_t;
 
 /* Node -> hub, unicast, encrypted. Absent values use the storage markers. */

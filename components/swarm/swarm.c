@@ -464,6 +464,7 @@ static void forward_task(void *arg)
 
     for (;;) {
         bool have_reading = xQueueReceive(s_fwd_queue, &r, 0) == pdTRUE;
+        bool from_backlog = false;
 
         if (!have_reading) {
             buffered_reading_t br;
@@ -484,6 +485,7 @@ static void forward_task(void *arg)
                 uint32_t total_s = (uint32_t)r.age_s + extra_s;
                 r.age_s = (total_s > UINT16_MAX) ? UINT16_MAX : (uint16_t)total_s;
                 have_reading = true;
+                from_backlog = true;
             } else {
                 /* Nothing live, nothing buffered: block until a live
                  * reading arrives. Draining is only ever driven by this
@@ -519,6 +521,34 @@ static void forward_task(void *arg)
             ESP_LOGI(TAG, "resync after %d consecutive failures: %s",
                      consec_fail, esp_err_to_name(rerr));
             consec_fail = 0;
+        }
+
+        /* Backoff, but only while draining the backlog: a LIVE reading that
+         * fails still falls straight through to the top of the loop (a
+         * fresh live reading may already be waiting, and preferring it over
+         * a stale backlog is the whole point of the check at the top of
+         * this loop), same as before this change. The backlog case is
+         * different. M5a had no backlog at all, so once a node's small
+         * live traffic dried up during a hub outage this task simply ran
+         * out of anything to send and blocked on the queue receive further
+         * up (portMAX_DELAY) -- that blocking self-limited the retry rate
+         * for free. The backlog broke that: once it's non-empty this task
+         * never blocks any more -- pop, send (espnow_link.c's send_blocking()
+         * resolves a failure within its own ~200ms completion wait, not the
+         * multi-second span of a full channel sweep), re-buffer, loop -- so
+         * a prolonged hub outage now has the node spending essentially all
+         * of its time either send-failing or, every SWARM_FWD_FAIL_THRESHOLD
+         * failures, sweeping all 13 channels (~6.5s) for a hub that isn't
+         * there. A one-second delay here caps that to roughly one attempt
+         * per second, which is plenty fast to notice the hub coming back
+         * while not spinning for the length of the outage. This matters
+         * more than the CPU cost alone suggests:
+         * M7's battery-powered nodes will pay for every one of these
+         * attempts in radio-on wake time, so an unthrottled retry loop
+         * during a multi-hour hub outage would be a real, avoidable battery
+         * cost, not just wasted cycles. */
+        if (from_backlog) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 }
