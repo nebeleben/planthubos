@@ -139,13 +139,34 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
          * during an operator-opened window and is pairing_handle_frame's
          * job to police. */
         if (!is_paired_node(src_mac)) {
-            /* Rate-limited: a noisy or hostile neighbour repeatedly
-             * broadcasting garbage READING frames must not be able to
-             * flood the console via this path. */
+            /* WARN (not DEBUG) and includes every stored node MAC being
+             * compared against, not just the rejected sender -- this gate
+             * started rejecting a legitimate, hardware-confirmed-paired
+             * node immediately after 47f3db9 put the node's radio into
+             * APSTA mode, and the leading theory is that ESP-NOW frames
+             * from a node now egress tagged with its SoftAP interface MAC
+             * (conventionally base-MAC + 1) rather than the STA MAC that
+             * got stored at pairing time -- a mismatch that was invisible
+             * before this gate existed, since nothing previously compared
+             * the two. This log is diagnostic evidence for that, not a
+             * fix: still rate-limited to once per 5s so a noisy/hostile
+             * neighbour can't flood the console, and the gate's behaviour
+             * is unchanged -- do not weaken or remove it without first
+             * confirming what src_mac actually is here. */
             static int64_t s_last_drop_log_us;
             int64_t now_us = esp_timer_get_time();
             if (now_us - s_last_drop_log_us > 5000000) {
-                ESP_LOGD(TAG, "dropping READING from unpaired " MACSTR, MAC2STR(src_mac));
+                char known[SWARM_MAX_NODES * 20 + 8] = "";
+                int n = swarm_store_node_count();
+                for (int i = 0; i < n; i++) {
+                    uint8_t mac[6];
+                    if (!swarm_store_node_at(i, mac, NULL)) continue;
+                    char one[20];
+                    snprintf(one, sizeof(one), "%s" MACSTR, (known[0] != '\0') ? ", " : "", MAC2STR(mac));
+                    strlcat(known, one, sizeof(known));
+                }
+                ESP_LOGW(TAG, "dropping READING from " MACSTR ", known nodes: %s",
+                         MAC2STR(src_mac), n > 0 ? known : "(none)");
                 s_last_drop_log_us = now_us;
             }
             return;
