@@ -18,6 +18,12 @@ function Tile({ s, nowS }) {
         <div><span class="val">{s.conductivity ?? '–'}</span><span class="unit">µS/cm</span></div>
       </div>
       <p class="seen">{ago(s.last_seen_s, nowS)}</p>
+      {/* s.via is null when the hub heard this sensor directly on its own
+          BLE radio -- the common case -- so nothing renders there. Non-null
+          means a node relayed it (strongest-RSSI wins, see registry.h), and
+          this is the only place that becomes visible: move a plant closer
+          to a different node and this line switches automatically. */}
+      {s.via && <p class="via">via {s.via.name || s.via.mac} · {s.via.rssi} dBm</p>}
     </div>
   )
 }

@@ -37,6 +37,12 @@ function Row({ s, onSaved }) {
       <td class="mono">{s.mac}</td>
       <td>{s.battery != null ? `${s.battery}%` : '–'}</td>
       <td>{s.moisture != null ? `${s.moisture}%` : '–'}</td>
+      {/* Direct BLE reception (the hub hearing it on its own radio) is the
+          strictly-better case and renders nothing here; a non-null via
+          means a node currently relays this sensor (strongest RSSI wins --
+          see registry.h) and names which one, so re-attribution after
+          moving a plant is visible instead of mysterious. */}
+      <td class="via">{s.via ? `via ${s.via.name || s.via.mac} · ${s.via.rssi} dBm` : ''}</td>
     </tr>
   )
 }
@@ -61,7 +67,7 @@ export function DevicesTab() {
   if (sensors.length === 0) return <p class="placeholder">No sensors discovered yet.</p>
   return (
     <table class="devices">
-      <thead><tr><th>Name</th><th>MAC</th><th>Battery</th><th>Moisture</th></tr></thead>
+      <thead><tr><th>Name</th><th>MAC</th><th>Battery</th><th>Moisture</th><th>Via</th></tr></thead>
       <tbody>{sensors.map((s) => <Row key={s.mac} s={s} onSaved={onSaved} />)}</tbody>
     </table>
   )

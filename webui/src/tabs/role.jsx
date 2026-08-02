@@ -62,13 +62,13 @@ export function RoleTab({ onMainChosen }) {
         {nodePhase === 'pairing' ? (
           <p>
             This device will leave its setup network shortly. If you haven’t
-            already, open pairing on your main hub now (Config &rarr; Add node).
+            already, open pairing on your main hub now (Nodes &rarr; Add node).
           </p>
         ) : (
           <p>
             This device has left its setup network, which is exactly what a
             paired node does. Check your main hub’s node list
-            (Config &rarr; Nodes) to confirm it was adopted.
+            (Nodes tab) to confirm it was adopted.
           </p>
         )}
       </div>
@@ -90,7 +90,7 @@ export function RoleTab({ onMainChosen }) {
           <h2>Node</h2>
           <p>Extends BLE range. Never joins WiFi; forwards readings to your main hub over its own radio link.</p>
           <p class="hint">
-            Two steps: first open pairing on your main hub (Config &rarr; Add node),
+            Two steps: first open pairing on your main hub (Nodes &rarr; Add node),
             <em> then</em> press Continue here.
           </p>
           <button onClick={chooseNode} disabled={busy !== ''}>

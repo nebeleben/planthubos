@@ -4,9 +4,10 @@ import { DashboardTab } from './tabs/dashboard.jsx'
 import { DevicesTab } from './tabs/devices.jsx'
 import { HistoryTab } from './tabs/history.jsx'
 import { NetworkTab } from './tabs/network.jsx'
+import { NodesTab } from './tabs/nodes.jsx'
 import { RoleTab } from './tabs/role.jsx'
 
-const TABS = ['Dashboard', 'Devices', 'History', 'Config', 'Network']
+const ALL_TABS = ['Dashboard', 'Devices', 'History', 'Nodes', 'Config', 'Network']
 
 function Placeholder({ name }) {
   return <p class="placeholder">{name} — coming in a later milestone.</p>
@@ -57,6 +58,11 @@ export function App() {
     )
   }
 
+  // Nodes only means anything on a hub (unset/main); a node device runs no
+  // node-management surface of its own, so hide the tab there rather than
+  // rendering an empty/confusing list.
+  const TABS = role === 'node' ? ALL_TABS.filter((t) => t !== 'Nodes') : ALL_TABS
+
   return (
     <div class="app">
       <header>
@@ -73,6 +79,7 @@ export function App() {
         {tab === 'Dashboard' ? <DashboardTab /> :
          tab === 'Devices' ? <DevicesTab /> :
          tab === 'History' ? <HistoryTab /> :
+         tab === 'Nodes' ? <NodesTab /> :
          tab === 'Config' ? <ConfigTab /> :
          tab === 'Network' ? <NetworkTab /> :
          <Placeholder name={tab} />}
