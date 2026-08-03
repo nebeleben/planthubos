@@ -47,7 +47,57 @@ typedef struct __attribute__((packed)) {
     node_entry_v0_t n[SWARM_STORE_V0_MAX_NODES];
 } nodes_blob_v0_t;
 
+/* ---------------- Locking invariant (M5c narrowing) ----------------
+ *
+ * Before M5c, every write here held s_mutex across its own nvs_commit() --
+ * a synchronous flash operation that can take single-digit milliseconds.
+ * is_paired_node() and swarm_store_node_name() (swarm.c) are called from
+ * the ESP-NOW receive callback (the WiFi driver task) and from the SSE
+ * path, both of which read through s_mutex -- so an operator renaming or
+ * forgetting a node could stall the WiFi task for the length of a flash
+ * commit, and the project-wide rule is that the receive callback must
+ * never block on flash. Two mutexes fix this:
+ *
+ *   - s_mutex guards ONLY the in-RAM cache (s_role/s_hub/s_hub_cc/s_nodes/
+ *     s_pair_failed). Every hold of it is a short, bounded, allocation-
+ *     free memcpy/compare -- never flash I/O. This is the invariant reads
+ *     depend on: swarm_store_role()/swarm_store_hub()/swarm_store_node_at()/
+ *     swarm_store_node_name()/etc. NEVER wait on a flash commit, no matter
+ *     what else is happening concurrently.
+ *
+ *   - s_nvs_mutex guards the actual NVS write/erase + nvs_commit(). Every
+ *     writer below follows the same three-step shape: (1) under s_mutex,
+ *     compute the new RAM state and store it into the cache immediately --
+ *     so a reader arriving right after this step already sees the new
+ *     value, even though it is not yet durable; (2) while STILL holding
+ *     s_mutex, take s_nvs_mutex, then release s_mutex; (3) perform the
+ *     flash write under s_nvs_mutex alone, then release it. Taking
+ *     s_nvs_mutex before giving up s_mutex (rather than after) is what
+ *     prevents a race between two concurrent writers: it forces flash
+ *     writes to be attempted in the same order their RAM mutations were
+ *     applied, so a second writer's (newer, superset) blob can never be
+ *     overwritten in flash by a first writer's (older) one committing
+ *     late. The only cost is narrow and bounded: if a second write starts
+ *     while a first write's flash commit is still in flight, that second
+ *     writer holds s_mutex for the (short) remainder of the first commit
+ *     while waiting for s_nvs_mutex -- so a reader would only ever wait on
+ *     flash in the rare case of two overlapping writes to this store,
+ *     never for a single writer's own commit. Every write path here (node
+ *     rename/forget from the UI, a pairing/resync event, a role change) is
+ *     human- or protocol-paced, seconds apart at minimum, so in practice
+ *     this edge case does not occur.
+ *
+ *   - Consequence: the RAM cache can run ahead of flash if a commit later
+ *     fails (logged, not silently swallowed) -- it is the source of truth
+ *     for the rest of THIS boot regardless. A failed write is only
+ *     "corrected" by the next successful write, or by a reboot (which
+ *     reloads from whatever IS durable, silently reverting to the last
+ *     value that actually committed). This mirrors the tradeoff
+ *     load_nodes_blob() already accepts for its own migration-write
+ *     failure path below ("kept in RAM for this boot only").
+ */
 static SemaphoreHandle_t s_mutex;
+static SemaphoreHandle_t s_nvs_mutex;
 static swarm_role_t s_role;
 static bool s_hub_set;
 static hub_blob_t s_hub;
@@ -193,7 +243,8 @@ static void load_nodes_blob(nvs_handle_t h, nodes_blob_t *out)
 esp_err_t swarm_store_init(void)
 {
     s_mutex = xSemaphoreCreateMutex();
-    if (!s_mutex) return ESP_ERR_NO_MEM;
+    s_nvs_mutex = xSemaphoreCreateMutex();
+    if (!s_mutex || !s_nvs_mutex) return ESP_ERR_NO_MEM;
 
     s_role = SWARM_ROLE_UNSET;
     s_hub_set = false;
@@ -257,6 +308,10 @@ swarm_role_t swarm_store_role(void)
 esp_err_t swarm_store_set_role(swarm_role_t r)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_role = r;                                    /* RAM commits now; see locking invariant above */
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);     /* reserve write order before releasing s_mutex */
+    xSemaphoreGive(s_mutex);
+
     nvs_handle_t h;
     esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
     if (err == ESP_OK) {
@@ -264,8 +319,12 @@ esp_err_t swarm_store_set_role(swarm_role_t r)
         if (err == ESP_OK) err = nvs_commit(h);
         nvs_close(h);
     }
-    if (err == ESP_OK) s_role = r;
-    xSemaphoreGive(s_mutex);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_role(%d): NVS write failed (%s); RAM cache already "
+                      "reflects the new role and will not revert until the next successful "
+                      "write or a reboot", r, esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -290,12 +349,18 @@ esp_err_t swarm_store_set_hub(const uint8_t mac[6], const uint8_t lmk[SWARM_LMK_
     blob.channel = channel;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    esp_err_t err = write_blob(KEY_HUB, &blob, sizeof(blob));
-    if (err == ESP_OK) {
-        s_hub = blob;
-        s_hub_set = true;
-    }
+    s_hub = blob;
+    s_hub_set = true;
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
+
+    esp_err_t err = write_blob(KEY_HUB, &blob, sizeof(blob));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_hub: NVS write failed (%s); RAM cache already "
+                      "reflects the new hub and will not revert until the next successful "
+                      "write or a reboot", esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -308,9 +373,17 @@ esp_err_t swarm_store_set_channel(uint8_t channel)
     }
     hub_blob_t blob = s_hub;
     blob.channel = channel;
-    esp_err_t err = write_blob(KEY_HUB, &blob, sizeof(blob));
-    if (err == ESP_OK) s_hub = blob;
+    s_hub = blob;
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
+
+    esp_err_t err = write_blob(KEY_HUB, &blob, sizeof(blob));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_channel(%u): NVS write failed (%s); RAM cache already "
+                      "reflects the new channel and will not revert until the next successful "
+                      "write or a reboot", channel, esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -327,35 +400,49 @@ bool swarm_store_hub_country(char out[3])
 esp_err_t swarm_store_set_hub_country(const char cc[3])
 {
     if (!cc) return ESP_ERR_INVALID_ARG;
+    char cc_copy[3];
+    memcpy(cc_copy, cc, 3);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    esp_err_t err = write_blob(KEY_HUBCC, cc, 3);
-    if (err == ESP_OK) {
-        memcpy(s_hub_cc, cc, sizeof(s_hub_cc));
-        s_hub_cc_set = true;
-    }
+    memcpy(s_hub_cc, cc_copy, sizeof(s_hub_cc));
+    s_hub_cc_set = true;
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
+
+    esp_err_t err = write_blob(KEY_HUBCC, cc_copy, 3);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_hub_country: NVS write failed (%s); RAM cache already "
+                      "reflects the new country and will not revert until the next successful "
+                      "write or a reboot", esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
 esp_err_t swarm_store_clear_hub(void)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    esp_err_t err = erase_key(KEY_HUB);
+    s_hub_set = false;
+    memset(&s_hub, 0, sizeof(s_hub));
     /* Best-effort, same reasoning as swarm_store_reset_all(): the country
      * is meaningless once unpaired from the hub that reported it, so clear
-     * it too, but don't let a failure here mask the hub-blob erase result
-     * above (the more important of the two). */
-    esp_err_t cc_err = erase_key(KEY_HUBCC);
-    if (err == ESP_OK) {
-        s_hub_set = false;
-        memset(&s_hub, 0, sizeof(s_hub));
-    }
-    if (cc_err == ESP_OK) {
-        s_hub_cc_set = false;
-        memset(s_hub_cc, 0, sizeof(s_hub_cc));
-    }
+     * it too, in the same RAM update. */
+    s_hub_cc_set = false;
+    memset(s_hub_cc, 0, sizeof(s_hub_cc));
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
+
+    esp_err_t err = erase_key(KEY_HUB);
+    esp_err_t cc_err = erase_key(KEY_HUBCC);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_clear_hub: NVS erase failed (%s); RAM cache already "
+                      "cleared and will not revert until the next successful write or a reboot",
+                 esp_err_to_name(err));
+    }
+    if (cc_err != ESP_OK) {
+        ESP_LOGW(TAG, "swarm_store_clear_hub: hub-country NVS erase failed: %s", esp_err_to_name(cc_err));
+    }
+    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -402,10 +489,17 @@ esp_err_t swarm_store_add_node(const uint8_t mac[6], const uint8_t lmk[SWARM_LMK
     /* name is deliberately left as-is: re-adopting an already-known MAC
      * (see pairing.c's find_stored_lmk()/idempotent re-ack) must not wipe
      * an operator-assigned name out from under them. */
+    s_nodes = blob;
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreGive(s_mutex);
 
     esp_err_t err = write_blob(KEY_NODES, &blob, sizeof(blob));
-    if (err == ESP_OK) s_nodes = blob;
-    xSemaphoreGive(s_mutex);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_add_node: NVS write failed (%s); RAM cache already "
+                      "reflects the new node table and will not revert until the next "
+                      "successful write or a reboot", esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -428,10 +522,17 @@ esp_err_t swarm_store_set_node_name(const uint8_t mac[6], const char *name)
     }
     memset(blob.n[idx].name, 0, sizeof(blob.n[idx].name));
     if (len) memcpy(blob.n[idx].name, name, len);  /* len == 0 clears */
+    s_nodes = blob;
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreGive(s_mutex);
 
     esp_err_t err = write_blob(KEY_NODES, &blob, sizeof(blob));
-    if (err == ESP_OK) s_nodes = blob;
-    xSemaphoreGive(s_mutex);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_node_name: NVS write failed (%s); RAM cache already "
+                      "reflects the new name and will not revert until the next successful "
+                      "write or a reboot", esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -467,22 +568,35 @@ esp_err_t swarm_store_forget_node(const uint8_t mac[6])
     for (int i = idx; i < blob.count - 1; i++) blob.n[i] = blob.n[i + 1];
     blob.count--;
     memset(&blob.n[blob.count], 0, sizeof(blob.n[blob.count]));  /* clear the vacated tail slot */
+    s_nodes = blob;
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreGive(s_mutex);
 
     esp_err_t err = write_blob(KEY_NODES, &blob, sizeof(blob));
-    if (err == ESP_OK) s_nodes = blob;
-    xSemaphoreGive(s_mutex);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_forget_node: NVS write failed (%s); RAM cache already "
+                      "reflects the forgotten node and will not revert until the next "
+                      "successful write or a reboot", esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
 esp_err_t swarm_store_clear_nodes(void)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    esp_err_t err = erase_key(KEY_NODES);
-    if (err == ESP_OK) {
-        memset(&s_nodes, 0, sizeof(s_nodes));
-        s_nodes.format = SWARM_STORE_FORMAT;
-    }
+    memset(&s_nodes, 0, sizeof(s_nodes));
+    s_nodes.format = SWARM_STORE_FORMAT;
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
+
+    esp_err_t err = erase_key(KEY_NODES);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_clear_nodes: NVS erase failed (%s); RAM cache already "
+                      "cleared and will not revert until the next successful write or a reboot",
+                 esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -497,6 +611,10 @@ bool swarm_store_pair_failed(void)
 esp_err_t swarm_store_set_pair_failed(bool failed)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_pair_failed = failed;
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreGive(s_mutex);
+
     nvs_handle_t h;
     esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
     if (err == ESP_OK) {
@@ -504,8 +622,12 @@ esp_err_t swarm_store_set_pair_failed(bool failed)
         if (err == ESP_OK) err = nvs_commit(h);
         nvs_close(h);
     }
-    if (err == ESP_OK) s_pair_failed = failed;
-    xSemaphoreGive(s_mutex);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_pair_failed(%d): NVS write failed (%s); RAM cache "
+                      "already reflects the new flag and will not revert until the next "
+                      "successful write or a reboot", failed, esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 

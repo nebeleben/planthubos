@@ -580,6 +580,69 @@ static void node_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* ---------------- Node side: FORGET ---------------- */
+
+/* Node side only. A FORGET frame means the hub no longer considers this
+ * device paired (see swarm.c's forget_broadcast_task()): reacting means
+ * removing the ESP-NOW peer, clearing swarm_store's hub record, setting
+ * the pair-failed flag (so main.c's boot branch lands in the portal rather
+ * than a fresh search) and restarting -- all NVS writes and a restart, none
+ * of which pairing_handle_frame() (the WiFi-driver-task receive callback)
+ * is allowed to do directly. So, same pattern as pong_task/hub_task above:
+ * the callback only validates and hands off; this task does the actual
+ * work. Queue depth 1 is enough -- once one FORGET is accepted the device
+ * is about to restart, so there is nothing further to queue. */
+typedef struct {
+    uint8_t hub_mac[6];
+} pending_forget_t;
+
+static QueueHandle_t s_forget_queue;
+static TaskHandle_t s_forget_task;
+
+static void forget_task(void *arg)
+{
+    (void)arg;
+    pending_forget_t item;
+    for (;;) {
+        if (xQueueReceive(s_forget_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+
+        ESP_LOGW(TAG, "FORGET accepted from hub " MACSTR "; clearing pairing and "
+                      "restarting into the portal", MAC2STR(item.hub_mac));
+
+        esp_err_t perr = espnow_link_remove_peer(item.hub_mac);
+        if (perr != ESP_OK) {
+            ESP_LOGW(TAG, "FORGET: espnow_link_remove_peer failed: %s (restarting anyway)",
+                     esp_err_to_name(perr));
+        }
+        swarm_store_clear_hub();
+        swarm_store_set_pair_failed(true);
+        esp_restart();
+    }
+}
+
+/* Lazily created the first time this node ever accepts a real FORGET --
+ * unlike pairing_hub_init()/ensure_hub_task() (called eagerly at hub boot),
+ * there is no equivalent "node boot" hook that every node path already
+ * calls, and a FORGET is rare enough that paying the one-time xTaskCreate()
+ * cost right here, on the WiFi driver task, the first (and likely only)
+ * time it is ever needed is preferable to adding a new public init call
+ * that every node start path would have to remember. xTaskCreate() itself
+ * is quick and does not touch NVS/flash, so this is still safe to do from
+ * pairing_handle_frame(). */
+static bool ensure_forget_task(void)
+{
+    if (s_forget_task) return true;
+    if (!s_forget_queue) s_forget_queue = xQueueCreate(1, sizeof(pending_forget_t));
+    if (!s_forget_queue) return false;
+    BaseType_t ok = xTaskCreate(forget_task, "pairing_forget", 3072, NULL, 5, &s_forget_task);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "ensure_forget_task: xTaskCreate(pairing_forget) failed");
+        s_forget_task = NULL;
+        return false;
+    }
+    return true;
+}
+
 /* ---------------- Shared receive path ---------------- */
 
 void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, int rssi)
@@ -729,6 +792,39 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
         xSemaphoreGive(s_resync_lock);
 
         if (match) xSemaphoreGive(s_resync_pong_sem);
+        return;
+    }
+
+    if (type == SWARM_MSG_FORGET) {
+        /* Node side only (a hub never has a "stored hub" of its own, so
+         * swarm_store_hub() below always fails there and this is a no-op
+         * on that role). A forgotten node is no longer an encrypted
+         * ESP-NOW peer on the hub's side, so this can only ever arrive as
+         * a broadcast (see swarm_frame.h's swarm_forget_t comment) --
+         * meaning `src` is whoever actually sent it, not necessarily
+         * addressed to us specifically. Accept it only from the hub this
+         * node believes it is paired to: swarm_store_hub() is the same
+         * short, bounded, allocation-free RAM-cache read already used for
+         * PONG's source check above (no NVS touched), so it's safe here
+         * too. Note: every OTHER node currently paired to the SAME hub
+         * will also see this broadcast and pass this same check -- see
+         * swarm.c's swarm_broadcast_forget() for the accepted limitation
+         * (forgetting one node currently forgets all of that hub's
+         * nodes). */
+        swarm_forget_t forget;
+        if (!swarm_decode_forget(data, (size_t)len, &forget)) return;
+
+        uint8_t hub_mac[6];
+        if (!swarm_store_hub(hub_mac, NULL, NULL) || memcmp(src, hub_mac, 6) != 0) return;
+
+        if (!ensure_forget_task()) {
+            ESP_LOGE(TAG, "FORGET from " MACSTR ": forget task unavailable, cannot act on it",
+                     MAC2STR(src));
+            return;
+        }
+        pending_forget_t item;
+        memcpy(item.hub_mac, hub_mac, 6);
+        xQueueSend(s_forget_queue, &item, 0);  /* depth 1: already-queued one is enough, device is about to restart */
         return;
     }
 

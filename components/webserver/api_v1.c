@@ -24,7 +24,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "api_v1";
-#define FW_VERSION "0.6.0"
+#define FW_VERSION "0.7.0"
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -599,6 +599,15 @@ static esp_err_t node_forget_delete(httpd_req_t *req)
     if (peer_err != ESP_OK) {
         ESP_LOGW(TAG, "forget: espnow_link_remove_peer failed: %s", esp_err_to_name(peer_err));
     }
+
+    /* Best-effort notification (M5c, closing the M5b gap): without this, a
+     * still-powered node never learns it was forgotten -- its reads are
+     * dropped hub-side by is_paired_node() from now on, but the node itself
+     * keeps believing it is paired and never resyncs or re-pairs on its
+     * own. Fire-and-forget from a dedicated task (see swarm.c); does not
+     * delay this response. A node that was powered off still needs the
+     * physical BOOT-button recovery -- this doesn't change that. */
+    swarm_broadcast_forget();
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");

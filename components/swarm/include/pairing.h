@@ -56,11 +56,16 @@ bool pairing_window_open(void);
 uint32_t pairing_window_remaining_s(void);
 
 /* Feed every received ESP-NOW frame here (from the shared espnow_rx_cb_t).
- * Handles PAIR_REQ (only meaningful while pairing_window_open()) and
- * PAIR_ACK (only meaningful while pairing_node_state() == PAIR_SEARCHING);
- * anything else, or a frame that doesn't decode, is silently ignored.
- * Safe to call unconditionally from the receive callback on both hub and
- * node builds. Must not block (see threading note above). */
+ * Handles PAIR_REQ (only meaningful while pairing_window_open()), PAIR_ACK
+ * (only meaningful while pairing_node_state() == PAIR_SEARCHING), PING/PONG
+ * (hub/node liveness, always live) and FORGET (node side: accepted only
+ * from this node's own stored hub MAC -- see pairing.c -- clears pairing
+ * and restarts into the portal); anything else, or a frame that doesn't
+ * decode, is silently ignored. Safe to call unconditionally from the
+ * receive callback on both hub and node builds. Must not block (see
+ * threading note above) -- FORGET, like PAIR_REQ/PING, only ever decodes
+ * and hands off to a dedicated task here, never touches NVS or the radio
+ * directly from this call. */
 void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, int rssi);
 
 /* --- Node side --- */

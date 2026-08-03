@@ -16,8 +16,10 @@
 #include "app_config.h"
 
 #include "cJSON.h"
+#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -189,6 +191,31 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
     pairing_handle_frame(src_mac, data, len, rssi);
 }
 
+/* Logs the hub's effective regulatory domain once it actually associates.
+ * espnow_link_init() already logs a country snapshot at boot, but the hub
+ * now runs 802.11d/AUTO policy (M5c, PlanV1 3.3/8f): at that early boot
+ * point wifi_manager_start() has only just been asked to connect, so
+ * esp_wifi_get_country() there can only ever report the compile-time
+ * CONFIG_PLANTHUB_WIFI_COUNTRY default, not whatever the router's beacons
+ * actually advertise. This handler fires once real association happens
+ * (IP_EVENT_STA_GOT_IP already implies WIFI_EVENT_STA_CONNECTED preceded
+ * it), by which point 802.11d has had a real beacon to learn from, so its
+ * read-back is the domain PAIR_ACK will actually hand to a newly-adopted
+ * node -- making a country mismatch (or a router still on the "01"
+ * world-safe default) visible at a glance instead of silently inferred. */
+static void log_effective_country(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg; (void)base; (void)id; (void)data;
+    wifi_country_t country;
+    if (esp_wifi_get_country(&country) == ESP_OK) {
+        ESP_LOGI(TAG, "effective wifi country after association: %c%c%c, usable channels %u-%u",
+                 country.cc[0], country.cc[1], country.cc[2], country.schan,
+                 country.schan + country.nchan - 1);
+    } else {
+        ESP_LOGW(TAG, "esp_wifi_get_country failed after association; cannot confirm effective country");
+    }
+}
+
 esp_err_t swarm_start_main(void)
 {
     if (!s_stats_mutex) s_stats_mutex = xSemaphoreCreateMutex();
@@ -196,6 +223,17 @@ esp_err_t swarm_start_main(void)
 
     esp_err_t err = espnow_link_init(hub_rx_cb);
     if (err != ESP_OK) return err;
+
+    /* Hub only (this function never runs for a node): logs the router's
+     * actually-adopted country the moment association happens, and again
+     * on every reconnect (a router could change its own advertised domain,
+     * e.g. after a firmware update) -- see log_effective_country() above.
+     * Registration failure is logged, not fatal: the hub still works, only
+     * this one diagnostic line would be missing. */
+    esp_err_t ev_err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, log_effective_country, NULL);
+    if (ev_err != ESP_OK) {
+        ESP_LOGW(TAG, "failed to register post-association country log handler: %s", esp_err_to_name(ev_err));
+    }
 
     /* Brings up the SWARM_MSG_PONG responder unconditionally, not only
      * once an operator opens a pairing window -- a node may call
@@ -310,6 +348,65 @@ void swarm_forget_node_stats(const uint8_t mac[6])
         }
     }
     xSemaphoreGive(s_stats_mutex);
+}
+
+#define SWARM_FORGET_BROADCAST_COUNT 3
+#define SWARM_FORGET_BROADCAST_GAP_MS 200
+
+/* One-shot task: broadcasts SWARM_MSG_FORGET a few times, then deletes
+ * itself. Deliberately a plain FreeRTOS task, spawned fresh per forget --
+ * NOT the ESP-NOW receive callback (which must never send) and not the
+ * httpd request task either (a blocking ~600ms sleep there would stall the
+ * HTTP response to the operator's browser for no reason). Broadcast, not
+ * unicast: by the time this runs, api_v1.c's forget handler has already
+ * called espnow_link_remove_peer() for the target, so there is no peer
+ * left to address a unicast frame to at all (mirrors PAIR_ACK/PONG's
+ * broadcast reasoning in swarm_frame.h, just for the opposite reason --
+ * those broadcast because the peer doesn't exist YET, this because it no
+ * longer does). Best-effort and fire-and-forget: nothing waits on the
+ * result, matching the plan's "a node that was powered off still needs the
+ * BOOT button" acceptance -- there is no ack for FORGET to wait for.
+ *
+ * Known limitation, accepted for M5c: swarm_forget_t carries no target MAC
+ * (see swarm_frame.h) -- ESP-NOW's own broadcast address is equally
+ * untargeted -- so EVERY node currently paired to this hub receives this
+ * broadcast and independently checks "is the sender my stored hub?" (see
+ * pairing.c's FORGET handling), which is true for all of them, not only
+ * the one just forgotten. Forgetting one node therefore currently forgets
+ * every node paired to this hub, not just the target. A future protocol
+ * revision could add a target MAC to swarm_forget_t to fix this without
+ * another version bump's worth of urgency; flagged here rather than
+ * silently accepted, since it is not obviously what an operator forgetting
+ * a single node would expect. */
+static void forget_broadcast_task(void *arg)
+{
+    (void)arg;
+    swarm_forget_t f = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_FORGET };
+    uint8_t buf[sizeof(f)];
+    size_t n = swarm_encode_forget(&f, buf, sizeof(buf));
+
+    for (int i = 0; i < SWARM_FORGET_BROADCAST_COUNT; i++) {
+        if (n) {
+            esp_err_t err = espnow_link_broadcast(buf, n);
+            ESP_LOGI(TAG, "FORGET broadcast %d/%d: %s", i + 1, SWARM_FORGET_BROADCAST_COUNT, esp_err_to_name(err));
+        }
+        if (i + 1 < SWARM_FORGET_BROADCAST_COUNT) vTaskDelay(pdMS_TO_TICKS(SWARM_FORGET_BROADCAST_GAP_MS));
+    }
+    vTaskDelete(NULL);
+}
+
+/* Hub: called by api_v1.c's DELETE /api/v1/nodes/{MAC12} handler after it
+ * has already removed the node from swarm_store and its ESP-NOW peer entry
+ * -- this only kicks off the best-effort radio notification, it does not
+ * touch swarm_store or the peer table itself. Safe to call from the httpd
+ * task: this function itself never blocks, it only spawns the task above. */
+void swarm_broadcast_forget(void)
+{
+    if (xTaskCreate(forget_broadcast_task, "swarm_forget_bc", 3072, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "swarm_broadcast_forget: failed to create broadcast task -- "
+                      "forgotten node(s) will not learn it over the air; "
+                      "BOOT-button recovery is still available");
+    }
 }
 
 /* ---------------- Node side: forwarding ---------------- */

@@ -35,10 +35,12 @@ function Row({ n, nowS, onSaved, onForgotten }) {
 
   async function forget() {
     if (!confirm(
-      `Forget node ${n.name || n.mac}? The node itself will keep believing it is paired: the hub ` +
-      `will silently drop its readings after radio-acking them, so the node sees "successful" sends ` +
-      `and never triggers a resync on its own. To actually recover it, someone must physically hold ` +
-      `the node's BOOT button for 10 seconds to force it back into pairing mode.`
+      `Forget node ${n.name || n.mac}? The hub will notify it over the air so it re-enters pairing ` +
+      `mode on its own -- but that notification is best-effort (it needs the node to be powered on ` +
+      `and listening right now). If it was off, or otherwise never receives it, it will keep ` +
+      `believing it is paired -- the hub silently drops its readings after radio-acking them, so it ` +
+      `sees "successful" sends and never resyncs by itself. In that case, recover it by physically ` +
+      `holding its BOOT button for 10 seconds to force it back into pairing mode.`
     )) return
     setForgetting(true)
     try {
