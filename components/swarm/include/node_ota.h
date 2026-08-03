@@ -50,9 +50,10 @@ enum {
     NODE_OTA_ERR_IMAGE_LEN     = 2,  /* couldn't determine the true image length (esp_image_get_metadata) */
     NODE_OTA_ERR_READ          = 3,  /* esp_partition_read() failed mid-session */
     NODE_OTA_ERR_BEGIN_SEND    = 4,  /* OTA_BEGIN never got out after repeated retries */
-    NODE_OTA_ERR_STALL         = 5,  /* 8 consecutive 5s-no-status stalls (M5c hardware round 1:
-                                       * was 3 -- see node_ota.c's NODE_OTA_MAX_STALLS) with no
-                                       * status arriving in between to prove the node fell behind */
+    NODE_OTA_ERR_STALL         = 5,  /* NODE_OTA_MAX_STALLS consecutive OTA_STATUS reports whose
+                                       * next_offset failed to advance since the previous one (M5c
+                                       * hardware round 3 fix -- see node_ota.c's stall-handling
+                                       * comment; was time-based silence before that) */
     NODE_OTA_ERR_TIMEOUT       = 6,  /* 10 minute total session timeout */
     NODE_OTA_ERR_ABORTED       = 7,  /* node_ota_abort() was called */
     NODE_OTA_ERR_NO_MEM        = 8,  /* task/session setup failed */

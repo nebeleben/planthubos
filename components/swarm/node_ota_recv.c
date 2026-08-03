@@ -26,17 +26,28 @@ static const char *TAG = "node_ota_recv";
 #define NODE_OTA_RECV_STATUS_EVERY 64
 #define NODE_OTA_RECV_RESTART_DELAY_MS 1500
 
+/* Rate limit for the "ahead of next_offset" OTA_STATUS below (fix, M5c
+ * hardware round 3 -- see handle_chunk()'s ahead-branch comment for the full
+ * evidence/rationale). One per second is generous next to how often chunks
+ * actually arrive (NODE_OTA_CHUNK_YIELD_MS = 2ms pacing in node_ota.c, i.e.
+ * hundreds of chunks/second) while still being far more responsive than the
+ * hub's multi-second stall patience (NODE_OTA_MAX_STALLS consecutive
+ * non-advancing statuses in node_ota.c, plus its 10-minute total cap). */
+#define NODE_OTA_RECV_AHEAD_STATUS_MIN_US ((int64_t)1000 * 1000)
+
 /* Idle-timeout guard: if the hub that started a session crashes, reboots, or
  * otherwise drops out of radio contact mid-transfer, its (RAM-only) session
  * state vanishes without ever sending OTA_ABORT -- this node would otherwise
  * be left with s_session.active == true forever, rejecting every later
  * OTA_BEGIN (including a retry from a hub that comes back) with
  * NODE_OTA_RECV_ERR_ALREADY_ACTIVE until physically power-cycled. 30s is
- * generous next to the hub's own go-back-N stall timer (NODE_OTA_STATUS_STALL_MS
- * = 5000 in node_ota.c, tripping after NODE_OTA_MAX_STALLS = 3 consecutive
- * misses -- i.e. the hub itself gives up/rewinds well inside this window
- * during a merely-slow link) while still being short enough that an
- * operator retrying "shortly after" a hub crash doesn't have to wait long.
+ * generous next to the hub's own go-back-N stall handling (node_ota.c aborts
+ * after NODE_OTA_MAX_STALLS consecutive OTA_STATUS reports whose next_offset
+ * failed to advance -- with statuses roughly 1/s apart at worst once this
+ * node's own ahead-branch rate limit above is in play -- i.e. the hub itself
+ * gives up/rewinds well inside this window during a merely-slow link) while
+ * still being short enough that an operator retrying "shortly after" a hub
+ * crash doesn't have to wait long.
  * NODE_OTA_RECV_IDLE_CHECK_MS is just how often node_ota_recv_task() below
  * wakes on its own to re-check the above while otherwise idle waiting on
  * s_queue -- unrelated to the timeout duration itself. */
@@ -81,6 +92,10 @@ typedef struct {
     int64_t                 last_activity_us; /* esp_timer_get_time() at the last accepted
                                                 * OTA_BEGIN/OTA_CHUNK; only meaningful while
                                                 * active -- see NODE_OTA_RECV_IDLE_TIMEOUT_MS */
+    int64_t                 last_ahead_status_us; /* esp_timer_get_time() at the last
+                                                * "ahead of next_offset" OTA_STATUS sent (0 =
+                                                * none sent yet this session); see handle_chunk()'s
+                                                * ahead-branch and NODE_OTA_RECV_AHEAD_STATUS_MIN_US */
 } recv_session_t;
 
 /* Cheap, bounded, allocation-free RAM-cache read (no NVS touched) -- same
@@ -341,11 +356,49 @@ static void handle_chunk(recv_session_t *s, const uint8_t src[6], const swarm_ot
         }
         if (at_end) finalize_session(s, src);   /* may esp_restart() and never return */
     } else if (chunk->offset < s->next_offset) {
+        /* Behind next_offset: this is normal rewind-replay traffic -- the
+         * hub already rewound sent_offset (in response to an earlier status
+         * from THIS node, or its own stall handling) and is now re-streaming
+         * a range already written. Deliberately silent: unlike the ahead
+         * branch below, staying quiet here is not what causes the deadlock
+         * (M5c hardware round 3) -- the hub already knows this node's real
+         * offset in this case, that is WHY it rewound. Do not "fix" this
+         * branch to also send a status; it would just be redundant traffic
+         * on every rewind replay chunk. */
         ESP_LOGD(TAG, "OTA_CHUNK offset %" PRIu32 " behind next_offset %" PRIu32 " (rewind replay), ignoring",
                  chunk->offset, s->next_offset);
     } else {
+        /* Ahead of next_offset: a chunk was lost in the radio, not a
+         * decode failure -- M5c hardware round 3 ran with a frame-level rx
+         * diagnostic active and it showed dropped=0 (every arriving frame
+         * decoded fine, e.g. "rx: wire_type=8 len=208 -> type=8"); the
+         * chunks that never showed up simply never arrived over the air.
+         * Once that happens, EVERY later chunk in the transfer lands in
+         * this branch forever (next_offset can't advance without the
+         * missing one), so chunks_since_status in the accepted branch above
+         * never reaches NODE_OTA_RECV_STATUS_EVERY again -- this node goes
+         * completely silent. The hub has no way to learn where to rewind
+         * to, keeps streaming into the void, burns its stall budget waiting
+         * for a status that will never come on its own, and aborts. That is
+         * exactly the observed hardware plateau: hub sent 1158800/1158800
+         * (100%), node had written only 985600 (85%), hub aborted err=5
+         * (stall).
+         *
+         * Fix: proactively report the CURRENT next_offset from right here
+         * so the hub can rewind -- rate-limited to roughly once a second.
+         * A lost chunk means every subsequent chunk (there can be hundreds,
+         * given node_ota.c's 2ms inter-chunk pacing, before the hub's own
+         * pacing/backoff even reacts) lands in this branch, so an
+         * unthrottled status per chunk here would flood the radio with
+         * exactly the kind of traffic PlanV1 8e already warns about --
+         * likely making delivery worse, not better. */
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - s->last_ahead_status_us >= NODE_OTA_RECV_AHEAD_STATUS_MIN_US) {
+            s->last_ahead_status_us = now_us;
+            send_status(src, s->session_id, OTA_ST_RECEIVING, NODE_OTA_RECV_ERR_NONE, s->next_offset);
+        }
         ESP_LOGD(TAG, "OTA_CHUNK offset %" PRIu32 " ahead of next_offset %" PRIu32
-                      ", ignoring (periodic status will pull the hub back)",
+                      ", ignoring (rate-limited status will pull the hub back)",
                  chunk->offset, s->next_offset);
     }
 }

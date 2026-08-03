@@ -41,16 +41,17 @@
 static const char *TAG = "node_ota";
 
 /* Go-back-N tuning, per the plan. */
-#define NODE_OTA_STATUS_STALL_MS      5000     /* how long OTA_STATUS silence must persist before
-                                                  * counting as one stall -- no longer rewinds
-                                                  * sent_offset by itself, see the stall-handling
-                                                  * comment in the main loop below (fix, M5c
-                                                  * hardware round 1) */
-#define NODE_OTA_MAX_STALLS           8        /* abort after this many consecutive stalls (was 3;
-                                                  * raised because OTA_STATUS is now a broadcast --
-                                                  * see swarm_frame.h -- so occasionally losing one
-                                                  * is now routine, not evidence the node/link is
-                                                  * actually gone) */
+#define NODE_OTA_MAX_STALLS           8        /* abort after this many consecutive stalls. A
+                                                  * "stall" is now (M5c hardware round 3 fix) two
+                                                  * consecutive OTA_STATUS reports whose next_offset
+                                                  * did not advance -- see the stall-handling comment
+                                                  * in the main loop below; it is no longer about
+                                                  * silence duration (was, until this fix: "no status
+                                                  * for NODE_OTA_STATUS_STALL_MS=5000ms"). Left at 8
+                                                  * (raised from 3 in an earlier round) because
+                                                  * OTA_STATUS is a broadcast -- see swarm_frame.h --
+                                                  * so occasionally losing one is routine, not
+                                                  * evidence the node/link is actually gone. */
 #define NODE_OTA_TOTAL_TIMEOUT_US     ((int64_t)10 * 60 * 1000000)  /* 10 minutes */
 #define NODE_OTA_CHUNK_YIELD_MS       2        /* pace: yield between chunks */
 #define NODE_OTA_SEND_BACKOFF_MIN_MS  50
@@ -341,9 +342,10 @@ static void node_ota_task(void *arg)
 
     {
         int64_t started_us = esp_timer_get_time();
-        int64_t last_status_us = started_us;
         int consecutive_stalls = 0;
         uint32_t send_backoff_ms = 0;
+        uint32_t last_reported_offset = 0;   /* only meaningful once have_reported_offset */
+        bool     have_reported_offset = false;
 
         for (;;) {
             if (abort_was_requested()) {
@@ -373,9 +375,6 @@ static void node_ota_task(void *arg)
             xSemaphoreGive(s_mutex);
 
             if (got_status) {
-                last_status_us = esp_timer_get_time();
-                consecutive_stalls = 0;
-
                 if (st.state == OTA_ST_DONE) {
                     ESP_LOGI(TAG, "node OTA for " MACSTR ": node reports DONE", MAC2STR(mac));
                     finish_session(mac, OTA_ST_DONE, NODE_OTA_ERR_NONE, false, 0);
@@ -388,12 +387,52 @@ static void node_ota_task(void *arg)
                     break;
                 }
 
-                /* RECEIVING: reconcile go-back-N offsets. A rewind only ever
-                 * happens here, driven by the node's OWN reported next_offset
-                 * actually being behind sent_offset -- this is now the ONLY
-                 * place sent_offset can move backwards (M5c hardware round 1
-                 * fix; see the stall branch below for why mere silence no
-                 * longer does this too). */
+                /* RECEIVING: stall accounting based on reported PROGRESS, not
+                 * on silence (fix, M5c hardware round 3 -- replaces the old
+                 * "no status in NODE_OTA_STATUS_STALL_MS" timer entirely).
+                 * That old timer assumed silence itself was the danger sign,
+                 * which stopped being true the moment node_ota_recv.c's
+                 * handle_chunk() started emitting a rate-limited OTA_STATUS
+                 * whenever a chunk lands ahead of its next_offset (the fix
+                 * for the tail-loss deadlock this round addresses): a
+                 * transfer that is genuinely stuck now produces FREQUENT
+                 * statuses (about 1/s), not silence, so silence duration is
+                 * no longer diagnostic. What DOES indicate real trouble is
+                 * two consecutive statuses reporting the exact same
+                 * next_offset -- the node telling us, twice in a row, that
+                 * nothing landed in between. A status that shows progress
+                 * (or the very first one this session) always resets the
+                 * counter -- this must hold even once sent_offset has
+                 * already reached total_len (the drain phase below), so a
+                 * healthy final rewind-and-resend round never gets miscounted
+                 * as a stall. */
+                bool advanced = !have_reported_offset || st.next_offset > last_reported_offset;
+                last_reported_offset = st.next_offset;
+                have_reported_offset = true;
+                if (advanced) {
+                    consecutive_stalls = 0;
+                } else {
+                    consecutive_stalls++;
+                    ESP_LOGW(TAG, "node OTA for " MACSTR ": stall #%d (next_offset %" PRIu32
+                                  " unchanged from the previous status)",
+                             MAC2STR(mac), consecutive_stalls, st.next_offset);
+                    if (consecutive_stalls >= NODE_OTA_MAX_STALLS) {
+                        ESP_LOGE(TAG, "node OTA for " MACSTR ": %d consecutive stalls, aborting",
+                                 MAC2STR(mac), consecutive_stalls);
+                        finish_session(mac, OTA_ST_FAILED, NODE_OTA_ERR_STALL, true, NODE_OTA_ERR_STALL);
+                        break;
+                    }
+                }
+
+                /* Reconcile go-back-N offsets. A rewind only ever happens
+                 * here, driven by the node's OWN reported next_offset
+                 * actually being behind sent_offset -- the ONLY place
+                 * sent_offset can move backwards, and only ever backwards
+                 * (never forward: this is strictly `sent_offset =
+                 * st.next_offset` when st.next_offset < sent_offset, never
+                 * the reverse comparison). st.next_offset itself was already
+                 * clamped to total_len in node_ota_handle_status() above, so
+                 * this can never rewind (or read/send) past the image end. */
                 xSemaphoreTake(s_mutex, portMAX_DELAY);
                 if (st.next_offset > s_session.pub.acked_offset) s_session.pub.acked_offset = st.next_offset;
                 if (st.next_offset < s_session.pub.sent_offset) {
@@ -402,40 +441,6 @@ static void node_ota_task(void *arg)
                     s_session.pub.sent_offset = st.next_offset;
                 }
                 xSemaphoreGive(s_mutex);
-            } else if (esp_timer_get_time() - last_status_us > NODE_OTA_STATUS_STALL_MS * 1000) {
-                /* Tolerate lost status (fix, M5c hardware round 1): the
-                 * first real hardware OTA showed roughly a third of the
-                 * node's OTA_STATUS frames failing to arrive here even
-                 * while chunks kept sending and landing successfully.
-                 * Rewinding sent_offset back to acked_offset on every such
-                 * silence (as this branch used to) punished that as if the
-                 * node had actually fallen behind, discarding perfectly
-                 * good in-flight progress purely because the *report* of
-                 * progress went missing -- and burned through the stall
-                 * budget doing it, on a transfer that was otherwise healthy.
-                 * A status that never arrives says nothing about where the
-                 * node's next_offset actually is; only a status that DOES
-                 * arrive and reports a lower offset (the branch above) is
-                 * trustworthy evidence of that, so this branch no longer
-                 * touches sent_offset at all -- it keeps streaming from
-                 * wherever it already was. Still bounded: NODE_OTA_MAX_STALLS
-                 * consecutive misses (now 8, up from 3, since an occasional
-                 * lost broadcast is routine, not a sign of a dead link) and
-                 * the unconditional NODE_OTA_TOTAL_TIMEOUT_US cap above both
-                 * still give up on a genuinely dead node/link rather than
-                 * streaming forever. */
-                consecutive_stalls++;
-                last_status_us = esp_timer_get_time();
-                ESP_LOGW(TAG, "node OTA for " MACSTR ": stall #%d (no status in %dms), still "
-                              "streaming from sent_offset=%" PRIu32 " (not rewound)",
-                         MAC2STR(mac), consecutive_stalls, NODE_OTA_STATUS_STALL_MS,
-                         s_session.pub.sent_offset);
-                if (consecutive_stalls >= NODE_OTA_MAX_STALLS) {
-                    ESP_LOGE(TAG, "node OTA for " MACSTR ": %d consecutive stalls, aborting",
-                             MAC2STR(mac), consecutive_stalls);
-                    finish_session(mac, OTA_ST_FAILED, NODE_OTA_ERR_STALL, true, NODE_OTA_ERR_STALL);
-                    break;
-                }
             }
 
             uint32_t sent_offset, total;
@@ -445,9 +450,23 @@ static void node_ota_task(void *arg)
             xSemaphoreGive(s_mutex);
 
             if (sent_offset >= total) {
-                /* Everything sent at least once; idle briefly waiting for the
-                 * node's final OTA_STATUS{DONE} (or a stall/timeout/abort,
-                 * all still checked every iteration above). */
+                /* Drain phase (fix, M5c hardware round 3): everything has
+                 * been sent at least once, but "nothing left to send" is NOT
+                 * the same as "done" -- a chunk lost in the radio anywhere in
+                 * the stream leaves the node's next_offset short of total_len
+                 * even though the hub's sent_offset has already reached it.
+                 * This is not a separate code path: the got_status handling
+                 * above already does exactly what a drain loop needs --
+                 * wait for a status, and if the node reports next_offset <
+                 * total_len (== sent_offset here), rewind and let the normal
+                 * send logic below resume from there on the next iteration
+                 * -- so simply falling through to the bounded poll-and-retry
+                 * below when there's nothing new to send already IS the
+                 * drain loop. Bounded (50ms), not a spin: abort/timeout are
+                 * still checked every iteration above, and stall accounting
+                 * above already covers the "node stuck short of total_len"
+                 * case via non-advancing statuses -- this vTaskDelay only
+                 * avoids busy-waiting while no new status has arrived yet. */
                 vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
             }
