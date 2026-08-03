@@ -63,9 +63,15 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
     const uint8_t *mac = data;
     static registry_t snap;   /* only ever touched on the default event loop task */
     /* static: this handler only ever runs on the single default event-loop
-     * task, which has just a 2304 B stack -- keep the 320 B message buffer
-     * off it. */
-    static char buf[320];
+     * task, which has just a 2304 B stack -- keep the message buffer off it.
+     * 512, not 320: M5b's "via" attribution (sensor_json()) added a nested
+     * object carrying a 32-char sensor name plus, when relayed, a node's own
+     * up-to-24-char name (SWARM_NODE_NAME_LEN) and MAC/rssi -- worst case is
+     * now ~250 B of JSON before the "data: "/"\n\n" SSE framing, versus the
+     * ~120 B this 320 B figure was originally sized for. 512 keeps a real
+     * margin above that ~250 B worst case rather than trimming right up
+     * against it. */
+    static char buf[512];
     data_core_snapshot(&snap);
     int idx = registry_find(&snap, mac);
     if (idx < 0) return;

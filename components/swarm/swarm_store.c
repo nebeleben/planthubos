@@ -47,54 +47,75 @@ typedef struct __attribute__((packed)) {
     node_entry_v0_t n[SWARM_STORE_V0_MAX_NODES];
 } nodes_blob_v0_t;
 
-/* ---------------- Locking invariant (M5c narrowing) ----------------
+/* ---------------- Locking invariant (M5c) ----------------
  *
- * Before M5c, every write here held s_mutex across its own nvs_commit() --
- * a synchronous flash operation that can take single-digit milliseconds.
  * is_paired_node() and swarm_store_node_name() (swarm.c) are called from
  * the ESP-NOW receive callback (the WiFi driver task) and from the SSE
- * path, both of which read through s_mutex -- so an operator renaming or
- * forgetting a node could stall the WiFi task for the length of a flash
- * commit, and the project-wide rule is that the receive callback must
- * never block on flash. Two mutexes fix this:
+ * path -- so an operator renaming or forgetting a node must never be able
+ * to stall the WiFi task for the length of a flash commit; the
+ * project-wide rule is that the receive callback must never block on
+ * flash. Two mutexes:
  *
  *   - s_mutex guards ONLY the in-RAM cache (s_role/s_hub/s_hub_cc/s_nodes/
  *     s_pair_failed). Every hold of it is a short, bounded, allocation-
- *     free memcpy/compare -- never flash I/O. This is the invariant reads
- *     depend on: swarm_store_role()/swarm_store_hub()/swarm_store_node_at()/
- *     swarm_store_node_name()/etc. NEVER wait on a flash commit, no matter
- *     what else is happening concurrently.
+ *     free memcpy/compare -- never flash I/O, and NEVER held while also
+ *     contending for s_nvs_mutex (see the bug this fixes, below). This is
+ *     the invariant reads depend on: swarm_store_role()/swarm_store_hub()/
+ *     swarm_store_node_at()/swarm_store_node_name()/etc. can wait, at
+ *     worst, on another equally short RAM-only critical section -- NEVER
+ *     on a flash commit, no matter what else is happening concurrently,
+ *     including a second writer's commit still in flight.
  *
  *   - s_nvs_mutex guards the actual NVS write/erase + nvs_commit(). Every
- *     writer below follows the same three-step shape: (1) under s_mutex,
- *     compute the new RAM state and store it into the cache immediately --
- *     so a reader arriving right after this step already sees the new
- *     value, even though it is not yet durable; (2) while STILL holding
- *     s_mutex, take s_nvs_mutex, then release s_mutex; (3) perform the
- *     flash write under s_nvs_mutex alone, then release it. Taking
- *     s_nvs_mutex before giving up s_mutex (rather than after) is what
- *     prevents a race between two concurrent writers: it forces flash
- *     writes to be attempted in the same order their RAM mutations were
- *     applied, so a second writer's (newer, superset) blob can never be
- *     overwritten in flash by a first writer's (older) one committing
- *     late. The only cost is narrow and bounded: if a second write starts
- *     while a first write's flash commit is still in flight, that second
- *     writer holds s_mutex for the (short) remainder of the first commit
- *     while waiting for s_nvs_mutex -- so a reader would only ever wait on
- *     flash in the rare case of two overlapping writes to this store,
- *     never for a single writer's own commit. Every write path here (node
- *     rename/forget from the UI, a pairing/resync event, a role change) is
- *     human- or protocol-paced, seconds apart at minimum, so in practice
- *     this edge case does not occur.
+ *     public setter below follows the same two-phase shape: PHASE 1 (RAM,
+ *     under s_mutex only) computes the new value, stores it into the
+ *     cache, and releases s_mutex completely -- so a reader arriving right
+ *     after this phase already sees the new value, even though it is not
+ *     yet durable, and a SECOND writer arriving right after can also
+ *     acquire s_mutex immediately, nothing held across the flash step.
+ *     PHASE 2 (flash, one of the persist_*() helpers below write_blob()/
+ *     erase_key()) takes s_nvs_mutex, briefly RE-takes s_mutex just long
+ *     enough to copy the CURRENT cache value -- not whatever phase 1
+ *     computed, which may already be stale by the time phase 2 actually
+ *     runs -- releases s_mutex, performs the write/erase, then releases
+ *     s_nvs_mutex.
  *
- *   - Consequence: the RAM cache can run ahead of flash if a commit later
- *     fails (logged, not silently swallowed) -- it is the source of truth
- *     for the rest of THIS boot regardless. A failed write is only
- *     "corrected" by the next successful write, or by a reboot (which
- *     reloads from whatever IS durable, silently reverting to the last
- *     value that actually committed). This mirrors the tradeoff
- *     load_nodes_blob() already accepts for its own migration-write
- *     failure path below ("kept in RAM for this boot only").
+ *   Fixed bug (pre-M5c): phase 2 used to take s_nvs_mutex WHILE STILL
+ *   HOLDING s_mutex, only releasing s_mutex afterward. If writer A's flash
+ *   commit was still in flight when writer B arrived, B blocked on
+ *   s_nvs_mutex while CONTINUING TO HOLD s_mutex -- so any reader arriving
+ *   during that window transitively waited on A's flash commit through B,
+ *   breaking the exact "reads never wait on flash" invariant this store
+ *   exists to guarantee. Releasing s_mutex before ever contending for
+ *   s_nvs_mutex (the shape above) closes that: the two mutexes are never
+ *   both held by the same caller across a blocking wait, only back-to-back
+ *   and briefly.
+ *
+ *   That reordering alone would open a different gap: nothing would then
+ *   stop writer B's commit from finishing BEFORE writer A's and being
+ *   clobbered when A's older, now-stale snapshot commits afterward,
+ *   silently reverting B's change on disk while RAM (correctly) still
+ *   reflects it. Re-reading the cache under s_mutex inside phase 2 -- not
+ *   trusting whatever a writer's own phase 1 computed earlier -- is what
+ *   closes that: whichever writer actually holds s_nvs_mutex at the moment
+ *   it performs the write always writes the FRESHEST RAM state at that
+ *   moment, which may already be a later writer's change even if this
+ *   writer "started first". The other writer, running its own phase 2
+ *   right after, then just writes the same (or newer still) value again --
+ *   a harmless redundant commit, never a regression. Flash therefore only
+ *   ever moves forward in freshness, and the whole struct/scalar is copied
+ *   out as one atomic unit under s_mutex each time, so a torn/half-updated
+ *   blob can never reach flash either.
+ *
+ *   - Consequence, unchanged from before: the RAM cache can run ahead of
+ *     flash if a commit later fails (logged, not silently swallowed) -- it
+ *     is the source of truth for the rest of THIS boot regardless. A
+ *     failed write is only "corrected" by the next successful write, or by
+ *     a reboot (which reloads from whatever IS durable, silently
+ *     reverting to the last value that actually committed). This mirrors
+ *     the tradeoff load_nodes_blob() already accepts for its own
+ *     migration-write failure path below ("kept in RAM for this boot
+ *     only").
  */
 static SemaphoreHandle_t s_mutex;
 static SemaphoreHandle_t s_nvs_mutex;
@@ -126,6 +147,98 @@ static esp_err_t erase_key(const char *key)
     if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
+    return err;
+}
+
+/* ---- Phase-2 persistence helpers (see the locking invariant comment
+ * above): each one serialises against other writers of the SAME key via
+ * s_nvs_mutex, re-reads the CURRENT cache value under a brief s_mutex hold
+ * (never held during the flash step itself), then performs the flash
+ * write/erase. Callers (the public setters below) must have already
+ * completed their own RAM mutation, under s_mutex, and released s_mutex
+ * BEFORE calling one of these -- none of them may be called while still
+ * holding s_mutex. */
+
+static esp_err_t persist_role(void)
+{
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    swarm_role_t r = s_role;
+    xSemaphoreGive(s_mutex);
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, KEY_ROLE, (uint8_t)r);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreGive(s_nvs_mutex);
+    return err;
+}
+
+static esp_err_t persist_hub(void)
+{
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool set = s_hub_set;
+    hub_blob_t blob = s_hub;
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = set ? write_blob(KEY_HUB, &blob, sizeof(blob)) : erase_key(KEY_HUB);
+    xSemaphoreGive(s_nvs_mutex);
+    return err;
+}
+
+static esp_err_t persist_hub_cc(void)
+{
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool set = s_hub_cc_set;
+    char cc[3];
+    memcpy(cc, s_hub_cc, sizeof(cc));
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = set ? write_blob(KEY_HUBCC, cc, sizeof(cc)) : erase_key(KEY_HUBCC);
+    xSemaphoreGive(s_nvs_mutex);
+    return err;
+}
+
+/* Also used by swarm_store_clear_nodes(): writing a freshly-zeroed (but
+ * still current-format, count=0) blob rather than erasing the key
+ * outright is functionally identical on load (load_nodes_blob() treats
+ * both "absent" and "present, count=0, right format" as an empty table),
+ * and going through the same write path as every other node-table mutator
+ * means a clear can never race a concurrent add/rename/forget into writing
+ * stale data over fresh, or vice versa -- the same re-read-freshest
+ * guarantee described above applies uniformly. */
+static esp_err_t persist_nodes(void)
+{
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    nodes_blob_t blob = s_nodes;
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = write_blob(KEY_NODES, &blob, sizeof(blob));
+    xSemaphoreGive(s_nvs_mutex);
+    return err;
+}
+
+static esp_err_t persist_pair_failed(void)
+{
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool failed = s_pair_failed;
+    xSemaphoreGive(s_mutex);
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, KEY_PFAIL, failed ? 1 : 0);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -309,22 +422,14 @@ esp_err_t swarm_store_set_role(swarm_role_t r)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_role = r;                                    /* RAM commits now; see locking invariant above */
-    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);     /* reserve write order before releasing s_mutex */
-    xSemaphoreGive(s_mutex);
+    xSemaphoreGive(s_mutex);                        /* released BEFORE touching s_nvs_mutex */
 
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
-    if (err == ESP_OK) {
-        err = nvs_set_u8(h, KEY_ROLE, (uint8_t)r);
-        if (err == ESP_OK) err = nvs_commit(h);
-        nvs_close(h);
-    }
+    esp_err_t err = persist_role();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "swarm_store_set_role(%d): NVS write failed (%s); RAM cache already "
                       "reflects the new role and will not revert until the next successful "
                       "write or a reboot", r, esp_err_to_name(err));
     }
-    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -351,16 +456,14 @@ esp_err_t swarm_store_set_hub(const uint8_t mac[6], const uint8_t lmk[SWARM_LMK_
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_hub = blob;
     s_hub_set = true;
-    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
 
-    esp_err_t err = write_blob(KEY_HUB, &blob, sizeof(blob));
+    esp_err_t err = persist_hub();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "swarm_store_set_hub: NVS write failed (%s); RAM cache already "
                       "reflects the new hub and will not revert until the next successful "
                       "write or a reboot", esp_err_to_name(err));
     }
-    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -371,19 +474,15 @@ esp_err_t swarm_store_set_channel(uint8_t channel)
         xSemaphoreGive(s_mutex);
         return ESP_ERR_INVALID_STATE;
     }
-    hub_blob_t blob = s_hub;
-    blob.channel = channel;
-    s_hub = blob;
-    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    s_hub.channel = channel;
     xSemaphoreGive(s_mutex);
 
-    esp_err_t err = write_blob(KEY_HUB, &blob, sizeof(blob));
+    esp_err_t err = persist_hub();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "swarm_store_set_channel(%u): NVS write failed (%s); RAM cache already "
                       "reflects the new channel and will not revert until the next successful "
                       "write or a reboot", channel, esp_err_to_name(err));
     }
-    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -400,22 +499,18 @@ bool swarm_store_hub_country(char out[3])
 esp_err_t swarm_store_set_hub_country(const char cc[3])
 {
     if (!cc) return ESP_ERR_INVALID_ARG;
-    char cc_copy[3];
-    memcpy(cc_copy, cc, 3);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    memcpy(s_hub_cc, cc_copy, sizeof(s_hub_cc));
+    memcpy(s_hub_cc, cc, sizeof(s_hub_cc));
     s_hub_cc_set = true;
-    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
 
-    esp_err_t err = write_blob(KEY_HUBCC, cc_copy, 3);
+    esp_err_t err = persist_hub_cc();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "swarm_store_set_hub_country: NVS write failed (%s); RAM cache already "
                       "reflects the new country and will not revert until the next successful "
                       "write or a reboot", esp_err_to_name(err));
     }
-    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -429,11 +524,13 @@ esp_err_t swarm_store_clear_hub(void)
      * it too, in the same RAM update. */
     s_hub_cc_set = false;
     memset(s_hub_cc, 0, sizeof(s_hub_cc));
-    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
 
-    esp_err_t err = erase_key(KEY_HUB);
-    esp_err_t cc_err = erase_key(KEY_HUBCC);
+    /* Two independent keys, so two independent phase-2 calls -- each
+     * re-reads its own slice of the (already fully updated) cache, so
+     * there is no ordering requirement between them. */
+    esp_err_t err = persist_hub();
+    esp_err_t cc_err = persist_hub_cc();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "swarm_store_clear_hub: NVS erase failed (%s); RAM cache already "
                       "cleared and will not revert until the next successful write or a reboot",
@@ -442,7 +539,6 @@ esp_err_t swarm_store_clear_hub(void)
     if (cc_err != ESP_OK) {
         ESP_LOGW(TAG, "swarm_store_clear_hub: hub-country NVS erase failed: %s", esp_err_to_name(cc_err));
     }
-    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -490,16 +586,14 @@ esp_err_t swarm_store_add_node(const uint8_t mac[6], const uint8_t lmk[SWARM_LMK
      * (see pairing.c's find_stored_lmk()/idempotent re-ack) must not wipe
      * an operator-assigned name out from under them. */
     s_nodes = blob;
-    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
 
-    esp_err_t err = write_blob(KEY_NODES, &blob, sizeof(blob));
+    esp_err_t err = persist_nodes();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "swarm_store_add_node: NVS write failed (%s); RAM cache already "
                       "reflects the new node table and will not revert until the next "
                       "successful write or a reboot", esp_err_to_name(err));
     }
-    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -523,16 +617,14 @@ esp_err_t swarm_store_set_node_name(const uint8_t mac[6], const char *name)
     memset(blob.n[idx].name, 0, sizeof(blob.n[idx].name));
     if (len) memcpy(blob.n[idx].name, name, len);  /* len == 0 clears */
     s_nodes = blob;
-    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
 
-    esp_err_t err = write_blob(KEY_NODES, &blob, sizeof(blob));
+    esp_err_t err = persist_nodes();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "swarm_store_set_node_name: NVS write failed (%s); RAM cache already "
                       "reflects the new name and will not revert until the next successful "
                       "write or a reboot", esp_err_to_name(err));
     }
-    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -569,16 +661,14 @@ esp_err_t swarm_store_forget_node(const uint8_t mac[6])
     blob.count--;
     memset(&blob.n[blob.count], 0, sizeof(blob.n[blob.count]));  /* clear the vacated tail slot */
     s_nodes = blob;
-    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
 
-    esp_err_t err = write_blob(KEY_NODES, &blob, sizeof(blob));
+    esp_err_t err = persist_nodes();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "swarm_store_forget_node: NVS write failed (%s); RAM cache already "
                       "reflects the forgotten node and will not revert until the next "
                       "successful write or a reboot", esp_err_to_name(err));
     }
-    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -587,16 +677,19 @@ esp_err_t swarm_store_clear_nodes(void)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     memset(&s_nodes, 0, sizeof(s_nodes));
     s_nodes.format = SWARM_STORE_FORMAT;
-    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
 
-    esp_err_t err = erase_key(KEY_NODES);
+    /* persist_nodes(), not erase_key(): see its comment above -- a
+     * current-format, count=0 blob loads identically to an absent key, and
+     * routing every node-table mutator (including clear) through the same
+     * persist path is what keeps a concurrent add/rename/forget from ever
+     * racing an erase into losing data either way. */
+    esp_err_t err = persist_nodes();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "swarm_store_clear_nodes: NVS erase failed (%s); RAM cache already "
+        ESP_LOGE(TAG, "swarm_store_clear_nodes: NVS write failed (%s); RAM cache already "
                       "cleared and will not revert until the next successful write or a reboot",
                  esp_err_to_name(err));
     }
-    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 
@@ -612,22 +705,14 @@ esp_err_t swarm_store_set_pair_failed(bool failed)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_pair_failed = failed;
-    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
     xSemaphoreGive(s_mutex);
 
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
-    if (err == ESP_OK) {
-        err = nvs_set_u8(h, KEY_PFAIL, failed ? 1 : 0);
-        if (err == ESP_OK) err = nvs_commit(h);
-        nvs_close(h);
-    }
+    esp_err_t err = persist_pair_failed();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "swarm_store_set_pair_failed(%d): NVS write failed (%s); RAM cache "
                       "already reflects the new flag and will not revert until the next "
                       "successful write or a reboot", failed, esp_err_to_name(err));
     }
-    xSemaphoreGive(s_nvs_mutex);
     return err;
 }
 

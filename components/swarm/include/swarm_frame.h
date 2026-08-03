@@ -110,11 +110,23 @@ typedef struct __attribute__((packed)) {
 /* Hub -> broadcast, plaintext -- same reasoning as PAIR_ACK/PONG above: a
  * forgotten node is no longer an encrypted ESP-NOW peer on the hub's side
  * (the hub deletes the peer entry when it forgets), so a unicast send has
- * no peer to address any more. The node only acts on this if the sender
- * MAC equals its own stored hub MAC; anyone else's FORGET is ignored. */
+ * no peer to address any more.
+ *
+ * target_mac (M5c; the original M5a/M5b shape had no target and every node
+ * paired to the hub reacted to any FORGET, unpairing all of them instead of
+ * just the one an operator actually forgot -- a real defect, not an
+ * accepted trade, since it silently strands every OTHER node too). A node
+ * now acts on this frame only when BOTH hold: the sender MAC equals its own
+ * stored hub MAC (unchanged from before -- rejects a FORGET from anyone
+ * else in radio range), AND target_mac equals its own STA MAC (new -- so a
+ * node paired to the same hub but NOT the one being forgotten silently
+ * ignores it). Broadcast is still the only viable transport (see above),
+ * so every paired node still receives every FORGET; target_mac is what
+ * makes only the intended one act on it. */
 typedef struct __attribute__((packed)) {
     uint8_t version;
     uint8_t type;
+    uint8_t target_mac[6];
 } swarm_forget_t;
 
 /* Hub -> node, unicast, encrypted (an OTA session only ever targets an

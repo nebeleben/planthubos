@@ -8,6 +8,7 @@
 #include "swarm.h"
 #include "swarm_store.h"
 #include "swarm_frame.h"
+#include "swarm_buf.h"
 #include "espnow_link.h"
 #include "pairing.h"
 #include "data_core.h"
@@ -353,42 +354,48 @@ void swarm_forget_node_stats(const uint8_t mac[6])
 #define SWARM_FORGET_BROADCAST_COUNT 3
 #define SWARM_FORGET_BROADCAST_GAP_MS 200
 
-/* One-shot task: broadcasts SWARM_MSG_FORGET a few times, then deletes
- * itself. Deliberately a plain FreeRTOS task, spawned fresh per forget --
- * NOT the ESP-NOW receive callback (which must never send) and not the
- * httpd request task either (a blocking ~600ms sleep there would stall the
- * HTTP response to the operator's browser for no reason). Broadcast, not
- * unicast: by the time this runs, api_v1.c's forget handler has already
- * called espnow_link_remove_peer() for the target, so there is no peer
- * left to address a unicast frame to at all (mirrors PAIR_ACK/PONG's
- * broadcast reasoning in swarm_frame.h, just for the opposite reason --
- * those broadcast because the peer doesn't exist YET, this because it no
- * longer does). Best-effort and fire-and-forget: nothing waits on the
- * result, matching the plan's "a node that was powered off still needs the
- * BOOT button" acceptance -- there is no ack for FORGET to wait for.
+/* One-shot task: broadcasts SWARM_MSG_FORGET (now carrying the target's
+ * MAC -- see swarm_frame.h) a few times, then deletes itself. Deliberately
+ * a plain FreeRTOS task, spawned fresh per forget -- NOT the ESP-NOW
+ * receive callback (which must never send) and not the httpd request task
+ * either (a blocking ~600ms sleep there would stall the HTTP response to
+ * the operator's browser for no reason). Broadcast, not unicast: by the
+ * time this runs, api_v1.c's forget handler has already called
+ * espnow_link_remove_peer() for the target, so there is no peer left to
+ * address a unicast frame to at all (mirrors PAIR_ACK/PONG's broadcast
+ * reasoning in swarm_frame.h, just for the opposite reason -- those
+ * broadcast because the peer doesn't exist YET, this because it no longer
+ * does). Best-effort and fire-and-forget: nothing waits on the result,
+ * matching the plan's "a node that was powered off still needs the BOOT
+ * button" acceptance -- there is no ack for FORGET to wait for.
  *
- * Known limitation, accepted for M5c: swarm_forget_t carries no target MAC
- * (see swarm_frame.h) -- ESP-NOW's own broadcast address is equally
- * untargeted -- so EVERY node currently paired to this hub receives this
- * broadcast and independently checks "is the sender my stored hub?" (see
- * pairing.c's FORGET handling), which is true for all of them, not only
- * the one just forgotten. Forgetting one node therefore currently forgets
- * every node paired to this hub, not just the target. A future protocol
- * revision could add a target MAC to swarm_forget_t to fix this without
- * another version bump's worth of urgency; flagged here rather than
- * silently accepted, since it is not obviously what an operator forgetting
- * a single node would expect. */
+ * Fixed, M5c: swarm_forget_t now carries the forgotten node's MAC
+ * (target_mac). ESP-NOW's own broadcast address is still untargeted -- every
+ * node paired to this hub still RECEIVES this frame -- but each one now
+ * checks target_mac against its own STA MAC (pairing.c's FORGET handling)
+ * before checking sender identity, so only the actual target ever acts on
+ * it; every other paired node now correctly ignores it instead of also
+ * unpairing. `arg` is a heap-allocated 6-byte MAC, owned by this task and
+ * freed here -- xTaskCreate's caller (swarm_broadcast_forget() below) may
+ * return and its own stack copy of the MAC may go away before this task
+ * ever actually runs, so the MAC has to travel via the heap, not a stack
+ * pointer. */
 static void forget_broadcast_task(void *arg)
 {
-    (void)arg;
+    uint8_t target_mac[6];
+    memcpy(target_mac, arg, 6);
+    free(arg);
+
     swarm_forget_t f = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_FORGET };
+    memcpy(f.target_mac, target_mac, 6);
     uint8_t buf[sizeof(f)];
     size_t n = swarm_encode_forget(&f, buf, sizeof(buf));
 
     for (int i = 0; i < SWARM_FORGET_BROADCAST_COUNT; i++) {
         if (n) {
             esp_err_t err = espnow_link_broadcast(buf, n);
-            ESP_LOGI(TAG, "FORGET broadcast %d/%d: %s", i + 1, SWARM_FORGET_BROADCAST_COUNT, esp_err_to_name(err));
+            ESP_LOGI(TAG, "FORGET(" MACSTR ") broadcast %d/%d: %s",
+                     MAC2STR(target_mac), i + 1, SWARM_FORGET_BROADCAST_COUNT, esp_err_to_name(err));
         }
         if (i + 1 < SWARM_FORGET_BROADCAST_COUNT) vTaskDelay(pdMS_TO_TICKS(SWARM_FORGET_BROADCAST_GAP_MS));
     }
@@ -396,13 +403,22 @@ static void forget_broadcast_task(void *arg)
 }
 
 /* Hub: called by api_v1.c's DELETE /api/v1/nodes/{MAC12} handler after it
- * has already removed the node from swarm_store and its ESP-NOW peer entry
- * -- this only kicks off the best-effort radio notification, it does not
+ * has already removed `mac` from swarm_store and its ESP-NOW peer entry --
+ * this only kicks off the best-effort radio notification, it does not
  * touch swarm_store or the peer table itself. Safe to call from the httpd
- * task: this function itself never blocks, it only spawns the task above. */
-void swarm_broadcast_forget(void)
+ * task: this function itself never blocks, it only spawns the task above
+ * (after copying mac onto the heap for that task to own). */
+void swarm_broadcast_forget(const uint8_t mac[6])
 {
-    if (xTaskCreate(forget_broadcast_task, "swarm_forget_bc", 3072, NULL, 5, NULL) != pdPASS) {
+    uint8_t *arg = malloc(6);
+    if (!arg) {
+        ESP_LOGE(TAG, "swarm_broadcast_forget: out of memory -- forgotten node will not learn it "
+                      "over the air; BOOT-button recovery is still available");
+        return;
+    }
+    memcpy(arg, mac, 6);
+    if (xTaskCreate(forget_broadcast_task, "swarm_forget_bc", 3072, arg, 5, NULL) != pdPASS) {
+        free(arg);
         ESP_LOGE(TAG, "swarm_broadcast_forget: failed to create broadcast task -- "
                       "forgotten node(s) will not learn it over the air; "
                       "BOOT-button recovery is still available");
@@ -484,54 +500,27 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
  * always rebuild "current" state), so a node reboot loses only the backlog
  * of already-superseded history, never the current reading. Owned
  * exclusively by forward_task() below -- nothing else ever reads or writes
- * it, so it needs no lock. */
-#define SWARM_NODE_BUFFER_LEN 32
-
-typedef struct {
-    swarm_reading_t r;
-    int64_t         captured_us;  /* esp_timer_get_time() when last (re)buffered;
-                                    * age_s is recomputed from this at transmit time */
-} buffered_reading_t;
-
-static buffered_reading_t s_buf[SWARM_NODE_BUFFER_LEN];
-static int                s_buf_head;     /* index of the oldest entry */
-static int                s_buf_count;    /* number of valid entries, 0..SWARM_NODE_BUFFER_LEN */
-static uint32_t           s_buf_dropped;  /* running count of oldest-entries evicted because the ring was full */
+ * it, so it needs no lock (the ring's own mechanics carry no lock either --
+ * see swarm_buf.h -- for the same reason: a single owner needs none). The
+ * push/pop/evict/FIFO/age-clamp mechanics themselves live in swarm_buf.c/.h,
+ * a pure-C unit extracted specifically so tests/host/test_swarm_buf.c can
+ * exercise them without any FreeRTOS/ESP-IDF dependency -- this was M5b's
+ * one untested piece of logic. */
+static swarm_buf_t s_buf;
 
 /* Buffers a reading that just failed to send. When full, the oldest entry is
  * evicted to make room -- logged at debug with a running counter, per the
  * brief, rather than silently discarding without any trace. */
 static void buffer_push(const swarm_reading_t *r, int64_t now_us)
 {
-    if (s_buf_count == SWARM_NODE_BUFFER_LEN) {
-        s_buf_dropped++;
+    bool was_full = swarm_buf_count(&s_buf) == SWARM_NODE_BUFFER_LEN;
+    if (was_full) {
         ESP_LOGD(TAG, "reading buffer full (%d), dropping oldest for " MACSTR
-                      " (dropped=%" PRIu32 " total)",
-                 SWARM_NODE_BUFFER_LEN, MAC2STR(s_buf[s_buf_head].r.mac), s_buf_dropped);
-        /* Overwrite the oldest slot in place, then advance head: that slot
-         * becomes the newest entry and the next one becomes the new oldest --
-         * count stays at SWARM_NODE_BUFFER_LEN throughout. */
-        s_buf[s_buf_head].r = *r;
-        s_buf[s_buf_head].captured_us = now_us;
-        s_buf_head = (s_buf_head + 1) % SWARM_NODE_BUFFER_LEN;
-    } else {
-        int idx = (s_buf_head + s_buf_count) % SWARM_NODE_BUFFER_LEN;
-        s_buf[idx].r = *r;
-        s_buf[idx].captured_us = now_us;
-        s_buf_count++;
+                      " (dropped=%" PRIu32 " total, about to become %" PRIu32 ")",
+                 SWARM_NODE_BUFFER_LEN, MAC2STR(s_buf.entries[s_buf.head].r.mac),
+                 swarm_buf_dropped(&s_buf), swarm_buf_dropped(&s_buf) + 1);
     }
-}
-
-/* Pops the oldest buffered reading, if any. Does NOT recompute age_s -- the
- * caller does that at transmit time, since "now" is only meaningful right
- * before the send actually happens. */
-static bool buffer_pop(buffered_reading_t *out)
-{
-    if (s_buf_count == 0) return false;
-    *out = s_buf[s_buf_head];
-    s_buf_head = (s_buf_head + 1) % SWARM_NODE_BUFFER_LEN;
-    s_buf_count--;
-    return true;
+    swarm_buf_push(&s_buf, r, now_us);
 }
 
 /* Owns every espnow_link_send() the node makes for readings, so a slow or
@@ -564,23 +553,21 @@ static void forward_task(void *arg)
         bool from_backlog = false;
 
         if (!have_reading) {
-            buffered_reading_t br;
-            if (buffer_pop(&br)) {
+            swarm_buf_entry_t br;
+            if (swarm_buf_pop(&s_buf, &br)) {
                 r = br.r;
                 /* age_s is recomputed here, at transmit time, not at the
                  * moment it was (re)buffered -- the whole point of
                  * buffering is riding out an outage of unknown length, so
                  * the hub must see how stale this reading actually is right
                  * now. r.age_s already carries whatever age had accumulated
-                 * before this buffering, so this ADDS the additional wait,
-                 * compounding correctly across repeated buffer/retry
-                 * cycles. Clamped rather than left to wrap past UINT16_MAX
-                 * (~18h) -- data_core's own DATA_CORE_MAX_AGE_S (30 min)
-                 * will drop it hub-side long before that matters anyway. */
-                int64_t extra_us = esp_timer_get_time() - br.captured_us;
-                uint32_t extra_s = (extra_us > 0) ? (uint32_t)(extra_us / 1000000) : 0;
-                uint32_t total_s = (uint32_t)r.age_s + extra_s;
-                r.age_s = (total_s > UINT16_MAX) ? UINT16_MAX : (uint16_t)total_s;
+                 * before this buffering, so swarm_buf_recompute_age() ADDS
+                 * the additional wait on top of it, compounding correctly
+                 * across repeated buffer/retry cycles (and clamping at
+                 * UINT16_MAX rather than wrapping -- data_core's own
+                 * DATA_CORE_MAX_AGE_S (30 min) will drop it hub-side long
+                 * before that matters anyway). */
+                r.age_s = swarm_buf_recompute_age(r.age_s, br.captured_us, esp_timer_get_time());
                 have_reading = true;
                 from_backlog = true;
             } else {
@@ -783,6 +770,7 @@ esp_err_t swarm_start_node(void)
         actual_ch = espnow_link_channel();
     }
 
+    swarm_buf_init(&s_buf);   /* static, already zero at boot -- explicit for clarity */
     s_fwd_queue = xQueueCreate(SWARM_FWD_QUEUE_LEN, sizeof(swarm_reading_t));
     if (!s_fwd_queue) return ESP_ERR_NO_MEM;
     if (xTaskCreate(forward_task, "swarm_fwd", 4096, NULL, 5, NULL) != pdPASS) {

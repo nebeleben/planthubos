@@ -802,20 +802,34 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
          * ESP-NOW peer on the hub's side, so this can only ever arrive as
          * a broadcast (see swarm_frame.h's swarm_forget_t comment) --
          * meaning `src` is whoever actually sent it, not necessarily
-         * addressed to us specifically. Accept it only from the hub this
-         * node believes it is paired to: swarm_store_hub() is the same
-         * short, bounded, allocation-free RAM-cache read already used for
-         * PONG's source check above (no NVS touched), so it's safe here
-         * too. Note: every OTHER node currently paired to the SAME hub
-         * will also see this broadcast and pass this same check -- see
-         * swarm.c's swarm_broadcast_forget() for the accepted limitation
-         * (forgetting one node currently forgets all of that hub's
-         * nodes). */
+         * addressed to us specifically, and every OTHER node currently
+         * paired to the SAME hub also receives this exact broadcast.
+         * Two independent checks gate whether THIS device acts on it:
+         *
+         *   1. sender identity -- accept only from the hub this node
+         *      believes it is paired to. swarm_store_hub() is the same
+         *      short, bounded, allocation-free RAM-cache read already used
+         *      for PONG's source check above (no NVS touched), so it's
+         *      safe here too.
+         *   2. target identity (M5c fix) -- accept only when the frame's
+         *      target_mac equals this device's own STA MAC. Without this,
+         *      every node paired to the same hub would unpair itself on
+         *      ANY single node's forget (M5b's actual behaviour, since
+         *      swarm_forget_t carried no target then) -- clearly not what
+         *      an operator forgetting one specific node would expect.
+         *      esp_read_mac() is a cheap register/eFuse read, not NVS/flash,
+         *      so it's safe to call from this receive-callback path too. */
         swarm_forget_t forget;
         if (!swarm_decode_forget(data, (size_t)len, &forget)) return;
 
         uint8_t hub_mac[6];
         if (!swarm_store_hub(hub_mac, NULL, NULL) || memcmp(src, hub_mac, 6) != 0) return;
+
+        uint8_t own_mac[6];
+        if (esp_read_mac(own_mac, ESP_MAC_WIFI_STA) != ESP_OK ||
+            memcmp(forget.target_mac, own_mac, 6) != 0) {
+            return;
+        }
 
         if (!ensure_forget_task()) {
             ESP_LOGE(TAG, "FORGET from " MACSTR ": forget task unavailable, cannot act on it",
@@ -838,7 +852,13 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
  * non-blocking queue send + pong_task waking and broadcasting -- all of
  * which should complete in well under a millisecond of CPU time), to
  * absorb real-world scheduling jitter on both ends without materially
- * slowing a 13-channel sweep (worst case adds under 4s total). */
+ * slowing a 13-channel sweep. Worst case per channel is NOT just this
+ * timeout: espnow_link_send()'s own send_blocking() can itself wait up to
+ * its own 200ms completion timeout before ever returning ESP_OK (see
+ * espnow_link.c), and only then does this 300ms PONG wait start on top of
+ * that -- so a full sweep's worst case is up to 13 * (200 + 300)ms =
+ * ~6.5s, not the ~3.9s (13 * 300ms) this comment previously claimed by
+ * counting only the PONG wait. */
 #define RESYNC_PONG_TIMEOUT_MS 300
 
 esp_err_t pairing_node_resync_channel(void)

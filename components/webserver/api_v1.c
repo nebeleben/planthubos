@@ -606,8 +606,10 @@ static esp_err_t node_forget_delete(httpd_req_t *req)
      * keeps believing it is paired and never resyncs or re-pairs on its
      * own. Fire-and-forget from a dedicated task (see swarm.c); does not
      * delay this response. A node that was powered off still needs the
-     * physical BOOT-button recovery -- this doesn't change that. */
-    swarm_broadcast_forget();
+     * physical BOOT-button recovery -- this doesn't change that. `mac`
+     * (already parsed above) travels as the frame's target_mac so only
+     * this node acts on it, not every node paired to this hub. */
+    swarm_broadcast_forget(mac);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");

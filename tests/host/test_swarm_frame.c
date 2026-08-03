@@ -19,7 +19,7 @@ int main(void)
     assert(sizeof(swarm_ping_t) == 6);
     assert(sizeof(swarm_pong_t) == 6);
     /* protocol v3 additions */
-    assert(sizeof(swarm_forget_t) == 2);
+    assert(sizeof(swarm_forget_t) == 8);  /* +6 for target_mac, closing the "forgets every node" defect */
     assert(sizeof(swarm_ota_begin_t) == 54);
     assert(sizeof(swarm_ota_chunk_t) == 8 + SWARM_OTA_CHUNK_DATA);
     assert(sizeof(swarm_ota_status_t) == 8);
@@ -99,12 +99,14 @@ int main(void)
     swarm_pong_t pong_out;
     assert(swarm_decode_pong(buf, n, &pong_out) && pong_out.nonce == 0xC0FFEEu);
 
-    /* --- FORGET round-trip (protocol v3) --- */
-    swarm_forget_t forget = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_FORGET };
+    /* --- FORGET round-trip (protocol v3, target_mac added M5c) --- */
+    swarm_forget_t forget = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_FORGET,
+                               .target_mac = { 0x64, 0xE8, 0x33, 0x88, 0x6A, 0xDC } };
     n = swarm_encode_forget(&forget, buf, sizeof(buf));
     assert(n == sizeof(forget) && swarm_frame_type(buf, n) == SWARM_MSG_FORGET);
     swarm_forget_t forget_out;
     assert(swarm_decode_forget(buf, n, &forget_out));
+    assert(memcmp(forget_out.target_mac, forget.target_mac, 6) == 0);
 
     /* --- OTA_BEGIN round-trip --- */
     swarm_ota_begin_t begin = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_OTA_BEGIN,

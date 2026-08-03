@@ -62,16 +62,18 @@ uint32_t swarm_frames_rx(void);
  * from the ESP-NOW receive callback, which only ever calls record_stat(). */
 void swarm_forget_node_stats(const uint8_t mac[6]);
 
-/* Hub: broadcasts SWARM_MSG_FORGET a few times (from a dedicated task, not
- * the caller) so a still-powered node learns it was forgotten and returns
- * to its portal on its own, instead of believing it is paired forever
- * (M5b's gap -- see PlanV1 8f). Call AFTER swarm_store_forget_node() and
- * espnow_link_remove_peer() have already run for the target -- this
- * function does not touch either itself. Best-effort/fire-and-forget: a
- * node that was powered off at the time still needs the physical BOOT-
- * button recovery; this does not replace that path, only shortcuts it when
- * the node happens to be listening. Known limitation: the FORGET frame
- * carries no target MAC (see swarm_frame.h), so every node currently
- * paired to this hub -- not only the one just forgotten -- will act on it;
- * see swarm.c's forget_broadcast_task() for the full reasoning. */
-void swarm_broadcast_forget(void);
+/* Hub: broadcasts SWARM_MSG_FORGET (carrying `mac` as its target_mac -- see
+ * swarm_frame.h) a few times (from a dedicated task, not the caller) so a
+ * still-powered node learns it was forgotten and returns to its portal on
+ * its own, instead of believing it is paired forever (M5b's gap -- see
+ * PlanV1 8f). Call AFTER swarm_store_forget_node() and
+ * espnow_link_remove_peer() have already run for `mac` -- this function
+ * does not touch either itself. Best-effort/fire-and-forget: a node that
+ * was powered off at the time still needs the physical BOOT-button
+ * recovery; this does not replace that path, only shortcuts it when the
+ * node happens to be listening. Every node paired to this hub still
+ * receives the broadcast (ESP-NOW has no way to unicast to a peer that was
+ * just removed), but target_mac now scopes WHICH one acts on it -- only the
+ * node whose own STA MAC equals `mac` unpairs; see swarm.c's
+ * forget_broadcast_task() and pairing.c's FORGET handling. */
+void swarm_broadcast_forget(const uint8_t mac[6]);

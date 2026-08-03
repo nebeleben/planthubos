@@ -118,7 +118,23 @@ export function NodesTab() {
     return () => controller.abort()
   }, [])
 
-  // Pairing-window timers only, not the initial-load AbortController above --
+  // Background keep-fresh poll, independent of the pairing window's own
+  // faster 5s poll (nodesPollRef, started only while a pairing countdown is
+  // active -- see doAddNode). Without this, the tab fetched /api/v1/nodes
+  // exactly once at mount and then never again outside a pairing window, so
+  // "Last seen"/"frames_rx" went stale the moment an operator just left the
+  // tab open. 10s is plenty for a background tick nobody is actively
+  // watching count down (contrast the pairing poll's 5s, sized for a human
+  // watching a countdown). Own AbortController + cleanup, same discipline as
+  // the mount effect above: aborts any in-flight fetch on unmount so a late
+  // response never calls setState on an unmounted component.
+  useEffect(() => {
+    const controller = new AbortController()
+    const id = setInterval(() => refreshNodes(controller.signal), 10000)
+    return () => { clearInterval(id); controller.abort() }
+  }, [])
+
+  // Pairing-window timers only, not the initial-load AbortControllers above --
   // these belong to the "Add node" flow and must not leak across unmounts.
   useEffect(() => () => {
     clearInterval(pairTickRef.current)
