@@ -9,6 +9,7 @@
 #include "swarm_store.h"
 #include "swarm_frame.h"
 #include "swarm_buf.h"
+#include "node_ota.h"
 #include "espnow_link.h"
 #include "pairing.h"
 #include "data_core.h"
@@ -185,10 +186,27 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
         if (swarm_decode_reading(data, (size_t)len, &r)) ingest_reading(src_mac, &r, rssi);
         return;
     }
-    /* PAIR_REQ/PAIR_ACK, PING/PONG or anything unrecognised: pairing_handle_frame
-     * already filters to PAIR_* and silently ignores everything else, so
-     * handing it anything that isn't a reading is safe and keeps this
-     * dispatcher a one-line decision. */
+    if (type == SWARM_MSG_OTA_STATUS) {
+        /* Node -> hub, unicast, encrypted (swarm_frame.h). Successfully
+         * decrypting at all already implies src_mac is a registered
+         * encrypted ESP-NOW peer, which for this hub only ever means an
+         * adopted node (the LMK is handed out exactly once, at PAIR_ACK) --
+         * so the is_paired_node() check below is defense-in-depth, not the
+         * only gate. node_ota_handle_status() independently re-checks src
+         * against whichever node the CURRENT session actually targets, so a
+         * status from a paired-but-not-being-updated node is a no-op there
+         * regardless. node_ota_handle_status() only ever records/enqueues --
+         * see its own header comment -- so it is exactly as safe to call
+         * from this callback as is_paired_node()/record_stat() already are. */
+        if (!is_paired_node(src_mac)) return;
+        swarm_ota_status_t st;
+        if (swarm_decode_ota_status(data, (size_t)len, &st)) node_ota_handle_status(src_mac, &st);
+        return;
+    }
+    /* PAIR_REQ/PAIR_ACK, PING/PONG, FORGET or anything unrecognised:
+     * pairing_handle_frame already filters to the types it understands and
+     * silently ignores everything else, so handing it anything that isn't a
+     * reading or an OTA status is safe and keeps this dispatcher small. */
     pairing_handle_frame(src_mac, data, len, rssi);
 }
 
