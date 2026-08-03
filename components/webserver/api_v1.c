@@ -9,6 +9,7 @@
 #include "ota_post.h"
 #include "swarm.h"
 #include "swarm_store.h"
+#include "node_ota.h"
 #include "pairing.h"
 #include "espnow_link.h"
 #include "cJSON.h"
@@ -495,22 +496,9 @@ static esp_err_t nodes_pair_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* POST /api/v1/nodes/{MAC12} body {"name":"..."} -- rename (empty clears).
- * Registered AFTER nodes_pair_post's exact "/api/v1/nodes/pair" route (see
- * api_v1_register()) so that reserved path keeps matching first; only a
- * request whose path segment isn't "pair" ever reaches this wildcard
- * handler, since httpd_find_uri_handler() returns the first registered
- * match in order (esp_http_server, httpd_uri.c). */
-static esp_err_t node_rename_post(httpd_req_t *req)
+/* POST /api/v1/nodes/{MAC12} body {"name":"..."} -- rename (empty clears). */
+static esp_err_t node_rename_post(httpd_req_t *req, const uint8_t mac[6])
 {
-    if (!api_auth_ok(req)) return api_send_401(req);
-
-    uint8_t mac[6];
-    if (!parse_mac12(req->uri + strlen("/api/v1/nodes/"), mac)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
-        return ESP_OK;
-    }
-
     char body[64];
     if (req->content_len == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
@@ -550,6 +538,122 @@ static esp_err_t node_rename_post(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
+}
+
+/* POST /api/v1/nodes/{MAC12}/ota -- starts a hub-side node_ota.c session
+ * pushing this hub's own running firmware to the node. 409 when one is
+ * already running (for ANY node -- node_ota.c allows only one session
+ * hub-wide at a time, see node_ota.h). */
+static esp_err_t node_ota_start_post(httpd_req_t *req, const uint8_t mac[6])
+{
+    esp_err_t err = node_ota_start(mac);
+    if (err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"an update is already in progress\"}");
+        return ESP_OK;
+    }
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown node");
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota start failed");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* POST /api/v1/nodes/{MAC12}/ota/abort. node_ota_abort() has no per-node
+ * target of its own (only one session can ever be active hub-wide -- see
+ * node_ota.h), so this checks the active session actually targets `mac`
+ * first: a stray abort against the wrong node's URL (a UI race, a stale
+ * tab) must not silently kill an unrelated node's in-flight transfer. */
+static esp_err_t node_ota_abort_post(httpd_req_t *req, const uint8_t mac[6])
+{
+    node_ota_progress_t p;
+    node_ota_progress(&p);
+    if (!p.active || memcmp(p.mac, mac, 6) != 0) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"no active update for this node\"}");
+        return ESP_OK;
+    }
+    esp_err_t err = node_ota_abort();
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "abort failed");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* POST /api/v1/nodes/{MAC12}[/ota[/abort]] -- rename, start an OTA push, or
+ * abort one, all under the SAME registered route. ESP-IDF's
+ * httpd_uri_match_wildcard only ever special-cases a trailing '*' in the
+ * template (verified against this repo's installed IDF,
+ * components/esp_http_server/src/httpd_uri.c: `asterisk` is only set when
+ * the template's LAST character is '*') -- so a second, more specific
+ * wildcard registered under the same "/api/v1/nodes/" prefix would be
+ * rejected outright at registration time (httpd_register_uri_handler()
+ * runs the very same wildcard match against every already-registered
+ * template as its own duplicate check, and the existing wildcard node
+ * route already "covers" any such string). Dispatching on the URI
+ * suffix inside one handler is therefore the only option, not a stylistic
+ * choice. Registered AFTER nodes_pair_post's exact "/api/v1/nodes/pair"
+ * route (see api_v1_register()) so that reserved path keeps matching
+ * first; only a request whose path segment isn't "pair" ever reaches this
+ * wildcard handler, since httpd_find_uri_handler() returns the first
+ * registered match in order. */
+static esp_err_t node_post_dispatch(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/nodes/");
+    uint8_t mac[6];
+    if (!parse_mac12(tail, mac)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
+        return ESP_OK;
+    }
+    const char *suffix = tail + 12;
+
+    if (strcmp(suffix, "/ota") == 0) return node_ota_start_post(req, mac);
+    if (strcmp(suffix, "/ota/abort") == 0) return node_ota_abort_post(req, mac);
+    return node_rename_post(req, mac);
+}
+
+/* GET /api/v1/nodes/{MAC12}/ota -- progress of the hub-wide node_ota.c
+ * session, scoped to `mac`: since only one session can ever be active at a
+ * time (node_ota.h), a query for a node that ISN'T the current/last
+ * session's target reports an honest idle/zeroed state rather than another
+ * node's numbers. Unauthenticated, like every other GET in this file
+ * (nodes_get included) -- only the mutating start/abort routes above are
+ * gated. New route (no existing GET wildcard under this prefix), so no
+ * registration-order dependency with anything else. */
+static esp_err_t node_ota_get(httpd_req_t *req)
+{
+    const char *tail = req->uri + strlen("/api/v1/nodes/");
+    uint8_t mac[6];
+    if (!parse_mac12(tail, mac) || strcmp(tail + 12, "/ota") != 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+        return ESP_OK;
+    }
+
+    node_ota_progress_t p;
+    node_ota_progress(&p);
+    bool for_this_node = p.state != OTA_ST_IDLE && memcmp(p.mac, mac, 6) == 0;
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "active", for_this_node && p.active);
+    cJSON_AddNumberToObject(root, "state", for_this_node ? p.state : OTA_ST_IDLE);
+    cJSON_AddNumberToObject(root, "sent", for_this_node ? p.sent_offset : 0);
+    cJSON_AddNumberToObject(root, "acked", for_this_node ? p.acked_offset : 0);
+    cJSON_AddNumberToObject(root, "total", for_this_node ? p.total_len : 0);
+    cJSON_AddNumberToObject(root, "err", for_this_node ? p.err : 0);
+    return send_json(req, root);
 }
 
 /* DELETE /api/v1/nodes/{MAC12} -- forget: removes the node from
@@ -738,11 +842,15 @@ void api_v1_register(httpd_handle_t server)
     httpd_uri_t nodes_pair = { .uri = "/api/v1/nodes/pair", .method = HTTP_POST, .handler = nodes_pair_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &nodes_pair));
     /* Registered AFTER nodes_pair above so that exact "/api/v1/nodes/pair"
-     * route keeps winning (see node_rename_post()'s comment). */
-    httpd_uri_t node_rename = { .uri = "/api/v1/nodes/*", .method = HTTP_POST, .handler = node_rename_post };
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &node_rename));
+     * route keeps winning (see node_post_dispatch()'s comment). Handles
+     * rename, OTA start and OTA abort -- all under this one route, per
+     * that same comment. */
+    httpd_uri_t node_post = { .uri = "/api/v1/nodes/*", .method = HTTP_POST, .handler = node_post_dispatch };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &node_post));
     httpd_uri_t node_forget = { .uri = "/api/v1/nodes/*", .method = HTTP_DELETE, .handler = node_forget_delete };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &node_forget));
+    httpd_uri_t node_ota_status = { .uri = "/api/v1/nodes/*", .method = HTTP_GET, .handler = node_ota_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &node_ota_status));
     httpd_uri_t role = { .uri = "/api/v1/role", .method = HTTP_POST, .handler = role_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &role));
     httpd_uri_t pair_retry = { .uri = "/api/v1/pair/retry", .method = HTTP_POST, .handler = pair_retry_post };

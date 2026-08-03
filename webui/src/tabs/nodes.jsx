@@ -12,7 +12,115 @@ function fmtAgo(lastSeenS, nowS) {
   return `${Math.round(d / 3600)}h ago`
 }
 
-function Row({ n, nowS, onSaved, onForgotten }) {
+// swarm_frame.h's OTA_ST_* enum, mirrored here for the GET .../ota "state" field
+// (OTA_ST_IDLE=0, OTA_ST_RECEIVING=1 are only ever seen via prog.active, not by value).
+const OTA_DONE = 2, OTA_FAILED = 3
+
+function macPath(mac) {
+  return mac.replaceAll(':', '')
+}
+
+// Per-node OTA push control: an Update button that starts the hub-side push
+// (node_ota.c) and, once active, polls GET /api/v1/nodes/{mac}/ota every 2s
+// for a progress bar, same discipline (AbortController + cleanup on unmount)
+// as the rest of this tab's polling. Self-contained per row -- node_ota.c
+// only ever runs one session hub-wide at a time (node_ota.h), so clicking
+// Update on a second node while another is mid-transfer just gets a 409
+// from the hub, surfaced inline below rather than tracked as separate
+// cross-row state.
+function OtaControl({ mac, fwVersion }) {
+  const [prog, setProg] = useState(null)   // last GET .../ota response, or null before the first poll
+  const [msg, setMsg] = useState('')
+  const [acting, setActing] = useState(false)  // starting/aborting request in flight
+  const pollRef = useRef(null)
+  const controllerRef = useRef(null)
+
+  function stopPolling() {
+    clearInterval(pollRef.current)
+    pollRef.current = null
+    controllerRef.current?.abort()
+    controllerRef.current = null
+  }
+
+  function poll() {
+    const controller = new AbortController()
+    controllerRef.current = controller
+    fetch(`/api/v1/nodes/${macPath(mac)}/ota`, { signal: controller.signal })
+      .then((r) => r.json())
+      .then((d) => {
+        setProg(d)
+        if (!d.active) {
+          stopPolling()
+          if (d.state === OTA_DONE) setMsg('Update complete — node is rebooting onto the new firmware.')
+          else if (d.state === OTA_FAILED) setMsg(`Update failed (err ${d.err}).`)
+        }
+      })
+      .catch(() => {})
+  }
+
+  useEffect(() => stopPolling, [])
+
+  async function start() {
+    if (!confirm(
+      `Push firmware${fwVersion ? ` ${fwVersion}` : ''} to this node? It will reboot once the transfer ` +
+      `completes and validates. An interrupted update is safe -- the node keeps running its current ` +
+      `firmware and stays paired; you can retry from here.`
+    )) return
+    setActing(true); setMsg('')
+    try {
+      const res = await fetch(`/api/v1/nodes/${macPath(mac)}/ota`, { method: 'POST', headers: authHeaders() })
+      if (res.ok) {
+        setMsg('')
+        stopPolling()
+        poll()
+        pollRef.current = setInterval(poll, 2000)
+      } else if (res.status === 401) {
+        setMsg('unauthorized — set the hub key in Config')
+      } else if (res.status === 409) {
+        setMsg('an update is already in progress (on this or another node)')
+      } else {
+        setMsg('failed to start update')
+      }
+    } catch {
+      setMsg('hub not reachable')
+    }
+    setActing(false)
+  }
+
+  async function doAbort() {
+    setActing(true)
+    try {
+      const res = await fetch(`/api/v1/nodes/${macPath(mac)}/ota/abort`, { method: 'POST', headers: authHeaders() })
+      if (!res.ok) setMsg(res.status === 401 ? 'unauthorized — set the hub key in Config' : 'abort failed')
+    } catch {
+      setMsg('hub not reachable')
+    }
+    setActing(false)
+  }
+
+  const active = prog?.active
+  const pct = active && prog.total ? Math.min(100, Math.round((100 * prog.sent) / prog.total)) : 0
+
+  return (
+    <span class="ota-control">
+      {!active && (
+        <button onClick={start} disabled={acting}>
+          {acting ? '…' : 'Update'}
+        </button>
+      )}
+      {active && (
+        <>
+          <progress max="100" value={pct} />
+          <span class="hint">{pct}%</span>
+          <button onClick={doAbort} disabled={acting}>{acting ? '…' : 'Abort'}</button>
+        </>
+      )}
+      {msg && <span class="error">{msg}</span>}
+    </span>
+  )
+}
+
+function Row({ n, nowS, fwVersion, onSaved, onForgotten }) {
   const [name, setName] = useState(n.name || '')
   const [state, setState] = useState('idle') // idle | saving | saved | error | unauth
   const [forgetting, setForgetting] = useState(false)
@@ -74,6 +182,9 @@ function Row({ n, nowS, onSaved, onForgotten }) {
       <td>{n.frames_rx}</td>
       <td>{n.rssi != null ? `${n.rssi} dBm` : '–'}</td>
       <td>
+        <OtaControl mac={n.mac} fwVersion={fwVersion} />
+      </td>
+      <td>
         <button onClick={forget} disabled={forgetting}>{forgetting ? '…' : 'Forget'}</button>
       </td>
     </tr>
@@ -84,6 +195,8 @@ export function NodesTab() {
   const [nodes, setNodes] = useState(null)
   const [total, setTotal] = useState(null)
   const [nowS, setNowS] = useState(null)
+  const [fwVersion, setFwVersion] = useState(null)  // hub's own version -- what an Update push sends (node_ota.c
+                                                     // always sources the hub's OWN running partition)
   const [error, setError] = useState(false)
   const [busy, setBusy] = useState('')          // '' | pair
   const [pairSecondsLeft, setPairSecondsLeft] = useState(0)
@@ -113,7 +226,7 @@ export function NodesTab() {
       refreshNodes(controller.signal),
       fetch('/api/v1/status', { signal: controller.signal })
         .then((r) => r.json())
-        .then((s) => setNowS(s.uptime_s)),
+        .then((s) => { setNowS(s.uptime_s); setFwVersion(s.version) }),
     ]).catch((err) => { if (err.name !== 'AbortError') setError(true) })
     return () => controller.abort()
   }, [])
@@ -190,11 +303,11 @@ export function NodesTab() {
       ) : (
         <table class="devices">
           <thead>
-            <tr><th>Name</th><th>MAC</th><th>Last seen</th><th>Frames</th><th>RSSI</th><th></th></tr>
+            <tr><th>Name</th><th>MAC</th><th>Last seen</th><th>Frames</th><th>RSSI</th><th>Firmware</th><th></th></tr>
           </thead>
           <tbody>
             {nodes.map((n) => (
-              <Row key={n.mac} n={n} nowS={nowS} onSaved={onSaved} onForgotten={onForgotten} />
+              <Row key={n.mac} n={n} nowS={nowS} fwVersion={fwVersion} onSaved={onSaved} onForgotten={onForgotten} />
             ))}
           </tbody>
         </table>
