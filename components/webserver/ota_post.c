@@ -42,6 +42,40 @@ void ota_rollback_guard_start(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, mark_valid_cb, NULL));
 }
 
+/* Node-side rollback guard (M5c) -----------------------------------------
+ * See ota_post.h for the full contract and why this is a separate pair of
+ * functions rather than an extra branch inside ota_rollback_guard_start()
+ * above: that function's own confirmation path (mark_valid_cb) is wired to
+ * WIFI_EVENT_AP_START/IP_EVENT_STA_GOT_IP, neither of which a paired node
+ * (radio-only ESP-NOW, no AP, never associates) ever fires. The hub's own
+ * criteria are untouched above; this is purely additive. */
+static bool s_node_pending;    /* true once start_node() finds a pending-verify image */
+static bool s_node_confirmed;  /* true once confirmed -- guards a wasted repeat flash write */
+
+void ota_rollback_guard_start_node(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) return;
+    if (state != ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGI(TAG, "running from %s, no rollback pending (node)", running->label);
+        return;
+    }
+    ESP_LOGW(TAG, "running from %s pending verify (node); confirming once a reading reaches "
+                  "the hub or a PONG is received", running->label);
+    s_node_pending = true;
+    s_node_confirmed = false;
+}
+
+void ota_rollback_guard_node_confirm(const char *reason)
+{
+    if (!s_node_pending || s_node_confirmed) return;
+    s_node_confirmed = true;
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    ESP_LOGW(TAG, "node healthy (%s), image confirmed (rollback cancelled): %s",
+             reason ? reason : "?", esp_err_to_name(err));
+}
+
 static void send_err_json(httpd_req_t *req, const char *status, const char *msg)
 {
     httpd_resp_set_status(req, status);

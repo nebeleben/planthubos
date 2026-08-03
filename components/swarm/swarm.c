@@ -10,6 +10,7 @@
 #include "swarm_frame.h"
 #include "swarm_buf.h"
 #include "node_ota.h"
+#include "node_ota_recv.h"
 #include "espnow_link.h"
 #include "pairing.h"
 #include "data_core.h"
@@ -452,11 +453,134 @@ static QueueHandle_t s_fwd_queue;
 static uint8_t       s_hub_mac[6];   /* set once in swarm_start_node(); MAC never
                                        * changes across a resync, only the channel does */
 
+/* ---------------- Node side: OTA rollback-guard health signal (M5c) ----------------
+ *
+ * ota_post.h's ota_rollback_guard_node_confirm() performs a flash write
+ * (otadata), so it must never be called from the ESP-NOW receive callback
+ * (node_rx_cb, below -- the WiFi driver task). Same DEFERRAL pattern as
+ * pairing.c's forget_task/pong_task: the callback only enqueues (a
+ * non-blocking send, depth-1 queue -- once one confirmation is queued
+ * there is nothing further to add, the guard confirms at most once), a
+ * dedicated task does the actual call.
+ *
+ * UNLIKE pairing.c's ensure_forget_task()/ensure_hub_task(), the queue and
+ * task here are created EAGERLY, in swarm_start_node() below, not lazily on
+ * first use: signal_node_healthy() is called from TWO different tasks --
+ * node_rx_cb (the WiFi driver task, on an accepted PONG) and forward_task
+ * (on its own task, on a successful send) -- so a lazy "if (!s_health_task)
+ * create it" check could race between them (both observe NULL, both create
+ * a task/queue, one handle gets silently overwritten and leaked). Every
+ * lazy-init precedent elsewhere in this codebase (pairing.c's
+ * ensure_forget_task/ensure_hub_task) is only ever called from ONE task (a
+ * receive callback processes frames strictly one at a time, so it cannot
+ * race itself), which does not apply here -- hence eager init instead of
+ * copying that pattern. */
+static void (*s_health_cb)(const char *reason);
+static QueueHandle_t s_health_queue;
+
+static void health_confirm_task(void *arg)
+{
+    (void)arg;
+    char reason[24];
+    for (;;) {
+        if (xQueueReceive(s_health_queue, reason, portMAX_DELAY) != pdTRUE) continue;
+        if (s_health_cb) s_health_cb(reason);
+    }
+}
+
+void swarm_node_set_health_cb(void (*cb)(const char *reason))
+{
+    s_health_cb = cb;
+}
+
+/* Called once from swarm_start_node(), before anything that could call
+ * signal_node_healthy() below is live (espnow_link_init()/forward_task()
+ * both start after this). */
+static esp_err_t ensure_health_task(void)
+{
+    if (s_health_queue) return ESP_OK;
+    s_health_queue = xQueueCreate(1, sizeof(char[24]));
+    if (!s_health_queue) return ESP_ERR_NO_MEM;
+    TaskHandle_t task;
+    BaseType_t ok = xTaskCreate(health_confirm_task, "swarm_health", 2560, NULL, 5, &task);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "ensure_health_task: xTaskCreate failed");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+/* Safe to call from any task, including the ESP-NOW receive callback
+ * (node_rx_cb): only ever does a non-blocking queue send here, never the
+ * flash write itself. A dropped signal (queue momentarily full, or
+ * ensure_health_task() never having been called -- e.g. a hub, which never
+ * calls it at all) just means confirmation is delayed to the next call, or
+ * simply never happens on a role that never needed it -- forward_task()
+ * calls this on every successful send, and node_rx_cb calls it on every
+ * accepted PONG, so there are repeated chances on a node, not just one. */
+static void signal_node_healthy(const char *reason)
+{
+    if (!s_health_queue) return;
+    char buf[24];
+    strlcpy(buf, reason, sizeof(buf));
+    xQueueSend(s_health_queue, buf, 0);
+}
+
 static void node_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, int rssi)
 {
-    /* A node only ever expects PAIR_ACK here (initial pairing, handled by
-     * pairing_node_start()'s own task); pairing_handle_frame() ignores
-     * anything else. Readings are never received here, only sent. */
+    int type = swarm_frame_type(data, (size_t)len);
+
+    /* OTA_BEGIN/OTA_CHUNK/OTA_ABORT (M5c Task 5): a node's receiver
+     * (node_ota_recv.c) validates the sender against the stored hub MAC
+     * itself before doing anything else, same defense-in-depth pattern as
+     * every other type handled directly in a receive callback in this
+     * codebase -- so no additional check is needed here. Decode failure
+     * (malformed/wrong-length frame) is silently dropped, same as every
+     * other decoder call on this path. */
+    if (type == SWARM_MSG_OTA_BEGIN) {
+        swarm_ota_begin_t begin;
+        if (swarm_decode_ota_begin(data, (size_t)len, &begin)) node_ota_recv_handle_begin(src_mac, &begin);
+        return;
+    }
+    if (type == SWARM_MSG_OTA_CHUNK) {
+        swarm_ota_chunk_t chunk;
+        if (swarm_decode_ota_chunk(data, (size_t)len, &chunk)) node_ota_recv_handle_chunk(src_mac, &chunk);
+        return;
+    }
+    if (type == SWARM_MSG_OTA_ABORT) {
+        swarm_ota_abort_t ab;
+        if (swarm_decode_ota_abort(data, (size_t)len, &ab)) node_ota_recv_handle_abort(src_mac, &ab);
+        return;
+    }
+
+    if (type == SWARM_MSG_PONG) {
+        /* Node-side OTA rollback-guard health signal (M5c): receiving a
+         * PONG from this node's own stored hub is the plan's explicit
+         * alternative criterion to "delivered a reading" -- proof the
+         * hub's application layer just processed a frame from this node,
+         * the same liveness bar pairing_node_resync_channel() itself uses.
+         * Deliberately looser than pairing.c's own PONG handling just
+         * below (no nonce match, no s_resync_waiting gate): any genuine
+         * PONG from the real hub is good enough evidence of connectivity
+         * for this purpose, not just one that happens to answer a resync
+         * currently in flight. swarm_store_hub() is the same short,
+         * bounded, allocation-free RAM-cache read already used for this
+         * exact check elsewhere on this receive-callback path (is_paired_node(),
+         * pairing.c's own PONG/FORGET handling) -- safe here too. Falls
+         * through to pairing_handle_frame() below regardless (that call
+         * still owns the actual resync-match logic). */
+        swarm_pong_t pong;
+        if (swarm_decode_pong(data, (size_t)len, &pong)) {
+            uint8_t hub_mac[6];
+            if (swarm_store_hub(hub_mac, NULL, NULL) && memcmp(src_mac, hub_mac, 6) == 0) {
+                signal_node_healthy("PONG received");
+            }
+        }
+    }
+
+    /* A node only ever expects PAIR_ACK/PONG/FORGET here (initial pairing,
+     * resync liveness, or a forget notification); pairing_handle_frame()
+     * ignores anything else. Readings are never received here, only sent. */
     pairing_handle_frame(src_mac, data, len, rssi);
 }
 
@@ -609,6 +733,14 @@ static void forward_task(void *arg)
             if (!first_delivered) {
                 first_delivered = true;
                 ESP_LOGI(TAG, "first reading delivered to hub");
+                /* Node-side OTA rollback-guard health signal (M5c): the
+                 * plan's primary criterion, "successfully delivered a
+                 * reading to its hub". Only needs signalling once -- see
+                 * signal_node_healthy()/ota_rollback_guard_node_confirm(),
+                 * both idempotent past their first call -- so this rides
+                 * the same first_delivered latch as the log line above
+                 * rather than firing on every single successful send. */
+                signal_node_healthy("reading delivered to hub");
             }
             continue;
         }
@@ -736,6 +868,33 @@ esp_err_t swarm_start_node(void)
         return ESP_ERR_INVALID_STATE;
     }
     memcpy(s_hub_mac, hub_mac, 6);
+
+    /* Must be armed BEFORE espnow_link_init() below hands node_rx_cb its
+     * first frame -- an OTA_BEGIN could arrive at any point after that call
+     * returns. node_ota_recv_init() only creates a queue + task (RAM-only,
+     * no flash/network I/O), so it's cheap and safe this early. Idempotent;
+     * a no-op on every boot that isn't currently receiving a push. */
+    esp_err_t oerr = node_ota_recv_init();
+    if (oerr != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_start_node: node_ota_recv_init failed (%s); node OTA pushes will not "
+                      "be receivable this boot", esp_err_to_name(oerr));
+    }
+
+    /* Same "must exist before node_rx_cb/forward_task can call it" reasoning
+     * as node_ota_recv_init() above -- see ensure_health_task()'s own
+     * comment for why this is eager rather than the lazy-on-first-use
+     * pattern used elsewhere in this file/pairing.c. Failure here is logged,
+     * not fatal: the node still forwards/pairs/receives OTA pushes fine,
+     * only the rollback-guard confirmation signal would never fire, so a
+     * genuinely OTA'd-and-healthy node could still roll back on its next
+     * reboot -- serious, but not a reason to refuse to start as a node
+     * entirely (which would itself be a worse outcome: no forwarding at
+     * all). */
+    esp_err_t herr = ensure_health_task();
+    if (herr != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_start_node: ensure_health_task failed (%s); the OTA rollback-guard "
+                      "health signal will never fire this boot", esp_err_to_name(herr));
+    }
 
     esp_err_t err = radio_only_wifi_start();
     if (err != ESP_OK) return err;

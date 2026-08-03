@@ -83,7 +83,20 @@ void app_main(void)
     if (node_paired) {
         /* Node, already paired to a hub: no web server, no storage sampler,
          * no STA/AP management -- radio-only wifi so ESP-NOW can run, plus
-         * BLE collection (started below, common to both roles). */
+         * BLE collection (started below, common to both roles).
+         *
+         * Rollback guard (M5c, critical -- see ota_post.h): a paired node
+         * has neither of ota_rollback_guard_start()'s two events (no AP, no
+         * IP) to confirm an OTA'd image on, so without this a node updated
+         * over the air would boot in PENDING_VERIFY, never confirm, and
+         * silently roll back to its old firmware on its very next reboot --
+         * every node update would appear to succeed and then quietly undo
+         * itself. Both calls below must run BEFORE swarm_start_node()
+         * starts forward_task()/the receive callback, so nothing can prove
+         * this node "healthy" before the guard is armed and a callback is
+         * wired to receive that signal. */
+        ota_rollback_guard_start_node();
+        swarm_node_set_health_cb(ota_rollback_guard_node_confirm);
         esp_err_t nerr = swarm_start_node();
         if (nerr != ESP_OK) {
             /* Without this fallback a device that fails here is completely

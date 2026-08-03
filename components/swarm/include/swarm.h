@@ -77,3 +77,20 @@ void swarm_forget_node_stats(const uint8_t mac[6]);
  * node whose own STA MAC equals `mac` unpairs; see swarm.c's
  * forget_broadcast_task() and pairing.c's FORGET handling. */
 void swarm_broadcast_forget(const uint8_t mac[6]);
+
+/* Node-only (M5c node-side OTA rollback guard -- see ota_post.h). Registers
+ * a callback invoked the first time this node proves itself "healthy"
+ * after boot: forward_task() successfully delivering a reading to the hub,
+ * or receiving a PONG from it. Call BEFORE swarm_start_node() so nothing
+ * can fire before a callback is armed; a NULL cb clears it (also this
+ * component's own initial state, so wiring this up is opt-in and a hub
+ * never has one set -- swarm_start_main() never calls the callback). The
+ * callback is always invoked from a dedicated FreeRTOS task, never from
+ * the ESP-NOW receive callback (see swarm.c's health-confirm task), so it
+ * is safe for the callback to do flash I/O (as ota_post.h's
+ * ota_rollback_guard_node_confirm() does). Deliberately decoupled via a
+ * function pointer rather than swarm.c calling into webserver/ota_post.h
+ * directly: the webserver component already depends on swarm (api_v1.c),
+ * so the reverse dependency would be circular -- main.c, which depends on
+ * both, does the wiring. */
+void swarm_node_set_health_cb(void (*cb)(const char *reason));
