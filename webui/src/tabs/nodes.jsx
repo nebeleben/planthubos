@@ -34,6 +34,13 @@ function OtaControl({ mac, fwVersion }) {
   const [acting, setActing] = useState(false)  // starting/aborting request in flight
   const pollRef = useRef(null)
   const controllerRef = useRef(null)
+  // Set by doAbort() right before it fires the request, so the poll loop can
+  // tell "the operator clicked Abort" apart from any other OTA_ST_FAILED
+  // (the err byte alone can't: node_ota.h's node_ota_progress_t.err is either
+  // a hub-detected NODE_OTA_ERR_* code or the node's own OTA_STATUS.err byte
+  // passed through verbatim, and the two numberspaces aren't disambiguated on
+  // the wire -- see that struct's comment). Reset whenever a fresh push starts.
+  const userAbortedRef = useRef(false)
 
   function stopPolling() {
     clearInterval(pollRef.current)
@@ -49,16 +56,42 @@ function OtaControl({ mac, fwVersion }) {
       .then((r) => r.json())
       .then((d) => {
         setProg(d)
-        if (!d.active) {
+        if (d.active) {
+          // Covers both the interval below and the resume-on-mount poll:
+          // once we learn a session is active, make sure it's ticking.
+          if (!pollRef.current) pollRef.current = setInterval(poll, 2000)
+        } else {
           stopPolling()
           if (d.state === OTA_DONE) setMsg('Update complete — node is rebooting onto the new firmware.')
-          else if (d.state === OTA_FAILED) setMsg(`Update failed (err ${d.err}).`)
+          else if (d.state === OTA_FAILED) {
+            setMsg(userAbortedRef.current ? 'Update cancelled.' : `Update failed (err ${d.err}).`)
+          }
         }
       })
       .catch(() => {})
   }
 
-  useEffect(() => stopPolling, [])
+  // Poll once on mount: if a push is already in flight (e.g. the operator
+  // reloaded the page mid-transfer, or another tab/session started one),
+  // this resumes the progress bar instead of showing a plain Update button
+  // that would then 409 on click. Deliberately does not set `msg` for a
+  // terminal state found on mount (DONE/FAILED) -- that reflects whatever
+  // the LAST session on this node was, possibly long over, and would be
+  // misleading to surface as if it just happened.
+  useEffect(() => {
+    const controller = new AbortController()
+    controllerRef.current = controller
+    fetch(`/api/v1/nodes/${macPath(mac)}/ota`, { signal: controller.signal })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.active) {
+          setProg(d)
+          pollRef.current = setInterval(poll, 2000)
+        }
+      })
+      .catch(() => {})
+    return stopPolling
+  }, [])
 
   async function start() {
     if (!confirm(
@@ -67,6 +100,7 @@ function OtaControl({ mac, fwVersion }) {
       `firmware and stays paired; you can retry from here.`
     )) return
     setActing(true); setMsg('')
+    userAbortedRef.current = false
     try {
       const res = await fetch(`/api/v1/nodes/${macPath(mac)}/ota`, { method: 'POST', headers: authHeaders() })
       if (res.ok) {
@@ -89,10 +123,15 @@ function OtaControl({ mac, fwVersion }) {
 
   async function doAbort() {
     setActing(true)
+    userAbortedRef.current = true
     try {
       const res = await fetch(`/api/v1/nodes/${macPath(mac)}/ota/abort`, { method: 'POST', headers: authHeaders() })
-      if (!res.ok) setMsg(res.status === 401 ? 'unauthorized — set the hub key in Config' : 'abort failed')
+      if (!res.ok) {
+        userAbortedRef.current = false
+        setMsg(res.status === 401 ? 'unauthorized — set the hub key in Config' : 'abort failed')
+      }
     } catch {
+      userAbortedRef.current = false
       setMsg('hub not reachable')
     }
     setActing(false)

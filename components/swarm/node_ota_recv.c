@@ -11,6 +11,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -24,6 +25,23 @@ static const char *TAG = "node_ota_recv";
 #define NODE_OTA_RECV_QUEUE_LEN 8
 #define NODE_OTA_RECV_STATUS_EVERY 64
 #define NODE_OTA_RECV_RESTART_DELAY_MS 1500
+
+/* Idle-timeout guard: if the hub that started a session crashes, reboots, or
+ * otherwise drops out of radio contact mid-transfer, its (RAM-only) session
+ * state vanishes without ever sending OTA_ABORT -- this node would otherwise
+ * be left with s_session.active == true forever, rejecting every later
+ * OTA_BEGIN (including a retry from a hub that comes back) with
+ * NODE_OTA_RECV_ERR_ALREADY_ACTIVE until physically power-cycled. 30s is
+ * generous next to the hub's own go-back-N stall timer (NODE_OTA_STATUS_STALL_MS
+ * = 5000 in node_ota.c, tripping after NODE_OTA_MAX_STALLS = 3 consecutive
+ * misses -- i.e. the hub itself gives up/rewinds well inside this window
+ * during a merely-slow link) while still being short enough that an
+ * operator retrying "shortly after" a hub crash doesn't have to wait long.
+ * NODE_OTA_RECV_IDLE_CHECK_MS is just how often node_ota_recv_task() below
+ * wakes on its own to re-check the above while otherwise idle waiting on
+ * s_queue -- unrelated to the timeout duration itself. */
+#define NODE_OTA_RECV_IDLE_TIMEOUT_MS 30000
+#define NODE_OTA_RECV_IDLE_CHECK_MS   1000
 
 /* Event handed from the ESP-NOW receive callback (node_rx_cb, WiFi driver
  * task) to node_ota_recv_task() below. Tagged union sized for the largest
@@ -57,6 +75,9 @@ typedef struct {
     uint32_t                next_offset;
     uint32_t                chunks_since_status;
     mbedtls_sha256_context  sha_ctx;          /* only valid while active */
+    int64_t                 last_activity_us; /* esp_timer_get_time() at the last accepted
+                                                * OTA_BEGIN/OTA_CHUNK; only meaningful while
+                                                * active -- see NODE_OTA_RECV_IDLE_TIMEOUT_MS */
 } recv_session_t;
 
 /* Cheap, bounded, allocation-free RAM-cache read (no NVS touched) -- same
@@ -162,6 +183,7 @@ static void handle_begin(recv_session_t *s, const uint8_t src[6], const swarm_ot
     s->total_len = begin->total_len;
     memcpy(s->sha256_expected, begin->sha256, sizeof(s->sha256_expected));
     memcpy(s->hub_mac, src, 6);
+    s->last_activity_us = esp_timer_get_time();
     mbedtls_sha256_init(&s->sha_ctx);
     mbedtls_sha256_starts(&s->sha_ctx, 0 /* SHA-256, not SHA-224 */);
 
@@ -253,6 +275,7 @@ static void handle_chunk(recv_session_t *s, const uint8_t src[6], const swarm_ot
         mbedtls_sha256_update(&s->sha_ctx, chunk->data, chunk->len);
         s->next_offset += chunk->len;
         s->chunks_since_status++;
+        s->last_activity_us = esp_timer_get_time();
 
         bool at_end = s->next_offset >= s->total_len;
         if (s->chunks_since_status >= NODE_OTA_RECV_STATUS_EVERY || at_end) {
@@ -281,6 +304,31 @@ static void handle_abort(recv_session_t *s, const uint8_t src[6], const swarm_ot
     s->active = false;
 }
 
+/* Self-aborts `s` if it has been active for more than NODE_OTA_RECV_IDLE_TIMEOUT_MS
+ * with no OTA_BEGIN/OTA_CHUNK accepted (see that constant's comment for why).
+ * Only ever called from node_ota_recv_task() -- same single-task ownership as
+ * every other recv_session_t mutation in this file, so this can never race a
+ * chunk being processed: the task is either sitting in xQueueReceive() (this
+ * check runs on its timeout branch) or already inside handle_begin()/
+ * handle_chunk()/handle_abort() (this check hasn't been reached yet). No
+ * OTA_STATUS is sent: the hub that started this session may well be gone
+ * (crashed, rebooted, out of range) -- there is nothing on the other end to
+ * notify, and a hub that does come back always starts over with a fresh
+ * OTA_BEGIN, which this node is now free to accept immediately. */
+static void check_idle_timeout(recv_session_t *s)
+{
+    if (!s->active) return;
+    int64_t idle_us = esp_timer_get_time() - s->last_activity_us;
+    if (idle_us < (int64_t)NODE_OTA_RECV_IDLE_TIMEOUT_MS * 1000) return;
+
+    ESP_LOGW(TAG, "OTA session from " MACSTR " idle for >%dms with no OTA_BEGIN/OTA_CHUNK "
+                  "accepted; self-aborting so a fresh OTA_BEGIN is accepted immediately",
+             MAC2STR(s->hub_mac), NODE_OTA_RECV_IDLE_TIMEOUT_MS);
+    esp_ota_abort(s->handle);
+    mbedtls_sha256_free(&s->sha_ctx);
+    s->active = false;
+}
+
 static void node_ota_recv_task(void *arg)
 {
     (void)arg;
@@ -288,7 +336,14 @@ static void node_ota_recv_task(void *arg)
 
     for (;;) {
         ota_recv_evt_t evt;
-        if (xQueueReceive(s_queue, &evt, portMAX_DELAY) != pdTRUE) continue;
+        /* Bounded wait, not portMAX_DELAY: this task must wake on its own
+         * even with no frames arriving at all, purely to re-check
+         * check_idle_timeout() above -- an idle queue is exactly the
+         * situation a hub-gone-silent leaves behind. */
+        if (xQueueReceive(s_queue, &evt, pdMS_TO_TICKS(NODE_OTA_RECV_IDLE_CHECK_MS)) != pdTRUE) {
+            check_idle_timeout(&s_session);
+            continue;
+        }
 
         if (evt.type == SWARM_MSG_OTA_BEGIN) {
             handle_begin(&s_session, evt.src, &evt.f.begin);
