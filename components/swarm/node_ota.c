@@ -41,7 +41,7 @@
 static const char *TAG = "node_ota";
 
 /* Go-back-N tuning, per the plan. */
-#define NODE_OTA_MAX_STALLS           8        /* abort after this many consecutive stalls. A
+#define NODE_OTA_MAX_STALLS           16       /* abort after this many consecutive stalls. A
                                                   * "stall" is now (M5c hardware round 3 fix) two
                                                   * consecutive OTA_STATUS reports whose next_offset
                                                   * did not advance -- see the stall-handling comment
@@ -51,7 +51,16 @@ static const char *TAG = "node_ota";
                                                   * (raised from 3 in an earlier round) because
                                                   * OTA_STATUS is a broadcast -- see swarm_frame.h --
                                                   * so occasionally losing one is routine, not
-                                                  * evidence the node/link is actually gone. */
+                                                  * evidence the node/link is actually gone.
+                                                  * Raised 8 -> 16 in round 4: the drain phase below
+                                                  * resends the tail repeatedly, and each pass can
+                                                  * draw more than one non-advancing ahead-status
+                                                  * (rate-limited to ~1/s on the node) before the
+                                                  * one missing chunk finally gets through, so 8
+                                                  * left too little room for a few honest retries. */
+#define NODE_OTA_DRAIN_GRACE_MS       300      /* drain phase: how long to let an in-flight
+                                                  * OTA_STATUS land before assuming acked_offset is
+                                                  * current and resending the tail from it. */
 #define NODE_OTA_TOTAL_TIMEOUT_US     ((int64_t)10 * 60 * 1000000)  /* 10 minutes */
 #define NODE_OTA_CHUNK_YIELD_MS       2        /* pace: yield between chunks */
 #define NODE_OTA_SEND_BACKOFF_MIN_MS  50
@@ -450,24 +459,62 @@ static void node_ota_task(void *arg)
             xSemaphoreGive(s_mutex);
 
             if (sent_offset >= total) {
-                /* Drain phase (fix, M5c hardware round 3): everything has
-                 * been sent at least once, but "nothing left to send" is NOT
-                 * the same as "done" -- a chunk lost in the radio anywhere in
-                 * the stream leaves the node's next_offset short of total_len
+                /* Drain phase (M5c hardware round 4): everything has been
+                 * sent at least once, but "nothing left to send" is NOT the
+                 * same as "done" -- a chunk lost in the radio anywhere in the
+                 * stream leaves the node's next_offset short of total_len
                  * even though the hub's sent_offset has already reached it.
-                 * This is not a separate code path: the got_status handling
-                 * above already does exactly what a drain loop needs --
-                 * wait for a status, and if the node reports next_offset <
-                 * total_len (== sent_offset here), rewind and let the normal
-                 * send logic below resume from there on the next iteration
-                 * -- so simply falling through to the bounded poll-and-retry
-                 * below when there's nothing new to send already IS the
-                 * drain loop. Bounded (50ms), not a spin: abort/timeout are
-                 * still checked every iteration above, and stall accounting
-                 * above already covers the "node stuck short of total_len"
-                 * case via non-advancing statuses -- this vTaskDelay only
-                 * avoids busy-waiting while no new status has arrived yet. */
-                vTaskDelay(pdMS_TO_TICKS(50));
+                 *
+                 * Round 3's fix tried to make this a PASSIVE wait: sit here
+                 * until a status arrives, then let the rewind logic above
+                 * resume the stream. Hardware round 4 showed why that
+                 * deadlocks in the opposite direction from the bug it fixed:
+                 * the node only ever emits its ahead-of-next_offset status
+                 * (node_ota_recv.c) in response to a chunk ARRIVING. Once
+                 * the hub stops sending, the node has nothing to react to
+                 * and says nothing; the hub is waiting for a status that
+                 * only its own traffic could provoke. Both sides go quiet.
+                 * Observed as sent=1159056/1159056 with acked frozen at
+                 * 1011200 and err=0, holding until the 10-minute cap.
+                 *
+                 * So drain ACTIVELY: the hub already knows where the node
+                 * is -- acked_offset is the last next_offset the node
+                 * reported -- so rewind to it and re-stream the tail rather
+                 * than waiting to be told a second time. Each pass either
+                 * gets the missing chunk through (the node advances, sends a
+                 * fresh status, acked moves, stall counter resets) or draws
+                 * another ahead-status at the same offset (stall counter
+                 * ticks, and NODE_OTA_MAX_STALLS eventually aborts) -- so
+                 * this converges or fails honestly, and cannot spin
+                 * silently.
+                 *
+                 * The grace delay first: a status may already be in flight
+                 * from the tail we just finished sending, and acting on a
+                 * stale acked_offset would resend a tail the node has in
+                 * fact already taken. Re-check has_status after waiting and
+                 * defer to the handling above if one landed. */
+                uint32_t acked;
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                acked = s_session.pub.acked_offset;
+                xSemaphoreGive(s_mutex);
+                if (acked >= total) {
+                    /* Node has the whole image; it is finalizing (verify +
+                     * set-boot + restart). Nothing to resend -- just wait
+                     * for the terminal status, still under the abort/total
+                     * timeout checks at the top of the loop. */
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    continue;
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(NODE_OTA_DRAIN_GRACE_MS));
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                if (!s_session.has_status && s_session.pub.acked_offset < s_session.pub.sent_offset) {
+                    ESP_LOGI(TAG, "node OTA for " MACSTR ": drain rewind %" PRIu32 " -> %" PRIu32
+                                  " (tail lost, resending)",
+                             MAC2STR(mac), s_session.pub.sent_offset, s_session.pub.acked_offset);
+                    s_session.pub.sent_offset = s_session.pub.acked_offset;
+                }
+                xSemaphoreGive(s_mutex);
                 continue;
             }
 
