@@ -255,6 +255,24 @@ static void handle_begin(recv_session_t *s, const uint8_t src[6], const swarm_ot
         return;
     }
 
+    /* Reboot survivor (fix: let a rebooted node still confirm its ota): a
+     * BEGIN whose session_id matches the persisted completed marker is the
+     * hub retrying a push this node already finished and rebooted from,
+     * before ever telling the hub -- see swarm_store.h's
+     * swarm_store_completed_ota_session() and finalize_session()'s persist
+     * call above. Answer truthfully instead of silently calling
+     * esp_ota_begin() again over a partition that already holds a verified,
+     * boot-selected image. */
+    uint32_t done_session_id, done_total_len;
+    bool has_done_session = swarm_store_completed_ota_session(&done_session_id, &done_total_len);
+    if (has_done_session && begin->session_id == done_session_id) {
+        ESP_LOGI(TAG, "OTA_BEGIN from " MACSTR " session=%" PRIu32 " matches the persisted "
+                      "completed session; replying DONE instead of starting a new one",
+                 MAC2STR(src), begin->session_id);
+        send_status(src, done_session_id, OTA_ST_DONE, NODE_OTA_RECV_ERR_NONE, done_total_len);
+        return;
+    }
+
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part) {
         ESP_LOGE(TAG, "OTA_BEGIN from " MACSTR ": no next update partition", MAC2STR(src));
@@ -274,6 +292,24 @@ static void handle_begin(recv_session_t *s, const uint8_t src[6], const swarm_ot
         ESP_LOGE(TAG, "OTA_BEGIN from " MACSTR ": esp_ota_begin failed: %s", MAC2STR(src), esp_err_to_name(err));
         send_status(src, begin->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_BEGIN_FAILED, 0);
         return;
+    }
+
+    if (has_done_session) {
+        /* Drop the OLD completed-session marker (fix: let a rebooted node
+         * still confirm its ota): begin->session_id was already confirmed,
+         * above, to differ from done_session_id, so this genuinely new
+         * session is starting -- from this point on nothing should still be
+         * able to match the old id. See swarm_store.h's
+         * swarm_store_clear_completed_ota_session() for why this is the
+         * right point to drop it. Best-effort: a failure here just means
+         * the (already vanishingly unlikely) stale-id-collision window
+         * described there stays open a little longer, not a correctness
+         * problem for THIS session. */
+        esp_err_t cerr = swarm_store_clear_completed_ota_session();
+        if (cerr != ESP_OK) {
+            ESP_LOGW(TAG, "OTA_BEGIN from " MACSTR ": failed to clear the stale completed-session "
+                          "marker (%s)", MAC2STR(src), esp_err_to_name(cerr));
+        }
     }
 
     memset(s, 0, sizeof(*s));
@@ -341,6 +377,31 @@ static void finalize_session(recv_session_t *s, const uint8_t src[6])
         return;
     }
 
+    /* Persist completion (fix: let a rebooted node still confirm its ota):
+     * esp_ota_set_boot_partition() above already succeeded, so the update is
+     * genuinely committed -- the bootloader boots s->part on the very next
+     * reset regardless of anything below. Save just enough (session_id +
+     * total_len) for handle_begin()/handle_chunk() to answer truthfully
+     * after that reset, before esp_restart() wipes the RAM-only `s` this
+     * function is mutating. This call happens here on node_ota_recv_task,
+     * never the ESP-NOW receive callback -- same NVS-write discipline as
+     * everywhere else in this component (see swarm_store.c). The DONE
+     * retransmissions just below remain the fast path; this is the backstop
+     * for when every one of those is also lost -- M5c hardware round 6:
+     * OTA_STATUS is a lossy broadcast (see swarm_frame.h), the hub's
+     * acked_offset badly lagged reality, and the hub was still mid-drain --
+     * not yet listening for a terminal status -- when this node rebooted.
+     * See swarm_store.h's swarm_store_completed_ota_session() for the full
+     * writeup and node_ota_recv.c's handle_begin()/handle_chunk() below for
+     * the other half: answering OTA_ST_DONE instead of OTA_ST_IDLE once
+     * this is set. */
+    esp_err_t perr = swarm_store_set_completed_ota_session(s->session_id, s->total_len);
+    if (perr != ESP_OK) {
+        ESP_LOGE(TAG, "OTA finalize for " MACSTR ": failed to persist the completed session (%s); "
+                      "a reboot before the DONE retransmissions below land will fall back to "
+                      "reporting IDLE instead of DONE", MAC2STR(src), esp_err_to_name(perr));
+    }
+
     s->active = false;
     ESP_LOGW(TAG, "node OTA complete (from " MACSTR "), restarting to boot %s after %d DONE retransmissions",
              MAC2STR(src), s->part->label, NODE_OTA_RECV_DONE_RETRANSMITS);
@@ -381,19 +442,46 @@ static void handle_chunk(recv_session_t *s, const uint8_t src[6], const swarm_ot
          * unthrottled reply here would just add to the exact radio
          * congestion this fix exists to relieve.
          *
-         * session_id is echoed as 0: this node has no active session to
-         * echo one from (a fresh boot's s_session is zero-initialised, and
-         * even an idle-timed-out or aborted former session's leftover
-         * session_id would be stale). node_ota.c's node_ota_handle_status()
-         * accepts state=OTA_ST_IDLE regardless of session_id for exactly
-         * this reason -- see its comment for why that is still safe. */
+         * session_id is echoed as 0 for a genuine IDLE reply: this node has
+         * no active session to echo one from (a fresh boot's s_session is
+         * zero-initialised, and even an idle-timed-out or aborted former
+         * session's leftover session_id would be stale). node_ota.c's
+         * node_ota_handle_status() accepts state=OTA_ST_IDLE regardless of
+         * session_id for exactly this reason -- see its comment for why
+         * that is still safe.
+         *
+         * DONE, not IDLE, when a completed session is persisted (fix: let a
+         * rebooted node still confirm its ota): this !active branch is also
+         * what a REBOOTED node hits for every drain-phase chunk the hub
+         * keeps sending after this node already finished and restarted --
+         * M5c hardware round 6's exact failure. OTA_CHUNK carries no
+         * session_id on the wire (see swarm_frame.h), unlike OTA_BEGIN, so
+         * there is nothing here to match against
+         * swarm_store_completed_ota_session()'s id directly -- but a chunk
+         * can only ever reach this branch as leftover go-back-N traffic
+         * from a session THIS node already accepted via OTA_BEGIN (a
+         * genuinely new session always starts with a BEGIN, which flips
+         * s->active to true before any of its chunks would land here), so
+         * "a completed session is persisted at all" is already the
+         * strongest match this frame shape can offer. The echoed
+         * session_id is still the real safety net regardless -- see
+         * swarm_store.h's swarm_store_completed_ota_session() comment: a
+         * hub only ever credits a DONE whose id matches its OWN current
+         * session, so a stale/unrelated id here is silently ignored by
+         * whichever hub receives it, same as no reply at all. */
+        uint32_t done_session_id, done_total_len;
+        bool has_done_session = swarm_store_completed_ota_session(&done_session_id, &done_total_len);
         int64_t now_us = esp_timer_get_time();
         if (now_us - s->last_idle_status_us >= NODE_OTA_RECV_AHEAD_STATUS_MIN_US) {
             s->last_idle_status_us = now_us;
-            send_status(src, 0, OTA_ST_IDLE, NODE_OTA_RECV_ERR_NONE, 0);
+            if (has_done_session) {
+                send_status(src, done_session_id, OTA_ST_DONE, NODE_OTA_RECV_ERR_NONE, done_total_len);
+            } else {
+                send_status(src, 0, OTA_ST_IDLE, NODE_OTA_RECV_ERR_NONE, 0);
+            }
         }
-        ESP_LOGD(TAG, "OTA_CHUNK from " MACSTR " with no active session, ignoring (rate-limited IDLE status sent)",
-                 MAC2STR(src));
+        ESP_LOGD(TAG, "OTA_CHUNK from " MACSTR " with no active session, ignoring (rate-limited %s status sent)",
+                 MAC2STR(src), has_done_session ? "DONE" : "IDLE");
         return;
     }
     if (memcmp(src, s->hub_mac, 6) != 0) return;  /* defense in depth; callback already checked */

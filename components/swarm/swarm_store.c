@@ -12,12 +12,22 @@ static const char *TAG = "swarm_store";
 #define KEY_HUBCC "sw_hubcc"
 #define KEY_NODES "sw_nodes"
 #define KEY_PFAIL "sw_pfail"
+#define KEY_OTADONE "sw_otadn"
 
 typedef struct __attribute__((packed)) {
     uint8_t mac[6];
     uint8_t lmk[SWARM_LMK_LEN];
     uint8_t channel;
 } hub_blob_t;
+
+/* Node side: see swarm_store.h's swarm_store_completed_ota_session() for
+ * why this exists. Intentionally minimal -- just enough for node_ota_recv.c
+ * to echo a truthful OTA_ST_DONE after a reboot wipes its RAM session
+ * state. */
+typedef struct __attribute__((packed)) {
+    uint32_t session_id;
+    uint32_t total_len;
+} ota_done_blob_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t mac[6];
@@ -126,6 +136,8 @@ static bool s_hub_cc_set;
 static char s_hub_cc[3];
 static nodes_blob_t s_nodes;
 static bool s_pair_failed;
+static bool s_ota_done_set;
+static ota_done_blob_t s_ota_done;
 
 static esp_err_t write_blob(const char *key, const void *data, size_t len)
 {
@@ -200,6 +212,19 @@ static esp_err_t persist_hub_cc(void)
     xSemaphoreGive(s_mutex);
 
     esp_err_t err = set ? write_blob(KEY_HUBCC, cc, sizeof(cc)) : erase_key(KEY_HUBCC);
+    xSemaphoreGive(s_nvs_mutex);
+    return err;
+}
+
+static esp_err_t persist_ota_done(void)
+{
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool set = s_ota_done_set;
+    ota_done_blob_t blob = s_ota_done;
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = set ? write_blob(KEY_OTADONE, &blob, sizeof(blob)) : erase_key(KEY_OTADONE);
     xSemaphoreGive(s_nvs_mutex);
     return err;
 }
@@ -367,6 +392,8 @@ esp_err_t swarm_store_init(void)
     memset(&s_nodes, 0, sizeof(s_nodes));
     s_nodes.format = SWARM_STORE_FORMAT;
     s_pair_failed = false;
+    s_ota_done_set = false;
+    memset(&s_ota_done, 0, sizeof(s_ota_done));
 
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return ESP_OK;  /* fresh NVS = defaults */
@@ -399,14 +426,27 @@ esp_err_t swarm_store_init(void)
     uint8_t pfail_byte;
     s_pair_failed = nvs_get_u8(h, KEY_PFAIL, &pfail_byte) == ESP_OK && pfail_byte != 0;
 
+    /* Read back at init -- not just written at completion -- so a completed
+     * session persisted just before a reboot is already visible to
+     * node_ota_recv.c's handle_begin()/handle_chunk() on the very first
+     * post-reboot frame: swarm_store_init() runs (main.c) well before
+     * swarm_start_node() brings up node_ota_recv_init()/espnow_link_init(),
+     * so this RAM cache is always populated before any ESP-NOW frame could
+     * possibly arrive. See swarm_store.h's swarm_store_completed_ota_session(). */
+    size_t ota_done_len = sizeof(s_ota_done);
+    s_ota_done_set = nvs_get_blob(h, KEY_OTADONE, &s_ota_done, &ota_done_len) == ESP_OK
+                     && ota_done_len == sizeof(s_ota_done);
+    if (!s_ota_done_set) memset(&s_ota_done, 0, sizeof(s_ota_done));
+
     nvs_close(h);
     /* hub_channel logged unconditionally (0 when !hub_paired) so a stored
      * channel is visible at a glance at every boot, not just inferred from
      * a separate pairing-time log line -- makes a hub/node channel
      * mismatch obvious in the console. */
-    ESP_LOGI(TAG, "role=%d hub_paired=%d hub_channel=%u hub_country=%s nodes=%d pair_failed=%d",
+    ESP_LOGI(TAG, "role=%d hub_paired=%d hub_channel=%u hub_country=%s nodes=%d pair_failed=%d "
+                  "completed_ota_session=%d",
              s_role, s_hub_set, s_hub.channel, s_hub_cc_set ? s_hub_cc : "(default)",
-             s_nodes.count, s_pair_failed);
+             s_nodes.count, s_pair_failed, s_ota_done_set);
     return ESP_OK;
 }
 
@@ -718,7 +758,7 @@ esp_err_t swarm_store_set_pair_failed(bool failed)
 
 esp_err_t swarm_store_reset_all(void)
 {
-    /* Best-effort across all four: keep going and report the first failure
+    /* Best-effort across all five: keep going and report the first failure
      * rather than bailing out partway and leaving some cleared and some
      * not -- a factory reset should end up as close to fully-clean as
      * possible even if one NVS write hiccups. */
@@ -726,8 +766,55 @@ esp_err_t swarm_store_reset_all(void)
     esp_err_t e2 = swarm_store_clear_hub();
     esp_err_t e3 = swarm_store_clear_nodes();
     esp_err_t e4 = swarm_store_set_pair_failed(false);
+    esp_err_t e5 = swarm_store_clear_completed_ota_session();
     if (err == ESP_OK) err = e2;
     if (err == ESP_OK) err = e3;
     if (err == ESP_OK) err = e4;
+    if (err == ESP_OK) err = e5;
+    return err;
+}
+
+bool swarm_store_completed_ota_session(uint32_t *session_id_out, uint32_t *total_len_out)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool ok = s_ota_done_set;
+    if (ok) {
+        if (session_id_out) *session_id_out = s_ota_done.session_id;
+        if (total_len_out) *total_len_out = s_ota_done.total_len;
+    }
+    xSemaphoreGive(s_mutex);
+    return ok;
+}
+
+esp_err_t swarm_store_set_completed_ota_session(uint32_t session_id, uint32_t total_len)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_ota_done.session_id = session_id;
+    s_ota_done.total_len = total_len;
+    s_ota_done_set = true;
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = persist_ota_done();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_completed_ota_session: NVS write failed (%s); RAM cache "
+                      "already reflects the completed session and will not revert until the "
+                      "next successful write or a reboot -- a reboot before this ever commits "
+                      "would lose the backstop this exists for (the DONE retransmissions remain "
+                      "the fast path regardless)", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t swarm_store_clear_completed_ota_session(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_ota_done_set = false;
+    memset(&s_ota_done, 0, sizeof(s_ota_done));
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = persist_ota_done();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "swarm_store_clear_completed_ota_session: NVS erase failed (%s)", esp_err_to_name(err));
+    }
     return err;
 }
