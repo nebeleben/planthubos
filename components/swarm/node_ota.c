@@ -28,6 +28,7 @@
 #include "esp_mac.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -40,8 +41,16 @@
 static const char *TAG = "node_ota";
 
 /* Go-back-N tuning, per the plan. */
-#define NODE_OTA_STATUS_STALL_MS      5000     /* rewind to acked_offset if silent this long */
-#define NODE_OTA_MAX_STALLS           3        /* abort after this many consecutive stalls */
+#define NODE_OTA_STATUS_STALL_MS      5000     /* how long OTA_STATUS silence must persist before
+                                                  * counting as one stall -- no longer rewinds
+                                                  * sent_offset by itself, see the stall-handling
+                                                  * comment in the main loop below (fix, M5c
+                                                  * hardware round 1) */
+#define NODE_OTA_MAX_STALLS           8        /* abort after this many consecutive stalls (was 3;
+                                                  * raised because OTA_STATUS is now a broadcast --
+                                                  * see swarm_frame.h -- so occasionally losing one
+                                                  * is now routine, not evidence the node/link is
+                                                  * actually gone) */
 #define NODE_OTA_TOTAL_TIMEOUT_US     ((int64_t)10 * 60 * 1000000)  /* 10 minutes */
 #define NODE_OTA_CHUNK_YIELD_MS       2        /* pace: yield between chunks */
 #define NODE_OTA_SEND_BACKOFF_MIN_MS  50
@@ -59,6 +68,13 @@ static const char *TAG = "node_ota";
 typedef struct {
     node_ota_progress_t pub;   /* mirrors node_ota_progress_t exactly, field for field */
 
+    uint32_t             session_id;  /* fresh esp_random() value per node_ota_start() call,
+                                        * set alongside pub.total_len below (same critical
+                                        * section) before OTA_BEGIN is ever sent; carried in
+                                        * that BEGIN and checked against every OTA_STATUS in
+                                        * node_ota_handle_status() below -- see swarm_frame.h's
+                                        * swarm_ota_begin_t comment for why (M5c hardware
+                                        * round 1 fix). */
     swarm_ota_status_t  last_status;
     bool                has_status;   /* true = last_status is unread by the task yet */
 
@@ -101,8 +117,30 @@ void node_ota_handle_status(const uint8_t src[6], const swarm_ota_status_t *st)
 {
     if (!src || !st || !s_mutex) return;
     if (xSemaphoreTake(s_mutex, 0) != pdTRUE) return;
-    if (s_session.pub.active && memcmp(s_session.pub.mac, src, 6) == 0) {
+    /* Session identity check (M5c hardware round 1 fix, required now that
+     * OTA_STATUS is a plaintext broadcast -- see swarm_frame.h): src alone
+     * is no longer enough, since anyone in radio range can broadcast a
+     * frame claiming to be from a paired node's MAC (hub_rx_cb()'s
+     * is_paired_node() already screens for that at the dispatch level, this
+     * is the second, session-specific gate). Requiring session_id to match
+     * the value THIS session generated and sent in its own OTA_BEGIN means a
+     * status left over from an aborted or superseded session -- e.g. a
+     * stale broadcast still in flight after the hub already gave up and
+     * started a fresh push to the same node -- can never be credited to the
+     * new one. */
+    if (s_session.pub.active && memcmp(s_session.pub.mac, src, 6) == 0
+        && st->session_id == s_session.session_id) {
         s_session.last_status = *st;
+        /* Clamp (M5c hardware round 1 fix): a reported next_offset must
+         * never be trusted past total_len -- a malformed, stale, or
+         * (broadcast, so unauthenticated-by-encryption) malicious frame
+         * claiming an offset beyond the image's real length must not be
+         * allowed to make the go-back-N sender below believe it has
+         * finished sending when it hasn't, or read/send past the end of
+         * the source partition. */
+        if (s_session.last_status.next_offset > s_session.pub.total_len) {
+            s_session.last_status.next_offset = s_session.pub.total_len;
+        }
         s_session.has_status = true;
     }
     xSemaphoreGive(s_mutex);
@@ -186,9 +224,11 @@ static esp_err_t hash_partition(const esp_partition_t *part, uint32_t total_len,
     return err;
 }
 
-static esp_err_t send_ota_begin(const uint8_t mac[6], uint32_t total_len, const uint8_t sha256[32])
+static esp_err_t send_ota_begin(const uint8_t mac[6], uint32_t total_len, const uint8_t sha256[32],
+                                 uint32_t session_id)
 {
-    swarm_ota_begin_t begin = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_OTA_BEGIN, .total_len = total_len };
+    swarm_ota_begin_t begin = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_OTA_BEGIN,
+                                 .session_id = session_id, .total_len = total_len };
     memcpy(begin.sha256, sha256, 32);
     const esp_app_desc_t *desc = esp_app_get_description();
     if (desc) {
@@ -205,12 +245,18 @@ static esp_err_t send_ota_begin(const uint8_t mac[6], uint32_t total_len, const 
      * esp_ota_begin() and every subsequent OTA_CHUNK is meaningless to it
      * (Task 5). A handful of retries here is cheap insurance against a
      * single transient radio failure aborting an entire session before it
-     * even starts. */
+     * even starts. `begin` (and therefore session_id) is built once, above,
+     * OUTSIDE this loop -- every retry re-sends the exact same frame, which
+     * is what lets node_ota_recv.c's handle_begin() recognise a retry that
+     * DID arrive the first time as an idempotent retransmission (same
+     * session_id) instead of a conflicting second session (M5c hardware
+     * round 1 fix: an ESP-NOW send failure here only means this hub's radio
+     * didn't get a clean callback, not that the node never received it). */
     esp_err_t err = ESP_FAIL;
     for (int attempt = 1; attempt <= NODE_OTA_BEGIN_MAX_ATTEMPTS; attempt++) {
         err = espnow_link_send(mac, buf, n);
-        ESP_LOGI(TAG, "OTA_BEGIN -> " MACSTR " attempt %d/%d (total_len=%" PRIu32 " fw=%s): %s",
-                 MAC2STR(mac), attempt, NODE_OTA_BEGIN_MAX_ATTEMPTS, total_len, begin.fw_version,
+        ESP_LOGI(TAG, "OTA_BEGIN -> " MACSTR " attempt %d/%d (session=%" PRIu32 " total_len=%" PRIu32 " fw=%s): %s",
+                 MAC2STR(mac), attempt, NODE_OTA_BEGIN_MAX_ATTEMPTS, session_id, total_len, begin.fw_version,
                  esp_err_to_name(err));
         if (err == ESP_OK) break;
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -269,8 +315,15 @@ static void node_ota_task(void *arg)
         goto done;
     }
 
+    /* session_id (M5c hardware round 1 fix): one fresh esp_random() value
+     * for this entire node_ota_start() call, stored alongside total_len in
+     * the same critical section so node_ota_handle_status() (which reads
+     * both under s_mutex) never observes one without the other. See
+     * swarm_frame.h's swarm_ota_begin_t comment for the full rationale. */
+    uint32_t session_id = esp_random();
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_session.pub.total_len = total_len;
+    s_session.session_id = session_id;
     xSemaphoreGive(s_mutex);
 
     if (abort_was_requested()) {
@@ -279,7 +332,7 @@ static void node_ota_task(void *arg)
         goto done;
     }
 
-    if (send_ota_begin(mac, total_len, digest) != ESP_OK) {
+    if (send_ota_begin(mac, total_len, digest, session_id) != ESP_OK) {
         ESP_LOGE(TAG, "node OTA for " MACSTR ": OTA_BEGIN never got out after %d attempts, giving up",
                  MAC2STR(mac), NODE_OTA_BEGIN_MAX_ATTEMPTS);
         finish_session(mac, OTA_ST_FAILED, NODE_OTA_ERR_BEGIN_SEND, false, 0);
@@ -335,7 +388,12 @@ static void node_ota_task(void *arg)
                     break;
                 }
 
-                /* RECEIVING: reconcile go-back-N offsets. */
+                /* RECEIVING: reconcile go-back-N offsets. A rewind only ever
+                 * happens here, driven by the node's OWN reported next_offset
+                 * actually being behind sent_offset -- this is now the ONLY
+                 * place sent_offset can move backwards (M5c hardware round 1
+                 * fix; see the stall branch below for why mere silence no
+                 * longer does this too). */
                 xSemaphoreTake(s_mutex, portMAX_DELAY);
                 if (st.next_offset > s_session.pub.acked_offset) s_session.pub.acked_offset = st.next_offset;
                 if (st.next_offset < s_session.pub.sent_offset) {
@@ -345,14 +403,33 @@ static void node_ota_task(void *arg)
                 }
                 xSemaphoreGive(s_mutex);
             } else if (esp_timer_get_time() - last_status_us > NODE_OTA_STATUS_STALL_MS * 1000) {
-                xSemaphoreTake(s_mutex, portMAX_DELAY);
-                uint32_t rewind_to = s_session.pub.acked_offset;
-                s_session.pub.sent_offset = rewind_to;
-                xSemaphoreGive(s_mutex);
+                /* Tolerate lost status (fix, M5c hardware round 1): the
+                 * first real hardware OTA showed roughly a third of the
+                 * node's OTA_STATUS frames failing to arrive here even
+                 * while chunks kept sending and landing successfully.
+                 * Rewinding sent_offset back to acked_offset on every such
+                 * silence (as this branch used to) punished that as if the
+                 * node had actually fallen behind, discarding perfectly
+                 * good in-flight progress purely because the *report* of
+                 * progress went missing -- and burned through the stall
+                 * budget doing it, on a transfer that was otherwise healthy.
+                 * A status that never arrives says nothing about where the
+                 * node's next_offset actually is; only a status that DOES
+                 * arrive and reports a lower offset (the branch above) is
+                 * trustworthy evidence of that, so this branch no longer
+                 * touches sent_offset at all -- it keeps streaming from
+                 * wherever it already was. Still bounded: NODE_OTA_MAX_STALLS
+                 * consecutive misses (now 8, up from 3, since an occasional
+                 * lost broadcast is routine, not a sign of a dead link) and
+                 * the unconditional NODE_OTA_TOTAL_TIMEOUT_US cap above both
+                 * still give up on a genuinely dead node/link rather than
+                 * streaming forever. */
                 consecutive_stalls++;
                 last_status_us = esp_timer_get_time();
-                ESP_LOGW(TAG, "node OTA for " MACSTR ": stall #%d (no status in %dms), rewinding to %" PRIu32,
-                         MAC2STR(mac), consecutive_stalls, NODE_OTA_STATUS_STALL_MS, rewind_to);
+                ESP_LOGW(TAG, "node OTA for " MACSTR ": stall #%d (no status in %dms), still "
+                              "streaming from sent_offset=%" PRIu32 " (not rewound)",
+                         MAC2STR(mac), consecutive_stalls, NODE_OTA_STATUS_STALL_MS,
+                         s_session.pub.sent_offset);
                 if (consecutive_stalls >= NODE_OTA_MAX_STALLS) {
                     ESP_LOGE(TAG, "node OTA for " MACSTR ": %d consecutive stalls, aborting",
                              MAC2STR(mac), consecutive_stalls);

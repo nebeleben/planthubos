@@ -134,10 +134,24 @@ typedef struct __attribute__((packed)) {
  * or FORGET, which precede or end that relationship). Announces an
  * incoming firmware push; the hub always sources the image from its own
  * running partition, so fw_version is informational for the node/UI, not
- * something the node can be asked to fetch itself. */
+ * something the node can be asked to fetch itself.
+ *
+ * session_id (fix, M5c hardware round 1): a fresh esp_random() value picked
+ * once per node_ota_start() call and carried unchanged through every retry
+ * of THIS begin (node_ota.c's send_ota_begin() builds the frame once,
+ * outside its retry loop). Echoed verbatim in every OTA_STATUS the node
+ * sends for this session (below) and checked by node_ota_handle_status()
+ * before crediting a status to the hub's current session -- without it, a
+ * status frame from an aborted or superseded session (e.g. a stale
+ * broadcast still in flight after the hub already gave up and started a new
+ * push) could be credited to a session it has nothing to do with. Also lets
+ * the node (node_ota_recv.c's handle_begin()) tell a genuine retransmission
+ * of the active session's own BEGIN (same session_id) apart from a
+ * different BEGIN arriving mid-session. */
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint32_t session_id;
     uint32_t total_len;
     uint8_t  sha256[32];
     char     fw_version[16];  /* human-readable; encoder/caller must NUL-terminate */
@@ -175,9 +189,29 @@ typedef struct __attribute__((packed)) {
     uint8_t  data[SWARM_OTA_CHUNK_DATA];
 } swarm_ota_chunk_t;
 
-/* Node -> hub, unicast, encrypted. Sent every 64 chunks and at completion so
- * the hub's go-back-N sender knows where to resume after a drop, and at
- * session start/end to report RECEIVING/DONE/FAILED. */
+/* Node -> BROADCAST, plaintext (fix, M5c hardware round 1; same reasoning as
+ * PAIR_ACK/PONG/FORGET above -- PlanV1 8e). Originally unicast/encrypted;
+ * the first real hardware OTA showed roughly a third of these going out as
+ * a unicast send the node's own radio reported successful, that the hub's
+ * application layer never saw -- the exact 802.11-MAC-ack-vs-actual-delivery
+ * gap 8e already documents for PAIR_ACK. Broadcasting removes the MAC-ack
+ * dependency entirely, and we already know a node's broadcasts reach the
+ * hub reliably: PAIR_REQ (also a node broadcast) is how pairing itself
+ * works in the first place. DO NOT "optimise" this back to unicast --
+ * see PlanV1 8e for the hardware round that lesson already cost once.
+ *
+ * Necessarily plaintext as a result (ESP-NOW never encrypts broadcast
+ * traffic) -- a much smaller trade than PAIR_ACK's, which is the accepted
+ * precedent: this frame carries only state/err/next_offset (transfer
+ * progress), never key material. session_id (see swarm_ota_begin_t above)
+ * plus the hub's own is_paired_node() source-MAC gate (swarm.c's
+ * hub_rx_cb()) together mean a spoofed or stray broadcast still cannot be
+ * credited to a real session without both a paired node's MAC AND that
+ * session's esp_random() session_id.
+ *
+ * Sent every 64 chunks and at completion so the hub's go-back-N sender
+ * knows where to resume after a drop, and at session start/end to report
+ * RECEIVING/DONE/FAILED. */
 enum {
     OTA_ST_IDLE      = 0,
     OTA_ST_RECEIVING = 1,
@@ -188,9 +222,12 @@ enum {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint32_t session_id;  /* echoed from the OTA_BEGIN that started this session */
     uint8_t  state;
     uint8_t  err;
-    uint32_t next_offset;
+    uint32_t next_offset; /* the hub clamps this to total_len before trusting it -- see
+                            * node_ota_handle_status() -- so a malformed/stale value can
+                            * never make the go-back-N sender believe it's past the end. */
 } swarm_ota_status_t;
 
 /* Hub -> node, unicast, encrypted. Ends a session early: hub-initiated

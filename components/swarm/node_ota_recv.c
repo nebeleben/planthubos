@@ -72,6 +72,9 @@ typedef struct {
     uint8_t                 sha256_expected[32];
     uint8_t                 hub_mac[6];       /* who started this session, for logging + a
                                                 * defense-in-depth re-check on later frames */
+    uint32_t                session_id;       /* echoed from the accepted OTA_BEGIN; carried in
+                                                * every OTA_STATUS this session sends -- see
+                                                * swarm_frame.h's swarm_ota_begin_t comment */
     uint32_t                next_offset;
     uint32_t                chunks_since_status;
     mbedtls_sha256_context  sha_ctx;          /* only valid while active */
@@ -124,16 +127,27 @@ void node_ota_recv_handle_abort(const uint8_t src[6], const swarm_ota_abort_t *a
     enqueue(SWARM_MSG_OTA_ABORT, src, ab, sizeof(*ab));
 }
 
-/* Task-only (espnow_link_send() blocks -- never call this from the receive
- * callback). Best-effort: logs the outcome, does not retry. The hub's own
- * go-back-N sender independently recovers from a dropped/failed status via
- * its 5s stall timer, so a single failed send here is not fatal to the
- * session. */
-static void send_status(const uint8_t dst[6], uint8_t state, uint8_t err, uint32_t next_offset)
+/* Task-only (espnow_link_broadcast() blocks -- never call this from the
+ * receive callback). Best-effort: logs the outcome, does not retry. The
+ * hub's own go-back-N sender independently recovers from a dropped/failed
+ * status via its stall handling, so a single failed send here is not fatal
+ * to the session.
+ *
+ * BROADCAST, not unicast (fix, M5c hardware round 1): the first real
+ * hardware OTA measured roughly a third of these failing to reach the hub's
+ * application layer as a unicast send, exactly the 802.11 MAC-ack-vs-actual-
+ * delivery gap PlanV1 8e already documents for PAIR_ACK/PONG -- see the full
+ * writeup on swarm_ota_status_t in swarm_frame.h. `dst` is kept purely so
+ * the log line below says which hub this status is for; it plays no part in
+ * addressing the send itself any more. DO NOT change this back to
+ * espnow_link_send(dst, ...) -- that is precisely the regression this fix
+ * addresses (PlanV1 8e). */
+static void send_status(const uint8_t dst[6], uint32_t session_id, uint8_t state, uint8_t err, uint32_t next_offset)
 {
     swarm_ota_status_t st = {
         .version = SWARM_PROTO_VERSION,
         .type = SWARM_MSG_OTA_STATUS,
+        .session_id = session_id,
         .state = state,
         .err = err,
         .next_offset = next_offset,
@@ -141,30 +155,72 @@ static void send_status(const uint8_t dst[6], uint8_t state, uint8_t err, uint32
     uint8_t buf[sizeof(st)];
     size_t n = swarm_encode_ota_status(&st, buf, sizeof(buf));
     if (!n) return;
-    esp_err_t serr = espnow_link_send(dst, buf, n);
-    ESP_LOGI(TAG, "OTA_STATUS -> " MACSTR " state=%u err=%u next_offset=%" PRIu32 ": %s",
-             MAC2STR(dst), state, err, next_offset, esp_err_to_name(serr));
+    esp_err_t serr = espnow_link_broadcast(buf, n);
+    ESP_LOGI(TAG, "OTA_STATUS (broadcast, hub=" MACSTR ") session=%" PRIu32 " state=%u err=%u "
+                  "next_offset=%" PRIu32 ": %s",
+             MAC2STR(dst), session_id, state, err, next_offset, esp_err_to_name(serr));
 }
 
 static void handle_begin(recv_session_t *s, const uint8_t src[6], const swarm_ota_begin_t *begin)
 {
     if (s->active) {
+        /* Idempotent OTA_BEGIN (fix, M5c hardware round 1): node_ota.c's
+         * send_ota_begin() retries up to NODE_OTA_BEGIN_MAX_ATTEMPTS times
+         * whenever a send's outcome looks like a failure -- but an ESP-NOW
+         * send failure reflects the local radio's own send-callback result,
+         * not proof the peer never received the frame (the same class of
+         * ack-vs-delivery ambiguity M5a hit for pairing). A retried BEGIN
+         * that actually WAS received the first time then looked, from this
+         * node's side, exactly like a second session starting mid-transfer:
+         * rejected with FAILED(ALREADY_ACTIVE), which is both noisy (a
+         * spurious error on an otherwise-healthy transfer) and misleading
+         * (the hub has no way to tell that apart from a real conflict).
+         *
+         * Detect a genuine retransmission -- same hub, same session_id
+         * (identical to what node_ota.c's send_ota_begin() built once,
+         * before its retry loop, so every retry of the SAME attempt carries
+         * the same value), same total_len/sha256 -- and just re-report
+         * where this session already is instead of tearing anything down. */
+        bool retransmit = memcmp(src, s->hub_mac, 6) == 0
+                        && begin->session_id == s->session_id
+                        && begin->total_len == s->total_len
+                        && memcmp(begin->sha256, s->sha256_expected, sizeof(s->sha256_expected)) == 0;
+        if (retransmit) {
+            ESP_LOGI(TAG, "OTA_BEGIN from " MACSTR " session=%" PRIu32 " is a retransmission of "
+                          "the active session; re-sending current status at next_offset=%" PRIu32,
+                     MAC2STR(src), s->session_id, s->next_offset);
+            send_status(src, s->session_id, OTA_ST_RECEIVING, NODE_OTA_RECV_ERR_NONE, s->next_offset);
+            return;
+        }
+
+        /* A BEGIN with DIFFERENT parameters (different hub, session_id,
+         * length, or image hash) while a session is active is REJECTED, not
+         * used to restart the session mid-flight: this node may already have
+         * partially written flash via esp_ota_write() under the CURRENT
+         * handle, and esp_ota_begin() must not be called again over a handle
+         * that hasn't been esp_ota_end()'d or esp_ota_abort()'d first --
+         * doing so risks leaving the partition in an inconsistent state.
+         * The correct way for the hub to actually switch targets is to send
+         * OTA_ABORT first (handle_abort() below tears the handle down
+         * cleanly via esp_ota_abort()) and only then a new OTA_BEGIN --
+         * exactly what node_ota.c's finish_session() already does whenever
+         * it gives up on a session before starting another. */
         ESP_LOGW(TAG, "OTA_BEGIN from " MACSTR " while a session is already active; rejecting",
                  MAC2STR(src));
-        send_status(src, OTA_ST_FAILED, NODE_OTA_RECV_ERR_ALREADY_ACTIVE, 0);
+        send_status(src, begin->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_ALREADY_ACTIVE, 0);
         return;
     }
 
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part) {
         ESP_LOGE(TAG, "OTA_BEGIN from " MACSTR ": no next update partition", MAC2STR(src));
-        send_status(src, OTA_ST_FAILED, NODE_OTA_RECV_ERR_NO_PARTITION, 0);
+        send_status(src, begin->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_NO_PARTITION, 0);
         return;
     }
     if (begin->total_len == 0 || begin->total_len > part->size) {
         ESP_LOGE(TAG, "OTA_BEGIN from " MACSTR ": total_len %" PRIu32 " invalid for partition size %" PRIu32,
                  MAC2STR(src), begin->total_len, part->size);
-        send_status(src, OTA_ST_FAILED, NODE_OTA_RECV_ERR_TOO_LARGE, 0);
+        send_status(src, begin->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_TOO_LARGE, 0);
         return;
     }
 
@@ -172,7 +228,7 @@ static void handle_begin(recv_session_t *s, const uint8_t src[6], const swarm_ot
     esp_err_t err = esp_ota_begin(part, begin->total_len, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OTA_BEGIN from " MACSTR ": esp_ota_begin failed: %s", MAC2STR(src), esp_err_to_name(err));
-        send_status(src, OTA_ST_FAILED, NODE_OTA_RECV_ERR_BEGIN_FAILED, 0);
+        send_status(src, begin->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_BEGIN_FAILED, 0);
         return;
     }
 
@@ -181,6 +237,7 @@ static void handle_begin(recv_session_t *s, const uint8_t src[6], const swarm_ot
     s->handle = handle;
     s->part = part;
     s->total_len = begin->total_len;
+    s->session_id = begin->session_id;
     memcpy(s->sha256_expected, begin->sha256, sizeof(s->sha256_expected));
     memcpy(s->hub_mac, src, 6);
     s->last_activity_us = esp_timer_get_time();
@@ -193,9 +250,9 @@ static void handle_begin(recv_session_t *s, const uint8_t src[6], const swarm_ot
                                                 * plaintext-after-decrypt -- don't trust it blindly) */
     memcpy(fwv, begin->fw_version, sizeof(begin->fw_version));
     fwv[sizeof(begin->fw_version)] = '\0';    /* the guaranteed extra byte, not the last real one */
-    ESP_LOGW(TAG, "OTA_BEGIN accepted from " MACSTR ": total_len=%" PRIu32 " fw=%s -> writing %s",
-             MAC2STR(src), s->total_len, fwv, part->label);
-    send_status(src, OTA_ST_RECEIVING, NODE_OTA_RECV_ERR_NONE, 0);
+    ESP_LOGW(TAG, "OTA_BEGIN accepted from " MACSTR ": session=%" PRIu32 " total_len=%" PRIu32 " fw=%s -> writing %s",
+             MAC2STR(src), s->session_id, s->total_len, fwv, part->label);
+    send_status(src, s->session_id, OTA_ST_RECEIVING, NODE_OTA_RECV_ERR_NONE, 0);
 }
 
 /* Finalizes a session whose next_offset has just reached total_len: order
@@ -210,7 +267,7 @@ static void finalize_session(recv_session_t *s, const uint8_t src[6])
         ESP_LOGE(TAG, "OTA finalize for " MACSTR ": esp_ota_end failed: %s", MAC2STR(src), esp_err_to_name(eerr));
         mbedtls_sha256_free(&s->sha_ctx);
         s->active = false;
-        send_status(src, OTA_ST_FAILED, NODE_OTA_RECV_ERR_END_FAILED, s->next_offset);
+        send_status(src, s->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_END_FAILED, s->next_offset);
         return;
     }
 
@@ -227,7 +284,7 @@ static void finalize_session(recv_session_t *s, const uint8_t src[6])
          * the bootloader keeps booting the CURRENT partition on the next
          * reboot regardless, the same "stay on current firmware" outcome
          * every other failure path here reaches via esp_ota_abort(). */
-        send_status(src, OTA_ST_FAILED, NODE_OTA_RECV_ERR_HASH_MISMATCH, s->next_offset);
+        send_status(src, s->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_HASH_MISMATCH, s->next_offset);
         return;
     }
 
@@ -236,12 +293,12 @@ static void finalize_session(recv_session_t *s, const uint8_t src[6])
         ESP_LOGE(TAG, "OTA finalize for " MACSTR ": esp_ota_set_boot_partition failed: %s",
                  MAC2STR(src), esp_err_to_name(berr));
         s->active = false;
-        send_status(src, OTA_ST_FAILED, NODE_OTA_RECV_ERR_SET_BOOT_FAILED, s->next_offset);
+        send_status(src, s->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_SET_BOOT_FAILED, s->next_offset);
         return;
     }
 
     s->active = false;
-    send_status(src, OTA_ST_DONE, NODE_OTA_RECV_ERR_NONE, s->next_offset);
+    send_status(src, s->session_id, OTA_ST_DONE, NODE_OTA_RECV_ERR_NONE, s->next_offset);
     ESP_LOGW(TAG, "node OTA complete (from " MACSTR "), restarting in %dms to boot %s",
              MAC2STR(src), NODE_OTA_RECV_RESTART_DELAY_MS, s->part->label);
     /* Delay so the DONE status frame above actually gets out over the radio
@@ -269,7 +326,7 @@ static void handle_chunk(recv_session_t *s, const uint8_t src[6], const swarm_ot
             esp_ota_abort(s->handle);
             mbedtls_sha256_free(&s->sha_ctx);
             s->active = false;
-            send_status(src, OTA_ST_FAILED, NODE_OTA_RECV_ERR_WRITE_FAILED, s->next_offset);
+            send_status(src, s->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_WRITE_FAILED, s->next_offset);
             return;
         }
         mbedtls_sha256_update(&s->sha_ctx, chunk->data, chunk->len);
@@ -279,7 +336,7 @@ static void handle_chunk(recv_session_t *s, const uint8_t src[6], const swarm_ot
 
         bool at_end = s->next_offset >= s->total_len;
         if (s->chunks_since_status >= NODE_OTA_RECV_STATUS_EVERY || at_end) {
-            send_status(src, OTA_ST_RECEIVING, NODE_OTA_RECV_ERR_NONE, s->next_offset);
+            send_status(src, s->session_id, OTA_ST_RECEIVING, NODE_OTA_RECV_ERR_NONE, s->next_offset);
             s->chunks_since_status = 0;
         }
         if (at_end) finalize_session(s, src);   /* may esp_restart() and never return */

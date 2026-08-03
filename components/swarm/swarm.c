@@ -188,17 +188,23 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
         return;
     }
     if (type == SWARM_MSG_OTA_STATUS) {
-        /* Node -> hub, unicast, encrypted (swarm_frame.h). Successfully
-         * decrypting at all already implies src_mac is a registered
-         * encrypted ESP-NOW peer, which for this hub only ever means an
-         * adopted node (the LMK is handed out exactly once, at PAIR_ACK) --
-         * so the is_paired_node() check below is defense-in-depth, not the
-         * only gate. node_ota_handle_status() independently re-checks src
-         * against whichever node the CURRENT session actually targets, so a
-         * status from a paired-but-not-being-updated node is a no-op there
-         * regardless. node_ota_handle_status() only ever records/enqueues --
-         * see its own header comment -- so it is exactly as safe to call
-         * from this callback as is_paired_node()/record_stat() already are. */
+        /* Node -> BROADCAST, plaintext (fix, M5c hardware round 1 -- see the
+         * doc comment on swarm_ota_status_t in swarm_frame.h for why; do not
+         * re-derive it back to unicast/encrypted). Unlike the pre-fix
+         * unicast/encrypted shape, successfully receiving this frame at all
+         * says nothing about the sender's identity any more -- anyone in
+         * radio range can broadcast a well-formed OTA_STATUS. is_paired_node()
+         * below is therefore now the PRIMARY gate, not defense-in-depth: it
+         * is what stops a non-node from injecting one. node_ota_handle_status()
+         * is the second, session-specific gate -- it independently re-checks
+         * src against whichever node the CURRENT session actually targets
+         * AND requires the frame's session_id to match the hub's own
+         * esp_random() value for that session (swarm_frame.h), so even a
+         * spoofed source MAC from a real paired node cannot be credited to a
+         * session it wasn't part of. node_ota_handle_status() only ever
+         * records/enqueues -- see its own header comment -- so it is exactly
+         * as safe to call from this callback as is_paired_node()/record_stat()
+         * already are. */
         if (!is_paired_node(src_mac)) return;
         swarm_ota_status_t st;
         if (swarm_decode_ota_status(data, (size_t)len, &st)) node_ota_handle_status(src_mac, &st);

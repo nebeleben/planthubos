@@ -20,9 +20,12 @@ int main(void)
     assert(sizeof(swarm_pong_t) == 6);
     /* protocol v3 additions */
     assert(sizeof(swarm_forget_t) == 8);  /* +6 for target_mac, closing the "forgets every node" defect */
-    assert(sizeof(swarm_ota_begin_t) == 54);
+    /* +4 for session_id on both (M5c hardware round 1 fix: OTA_STATUS became
+     * broadcast/plaintext and needs a way to reject a status from a stale or
+     * aborted session -- see swarm_frame.h). */
+    assert(sizeof(swarm_ota_begin_t) == 58);
     assert(sizeof(swarm_ota_chunk_t) == 8 + SWARM_OTA_CHUNK_DATA);
-    assert(sizeof(swarm_ota_status_t) == 8);
+    assert(sizeof(swarm_ota_status_t) == 12);
     assert(sizeof(swarm_ota_abort_t) == 3);
 
     /* --- reading round-trip --- */
@@ -110,13 +113,14 @@ int main(void)
 
     /* --- OTA_BEGIN round-trip --- */
     swarm_ota_begin_t begin = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_OTA_BEGIN,
-                                 .total_len = 1048576 };
+                                 .session_id = 0xA5A5A5A5u, .total_len = 1048576 };
     for (int i = 0; i < 32; i++) begin.sha256[i] = (uint8_t)(i * 7 + 3);
     memcpy(begin.fw_version, "0.7.0", 6);
     n = swarm_encode_ota_begin(&begin, buf, sizeof(buf));
     assert(n == sizeof(begin) && swarm_frame_type(buf, n) == SWARM_MSG_OTA_BEGIN);
     swarm_ota_begin_t begin_out;
     assert(swarm_decode_ota_begin(buf, n, &begin_out));
+    assert(begin_out.session_id == 0xA5A5A5A5u);
     assert(begin_out.total_len == 1048576);
     assert(memcmp(begin_out.sha256, begin.sha256, 32) == 0);
     assert(memcmp(begin_out.fw_version, "0.7.0", 6) == 0);
@@ -150,11 +154,13 @@ int main(void)
 
     /* --- OTA_STATUS round-trip, one per state --- */
     swarm_ota_status_t st = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_OTA_STATUS,
-                               .state = OTA_ST_RECEIVING, .err = 0, .next_offset = 12800 };
+                               .session_id = 0xA5A5A5A5u, .state = OTA_ST_RECEIVING, .err = 0,
+                               .next_offset = 12800 };
     n = swarm_encode_ota_status(&st, buf, sizeof(buf));
     assert(n == sizeof(st) && swarm_frame_type(buf, n) == SWARM_MSG_OTA_STATUS);
     swarm_ota_status_t st_out;
     assert(swarm_decode_ota_status(buf, n, &st_out));
+    assert(st_out.session_id == 0xA5A5A5A5u);
     assert(st_out.state == OTA_ST_RECEIVING && st_out.next_offset == 12800);
     st.state = OTA_ST_FAILED; st.err = 5;
     n = swarm_encode_ota_status(&st, buf, sizeof(buf));
