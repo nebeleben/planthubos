@@ -282,6 +282,12 @@ int swarm_node_list_json(char *buf, size_t cap)
 {
     node_stat_t snap[SWARM_MAX_NODES];
     uint32_t total;
+    /* Snapshotted once, up front, so every node in this response is aged
+     * against the same instant rather than drifting across however long
+     * cJSON construction below takes -- irrelevant in practice at this
+     * scale, but "one now_s per response" is the honest way to compute an
+     * age at all. */
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
     if (s_stats_mutex) {
         xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
@@ -305,7 +311,20 @@ int swarm_node_list_json(char *buf, size_t cap)
      * a contradiction that made a one-sided-pairing defect look like a
      * hub-side bug when it wasn't. Merge in s_stats where available and
      * report null for last_seen_s/rssi (a real, meaningful "never heard"
-     * value) and 0 for frames_rx (a real, meaningful count) otherwise. */
+     * value) and 0 for frames_rx (a real, meaningful count) otherwise.
+     *
+     * last_seen_s is an AGE in seconds (now_s - the record_stat() timestamp),
+     * not the raw stored timestamp (fix, M5c hardware round 4, defect 3):
+     * record_stat() stores esp_timer_get_time()/1e6 -- the hub's own uptime
+     * at the moment it last heard this node -- and emitting that verbatim
+     * made a client rendering "last seen N seconds ago" simply wrong (a
+     * round 4 API poll showed last_seen_s climbing 802 -> 882 while
+     * frames_rx was actively incrementing 98 -> 111, i.e. moving in exactly
+     * the wrong direction for an age while the node was demonstrably alive).
+     * Converting to an age here means every consumer of this JSON gets a
+     * value that means what its name says, without having to separately
+     * fetch GET /api/v1/status's uptime_s and subtract it themselves the
+     * way the webui's Nodes tab used to. */
     int n_nodes = swarm_store_node_count();
     for (int i = 0; i < n_nodes; i++) {
         uint8_t mac[6];
@@ -324,8 +343,16 @@ int swarm_node_list_json(char *buf, size_t cap)
         char name[SWARM_NODE_NAME_LEN + 1];
         if (swarm_store_node_name(mac, name) && name[0] != '\0') cJSON_AddStringToObject(o, "name", name);
         else cJSON_AddNullToObject(o, "name");
-        if (stat) cJSON_AddNumberToObject(o, "last_seen_s", stat->last_seen_s);
-        else cJSON_AddNullToObject(o, "last_seen_s");
+        if (stat) {
+            /* now_s and last_seen_s are both esp_timer_get_time()/1e6 off the
+             * same monotonic clock, so now_s >= last_seen_s always holds in
+             * practice; the clamp is just defensive floor-at-zero, same
+             * spirit as the next_offset clamp in node_ota.c. */
+            uint32_t age_s = (now_s >= stat->last_seen_s) ? (now_s - stat->last_seen_s) : 0;
+            cJSON_AddNumberToObject(o, "last_seen_s", age_s);
+        } else {
+            cJSON_AddNullToObject(o, "last_seen_s");
+        }
         cJSON_AddNumberToObject(o, "frames_rx", stat ? stat->frames_rx : 0);
         if (stat) cJSON_AddNumberToObject(o, "rssi", stat->rssi);
         else cJSON_AddNullToObject(o, "rssi");

@@ -61,6 +61,21 @@ static const char *TAG = "node_ota";
 #define NODE_OTA_DRAIN_GRACE_MS       300      /* drain phase: how long to let an in-flight
                                                   * OTA_STATUS land before assuming acked_offset is
                                                   * current and resending the tail from it. */
+#define NODE_OTA_DRAIN_MAX_SILENT_PASSES 10    /* drain phase (fix, M5c hardware round 4, defect
+                                                  * 2b): give up after this many CONSECUTIVE drain
+                                                  * passes that produced no status at all from the
+                                                  * node (as opposed to a non-advancing one, which
+                                                  * NODE_OTA_MAX_STALLS above already bounds). Without
+                                                  * this, total silence during drain was bounded only
+                                                  * by NODE_OTA_TOTAL_TIMEOUT_US -- 10 minutes -- which
+                                                  * is exactly the ~3-minutes-and-counting drain
+                                                  * round 4 hit. The OTA_ST_IDLE fix just above (defect
+                                                  * 2a/2b's main fix) is expected to end most such
+                                                  * sessions long before this bound is ever reached;
+                                                  * this is the last-resort net for the case where even
+                                                  * that status is lost every time. At
+                                                  * NODE_OTA_DRAIN_GRACE_MS=300ms/pass this is on the
+                                                  * order of a few seconds, not minutes. */
 #define NODE_OTA_TOTAL_TIMEOUT_US     ((int64_t)10 * 60 * 1000000)  /* 10 minutes */
 #define NODE_OTA_CHUNK_YIELD_MS       2        /* pace: yield between chunks */
 #define NODE_OTA_SEND_BACKOFF_MIN_MS  50
@@ -138,8 +153,18 @@ void node_ota_handle_status(const uint8_t src[6], const swarm_ota_status_t *st)
      * stale broadcast still in flight after the hub already gave up and
      * started a fresh push to the same node -- can never be credited to the
      * new one. */
+    /* state==OTA_ST_IDLE bypasses the session_id match (fix, M5c hardware
+     * round 4, defect 2b): a node reporting "I have no active session" by
+     * definition cannot echo back a session_id it doesn't have -- see
+     * node_ota_recv.c's handle_chunk() !active branch, which always sends 0
+     * there. The src MAC check just above is NOT bypassed, so this still
+     * requires the frame to come from the exact node this session targets
+     * (already gated a layer up by swarm.c's is_paired_node() too, per the
+     * dispatch comment there) -- the same spoofing exposure already accepted
+     * for every other OTA_STATUS broadcast since M5c hardware round 1 (see
+     * swarm_frame.h), not a new one. */
     if (s_session.pub.active && memcmp(s_session.pub.mac, src, 6) == 0
-        && st->session_id == s_session.session_id) {
+        && (st->session_id == s_session.session_id || st->state == OTA_ST_IDLE)) {
         s_session.last_status = *st;
         /* Clamp (M5c hardware round 1 fix): a reported next_offset must
          * never be trusted past total_len -- a malformed, stale, or
@@ -355,6 +380,8 @@ static void node_ota_task(void *arg)
         uint32_t send_backoff_ms = 0;
         uint32_t last_reported_offset = 0;   /* only meaningful once have_reported_offset */
         bool     have_reported_offset = false;
+        uint32_t drain_silent_passes = 0;    /* consecutive drain-phase loop passes with no status
+                                               * at all -- see NODE_OTA_DRAIN_MAX_SILENT_PASSES */
 
         for (;;) {
             if (abort_was_requested()) {
@@ -393,6 +420,26 @@ static void node_ota_task(void *arg)
                     ESP_LOGW(TAG, "node OTA for " MACSTR ": node reports FAILED (err=%u)",
                              MAC2STR(mac), st.err);
                     finish_session(mac, OTA_ST_FAILED, st.err, false, 0);
+                    break;
+                }
+                if (st.state == OTA_ST_IDLE) {
+                    /* Fix, M5c hardware round 4, defect 2b: the node just
+                     * told us -- via node_ota_recv.c's handle_chunk()
+                     * !active branch -- that it has no active session,
+                     * despite this hub-side session still being active.
+                     * Most commonly this means the node already finished,
+                     * rebooted, and lost all RAM session state before its
+                     * own terminal DONE status got through (see
+                     * finalize_session()'s DONE retransmission, defect 1's
+                     * fix). Whatever the cause, there is nothing left to
+                     * wait for: stop now, with NODE_OTA_ERR_SESSION_LOST
+                     * (distinct from STALL -- see its comment in
+                     * node_ota.h), rather than burning the remaining stall
+                     * budget or drain passes on a node that has already
+                     * said it isn't receiving. */
+                    ESP_LOGW(TAG, "node OTA for " MACSTR ": node reports IDLE (no active session); "
+                                  "ending this session now instead of waiting it out", MAC2STR(mac));
+                    finish_session(mac, OTA_ST_FAILED, NODE_OTA_ERR_SESSION_LOST, true, NODE_OTA_ERR_SESSION_LOST);
                     break;
                 }
 
@@ -492,7 +539,37 @@ static void node_ota_task(void *arg)
                  * from the tail we just finished sending, and acting on a
                  * stale acked_offset would resend a tail the node has in
                  * fact already taken. Re-check has_status after waiting and
-                 * defer to the handling above if one landed. */
+                 * defer to the handling above if one landed.
+                 *
+                 * Silent-pass bound (fix, M5c hardware round 4, defect 2b):
+                 * NODE_OTA_MAX_STALLS above only bounds passes where a
+                 * status DID arrive but didn't advance -- it does nothing
+                 * for a node that says NOTHING at all, which is exactly the
+                 * "acked >= total, waiting for the terminal status" case
+                 * right below when every one of finalize_session()'s DONE
+                 * retransmissions (node_ota_recv.c, defect 1's fix) is lost.
+                 * Count consecutive passes through this whole drain block
+                 * with no status of ANY kind and give up after
+                 * NODE_OTA_DRAIN_MAX_SILENT_PASSES -- honestly reporting
+                 * NODE_OTA_ERR_SESSION_LOST in seconds instead of silently
+                 * resending (or silently waiting) for minutes. See that
+                 * constant's comment and NODE_OTA_ERR_SESSION_LOST's for the
+                 * limitation this accepts: an update that actually succeeded
+                 * but whose every completion frame was lost is still
+                 * reported FAILED -- there is no other evidence available to
+                 * the hub, and that honest failure now arrives quickly. */
+                if (!got_status) {
+                    drain_silent_passes++;
+                    if (drain_silent_passes >= NODE_OTA_DRAIN_MAX_SILENT_PASSES) {
+                        ESP_LOGE(TAG, "node OTA for " MACSTR ": %" PRIu32 " consecutive drain passes with "
+                                      "no status at all from the node, giving up", MAC2STR(mac), drain_silent_passes);
+                        finish_session(mac, OTA_ST_FAILED, NODE_OTA_ERR_SESSION_LOST, true, NODE_OTA_ERR_SESSION_LOST);
+                        break;
+                    }
+                } else {
+                    drain_silent_passes = 0;
+                }
+
                 uint32_t acked;
                 xSemaphoreTake(s_mutex, portMAX_DELAY);
                 acked = s_session.pub.acked_offset;
@@ -501,8 +578,9 @@ static void node_ota_task(void *arg)
                     /* Node has the whole image; it is finalizing (verify +
                      * set-boot + restart). Nothing to resend -- just wait
                      * for the terminal status, still under the abort/total
-                     * timeout checks at the top of the loop. */
-                    vTaskDelay(pdMS_TO_TICKS(50));
+                     * timeout checks at the top of the loop, and now also
+                     * under the silent-pass bound just above. */
+                    vTaskDelay(pdMS_TO_TICKS(NODE_OTA_DRAIN_GRACE_MS));
                     continue;
                 }
 

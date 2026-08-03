@@ -26,6 +26,24 @@ static const char *TAG = "node_ota_recv";
 #define NODE_OTA_RECV_STATUS_EVERY 64
 #define NODE_OTA_RECV_RESTART_DELAY_MS 1500
 
+/* Terminal DONE retransmission (fix, M5c hardware round 4, defect 1): the
+ * single OTA_STATUS(state=OTA_ST_DONE) sent at the end of finalize_session()
+ * below is this node's ONLY chance to tell the hub the transfer succeeded --
+ * unlike every status during the transfer, there is no later chunk or status
+ * to prompt a retry, because this node restarts shortly after. Round 4 hit
+ * exactly that: that one frame was lost, the hub never learned the transfer
+ * finished, and it reported the update FAILED even though it had actually
+ * succeeded (verified sha256, booted app1, rollback cancelled). Resend the
+ * same terminal status a handful of times, spaced out, instead of once --
+ * losing one out of five is far less likely than losing the one-and-only
+ * frame this used to be. Sized to fit comfortably inside
+ * NODE_OTA_RECV_RESTART_DELAY_MS -- see the _Static_assert below -- per the
+ * plan's explicit constraint not to lengthen the restart delay to fit this. */
+#define NODE_OTA_RECV_DONE_RETRANSMITS   5
+#define NODE_OTA_RECV_DONE_RETRANSMIT_MS 200
+_Static_assert(NODE_OTA_RECV_DONE_RETRANSMITS * NODE_OTA_RECV_DONE_RETRANSMIT_MS <= NODE_OTA_RECV_RESTART_DELAY_MS,
+               "terminal DONE retransmissions must fit inside the existing restart delay window");
+
 /* Rate limit for the "ahead of next_offset" OTA_STATUS below (fix, M5c
  * hardware round 3 -- see handle_chunk()'s ahead-branch comment for the full
  * evidence/rationale). One per second is generous next to how often chunks
@@ -96,6 +114,17 @@ typedef struct {
                                                 * "ahead of next_offset" OTA_STATUS sent (0 =
                                                 * none sent yet this session); see handle_chunk()'s
                                                 * ahead-branch and NODE_OTA_RECV_AHEAD_STATUS_MIN_US */
+    int64_t                 last_idle_status_us; /* esp_timer_get_time() at the last
+                                                * state=OTA_ST_IDLE status sent for an OTA_CHUNK that
+                                                * arrived with NO active session (0 = none sent yet).
+                                                * Unlike the fields above it, this one is meaningful
+                                                * precisely WHILE s->active is false -- handle_begin()'s
+                                                * memset() on a fresh accept also clears it, which is
+                                                * harmless: it just means the next idle chunk (after
+                                                * this new session eventually ends) is answered
+                                                * immediately rather than rate-limited from a stale
+                                                * timestamp. See the !s->active branch of handle_chunk()
+                                                * below (fix, M5c hardware round 4, defect 2a). */
 } recv_session_t;
 
 /* Cheap, bounded, allocation-free RAM-cache read (no NVS touched) -- same
@@ -313,22 +342,58 @@ static void finalize_session(recv_session_t *s, const uint8_t src[6])
     }
 
     s->active = false;
-    send_status(src, s->session_id, OTA_ST_DONE, NODE_OTA_RECV_ERR_NONE, s->next_offset);
-    ESP_LOGW(TAG, "node OTA complete (from " MACSTR "), restarting in %dms to boot %s",
-             MAC2STR(src), NODE_OTA_RECV_RESTART_DELAY_MS, s->part->label);
-    /* Delay so the DONE status frame above actually gets out over the radio
-     * before this device restarts -- same reasoning as ota_post.c's
-     * restart_cb, just via vTaskDelay() directly since (unlike that HTTP
-     * handler) this task has no in-flight response it needs to return
-     * first. */
-    vTaskDelay(pdMS_TO_TICKS(NODE_OTA_RECV_RESTART_DELAY_MS));
+    ESP_LOGW(TAG, "node OTA complete (from " MACSTR "), restarting to boot %s after %d DONE retransmissions",
+             MAC2STR(src), s->part->label, NODE_OTA_RECV_DONE_RETRANSMITS);
+    /* Retransmit the terminal DONE status (fix, M5c hardware round 4, defect
+     * 1 -- see NODE_OTA_RECV_DONE_RETRANSMITS' comment above for why one
+     * send is not enough) instead of sending it once. Each send is followed
+     * by the same delay that used to run once, so the total time spent here
+     * -- NODE_OTA_RECV_DONE_RETRANSMITS * NODE_OTA_RECV_DONE_RETRANSMIT_MS,
+     * statically asserted above to fit inside NODE_OTA_RECV_RESTART_DELAY_MS
+     * -- still gives the LAST send a chance to actually clear the radio
+     * before esp_restart(), same reasoning as the single delay this
+     * replaces (itself modeled on ota_post.c's restart_cb, just via
+     * vTaskDelay() directly since this task has no in-flight HTTP response
+     * to return first). */
+    for (int i = 0; i < NODE_OTA_RECV_DONE_RETRANSMITS; i++) {
+        send_status(src, s->session_id, OTA_ST_DONE, NODE_OTA_RECV_ERR_NONE, s->next_offset);
+        vTaskDelay(pdMS_TO_TICKS(NODE_OTA_RECV_DONE_RETRANSMIT_MS));
+    }
     esp_restart();
 }
 
 static void handle_chunk(recv_session_t *s, const uint8_t src[6], const swarm_ota_chunk_t *chunk)
 {
     if (!s->active) {
-        ESP_LOGD(TAG, "OTA_CHUNK from " MACSTR " with no active session, ignoring", MAC2STR(src));
+        /* No active session (fix, M5c hardware round 4, defect 2a): this
+         * used to be a silent drop, which is exactly why the hub kept
+         * drain-resending chunks for ~3 minutes after round 4's node had
+         * already finished and rebooted -- that traffic itself then
+         * disrupted the REBOOTED node's own reading delivery (serial showed
+         * repeated "reading send failed" / "resync: hub not reachable"
+         * throughout). Reply with a status carrying state=OTA_ST_IDLE so the
+         * hub can tell "not currently in a session" apart from silence and
+         * stop on its own -- see node_ota.c's handling of OTA_ST_IDLE for
+         * the other half of this fix. Rate-limited the same way as the
+         * ahead-of-next_offset branch below (~once/s): a hub that keeps
+         * sending after this node has nothing to write can push hundreds of
+         * chunks/second (NODE_OTA_CHUNK_YIELD_MS in node_ota.c), and an
+         * unthrottled reply here would just add to the exact radio
+         * congestion this fix exists to relieve.
+         *
+         * session_id is echoed as 0: this node has no active session to
+         * echo one from (a fresh boot's s_session is zero-initialised, and
+         * even an idle-timed-out or aborted former session's leftover
+         * session_id would be stale). node_ota.c's node_ota_handle_status()
+         * accepts state=OTA_ST_IDLE regardless of session_id for exactly
+         * this reason -- see its comment for why that is still safe. */
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - s->last_idle_status_us >= NODE_OTA_RECV_AHEAD_STATUS_MIN_US) {
+            s->last_idle_status_us = now_us;
+            send_status(src, 0, OTA_ST_IDLE, NODE_OTA_RECV_ERR_NONE, 0);
+        }
+        ESP_LOGD(TAG, "OTA_CHUNK from " MACSTR " with no active session, ignoring (rate-limited IDLE status sent)",
+                 MAC2STR(src));
         return;
     }
     if (memcmp(src, s->hub_mac, 6) != 0) return;  /* defense in depth; callback already checked */

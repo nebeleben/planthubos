@@ -1,15 +1,20 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 
-// last_seen_s is the hub's own uptime at the moment it last heard the node,
-// not wall-clock -- pair it with status.uptime_s, same as the Dashboard and
-// Devices tabs do for sensors.
-function fmtAgo(lastSeenS, nowS) {
-  if (lastSeenS == null || nowS == null) return '–'
-  const d = Math.max(0, nowS - lastSeenS)
-  if (d < 90) return `${d}s ago`
-  if (d < 5400) return `${Math.round(d / 60)}m ago`
-  return `${Math.round(d / 3600)}h ago`
+// last_seen_s is already an AGE in seconds, computed hub-side (swarm.c's
+// swarm_node_list_json -- fix, M5c hardware round 4, defect 3: it used to be
+// the hub's raw uptime at the moment it last heard the node, which this tab
+// then paired with status.uptime_s the same way the Dashboard/Devices tabs
+// still do for sensors -- but that field is a live snapshot from the
+// /api/v1/nodes response, not a ticking clock, so no further subtraction is
+// needed or correct here. It only advances on the next poll (10s background,
+// 5s during a pairing window -- see NodesTab below), unlike the Dashboard's
+// per-second local ticker.
+function fmtAgo(ageS) {
+  if (ageS == null) return '–'
+  if (ageS < 90) return `${ageS}s ago`
+  if (ageS < 5400) return `${Math.round(ageS / 60)}m ago`
+  return `${Math.round(ageS / 3600)}h ago`
 }
 
 // swarm_frame.h's OTA_ST_* enum, mirrored here for the GET .../ota "state" field
@@ -159,7 +164,7 @@ function OtaControl({ mac, fwVersion }) {
   )
 }
 
-function Row({ n, nowS, fwVersion, onSaved, onForgotten }) {
+function Row({ n, fwVersion, onSaved, onForgotten }) {
   const [name, setName] = useState(n.name || '')
   const [state, setState] = useState('idle') // idle | saving | saved | error | unauth
   const [forgetting, setForgetting] = useState(false)
@@ -217,7 +222,7 @@ function Row({ n, nowS, fwVersion, onSaved, onForgotten }) {
         </form>
       </td>
       <td class="mono">{n.mac}</td>
-      <td>{n.last_seen_s != null ? fmtAgo(n.last_seen_s, nowS) : 'never'}</td>
+      <td>{n.last_seen_s != null ? fmtAgo(n.last_seen_s) : 'never'}</td>
       <td>{n.frames_rx}</td>
       <td>{n.rssi != null ? `${n.rssi} dBm` : '–'}</td>
       <td>
@@ -233,7 +238,6 @@ function Row({ n, nowS, fwVersion, onSaved, onForgotten }) {
 export function NodesTab() {
   const [nodes, setNodes] = useState(null)
   const [total, setTotal] = useState(null)
-  const [nowS, setNowS] = useState(null)
   const [fwVersion, setFwVersion] = useState(null)  // hub's own version -- what an Update push sends (node_ota.c
                                                      // always sources the hub's OWN running partition)
   const [error, setError] = useState(false)
@@ -265,7 +269,7 @@ export function NodesTab() {
       refreshNodes(controller.signal),
       fetch('/api/v1/status', { signal: controller.signal })
         .then((r) => r.json())
-        .then((s) => { setNowS(s.uptime_s); setFwVersion(s.version) }),
+        .then((s) => { setFwVersion(s.version) }),
     ]).catch((err) => { if (err.name !== 'AbortError') setError(true) })
     return () => controller.abort()
   }, [])
@@ -346,7 +350,7 @@ export function NodesTab() {
           </thead>
           <tbody>
             {nodes.map((n) => (
-              <Row key={n.mac} n={n} nowS={nowS} fwVersion={fwVersion} onSaved={onSaved} onForgotten={onForgotten} />
+              <Row key={n.mac} n={n} fwVersion={fwVersion} onSaved={onSaved} onForgotten={onForgotten} />
             ))}
           </tbody>
         </table>

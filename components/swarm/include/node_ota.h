@@ -57,6 +57,26 @@ enum {
     NODE_OTA_ERR_TIMEOUT       = 6,  /* 10 minute total session timeout */
     NODE_OTA_ERR_ABORTED       = 7,  /* node_ota_abort() was called */
     NODE_OTA_ERR_NO_MEM        = 8,  /* task/session setup failed */
+    NODE_OTA_ERR_SESSION_LOST  = 9,  /* M5c hardware round 4, defect 2: the node is no longer
+                                       * receiving this session. Reached two ways -- (a) an
+                                       * OTA_STATUS with state=OTA_ST_IDLE arrived for the current
+                                       * session (node_ota_handle_status() below accepts this
+                                       * regardless of session_id -- a node with no active session
+                                       * cannot echo one back, most commonly because it already
+                                       * finished, rebooted, and lost all RAM session state before
+                                       * its own terminal DONE status got through; see
+                                       * node_ota_recv.c's handle_chunk() !active branch and
+                                       * finalize_session()'s DONE retransmission), or (b)
+                                       * node_ota_task()'s drain phase ran too many consecutive
+                                       * passes with NO status at all from the node. Distinct from
+                                       * NODE_OTA_ERR_STALL: STALL means the node IS reporting, just
+                                       * without progress; SESSION_LOST means the hub has no
+                                       * evidence at all that the node is still there. NOTE: if
+                                       * every DONE retransmission the node sends is lost, the hub
+                                       * reaches this same code for an update that actually
+                                       * succeeded -- that is the correct, honest outcome given the
+                                       * hub has no other completion evidence, and (unlike before
+                                       * this fix) it is now reached in seconds, not minutes. */
 };
 
 /* Begins a session pushing the hub's running firmware to node_mac. Returns
