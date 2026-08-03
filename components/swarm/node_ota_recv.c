@@ -107,8 +107,10 @@ typedef struct {
     uint32_t                next_offset;
     uint32_t                chunks_since_status;
     mbedtls_sha256_context  sha_ctx;          /* only valid while active */
-    int64_t                 last_activity_us; /* esp_timer_get_time() at the last accepted
-                                                * OTA_BEGIN/OTA_CHUNK; only meaningful while
+    int64_t                 last_activity_us; /* esp_timer_get_time() at the last OTA_BEGIN/
+                                                * OTA_CHUNK received from this session's hub --
+                                                * accepted or not (see handle_chunk(), M5c
+                                                * hardware round 8); only meaningful while
                                                 * active -- see NODE_OTA_RECV_IDLE_TIMEOUT_MS */
     int64_t                 last_ahead_status_us; /* esp_timer_get_time() at the last
                                                 * "ahead of next_offset" OTA_STATUS sent (0 =
@@ -486,6 +488,23 @@ static void handle_chunk(recv_session_t *s, const uint8_t src[6], const swarm_ot
     }
     if (memcmp(src, s->hub_mac, 6) != 0) return;  /* defense in depth; callback already checked */
 
+    /* Any chunk from this session's hub proves the hub is alive and still
+     * pushing -- that is what NODE_OTA_RECV_IDLE_TIMEOUT_MS is actually
+     * asking about ("has the hub dropped out?"), so the timestamp belongs
+     * here rather than only in the accepted branch below.
+     *
+     * M5c hardware round 8: while the node waits for one specific missing
+     * chunk, go-back-N means it legitimately ACCEPTS nothing for as long as
+     * the recovery takes -- the hub resent a 48KB tail nine times over
+     * ~100s and every one of those chunks was a duplicate the node
+     * (correctly) ignored. With the timestamp bumped only on accepts, the
+     * 30s idle timeout fired mid-recovery and tore down a perfectly healthy
+     * session over a busy link, after which every further chunk was
+     * rejected outright and recovery became impossible. Silence FROM THE
+     * HUB is the failure this timeout exists to catch; a hub hammering
+     * duplicates is the opposite of that. */
+    s->last_activity_us = esp_timer_get_time();
+
     if (chunk->offset == s->next_offset) {
         esp_err_t werr = esp_ota_write(s->handle, chunk->data, chunk->len);
         if (werr != ESP_OK) {
@@ -500,7 +519,6 @@ static void handle_chunk(recv_session_t *s, const uint8_t src[6], const swarm_ot
         mbedtls_sha256_update(&s->sha_ctx, chunk->data, chunk->len);
         s->next_offset += chunk->len;
         s->chunks_since_status++;
-        s->last_activity_us = esp_timer_get_time();
 
         bool at_end = s->next_offset >= s->total_len;
         if (s->chunks_since_status >= NODE_OTA_RECV_STATUS_EVERY || at_end) {

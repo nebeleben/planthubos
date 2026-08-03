@@ -76,6 +76,27 @@ static const char *TAG = "node_ota";
                                                   * that status is lost every time. At
                                                   * NODE_OTA_DRAIN_GRACE_MS=300ms/pass this is on the
                                                   * order of a few seconds, not minutes. */
+#define NODE_OTA_FINALIZE_WAIT_MS     45000    /* how long to wait, once the node has reported
+                                                  * taking the WHOLE image, for it to confirm.
+                                                  * It has to verify ~1.16MB, write the boot
+                                                  * partition and restart, so silence here is
+                                                  * expected -- the drain silent-pass bound
+                                                  * deliberately does not apply (M5c hardware
+                                                  * round 7 gave up after 3s with
+                                                  * sent == acked == total_len, abandoning an
+                                                  * update seconds from confirming itself).
+                                                  * Generous because the cost of waiting is a
+                                                  * late report, while the cost of giving up
+                                                  * early is reporting a successful update as
+                                                  * FAILED. */
+#define NODE_OTA_FINALIZE_POLL_MS     1200     /* while in that wait, re-send OTA_BEGIN this
+                                                  * often as a completion probe -- see the
+                                                  * finalize-wait comment in the main loop for
+                                                  * why BEGIN specifically. Must be a multiple
+                                                  * of NODE_OTA_DRAIN_GRACE_MS (the wait's tick)
+                                                  * for the modulo test to ever fire. */
+_Static_assert(NODE_OTA_FINALIZE_POLL_MS % NODE_OTA_DRAIN_GRACE_MS == 0,
+               "finalize poll interval must be a multiple of the drain tick");
 #define NODE_OTA_TOTAL_TIMEOUT_US     ((int64_t)10 * 60 * 1000000)  /* 10 minutes */
 #define NODE_OTA_CHUNK_YIELD_MS       2        /* pace: yield between chunks */
 #define NODE_OTA_SEND_BACKOFF_MIN_MS  50
@@ -380,6 +401,8 @@ static void node_ota_task(void *arg)
         uint32_t send_backoff_ms = 0;
         uint32_t last_reported_offset = 0;   /* only meaningful once have_reported_offset */
         bool     have_reported_offset = false;
+        uint32_t finalize_wait_ms = 0;       /* time spent in the acked>=total finalize wait --
+                                               * see NODE_OTA_FINALIZE_WAIT_MS */
         uint32_t drain_silent_passes = 0;    /* consecutive drain-phase loop passes with no status
                                                * at all -- see NODE_OTA_DRAIN_MAX_SILENT_PASSES */
 
@@ -558,6 +581,49 @@ static void node_ota_task(void *arg)
                  * but whose every completion frame was lost is still
                  * reported FAILED -- there is no other evidence available to
                  * the hub, and that honest failure now arrives quickly. */
+                uint32_t acked;
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                acked = s_session.pub.acked_offset;
+                xSemaphoreGive(s_mutex);
+
+                if (acked >= total) {
+                    /* Finalize wait (fix, M5c hardware round 7). The node
+                     * has provably taken the WHOLE image -- it said so
+                     * itself -- and is now verifying ~1.16MB, writing the
+                     * boot partition and restarting. Silence here is the
+                     * EXPECTED state, not evidence of a lost node, so the
+                     * silent-pass bound below deliberately does not apply:
+                     * round 7 counted these passes and gave up after 3s
+                     * with sent == acked == total_len, i.e. it abandoned an
+                     * update that was seconds from confirming itself.
+                     *
+                     * Poll instead of waiting mutely. Once the node
+                     * restarts, the hub's own traffic is the only thing
+                     * that can provoke a reply, and OTA_BEGIN is exactly
+                     * the right probe: node_ota_recv.c's handle_begin()
+                     * answers a retransmitted BEGIN for the ACTIVE session
+                     * with its current status, and one whose session_id
+                     * matches the persisted completed-session marker with
+                     * OTA_ST_DONE -- so this reaches the reboot-survivor
+                     * backstop that finalize_session() persists, which
+                     * nothing else would ever trigger. Bounded by
+                     * NODE_OTA_FINALIZE_WAIT_MS; the abort/total-timeout
+                     * checks at the top of the loop still apply. */
+                    if (finalize_wait_ms >= NODE_OTA_FINALIZE_WAIT_MS) {
+                        ESP_LOGE(TAG, "node OTA for " MACSTR ": node took the whole image but never "
+                                      "confirmed within %dms, giving up",
+                                 MAC2STR(mac), NODE_OTA_FINALIZE_WAIT_MS);
+                        finish_session(mac, OTA_ST_FAILED, NODE_OTA_ERR_SESSION_LOST, true, NODE_OTA_ERR_SESSION_LOST);
+                        break;
+                    }
+                    if (finalize_wait_ms % NODE_OTA_FINALIZE_POLL_MS == 0) {
+                        send_ota_begin(mac, total, digest, session_id);
+                    }
+                    finalize_wait_ms += NODE_OTA_DRAIN_GRACE_MS;
+                    vTaskDelay(pdMS_TO_TICKS(NODE_OTA_DRAIN_GRACE_MS));
+                    continue;
+                }
+
                 if (!got_status) {
                     drain_silent_passes++;
                     if (drain_silent_passes >= NODE_OTA_DRAIN_MAX_SILENT_PASSES) {
@@ -568,20 +634,6 @@ static void node_ota_task(void *arg)
                     }
                 } else {
                     drain_silent_passes = 0;
-                }
-
-                uint32_t acked;
-                xSemaphoreTake(s_mutex, portMAX_DELAY);
-                acked = s_session.pub.acked_offset;
-                xSemaphoreGive(s_mutex);
-                if (acked >= total) {
-                    /* Node has the whole image; it is finalizing (verify +
-                     * set-boot + restart). Nothing to resend -- just wait
-                     * for the terminal status, still under the abort/total
-                     * timeout checks at the top of the loop, and now also
-                     * under the silent-pass bound just above. */
-                    vTaskDelay(pdMS_TO_TICKS(NODE_OTA_DRAIN_GRACE_MS));
-                    continue;
                 }
 
                 vTaskDelay(pdMS_TO_TICKS(NODE_OTA_DRAIN_GRACE_MS));
