@@ -41,3 +41,7 @@ $CC -Wall -Wextra -Werror -I../../components/swarm/include \
 $CC -Wall -Wextra -Werror -I../../components/swarm/include \
     test_swarm_buf.c ../../components/swarm/swarm_buf.c -o test_swarm_buf
 ./test_swarm_buf
+
+$CC -Wall -Wextra -Werror -I../../components/integrations/include \
+    test_lineproto.c ../../components/integrations/lineproto.c -o test_lineproto
+./test_lineproto
