@@ -122,6 +122,48 @@ int main(void)
     assert(rc.sensors[ic1].via_node_valid && memcmp(rc.sensors[ic1].via_node, nodeD, 6) == 0);
     assert(rc.sensors[ic1].best_rssi == -45);
 
+    /* --- registry_set_battery (M6: MiFlora battery poll) --- */
+    registry_t rb;
+    registry_init(&rb);
+    uint8_t bmac[6] = { 0xC4, 0x7C, 0x8D, 0x33, 0x33, 0x01 };
+
+    /* first time heard: creates the entry with no MiBeacon frame at all */
+    assert(registry_set_battery(&rb, bmac, 42, 500) == 1);
+    int ib = registry_find(&rb, bmac);
+    assert(ib >= 0);
+    assert(rb.sensors[ib].latest.has_battery && rb.sensors[ib].latest.battery_pct == 42);
+    assert(rb.sensors[ib].last_seen_s == 500);
+    assert(rb.sensors[ib].latest.frame_cnt == 0 && rb.sensors[ib].latest.product_id == 0);
+
+    /* a later poll updates in place -- never treated as a dup even though
+     * the entry's frame_cnt is (and stays) 0, unlike registry_update_from() */
+    assert(registry_set_battery(&rb, bmac, 55, 900) == 1);
+    assert(rb.sensors[ib].latest.battery_pct == 55 && rb.sensors[ib].last_seen_s == 900);
+
+    /* battery-only updates never disturb frame_cnt/product_id/other fields */
+    mibeacon_t full = mk(0x01, 7, 300);
+    uint8_t fmac[6];
+    memcpy(fmac, full.mac, 6);
+    assert(registry_update(&rb, &full, 1000) == 1);
+    int ifm = registry_find(&rb, fmac);
+    assert(registry_set_battery(&rb, fmac, 61, 1010) == 1);
+    assert(rb.sensors[ifm].latest.frame_cnt == 7);
+    assert(rb.sensors[ifm].latest.product_id == MIBEACON_PRODUCT_MIFLORA);
+    assert(rb.sensors[ifm].latest.has_temp && rb.sensors[ifm].latest.temp_dc == 300);
+    assert(rb.sensors[ifm].latest.has_battery && rb.sensors[ifm].latest.battery_pct == 61);
+    assert(rb.sensors[ifm].last_seen_s == 1010);
+
+    /* registry full: a new mac is rejected and never created */
+    registry_t rf;
+    registry_init(&rf);
+    for (uint8_t i = 1; i <= REGISTRY_MAX_SENSORS; i++) {
+        mibeacon_t y = mk(i, 1, 100);
+        assert(registry_update(&rf, &y, 100) == 1);
+    }
+    uint8_t newmac[6] = { 0xC4, 0x7C, 0x8D, 0x99, 0x99, 0x99 };
+    assert(registry_set_battery(&rf, newmac, 50, 100) == -1);
+    assert(registry_find(&rf, newmac) == -1);
+
     printf("test_registry: OK\n");
     return 0;
 }

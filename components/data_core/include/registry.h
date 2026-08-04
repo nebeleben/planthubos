@@ -51,6 +51,20 @@ int  registry_update(registry_t *r, const mibeacon_t *m, uint32_t now_s);
 int  registry_find(const registry_t *r, const uint8_t mac[6]);
 int  registry_count(const registry_t *r);
 
+/* Applies a battery-poll result (battery_poll.c, M6): finds/creates the
+ * entry for mac, sets has_battery/battery_pct, and refreshes last_seen_s.
+ * Deliberately bypasses registry_update_from()'s frame_cnt dedup entirely
+ * (it neither reads nor writes frame_cnt/product_id/any other field) --
+ * unlike a MiBeacon advertisement, a GATT battery read has no frame_cnt of
+ * its own, and going through registry_update_from() with a synthetic
+ * mibeacon_t{.frame_cnt=0} would get silently treated as a duplicate
+ * whenever the stored entry's frame_cnt already happens to be 0, dropping
+ * a freshly-read value. A battery poll result is new data by construction
+ * -- it was just read live over GATT -- so it is always applied.
+ * Returns 1 on success, -1 if the registry is full and mac was not already
+ * present (nothing is created or modified in that case). */
+int  registry_set_battery(registry_t *r, const uint8_t mac[6], uint8_t pct, uint32_t now_s);
+
 /* Forgetting a node (see swarm_store_forget_node()) must forget it fully:
  * without this, every sensor entry currently attributed to node_mac keeps
  * reporting it as the "via" source forever, since is_paired_node()

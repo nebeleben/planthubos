@@ -1,16 +1,23 @@
 /* Runtime half of MiFlora battery polling. The pure scheduling decision
  * (battery_sched.c/.h) is host-tested; this file is the NimBLE-facing
- * driver ble_collector.c hands its s_batt_tab to via battery_poll_start().
+ * driver ble_collector.c hands its s_batt_tab (+ the mutex guarding it) to
+ * via battery_poll_start().
  *
  * Callback discipline (PlanV1 §8e, mirrored from ble_collector.c): the
  * esp_timer callback and every NimBLE host-task callback here
  * (poll_gap_event, read_cb) only ever queue a short fixed-size message to
- * poll_task -- they never block, connect, scan, or call data_core_submit()
+ * poll_task -- they never block, connect, scan, or call data_core_submit*()
  * directly. All of that happens on poll_task instead.
+ *
+ * s_tab is shared with ble_collector.c's gap_event, running on the NimBLE
+ * host task -- a different task from poll_task. Every access to s_tab here
+ * holds s_batt_mutex for a short, bounded critical section (mirroring
+ * data_core.c's s_mutex around s_registry); BLE calls themselves are always
+ * made after releasing it, from a local copy of whatever table data they
+ * need.
  */
 #include "battery_sched.h"
 #include "data_core.h"
-#include "mibeacon.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_err.h"
@@ -19,12 +26,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include <string.h>
 
 static const char *TAG = "battery_poll";
 
 #define POLL_TICK_S           60
 #define POLL_CONN_TIMEOUT_MS  10000
+
+/* Watchdog for a peer that accepts the connection but then never answers
+ * the ATT read and never disconnects: without this, s_in_flight would stay
+ * true forever and polling would silently stop for good. Bounded by the
+ * poll_task wait loop below, not a separate timer. */
+#define POLL_WATCHDOG_S        30
 
 /* MiFlora battery/firmware characteristic 00001a02-0000-1000-8000-00805f9b34fb,
  * 128-bit little-endian byte array (BLE_UUID128_DECLARE order). */
@@ -50,10 +64,18 @@ typedef struct {
 } poll_msg_t;
 
 static batt_entry_t *s_tab;
+static SemaphoreHandle_t s_batt_mutex;    /* guards every s_tab access -- shared with ble_collector.c */
 static QueueHandle_t s_queue;
-static bool s_in_flight;          /* touched only on poll_task -- see handle_tick()/POLL_MSG_DONE */
-static uint8_t s_polling_mac[6];  /* which s_tab entry the in-flight poll is for */
-static bool s_got_result;         /* read_cb already queued a value for this poll */
+
+/* All of the following are touched only on poll_task: set when a poll
+ * attempt starts (handle_tick) and cleared on POLL_MSG_DONE or by the
+ * watchdog, both handled in poll_task's own loop -- no cross-task access,
+ * so no lock needed for these (contrast s_tab above). */
+static bool s_in_flight;
+static uint8_t s_polling_mac[6];   /* which s_tab entry the in-flight poll is for */
+static bool s_got_result;          /* read_cb already queued a value for this poll */
+static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint32_t s_inflight_started_s;
 
 static uint32_t now_s(void)
 {
@@ -104,6 +126,7 @@ static int poll_gap_event(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
+            s_conn_handle = event->connect.conn_handle;
             int rc = ble_gattc_read_by_uuid(event->connect.conn_handle, 1, 0xffff,
                                              MIFLORA_BATT_UUID, read_cb, NULL);
             if (rc != 0) {
@@ -133,15 +156,21 @@ static void handle_tick(void)
     if (s_in_flight) return;   /* single in-flight poll */
 
     uint32_t now = now_s();
-    int idx = batt_sched_pick(s_tab, now);
-    if (idx < 0) return;
 
+    xSemaphoreTake(s_batt_mutex, portMAX_DELAY);
+    int idx = batt_sched_pick(s_tab, now);
+    if (idx < 0) {
+        xSemaphoreGive(s_batt_mutex);
+        return;
+    }
     s_tab[idx].last_attempt_s = now;
     memcpy(s_polling_mac, s_tab[idx].mac, 6);
-    s_got_result = false;
-
     ble_addr_t peer = { .type = s_tab[idx].addr_type };
     memcpy(peer.val, s_tab[idx].addr_val, 6);
+    xSemaphoreGive(s_batt_mutex);
+
+    s_got_result = false;
+    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
     int rc = ble_gap_disc_cancel();
     if (rc != 0 && rc != BLE_HS_EALREADY) {
@@ -149,6 +178,7 @@ static void handle_tick(void)
     }
 
     s_in_flight = true;
+    s_inflight_started_s = now;
     rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer, POLL_CONN_TIMEOUT_MS, NULL, poll_gap_event, NULL);
     if (rc != 0) {
         ESP_LOGI(TAG, "battery poll connect failed to start: %d", rc);
@@ -159,19 +189,51 @@ static void handle_tick(void)
 
 static void handle_result(const poll_msg_t *msg)
 {
-    mibeacon_t m = { 0 };
-    memcpy(m.mac, msg->mac, 6);
-    m.has_battery = true;
-    m.battery_pct = msg->battery_pct;
-    data_core_submit(&m);
+    /* registry_set_battery() (via data_core_submit_battery()), not
+     * data_core_submit()/registry_update_from() -- a synthetic
+     * mibeacon_t{.frame_cnt=0} built here would risk being read as a
+     * duplicate of whatever frame the sensor's last real advertisement
+     * happened to carry frame_cnt 0, silently dropping this reading. See
+     * registry_set_battery()'s doc comment. */
+    bool applied = data_core_submit_battery(msg->mac, msg->battery_pct);
+    if (!applied) {
+        /* Registry full: this reading never landed anywhere, so don't
+         * advance last_ok_s either -- otherwise the scheduler would wait a
+         * full 24h to retry a poll that never actually succeeded. */
+        ESP_LOGW(TAG, "battery reading for a polled sensor dropped (registry full)");
+        return;
+    }
 
     uint32_t now = now_s();
+    xSemaphoreTake(s_batt_mutex, portMAX_DELAY);
     for (int i = 0; i < BATT_MAX_SENSORS; i++) {
         if (s_tab[i].in_use && memcmp(s_tab[i].mac, msg->mac, 6) == 0) {
             s_tab[i].last_ok_s = now;
             break;
         }
     }
+    xSemaphoreGive(s_batt_mutex);
+}
+
+/* Aborts a stuck in-flight poll (peer connected but never answered the ATT
+ * read and never disconnected on its own) so the scheduler isn't wedged
+ * forever. Called only from poll_task's own wait-loop timeout, never from
+ * a callback. */
+static void handle_watchdog(void)
+{
+    if (!s_in_flight) return;
+    if (now_s() - s_inflight_started_s <= POLL_WATCHDOG_S) return;
+
+    ESP_LOGW(TAG, "battery poll watchdog: conn_handle=%u unresponsive after %us, aborting",
+             (unsigned)s_conn_handle, (unsigned)POLL_WATCHDOG_S);
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    s_in_flight = false;
+    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    ble_collector_resume_scan();
+    /* If the terminate above does still produce a DISCONNECT event, its
+     * POLL_MSG_DONE/resume-scan are both idempotent no-ops on top of this. */
 }
 
 static void poll_task(void *arg)
@@ -179,11 +241,18 @@ static void poll_task(void *arg)
     (void)arg;
     poll_msg_t msg;
     for (;;) {
-        if (xQueueReceive(s_queue, &msg, portMAX_DELAY) != pdTRUE) continue;
+        /* While a poll is in flight, wake at least once a second so the
+         * watchdog above can notice a stuck peer within POLL_WATCHDOG_S;
+         * otherwise block indefinitely for the next tick/result. */
+        TickType_t wait = s_in_flight ? pdMS_TO_TICKS(1000) : portMAX_DELAY;
+        if (xQueueReceive(s_queue, &msg, wait) != pdTRUE) {
+            handle_watchdog();
+            continue;
+        }
         switch (msg.type) {
         case POLL_MSG_TICK:   handle_tick(); break;
         case POLL_MSG_RESULT: handle_result(&msg); break;
-        case POLL_MSG_DONE:   s_in_flight = false; break;
+        case POLL_MSG_DONE:   s_in_flight = false; s_conn_handle = BLE_HS_CONN_HANDLE_NONE; break;
         }
     }
 }
@@ -194,9 +263,10 @@ static void timer_cb(void *arg)
     post_simple(POLL_MSG_TICK);   /* never connect/scan/block from the timer callback */
 }
 
-void battery_poll_start(batt_entry_t *tab)
+void battery_poll_start(batt_entry_t *tab, SemaphoreHandle_t batt_mutex)
 {
     s_tab = tab;
+    s_batt_mutex = batt_mutex;
     s_queue = xQueueCreate(4, sizeof(poll_msg_t));
     if (!s_queue) {
         ESP_LOGE(TAG, "queue alloc failed; battery polling disabled");

@@ -90,3 +90,22 @@ void data_core_clear_node_attribution(const uint8_t node_mac[6])
                  MAC_ARG(node_mac), n);
     }
 }
+
+bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)
+{
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int rc = registry_set_battery(&s_registry, mac, pct, now_s);
+    xSemaphoreGive(s_mutex);
+
+    if (rc < 0) {
+        ESP_LOGW(TAG, "registry full, dropping battery reading for " MACSTR_FMT, MAC_ARG(mac));
+        return false;
+    }
+    /* mac is copied into the event queue by esp_event, same as
+     * data_core_submit_from()'s post on a merge. */
+    esp_event_post(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE,
+                   (void *)mac, 6, 0 /* don't block the battery poller task */);
+    return true;
+}
