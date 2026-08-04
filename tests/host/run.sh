@@ -45,3 +45,7 @@ $CC -Wall -Wextra -Werror -I../../components/swarm/include \
 $CC -Wall -Wextra -Werror -I../../components/integrations/include \
     test_lineproto.c ../../components/integrations/lineproto.c -o test_lineproto
 ./test_lineproto
+
+$CC -Wall -Wextra -Werror -I../../components/integrations/include \
+    test_mqtt_json.c ../../components/integrations/mqtt_json.c -o test_mqtt_json
+./test_mqtt_json
