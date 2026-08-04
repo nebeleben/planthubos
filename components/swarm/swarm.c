@@ -8,6 +8,9 @@
 #include "swarm.h"
 #include "swarm_store.h"
 #include "swarm_frame.h"
+#include "swarm_buf.h"
+#include "node_ota.h"
+#include "node_ota_recv.h"
 #include "espnow_link.h"
 #include "pairing.h"
 #include "data_core.h"
@@ -16,8 +19,10 @@
 #include "app_config.h"
 
 #include "cJSON.h"
+#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -182,11 +187,59 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
         if (swarm_decode_reading(data, (size_t)len, &r)) ingest_reading(src_mac, &r, rssi);
         return;
     }
-    /* PAIR_REQ/PAIR_ACK, PING/PONG or anything unrecognised: pairing_handle_frame
-     * already filters to PAIR_* and silently ignores everything else, so
-     * handing it anything that isn't a reading is safe and keeps this
-     * dispatcher a one-line decision. */
+    if (type == SWARM_MSG_OTA_STATUS) {
+        /* Node -> BROADCAST, plaintext (fix, M5c hardware round 1 -- see the
+         * doc comment on swarm_ota_status_t in swarm_frame.h for why; do not
+         * re-derive it back to unicast/encrypted). Unlike the pre-fix
+         * unicast/encrypted shape, successfully receiving this frame at all
+         * says nothing about the sender's identity any more -- anyone in
+         * radio range can broadcast a well-formed OTA_STATUS. is_paired_node()
+         * below is therefore now the PRIMARY gate, not defense-in-depth: it
+         * is what stops a non-node from injecting one. node_ota_handle_status()
+         * is the second, session-specific gate -- it independently re-checks
+         * src against whichever node the CURRENT session actually targets
+         * AND requires the frame's session_id to match the hub's own
+         * esp_random() value for that session (swarm_frame.h), so even a
+         * spoofed source MAC from a real paired node cannot be credited to a
+         * session it wasn't part of. node_ota_handle_status() only ever
+         * records/enqueues -- see its own header comment -- so it is exactly
+         * as safe to call from this callback as is_paired_node()/record_stat()
+         * already are. */
+        if (!is_paired_node(src_mac)) return;
+        swarm_ota_status_t st;
+        if (swarm_decode_ota_status(data, (size_t)len, &st)) node_ota_handle_status(src_mac, &st);
+        return;
+    }
+    /* PAIR_REQ/PAIR_ACK, PING/PONG, FORGET or anything unrecognised:
+     * pairing_handle_frame already filters to the types it understands and
+     * silently ignores everything else, so handing it anything that isn't a
+     * reading or an OTA status is safe and keeps this dispatcher small. */
     pairing_handle_frame(src_mac, data, len, rssi);
+}
+
+/* Logs the hub's effective regulatory domain once it actually associates.
+ * espnow_link_init() already logs a country snapshot at boot, but the hub
+ * now runs 802.11d/AUTO policy (M5c, PlanV1 3.3/8f): at that early boot
+ * point wifi_manager_start() has only just been asked to connect, so
+ * esp_wifi_get_country() there can only ever report the compile-time
+ * CONFIG_PLANTHUB_WIFI_COUNTRY default, not whatever the router's beacons
+ * actually advertise. This handler fires once real association happens
+ * (IP_EVENT_STA_GOT_IP already implies WIFI_EVENT_STA_CONNECTED preceded
+ * it), by which point 802.11d has had a real beacon to learn from, so its
+ * read-back is the domain PAIR_ACK will actually hand to a newly-adopted
+ * node -- making a country mismatch (or a router still on the "01"
+ * world-safe default) visible at a glance instead of silently inferred. */
+static void log_effective_country(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg; (void)base; (void)id; (void)data;
+    wifi_country_t country;
+    if (esp_wifi_get_country(&country) == ESP_OK) {
+        ESP_LOGI(TAG, "effective wifi country after association: %c%c%c, usable channels %u-%u",
+                 country.cc[0], country.cc[1], country.cc[2], country.schan,
+                 country.schan + country.nchan - 1);
+    } else {
+        ESP_LOGW(TAG, "esp_wifi_get_country failed after association; cannot confirm effective country");
+    }
 }
 
 esp_err_t swarm_start_main(void)
@@ -196,6 +249,17 @@ esp_err_t swarm_start_main(void)
 
     esp_err_t err = espnow_link_init(hub_rx_cb);
     if (err != ESP_OK) return err;
+
+    /* Hub only (this function never runs for a node): logs the router's
+     * actually-adopted country the moment association happens, and again
+     * on every reconnect (a router could change its own advertised domain,
+     * e.g. after a firmware update) -- see log_effective_country() above.
+     * Registration failure is logged, not fatal: the hub still works, only
+     * this one diagnostic line would be missing. */
+    esp_err_t ev_err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, log_effective_country, NULL);
+    if (ev_err != ESP_OK) {
+        ESP_LOGW(TAG, "failed to register post-association country log handler: %s", esp_err_to_name(ev_err));
+    }
 
     /* Brings up the SWARM_MSG_PONG responder unconditionally, not only
      * once an operator opens a pairing window -- a node may call
@@ -218,6 +282,12 @@ int swarm_node_list_json(char *buf, size_t cap)
 {
     node_stat_t snap[SWARM_MAX_NODES];
     uint32_t total;
+    /* Snapshotted once, up front, so every node in this response is aged
+     * against the same instant rather than drifting across however long
+     * cJSON construction below takes -- irrelevant in practice at this
+     * scale, but "one now_s per response" is the honest way to compute an
+     * age at all. */
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
     if (s_stats_mutex) {
         xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
@@ -241,7 +311,20 @@ int swarm_node_list_json(char *buf, size_t cap)
      * a contradiction that made a one-sided-pairing defect look like a
      * hub-side bug when it wasn't. Merge in s_stats where available and
      * report null for last_seen_s/rssi (a real, meaningful "never heard"
-     * value) and 0 for frames_rx (a real, meaningful count) otherwise. */
+     * value) and 0 for frames_rx (a real, meaningful count) otherwise.
+     *
+     * last_seen_s is an AGE in seconds (now_s - the record_stat() timestamp),
+     * not the raw stored timestamp (fix, M5c hardware round 4, defect 3):
+     * record_stat() stores esp_timer_get_time()/1e6 -- the hub's own uptime
+     * at the moment it last heard this node -- and emitting that verbatim
+     * made a client rendering "last seen N seconds ago" simply wrong (a
+     * round 4 API poll showed last_seen_s climbing 802 -> 882 while
+     * frames_rx was actively incrementing 98 -> 111, i.e. moving in exactly
+     * the wrong direction for an age while the node was demonstrably alive).
+     * Converting to an age here means every consumer of this JSON gets a
+     * value that means what its name says, without having to separately
+     * fetch GET /api/v1/status's uptime_s and subtract it themselves the
+     * way the webui's Nodes tab used to. */
     int n_nodes = swarm_store_node_count();
     for (int i = 0; i < n_nodes; i++) {
         uint8_t mac[6];
@@ -260,8 +343,16 @@ int swarm_node_list_json(char *buf, size_t cap)
         char name[SWARM_NODE_NAME_LEN + 1];
         if (swarm_store_node_name(mac, name) && name[0] != '\0') cJSON_AddStringToObject(o, "name", name);
         else cJSON_AddNullToObject(o, "name");
-        if (stat) cJSON_AddNumberToObject(o, "last_seen_s", stat->last_seen_s);
-        else cJSON_AddNullToObject(o, "last_seen_s");
+        if (stat) {
+            /* now_s and last_seen_s are both esp_timer_get_time()/1e6 off the
+             * same monotonic clock, so now_s >= last_seen_s always holds in
+             * practice; the clamp is just defensive floor-at-zero, same
+             * spirit as the next_offset clamp in node_ota.c. */
+            uint32_t age_s = (now_s >= stat->last_seen_s) ? (now_s - stat->last_seen_s) : 0;
+            cJSON_AddNumberToObject(o, "last_seen_s", age_s);
+        } else {
+            cJSON_AddNullToObject(o, "last_seen_s");
+        }
         cJSON_AddNumberToObject(o, "frames_rx", stat ? stat->frames_rx : 0);
         if (stat) cJSON_AddNumberToObject(o, "rssi", stat->rssi);
         else cJSON_AddNullToObject(o, "rssi");
@@ -312,6 +403,80 @@ void swarm_forget_node_stats(const uint8_t mac[6])
     xSemaphoreGive(s_stats_mutex);
 }
 
+#define SWARM_FORGET_BROADCAST_COUNT 3
+#define SWARM_FORGET_BROADCAST_GAP_MS 200
+
+/* One-shot task: broadcasts SWARM_MSG_FORGET (now carrying the target's
+ * MAC -- see swarm_frame.h) a few times, then deletes itself. Deliberately
+ * a plain FreeRTOS task, spawned fresh per forget -- NOT the ESP-NOW
+ * receive callback (which must never send) and not the httpd request task
+ * either (a blocking ~600ms sleep there would stall the HTTP response to
+ * the operator's browser for no reason). Broadcast, not unicast: by the
+ * time this runs, api_v1.c's forget handler has already called
+ * espnow_link_remove_peer() for the target, so there is no peer left to
+ * address a unicast frame to at all (mirrors PAIR_ACK/PONG's broadcast
+ * reasoning in swarm_frame.h, just for the opposite reason -- those
+ * broadcast because the peer doesn't exist YET, this because it no longer
+ * does). Best-effort and fire-and-forget: nothing waits on the result,
+ * matching the plan's "a node that was powered off still needs the BOOT
+ * button" acceptance -- there is no ack for FORGET to wait for.
+ *
+ * Fixed, M5c: swarm_forget_t now carries the forgotten node's MAC
+ * (target_mac). ESP-NOW's own broadcast address is still untargeted -- every
+ * node paired to this hub still RECEIVES this frame -- but each one now
+ * checks target_mac against its own STA MAC (pairing.c's FORGET handling)
+ * before checking sender identity, so only the actual target ever acts on
+ * it; every other paired node now correctly ignores it instead of also
+ * unpairing. `arg` is a heap-allocated 6-byte MAC, owned by this task and
+ * freed here -- xTaskCreate's caller (swarm_broadcast_forget() below) may
+ * return and its own stack copy of the MAC may go away before this task
+ * ever actually runs, so the MAC has to travel via the heap, not a stack
+ * pointer. */
+static void forget_broadcast_task(void *arg)
+{
+    uint8_t target_mac[6];
+    memcpy(target_mac, arg, 6);
+    free(arg);
+
+    swarm_forget_t f = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_FORGET };
+    memcpy(f.target_mac, target_mac, 6);
+    uint8_t buf[sizeof(f)];
+    size_t n = swarm_encode_forget(&f, buf, sizeof(buf));
+
+    for (int i = 0; i < SWARM_FORGET_BROADCAST_COUNT; i++) {
+        if (n) {
+            esp_err_t err = espnow_link_broadcast(buf, n);
+            ESP_LOGI(TAG, "FORGET(" MACSTR ") broadcast %d/%d: %s",
+                     MAC2STR(target_mac), i + 1, SWARM_FORGET_BROADCAST_COUNT, esp_err_to_name(err));
+        }
+        if (i + 1 < SWARM_FORGET_BROADCAST_COUNT) vTaskDelay(pdMS_TO_TICKS(SWARM_FORGET_BROADCAST_GAP_MS));
+    }
+    vTaskDelete(NULL);
+}
+
+/* Hub: called by api_v1.c's DELETE /api/v1/nodes/{MAC12} handler after it
+ * has already removed `mac` from swarm_store and its ESP-NOW peer entry --
+ * this only kicks off the best-effort radio notification, it does not
+ * touch swarm_store or the peer table itself. Safe to call from the httpd
+ * task: this function itself never blocks, it only spawns the task above
+ * (after copying mac onto the heap for that task to own). */
+void swarm_broadcast_forget(const uint8_t mac[6])
+{
+    uint8_t *arg = malloc(6);
+    if (!arg) {
+        ESP_LOGE(TAG, "swarm_broadcast_forget: out of memory -- forgotten node will not learn it "
+                      "over the air; BOOT-button recovery is still available");
+        return;
+    }
+    memcpy(arg, mac, 6);
+    if (xTaskCreate(forget_broadcast_task, "swarm_forget_bc", 3072, arg, 5, NULL) != pdPASS) {
+        free(arg);
+        ESP_LOGE(TAG, "swarm_broadcast_forget: failed to create broadcast task -- "
+                      "forgotten node(s) will not learn it over the air; "
+                      "BOOT-button recovery is still available");
+    }
+}
+
 /* ---------------- Node side: forwarding ---------------- */
 
 #define SWARM_FWD_QUEUE_LEN     8
@@ -321,11 +486,134 @@ static QueueHandle_t s_fwd_queue;
 static uint8_t       s_hub_mac[6];   /* set once in swarm_start_node(); MAC never
                                        * changes across a resync, only the channel does */
 
+/* ---------------- Node side: OTA rollback-guard health signal (M5c) ----------------
+ *
+ * ota_post.h's ota_rollback_guard_node_confirm() performs a flash write
+ * (otadata), so it must never be called from the ESP-NOW receive callback
+ * (node_rx_cb, below -- the WiFi driver task). Same DEFERRAL pattern as
+ * pairing.c's forget_task/pong_task: the callback only enqueues (a
+ * non-blocking send, depth-1 queue -- once one confirmation is queued
+ * there is nothing further to add, the guard confirms at most once), a
+ * dedicated task does the actual call.
+ *
+ * UNLIKE pairing.c's ensure_forget_task()/ensure_hub_task(), the queue and
+ * task here are created EAGERLY, in swarm_start_node() below, not lazily on
+ * first use: signal_node_healthy() is called from TWO different tasks --
+ * node_rx_cb (the WiFi driver task, on an accepted PONG) and forward_task
+ * (on its own task, on a successful send) -- so a lazy "if (!s_health_task)
+ * create it" check could race between them (both observe NULL, both create
+ * a task/queue, one handle gets silently overwritten and leaked). Every
+ * lazy-init precedent elsewhere in this codebase (pairing.c's
+ * ensure_forget_task/ensure_hub_task) is only ever called from ONE task (a
+ * receive callback processes frames strictly one at a time, so it cannot
+ * race itself), which does not apply here -- hence eager init instead of
+ * copying that pattern. */
+static void (*s_health_cb)(const char *reason);
+static QueueHandle_t s_health_queue;
+
+static void health_confirm_task(void *arg)
+{
+    (void)arg;
+    char reason[24];
+    for (;;) {
+        if (xQueueReceive(s_health_queue, reason, portMAX_DELAY) != pdTRUE) continue;
+        if (s_health_cb) s_health_cb(reason);
+    }
+}
+
+void swarm_node_set_health_cb(void (*cb)(const char *reason))
+{
+    s_health_cb = cb;
+}
+
+/* Called once from swarm_start_node(), before anything that could call
+ * signal_node_healthy() below is live (espnow_link_init()/forward_task()
+ * both start after this). */
+static esp_err_t ensure_health_task(void)
+{
+    if (s_health_queue) return ESP_OK;
+    s_health_queue = xQueueCreate(1, sizeof(char[24]));
+    if (!s_health_queue) return ESP_ERR_NO_MEM;
+    TaskHandle_t task;
+    BaseType_t ok = xTaskCreate(health_confirm_task, "swarm_health", 2560, NULL, 5, &task);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "ensure_health_task: xTaskCreate failed");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+/* Safe to call from any task, including the ESP-NOW receive callback
+ * (node_rx_cb): only ever does a non-blocking queue send here, never the
+ * flash write itself. A dropped signal (queue momentarily full, or
+ * ensure_health_task() never having been called -- e.g. a hub, which never
+ * calls it at all) just means confirmation is delayed to the next call, or
+ * simply never happens on a role that never needed it -- forward_task()
+ * calls this on every successful send, and node_rx_cb calls it on every
+ * accepted PONG, so there are repeated chances on a node, not just one. */
+static void signal_node_healthy(const char *reason)
+{
+    if (!s_health_queue) return;
+    char buf[24];
+    strlcpy(buf, reason, sizeof(buf));
+    xQueueSend(s_health_queue, buf, 0);
+}
+
 static void node_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, int rssi)
 {
-    /* A node only ever expects PAIR_ACK here (initial pairing, handled by
-     * pairing_node_start()'s own task); pairing_handle_frame() ignores
-     * anything else. Readings are never received here, only sent. */
+    int type = swarm_frame_type(data, (size_t)len);
+
+    /* OTA_BEGIN/OTA_CHUNK/OTA_ABORT (M5c Task 5): a node's receiver
+     * (node_ota_recv.c) validates the sender against the stored hub MAC
+     * itself before doing anything else, same defense-in-depth pattern as
+     * every other type handled directly in a receive callback in this
+     * codebase -- so no additional check is needed here. Decode failure
+     * (malformed/wrong-length frame) is silently dropped, same as every
+     * other decoder call on this path. */
+    if (type == SWARM_MSG_OTA_BEGIN) {
+        swarm_ota_begin_t begin;
+        if (swarm_decode_ota_begin(data, (size_t)len, &begin)) node_ota_recv_handle_begin(src_mac, &begin);
+        return;
+    }
+    if (type == SWARM_MSG_OTA_CHUNK) {
+        swarm_ota_chunk_t chunk;
+        if (swarm_decode_ota_chunk(data, (size_t)len, &chunk)) node_ota_recv_handle_chunk(src_mac, &chunk);
+        return;
+    }
+    if (type == SWARM_MSG_OTA_ABORT) {
+        swarm_ota_abort_t ab;
+        if (swarm_decode_ota_abort(data, (size_t)len, &ab)) node_ota_recv_handle_abort(src_mac, &ab);
+        return;
+    }
+
+    if (type == SWARM_MSG_PONG) {
+        /* Node-side OTA rollback-guard health signal (M5c): receiving a
+         * PONG from this node's own stored hub is the plan's explicit
+         * alternative criterion to "delivered a reading" -- proof the
+         * hub's application layer just processed a frame from this node,
+         * the same liveness bar pairing_node_resync_channel() itself uses.
+         * Deliberately looser than pairing.c's own PONG handling just
+         * below (no nonce match, no s_resync_waiting gate): any genuine
+         * PONG from the real hub is good enough evidence of connectivity
+         * for this purpose, not just one that happens to answer a resync
+         * currently in flight. swarm_store_hub() is the same short,
+         * bounded, allocation-free RAM-cache read already used for this
+         * exact check elsewhere on this receive-callback path (is_paired_node(),
+         * pairing.c's own PONG/FORGET handling) -- safe here too. Falls
+         * through to pairing_handle_frame() below regardless (that call
+         * still owns the actual resync-match logic). */
+        swarm_pong_t pong;
+        if (swarm_decode_pong(data, (size_t)len, &pong)) {
+            uint8_t hub_mac[6];
+            if (swarm_store_hub(hub_mac, NULL, NULL) && memcmp(src_mac, hub_mac, 6) == 0) {
+                signal_node_healthy("PONG received");
+            }
+        }
+    }
+
+    /* A node only ever expects PAIR_ACK/PONG/FORGET here (initial pairing,
+     * resync liveness, or a forget notification); pairing_handle_frame()
+     * ignores anything else. Readings are never received here, only sent. */
     pairing_handle_frame(src_mac, data, len, rssi);
 }
 
@@ -387,54 +675,27 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
  * always rebuild "current" state), so a node reboot loses only the backlog
  * of already-superseded history, never the current reading. Owned
  * exclusively by forward_task() below -- nothing else ever reads or writes
- * it, so it needs no lock. */
-#define SWARM_NODE_BUFFER_LEN 32
-
-typedef struct {
-    swarm_reading_t r;
-    int64_t         captured_us;  /* esp_timer_get_time() when last (re)buffered;
-                                    * age_s is recomputed from this at transmit time */
-} buffered_reading_t;
-
-static buffered_reading_t s_buf[SWARM_NODE_BUFFER_LEN];
-static int                s_buf_head;     /* index of the oldest entry */
-static int                s_buf_count;    /* number of valid entries, 0..SWARM_NODE_BUFFER_LEN */
-static uint32_t           s_buf_dropped;  /* running count of oldest-entries evicted because the ring was full */
+ * it, so it needs no lock (the ring's own mechanics carry no lock either --
+ * see swarm_buf.h -- for the same reason: a single owner needs none). The
+ * push/pop/evict/FIFO/age-clamp mechanics themselves live in swarm_buf.c/.h,
+ * a pure-C unit extracted specifically so tests/host/test_swarm_buf.c can
+ * exercise them without any FreeRTOS/ESP-IDF dependency -- this was M5b's
+ * one untested piece of logic. */
+static swarm_buf_t s_buf;
 
 /* Buffers a reading that just failed to send. When full, the oldest entry is
  * evicted to make room -- logged at debug with a running counter, per the
  * brief, rather than silently discarding without any trace. */
 static void buffer_push(const swarm_reading_t *r, int64_t now_us)
 {
-    if (s_buf_count == SWARM_NODE_BUFFER_LEN) {
-        s_buf_dropped++;
+    bool was_full = swarm_buf_count(&s_buf) == SWARM_NODE_BUFFER_LEN;
+    if (was_full) {
         ESP_LOGD(TAG, "reading buffer full (%d), dropping oldest for " MACSTR
-                      " (dropped=%" PRIu32 " total)",
-                 SWARM_NODE_BUFFER_LEN, MAC2STR(s_buf[s_buf_head].r.mac), s_buf_dropped);
-        /* Overwrite the oldest slot in place, then advance head: that slot
-         * becomes the newest entry and the next one becomes the new oldest --
-         * count stays at SWARM_NODE_BUFFER_LEN throughout. */
-        s_buf[s_buf_head].r = *r;
-        s_buf[s_buf_head].captured_us = now_us;
-        s_buf_head = (s_buf_head + 1) % SWARM_NODE_BUFFER_LEN;
-    } else {
-        int idx = (s_buf_head + s_buf_count) % SWARM_NODE_BUFFER_LEN;
-        s_buf[idx].r = *r;
-        s_buf[idx].captured_us = now_us;
-        s_buf_count++;
+                      " (dropped=%" PRIu32 " total, about to become %" PRIu32 ")",
+                 SWARM_NODE_BUFFER_LEN, MAC2STR(s_buf.entries[s_buf.head].r.mac),
+                 swarm_buf_dropped(&s_buf), swarm_buf_dropped(&s_buf) + 1);
     }
-}
-
-/* Pops the oldest buffered reading, if any. Does NOT recompute age_s -- the
- * caller does that at transmit time, since "now" is only meaningful right
- * before the send actually happens. */
-static bool buffer_pop(buffered_reading_t *out)
-{
-    if (s_buf_count == 0) return false;
-    *out = s_buf[s_buf_head];
-    s_buf_head = (s_buf_head + 1) % SWARM_NODE_BUFFER_LEN;
-    s_buf_count--;
-    return true;
+    swarm_buf_push(&s_buf, r, now_us);
 }
 
 /* Owns every espnow_link_send() the node makes for readings, so a slow or
@@ -467,23 +728,21 @@ static void forward_task(void *arg)
         bool from_backlog = false;
 
         if (!have_reading) {
-            buffered_reading_t br;
-            if (buffer_pop(&br)) {
+            swarm_buf_entry_t br;
+            if (swarm_buf_pop(&s_buf, &br)) {
                 r = br.r;
                 /* age_s is recomputed here, at transmit time, not at the
                  * moment it was (re)buffered -- the whole point of
                  * buffering is riding out an outage of unknown length, so
                  * the hub must see how stale this reading actually is right
                  * now. r.age_s already carries whatever age had accumulated
-                 * before this buffering, so this ADDS the additional wait,
-                 * compounding correctly across repeated buffer/retry
-                 * cycles. Clamped rather than left to wrap past UINT16_MAX
-                 * (~18h) -- data_core's own DATA_CORE_MAX_AGE_S (30 min)
-                 * will drop it hub-side long before that matters anyway. */
-                int64_t extra_us = esp_timer_get_time() - br.captured_us;
-                uint32_t extra_s = (extra_us > 0) ? (uint32_t)(extra_us / 1000000) : 0;
-                uint32_t total_s = (uint32_t)r.age_s + extra_s;
-                r.age_s = (total_s > UINT16_MAX) ? UINT16_MAX : (uint16_t)total_s;
+                 * before this buffering, so swarm_buf_recompute_age() ADDS
+                 * the additional wait on top of it, compounding correctly
+                 * across repeated buffer/retry cycles (and clamping at
+                 * UINT16_MAX rather than wrapping -- data_core's own
+                 * DATA_CORE_MAX_AGE_S (30 min) will drop it hub-side long
+                 * before that matters anyway). */
+                r.age_s = swarm_buf_recompute_age(r.age_s, br.captured_us, esp_timer_get_time());
                 have_reading = true;
                 from_backlog = true;
             } else {
@@ -507,6 +766,14 @@ static void forward_task(void *arg)
             if (!first_delivered) {
                 first_delivered = true;
                 ESP_LOGI(TAG, "first reading delivered to hub");
+                /* Node-side OTA rollback-guard health signal (M5c): the
+                 * plan's primary criterion, "successfully delivered a
+                 * reading to its hub". Only needs signalling once -- see
+                 * signal_node_healthy()/ota_rollback_guard_node_confirm(),
+                 * both idempotent past their first call -- so this rides
+                 * the same first_delivered latch as the log line above
+                 * rather than firing on every single successful send. */
+                signal_node_healthy("reading delivered to hub");
             }
             continue;
         }
@@ -635,6 +902,33 @@ esp_err_t swarm_start_node(void)
     }
     memcpy(s_hub_mac, hub_mac, 6);
 
+    /* Must be armed BEFORE espnow_link_init() below hands node_rx_cb its
+     * first frame -- an OTA_BEGIN could arrive at any point after that call
+     * returns. node_ota_recv_init() only creates a queue + task (RAM-only,
+     * no flash/network I/O), so it's cheap and safe this early. Idempotent;
+     * a no-op on every boot that isn't currently receiving a push. */
+    esp_err_t oerr = node_ota_recv_init();
+    if (oerr != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_start_node: node_ota_recv_init failed (%s); node OTA pushes will not "
+                      "be receivable this boot", esp_err_to_name(oerr));
+    }
+
+    /* Same "must exist before node_rx_cb/forward_task can call it" reasoning
+     * as node_ota_recv_init() above -- see ensure_health_task()'s own
+     * comment for why this is eager rather than the lazy-on-first-use
+     * pattern used elsewhere in this file/pairing.c. Failure here is logged,
+     * not fatal: the node still forwards/pairs/receives OTA pushes fine,
+     * only the rollback-guard confirmation signal would never fire, so a
+     * genuinely OTA'd-and-healthy node could still roll back on its next
+     * reboot -- serious, but not a reason to refuse to start as a node
+     * entirely (which would itself be a worse outcome: no forwarding at
+     * all). */
+    esp_err_t herr = ensure_health_task();
+    if (herr != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_start_node: ensure_health_task failed (%s); the OTA rollback-guard "
+                      "health signal will never fire this boot", esp_err_to_name(herr));
+    }
+
     esp_err_t err = radio_only_wifi_start();
     if (err != ESP_OK) return err;
 
@@ -686,6 +980,7 @@ esp_err_t swarm_start_node(void)
         actual_ch = espnow_link_channel();
     }
 
+    swarm_buf_init(&s_buf);   /* static, already zero at boot -- explicit for clarity */
     s_fwd_queue = xQueueCreate(SWARM_FWD_QUEUE_LEN, sizeof(swarm_reading_t));
     if (!s_fwd_queue) return ESP_ERR_NO_MEM;
     if (xTaskCreate(forward_task, "swarm_fwd", 4096, NULL, 5, NULL) != pdPASS) {

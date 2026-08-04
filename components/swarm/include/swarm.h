@@ -61,3 +61,36 @@ uint32_t swarm_frames_rx(void);
  * slot to clear). Called only from the forget HTTP handler's task -- never
  * from the ESP-NOW receive callback, which only ever calls record_stat(). */
 void swarm_forget_node_stats(const uint8_t mac[6]);
+
+/* Hub: broadcasts SWARM_MSG_FORGET (carrying `mac` as its target_mac -- see
+ * swarm_frame.h) a few times (from a dedicated task, not the caller) so a
+ * still-powered node learns it was forgotten and returns to its portal on
+ * its own, instead of believing it is paired forever (M5b's gap -- see
+ * PlanV1 8f). Call AFTER swarm_store_forget_node() and
+ * espnow_link_remove_peer() have already run for `mac` -- this function
+ * does not touch either itself. Best-effort/fire-and-forget: a node that
+ * was powered off at the time still needs the physical BOOT-button
+ * recovery; this does not replace that path, only shortcuts it when the
+ * node happens to be listening. Every node paired to this hub still
+ * receives the broadcast (ESP-NOW has no way to unicast to a peer that was
+ * just removed), but target_mac now scopes WHICH one acts on it -- only the
+ * node whose own STA MAC equals `mac` unpairs; see swarm.c's
+ * forget_broadcast_task() and pairing.c's FORGET handling. */
+void swarm_broadcast_forget(const uint8_t mac[6]);
+
+/* Node-only (M5c node-side OTA rollback guard -- see ota_post.h). Registers
+ * a callback invoked the first time this node proves itself "healthy"
+ * after boot: forward_task() successfully delivering a reading to the hub,
+ * or receiving a PONG from it. Call BEFORE swarm_start_node() so nothing
+ * can fire before a callback is armed; a NULL cb clears it (also this
+ * component's own initial state, so wiring this up is opt-in and a hub
+ * never has one set -- swarm_start_main() never calls the callback). The
+ * callback is always invoked from a dedicated FreeRTOS task, never from
+ * the ESP-NOW receive callback (see swarm.c's health-confirm task), so it
+ * is safe for the callback to do flash I/O (as ota_post.h's
+ * ota_rollback_guard_node_confirm() does). Deliberately decoupled via a
+ * function pointer rather than swarm.c calling into webserver/ota_post.h
+ * directly: the webserver component already depends on swarm (api_v1.c),
+ * so the reverse dependency would be circular -- main.c, which depends on
+ * both, does the wiring. */
+void swarm_node_set_health_cb(void (*cb)(const char *reason));

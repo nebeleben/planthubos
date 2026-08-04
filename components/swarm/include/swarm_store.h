@@ -107,3 +107,49 @@ esp_err_t swarm_store_set_pair_failed(bool failed);
  * no web server at all once paired) is always recoverable without
  * reflashing. */
 esp_err_t swarm_store_reset_all(void);
+
+/* Node side: identifies the most recently node_ota_recv.c-completed OTA
+ * session, i.e. one whose esp_ota_set_boot_partition() has already
+ * succeeded -- the update is genuinely committed, not merely in progress.
+ * See node_ota_recv.c's finalize_session() for the writer and
+ * handle_begin()/handle_chunk() for the readers.
+ *
+ * WHY THIS EXISTS: a node OTA session finishes with
+ * esp_ota_set_boot_partition() immediately followed by esp_restart() --
+ * that reboot wipes the RAM-only session state (node_ota_recv.c's
+ * recv_session_t) that would otherwise let a later OTA_CHUNK/OTA_BEGIN be
+ * recognised as "this session already finished, right here" rather than
+ * "no session at all". node_ota_recv.c's own DONE-retransmission (sent 5x
+ * before the restart) is the fast path for telling the hub that; this is
+ * the backstop for when every one of those is also lost -- M5c hardware
+ * round 6 observed exactly that: the hub's acked_offset lagged reality so
+ * badly (broadcast OTA_STATUS is lossy by design, see swarm_frame.h) that
+ * it was still mid-drain, not yet listening for a terminal status, when
+ * this node rebooted. Without this, the node's only truthful answer to the
+ * hub's continued traffic was OTA_ST_IDLE ("no active session"), which the
+ * hub cannot tell apart from "I never had this session" -- and reports the
+ * update FAILED even though it fully succeeded.
+ *
+ * SAFETY even though this is a bare id+length with no expiry timer: the
+ * session_id is a fresh esp_random() value (swarm_frame.h's
+ * swarm_ota_begin_t comment), and node_ota.c's node_ota_handle_status()
+ * only ever credits a non-IDLE OTA_STATUS to a hub-side session whose OWN
+ * session_id matches the one echoed back. So even if this marker were
+ * somehow echoed to an unrelated later session (it won't be under normal
+ * operation -- see swarm_store_clear_completed_ota_session()), a mismatched
+ * id makes the hub silently ignore it, same as no reply at all. That
+ * built-in mismatch-is-harmless property is what lets this stay simple: no
+ * separate expiry clock, no hub-MAC cross-check duplicating what
+ * node_ota_recv.c's from_stored_hub() already gates at the enqueue
+ * boundary.
+ *
+ * Returns false (outputs untouched) when nothing is stored. */
+bool swarm_store_completed_ota_session(uint32_t *session_id_out, uint32_t *total_len_out);
+esp_err_t swarm_store_set_completed_ota_session(uint32_t session_id, uint32_t total_len);
+
+/* Drops the marker above. Called once a genuinely NEW OTA_BEGIN (different
+ * session_id) is accepted (node_ota_recv.c's handle_begin()) -- from that
+ * point on, the OLD session's hub has either already gotten its answer or
+ * long since given up, and nothing later this boot should still be able to
+ * match its id. Also called by swarm_store_reset_all() (factory reset). */
+esp_err_t swarm_store_clear_completed_ota_session(void);
