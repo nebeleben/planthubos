@@ -25,6 +25,8 @@ export function ConfigTab() {
   const xhrRef = useRef(null)
 
   const [cfg, setCfg] = useState(null)
+  const [cfgLoaded, setCfgLoaded] = useState(false)   // only true after a successful GET — guards Save
+  const [cfgLoadError, setCfgLoadError] = useState(false)
   const [mqtt, setMqtt] = useState({ enabled: false, uri: '', user: '', pass: '' })
   const [influx, setInflux] = useState({ enabled: false, url: '', org: '', bucket: '', token: '' })
   const [cfgMsg, setCfgMsg] = useState('')
@@ -38,14 +40,19 @@ export function ConfigTab() {
   useEffect(() => { refresh() }, [])
 
   function refreshConfig() {
+    setCfgLoaded(false); setCfgLoadError(false)
     fetch('/api/v1/config')
       .then((r) => r.json())
       .then((c) => {
         setCfg(c)
         setMqtt({ enabled: c.mqtt.enabled, uri: c.mqtt.uri, user: c.mqtt.user, pass: '' })
         setInflux({ enabled: c.influx.enabled, url: c.influx.url, org: c.influx.org, bucket: c.influx.bucket, token: '' })
+        setCfgLoaded(true)
       })
-      .catch(() => {})
+      // Leave cfgLoaded false on failure: the form would otherwise render
+      // blank defaults, and a wholesale-replace Save would wipe the real
+      // stored config with zeros. Save stays disabled until a load succeeds.
+      .catch(() => setCfgLoadError(true))
   }
   useEffect(() => { refreshConfig() }, [])
 
@@ -152,6 +159,7 @@ export function ConfigTab() {
 
   async function doSaveIntegrations(e) {
     e.preventDefault()
+    if (!cfgLoaded) return   // never wholesale-replace over an unloaded/failed config fetch
     setBusy('config'); setCfgMsg('')
     // The hub wholesale-replaces a present section's non-secret fields, so
     // both sections must always be sent complete -- omitting the secret
@@ -247,6 +255,12 @@ export function ConfigTab() {
       {otaMsg && <p class="hint">{otaMsg}</p>}
 
       <h2>Integrations</h2>
+      {cfgLoadError && (
+        <p class="error">
+          Couldn't load current settings — retry.{' '}
+          <button type="button" onClick={refreshConfig}>Retry</button>
+        </p>
+      )}
       <form onSubmit={doSaveIntegrations}>
         <fieldset>
           <legend>MQTT</legend>
@@ -304,7 +318,7 @@ export function ConfigTab() {
         </fieldset>
 
         <p>
-          <button type="submit" disabled={busy === 'config'}>
+          <button type="submit" disabled={busy === 'config' || !cfgLoaded}>
             {busy === 'config' ? 'Saving…' : 'Save integrations'}
           </button>
         </p>
