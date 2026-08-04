@@ -19,10 +19,15 @@ export function ConfigTab() {
   const [error, setError] = useState(false)
   const [secret, setSecret] = useState(null)     // freshly generated, shown once
   const [keyInput, setKeyInput] = useState(getKey())
-  const [busy, setBusy] = useState('')           // '' | claim | unclaim | ota | pair | retry | switch
+  const [busy, setBusy] = useState('')           // '' | claim | unclaim | ota | pair | retry | switch | config
   const [otaMsg, setOtaMsg] = useState('')
   const [otaPct, setOtaPct] = useState(null)
   const xhrRef = useRef(null)
+
+  const [cfg, setCfg] = useState(null)
+  const [mqtt, setMqtt] = useState({ enabled: false, uri: '', user: '', pass: '' })
+  const [influx, setInflux] = useState({ enabled: false, url: '', org: '', bucket: '', token: '' })
+  const [cfgMsg, setCfgMsg] = useState('')
 
   function refresh() {
     fetch('/api/v1/status')
@@ -31,6 +36,18 @@ export function ConfigTab() {
       .catch(() => setError(true))
   }
   useEffect(() => { refresh() }, [])
+
+  function refreshConfig() {
+    fetch('/api/v1/config')
+      .then((r) => r.json())
+      .then((c) => {
+        setCfg(c)
+        setMqtt({ enabled: c.mqtt.enabled, uri: c.mqtt.uri, user: c.mqtt.user, pass: '' })
+        setInflux({ enabled: c.influx.enabled, url: c.influx.url, org: c.influx.org, bucket: c.influx.bucket, token: '' })
+      })
+      .catch(() => {})
+  }
+  useEffect(() => { refreshConfig() }, [])
 
   // The hub's role_change_ok() gate requires either AP mode (this
   // device's own setup network) or a valid claim key. A pair-failed node
@@ -133,6 +150,44 @@ export function ConfigTab() {
     xhrRef.current?.abort()
   }
 
+  async function doSaveIntegrations(e) {
+    e.preventDefault()
+    setBusy('config'); setCfgMsg('')
+    // The hub wholesale-replaces a present section's non-secret fields, so
+    // both sections must always be sent complete -- omitting the secret
+    // field entirely (never blank) is the only way to "leave it unchanged".
+    const body = {
+      mqtt: { enabled: mqtt.enabled, uri: mqtt.uri, user: mqtt.user },
+      influx: { enabled: influx.enabled, url: influx.url, org: influx.org, bucket: influx.bucket },
+    }
+    if (mqtt.pass) body.mqtt.pass = mqtt.pass
+    if (influx.token) body.influx.token = influx.token
+    try {
+      const res = await fetch('/api/v1/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify(body),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setCfgMsg(data.restart_required
+          ? 'Saved — takes effect after the hub reboots. Reboot is manual: power-cycle or re-flash it.'
+          : 'Saved.')
+        setMqtt((m) => ({ ...m, pass: '' }))
+        setInflux((i) => ({ ...i, token: '' }))
+        refreshConfig()
+      } else if (res.status === 401) {
+        setCfgMsg('Unauthorized — set the hub key above.')
+      } else {
+        // Transport-level 400s may not be JSON, so fall back to a generic message.
+        let msg = 'Save failed.'
+        try { const d = await res.json(); if (d.error) msg = d.error } catch { /* non-JSON body */ }
+        setCfgMsg(msg)
+      }
+    } catch { setCfgMsg('hub not reachable') }
+    setBusy('')
+  }
+
   if (error) return <p class="error">Hub not reachable.</p>
   if (!st) return <p class="placeholder">Loading…</p>
 
@@ -190,6 +245,71 @@ export function ConfigTab() {
         </p>
       )}
       {otaMsg && <p class="hint">{otaMsg}</p>}
+
+      <h2>Integrations</h2>
+      <form onSubmit={doSaveIntegrations}>
+        <fieldset>
+          <legend>MQTT</legend>
+          <label>
+            <input type="checkbox" checked={mqtt.enabled}
+                   onChange={(e) => setMqtt((m) => ({ ...m, enabled: e.currentTarget.checked }))} />
+            {' '}Enabled
+          </label>
+          <label>
+            Broker URI
+            <input value={mqtt.uri} placeholder="mqtt://host:1883"
+                   onInput={(e) => setMqtt((m) => ({ ...m, uri: e.currentTarget.value }))} />
+          </label>
+          <label>
+            Username
+            <input value={mqtt.user}
+                   onInput={(e) => setMqtt((m) => ({ ...m, user: e.currentTarget.value }))} />
+          </label>
+          <label>
+            Password
+            <input type="password" value={mqtt.pass}
+                   placeholder={cfg?.mqtt?.pass_set ? 'saved' : ''}
+                   onInput={(e) => setMqtt((m) => ({ ...m, pass: e.currentTarget.value }))} />
+          </label>
+        </fieldset>
+
+        <fieldset>
+          <legend>InfluxDB</legend>
+          <label>
+            <input type="checkbox" checked={influx.enabled}
+                   onChange={(e) => setInflux((i) => ({ ...i, enabled: e.currentTarget.checked }))} />
+            {' '}Enabled
+          </label>
+          <label>
+            URL
+            <input value={influx.url} placeholder="http://host:8086"
+                   onInput={(e) => setInflux((i) => ({ ...i, url: e.currentTarget.value }))} />
+          </label>
+          <label>
+            Org
+            <input value={influx.org} placeholder="my-org"
+                   onInput={(e) => setInflux((i) => ({ ...i, org: e.currentTarget.value }))} />
+          </label>
+          <label>
+            Bucket
+            <input value={influx.bucket} placeholder="my-bucket"
+                   onInput={(e) => setInflux((i) => ({ ...i, bucket: e.currentTarget.value }))} />
+          </label>
+          <label>
+            Token
+            <input type="password" value={influx.token}
+                   placeholder={cfg?.influx?.token_set ? 'saved' : ''}
+                   onInput={(e) => setInflux((i) => ({ ...i, token: e.currentTarget.value }))} />
+          </label>
+        </fieldset>
+
+        <p>
+          <button type="submit" disabled={busy === 'config'}>
+            {busy === 'config' ? 'Saving…' : 'Save integrations'}
+          </button>
+        </p>
+      </form>
+      {cfgMsg && <p class="hint">{cfgMsg}</p>}
 
       {st.role !== 'node' && (
         <div>
