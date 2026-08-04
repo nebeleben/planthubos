@@ -53,6 +53,13 @@ _Static_assert(NODE_OTA_RECV_DONE_RETRANSMITS * NODE_OTA_RECV_DONE_RETRANSMIT_MS
  * non-advancing statuses in node_ota.c, plus its 10-minute total cap). */
 #define NODE_OTA_RECV_AHEAD_STATUS_MIN_US ((int64_t)1000 * 1000)
 
+/* Period of the unconditional status heartbeat while a session is active --
+ * see maybe_send_heartbeat() for why this exists. One per second keeps the
+ * hub's acked_offset at most ~1s stale even with heavy status loss, which
+ * is well inside every hub-side patience bound (NODE_OTA_MAX_STALLS,
+ * NODE_OTA_DRAIN_MAX_SILENT_PASSES, NODE_OTA_FINALIZE_WAIT_MS). */
+#define NODE_OTA_RECV_HEARTBEAT_MIN_US ((int64_t)1000 * 1000)
+
 /* Idle-timeout guard: if the hub that started a session crashes, reboots, or
  * otherwise drops out of radio contact mid-transfer, its (RAM-only) session
  * state vanishes without ever sending OTA_ABORT -- this node would otherwise
@@ -112,6 +119,9 @@ typedef struct {
                                                 * accepted or not (see handle_chunk(), M5c
                                                 * hardware round 8); only meaningful while
                                                 * active -- see NODE_OTA_RECV_IDLE_TIMEOUT_MS */
+    int64_t                 last_heartbeat_us; /* esp_timer_get_time() at the last periodic
+                                                * status; see maybe_send_heartbeat() and
+                                                * NODE_OTA_RECV_HEARTBEAT_MIN_US */
     int64_t                 last_ahead_status_us; /* esp_timer_get_time() at the last
                                                 * "ahead of next_offset" OTA_STATUS sent (0 =
                                                 * none sent yet this session); see handle_chunk()'s
@@ -610,6 +620,34 @@ static void check_idle_timeout(recv_session_t *s)
     s->active = false;
 }
 
+/* Heartbeat status (fix, M5c hardware round 9). Every failure mode this
+ * milestone hit on hardware traces back to the same fragility: OTA_STATUS
+ * was purely EVENT-driven (every 64 accepted chunks, on an ahead-of-offset
+ * chunk, on completion, on a rejection), it is a lossy broadcast, and the
+ * hub's node_ota_handle_status() additionally drops one whenever its
+ * non-blocking mutex attempt loses to the sender task. So a single dropped
+ * frame could leave the hub's acked_offset stale for the rest of a
+ * transfer -- round 9 streamed the whole 1.16MB image three times over with
+ * acked stuck at 0, because the one status that mattered (a rejection:
+ * "session already active") was emitted exactly once and lost.
+ *
+ * A periodic status makes every one of those single points of failure
+ * self-healing: the hub's view is never more than a second stale, drain and
+ * rewind decisions are made on fresh data, and no terminal or rejection
+ * status depends on one frame surviving. Sent from the task, never the
+ * receive callback, like every other send in this file.
+ *
+ * Cheap next to the traffic it rides alongside: one small frame per second
+ * against the hundreds of 208-byte chunks/second a transfer already pushes. */
+static void maybe_send_heartbeat(recv_session_t *s)
+{
+    if (!s->active) return;
+    int64_t now_us = esp_timer_get_time();
+    if (now_us - s->last_heartbeat_us < NODE_OTA_RECV_HEARTBEAT_MIN_US) return;
+    s->last_heartbeat_us = now_us;
+    send_status(s->hub_mac, s->session_id, OTA_ST_RECEIVING, NODE_OTA_RECV_ERR_NONE, s->next_offset);
+}
+
 static void node_ota_recv_task(void *arg)
 {
     (void)arg;
@@ -617,6 +655,10 @@ static void node_ota_recv_task(void *arg)
 
     for (;;) {
         ota_recv_evt_t evt;
+        /* Before the (possibly blocking) receive, so this still fires on a
+         * busy queue -- during a transfer the queue is rarely empty, so the
+         * timeout branch below alone would almost never run. */
+        maybe_send_heartbeat(&s_session);
         /* Bounded wait, not portMAX_DELAY: this task must wake on its own
          * even with no frames arriving at all, purely to re-check
          * check_idle_timeout() above -- an idle queue is exactly the

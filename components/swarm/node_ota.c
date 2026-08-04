@@ -388,11 +388,25 @@ static void node_ota_task(void *arg)
         goto done;
     }
 
+    /* A send error here is NOT proof the node didn't get it (fix, M5c
+     * hardware round 9): espnow_link_send() reports the MAC-layer ack, and a
+     * frame can be delivered and processed while the ack is lost. Round 9
+     * saw all 5 attempts report ESP_FAIL and the hub declare
+     * NODE_OTA_ERR_BEGIN_SEND -- while the node's own log showed "OTA_BEGIN
+     * accepted ... -> writing app1" for that very session_id. Worse, the
+     * operator's natural response (retry) then collided with the session the
+     * node had genuinely started, and the node rejected the retry as
+     * ALREADY_ACTIVE.
+     *
+     * So: log it and stream anyway. If the node really never got the BEGIN
+     * it ignores every chunk, says nothing, and the main loop's silence
+     * bounds end the session honestly a few seconds later -- the same
+     * outcome, minus the false negative and the session collision it
+     * invites. */
     if (send_ota_begin(mac, total_len, digest, session_id) != ESP_OK) {
-        ESP_LOGE(TAG, "node OTA for " MACSTR ": OTA_BEGIN never got out after %d attempts, giving up",
-                 MAC2STR(mac), NODE_OTA_BEGIN_MAX_ATTEMPTS);
-        finish_session(mac, OTA_ST_FAILED, NODE_OTA_ERR_BEGIN_SEND, false, 0);
-        goto done;
+        ESP_LOGW(TAG, "node OTA for " MACSTR ": no OTA_BEGIN ack after %d attempts; streaming "
+                      "anyway (the node may well have it -- the ack, not the frame, is what "
+                      "went missing)", MAC2STR(mac), NODE_OTA_BEGIN_MAX_ATTEMPTS);
     }
 
     {
