@@ -32,6 +32,7 @@ int main(void)
     assert(strstr(j, "\"dev_cla\":\"temperature\"") != NULL);
     assert(strstr(j, "\"name\":\"Palme temp\"") != NULL);
     assert(strstr(j, "\"via_device\":\"PlantHub-7814\"") != NULL);
+    assert(strstr(j, "\"unit_of_meas\":\"\\u00b0C\"") != NULL);
 
     /* no name falls back to mac12; conductivity omits dev_cla */
     assert(mqtt_json_discovery(j, sizeof j, "PlantHub-7814", "80EACA892563", "", "conductivity"));

@@ -151,12 +151,8 @@ bool mqtt_json_discovery(char *out, size_t cap, const char *hub, const char *mac
     if (n < 0 || (size_t)n >= cap - pos) return false;
     pos += n;
 
-    /* name: display_name metric (or just mac12 if no name) */
-    if (sensor_name && *sensor_name) {
-        n = snprintf(out + pos, cap - pos, "\"name\":\"%s %s\",", sensor_name, metric);
-    } else {
-        n = snprintf(out + pos, cap - pos, "\"name\":\"%s %s\",", mac12, metric);
-    }
+    /* name: display_name metric */
+    n = snprintf(out + pos, cap - pos, "\"name\":\"%s %s\",", display_name, metric);
     if (n < 0 || (size_t)n >= cap - pos) return false;
     pos += n;
 
@@ -187,8 +183,10 @@ bool mqtt_json_discovery(char *out, size_t cap, const char *hub, const char *mac
         pos += n;
     }
 
-    /* unit_of_meas - use unicode escape for µ */
-    if (strcmp(info->unit, "µS/cm") == 0) {
+    /* unit_of_meas - use unicode escapes for special characters */
+    if (strcmp(info->unit, "°C") == 0) {
+        n = snprintf(out + pos, cap - pos, "\"unit_of_meas\":\"\\u00b0C\",");
+    } else if (strcmp(info->unit, "µS/cm") == 0) {
         n = snprintf(out + pos, cap - pos, "\"unit_of_meas\":\"\\u00b5S/cm\",");
     } else {
         n = snprintf(out + pos, cap - pos, "\"unit_of_meas\":\"%s\",", info->unit);
