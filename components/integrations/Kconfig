@@ -1,0 +1,13 @@
+menu "PlantHub Integrations"
+
+config PLANTHUB_INFLUX_TLS
+    bool "Enable HTTPS for the InfluxDB client"
+    default n
+    help
+        Compiles TLS support into the Influx HTTP client and allows
+        https:// URLs in the Influx config. Off by default to save
+        flash (PlanV1 3.7); the v1 trust model is a trusted LAN over
+        plain http. The MQTT client is unaffected (always plain
+        mqtt:// in v1).
+
+endmenu
