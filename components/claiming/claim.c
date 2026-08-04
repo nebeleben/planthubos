@@ -16,7 +16,14 @@
 static const char *TAG = "claim";
 #define NS "planthub"
 #define KEY "claim_h"
-#define RESET_GPIO GPIO_NUM_0
+/* Must match the BOOT button of the board actually in use, or the only
+ * documented recovery path for an unreachable device does nothing at all.
+ * Was hardcoded to GPIO_NUM_0 (the classic-ESP32 boot pin) until hardware
+ * showed that no amount of holding BOOT reset an ESP32-C3 node: the C3
+ * devkit's button is on GPIO9 and nothing is wired to GPIO0, so the hold
+ * silently never fired on this project's primary target. Defaults are now
+ * per-target in Kconfig -- see CONFIG_PLANTHUB_FACTORY_RESET_GPIO. */
+#define RESET_GPIO ((gpio_num_t)CONFIG_PLANTHUB_FACTORY_RESET_GPIO)
 #define RESET_HOLD_MS 10000
 
 static bool s_claimed;

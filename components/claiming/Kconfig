@@ -1,0 +1,23 @@
+menu "PlantHub Claiming"
+
+config PLANTHUB_FACTORY_RESET_GPIO
+    int "GPIO for the 10-second factory-reset hold"
+    default 9 if IDF_TARGET_ESP32C3
+    default 0
+    help
+        Pin that must be held low for 10 seconds to clear the claim key,
+        WiFi credentials and swarm role/pairing. This is the documented
+        last-resort recovery for a device that cannot be reached any
+        other way -- a locked-out hub, or a node that runs no web server
+        at all because it is paired (see PlanV1 section 8e/8f) -- so it
+        has to match the BOOT button of the board actually in use.
+
+        The default follows the target's own BOOT button: GPIO9 on
+        ESP32-C3 devkits, GPIO0 on classic ESP32 ones. This was hardcoded
+        to GPIO0 until it was found on hardware that no amount of holding
+        BOOT reset an ESP32-C3 node -- GPIO0 is simply not wired to a
+        button there, so the only documented recovery path did nothing at
+        all on the primary target. Change this only for a custom board
+        whose button is on some other pin.
+
+endmenu
