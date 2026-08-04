@@ -49,3 +49,7 @@ $CC -Wall -Wextra -Werror -I../../components/integrations/include \
 $CC -Wall -Wextra -Werror -I../../components/integrations/include \
     test_mqtt_json.c ../../components/integrations/mqtt_json.c -o test_mqtt_json
 ./test_mqtt_json
+
+$CC -Wall -Wextra -Werror -I../../components/ble_collector/include \
+    test_battery_sched.c ../../components/ble_collector/battery_sched.c -o test_battery_sched
+./test_battery_sched

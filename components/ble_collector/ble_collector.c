@@ -1,7 +1,10 @@
 #include "ble_collector.h"
 #include "data_core.h"
 #include "mibeacon.h"
+#include "battery_sched.h"
+#include "swarm_store.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -13,6 +16,26 @@ static const char *TAG = "ble_collector";
 #define XIAOMI_SVC_UUID 0xFE95
 /* GAP scan units are 0.625 ms */
 #define SCAN_UNITS(ms) ((uint16_t)((ms) * 1000 / 625))
+
+/* Directly-heard sensors, candidates for the daily battery poll (see
+ * battery_poll.c). Only touched from this file's gap_event (host task) and
+ * from battery_poll.c's poller task, whose access pattern is documented
+ * there -- batt_sched_seen()/batt_sched_pick() are short, bounded,
+ * allocation-free table scans, same discipline as data_core_submit()'s
+ * registry access from this same host task. */
+static batt_entry_t s_batt_tab[BATT_MAX_SENSORS];
+
+/* Implemented below; called from battery_poll.c after a poll attempt ends
+ * (success, failure, timeout, disconnect) to resume the passive scan that
+ * was paused for the connect/read/terminate cycle. Not part of
+ * ble_collector.h -- the poller is an internal implementation detail of
+ * this component, never used outside it. */
+void ble_collector_resume_scan(void);
+
+/* Implemented in battery_poll.c; starts the 60s poll-kickoff timer and
+ * poller task operating on tab. Same "internal, no header" reasoning as
+ * ble_collector_resume_scan() above. */
+void battery_poll_start(batt_entry_t *tab);
 
 static int gap_event(struct ble_gap_event *event, void *arg);
 
@@ -28,6 +51,11 @@ static void start_scan(void)
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         ESP_LOGE(TAG, "ble_gap_disc failed: %d", rc);
     }
+}
+
+void ble_collector_resume_scan(void)
+{
+    start_scan();
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg)
@@ -56,6 +84,14 @@ static int gap_event(struct ble_gap_event *event, void *arg)
              * wrapper already uses for callers with no RSSI at all. */
             int8_t rssi = (event->disc.rssi == 127) ? 0 : event->disc.rssi;
             data_core_submit_from(&m, NULL, rssi, 0);
+
+            /* Direct reception (this file only ever handles the hub's own
+             * radio, never a node relay): record it as a battery-poll
+             * candidate. Address captured verbatim from the GAP event --
+             * ble_addr_t's byte order does not match m.mac's, so it must
+             * never be reconstructed from the MiBeacon MAC. */
+            uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+            batt_sched_seen(s_batt_tab, m.mac, event->disc.addr.type, event->disc.addr.val, now_s);
         }
         return 0;
     }
@@ -95,5 +131,12 @@ esp_err_t ble_collector_start(void)
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
     nimble_port_freertos_init(host_task);
+
+    /* Node role: battery polling connects out and would fight ESP-NOW
+     * timing on the node's single radio. Scanning/relaying (above) still
+     * runs on both roles; only the poll timer/task is hub-only. */
+    if (swarm_store_role() != SWARM_ROLE_NODE) {
+        battery_poll_start(s_batt_tab);
+    }
     return ESP_OK;
 }
