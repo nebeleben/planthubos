@@ -28,6 +28,20 @@ static bool nul_terminated(const char *buf, size_t len)
     return memchr(buf, '\0', len) != NULL;
 }
 
+/* org/bucket/token end up unescaped in a URL query string (org, bucket) or
+ * an HTTP header value (token) when influx.c builds the write request --
+ * restricting them to a safe charset up front is simpler and just as
+ * correct as escaping later. */
+static bool charset_ok(const char *s)
+{
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        bool ok = (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+                  (*p >= '0' && *p <= '9') || *p == '_' || *p == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 esp_err_t integr_config_init(void)
 {
     s_mutex = xSemaphoreCreateMutex();
@@ -98,7 +112,9 @@ esp_err_t integr_config_set(const integr_config_t *c)
         if (!url_ok) url_ok = strncmp(c->influx.url, "https://", 8) == 0;
 #endif
         if (!url_ok || c->influx.org[0] == '\0' || c->influx.bucket[0] == '\0' ||
-            c->influx.token[0] == '\0') {
+            c->influx.token[0] == '\0' ||
+            !charset_ok(c->influx.org) || !charset_ok(c->influx.bucket) ||
+            !charset_ok(c->influx.token)) {
             return ESP_ERR_INVALID_ARG;
         }
     }

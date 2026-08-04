@@ -8,6 +8,6 @@
  * of "read config once, start what's enabled": it starts MQTT itself, then
  * unconditionally calls influx_start(cfg), which is responsible for its
  * own off-by-default check (influx.enabled) exactly the way mqtt_pub.c
- * handles mqtt.enabled. Stub in influx.c for now (always ESP_OK, does
- * nothing); Task 5 replaces it with the real InfluxDB HTTP write client. */
+ * handles mqtt.enabled. Implemented in influx.c: spawns a task that POSTs
+ * batched InfluxDB v2 line protocol every 300s. */
 esp_err_t influx_start(const integr_config_t *cfg);
