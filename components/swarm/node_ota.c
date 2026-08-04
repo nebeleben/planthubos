@@ -242,6 +242,21 @@ static void finish_session(const uint8_t mac[6], uint8_t state, uint8_t err, boo
     s_session.pub.state = state;
     s_session.pub.err = err;
     s_session.pub.active = false;
+    /* On success the node has, by definition, taken and verified the whole
+     * image -- its DONE is authoritative, and it only sends one after
+     * esp_ota_end() validated the full total_len and the streamed sha256
+     * matched. The hub's own counters can still be behind at that moment,
+     * because acked_offset only advances as this hub's (lossy, broadcast)
+     * status frames arrive: hardware round 11 finished DONE/err=0 with
+     * sent=1075400 acked=998400 of 1162080, i.e. a progress bar frozen at
+     * 86% next to a "done" state. Snap both to total_len so the reported
+     * numbers agree with the reported outcome. Deliberately success-only --
+     * on a FAILED session the partial counters are real information about
+     * how far it got, and must not be inflated. */
+    if (state == OTA_ST_DONE) {
+        s_session.pub.sent_offset = s_session.pub.total_len;
+        s_session.pub.acked_offset = s_session.pub.total_len;
+    }
     xSemaphoreGive(s_mutex);
 }
 
