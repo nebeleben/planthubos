@@ -26,7 +26,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "api_v1";
-#define FW_VERSION "0.8.0"
+#define FW_VERSION "0.9.0"
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
