@@ -31,7 +31,7 @@ function macPath(mac) {
 // swarm_store.h's SWARM_PM_* enum, mirrored here for the GET /api/v1/nodes entry's
 // "reported_mode" field (the node's own last-CHECKIN-reported mode -- as opposed to
 // "power_mode", which is hub-side DESIRED state and is a string, not this numeric enum).
-const PM_ALWAYS_ON = 0
+const PM_ALWAYS_ON = 0, PM_BATTERY_15 = 1, PM_BATTERY_60 = 2
 
 // Wire strings for "power_mode" (swarm.c's power_mode_str()), and the labels this tab
 // shows for them -- both in the selector below and as the small "beside last-seen" hint.
@@ -43,16 +43,16 @@ const POWER_MODE_LABELS = {
 
 // While power_mode_pending, the node hasn't yet confirmed the desired mode via a
 // CHECKIN, so it's still running whatever cadence it last reported (reported_mode) --
-// that old cadence, not the new desired one, bounds how soon the change can land.
+// that OLD cadence, not the new desired one (n.power_mode), bounds how soon the
+// change can land, so the desired mode plays no part in this decision at all.
 // reported_mode_valid=false (never checked in this boot) is treated the same as
 // ALWAYS_ON: swarm_store.h's fresh-node default is ALWAYS_ON, so an unconfirmed node
 // is presumed to still be on that (short) cadence rather than a stale battery one.
 function pendingHint(n) {
-  const fromAlwaysOn = !n.reported_mode_valid || n.reported_mode === PM_ALWAYS_ON
-  if (n.power_mode === 'always_on' || fromAlwaysOn) {
+  if (!n.reported_mode_valid || n.reported_mode === PM_ALWAYS_ON) {
     return "applies at the node's next checkin (≤ a few minutes)"
   }
-  return n.power_mode === 'battery_15'
+  return n.reported_mode === PM_BATTERY_15
     ? "applies at the node's next checkin (≤ 15 min)"
     : "applies at the node's next checkin (≤ 60 min)"
 }
