@@ -516,12 +516,16 @@ static bool power_mode_from_str(const char *s, swarm_power_mode_t *out)
  * rename (empty name clears) and/or set the node's DESIRED power mode
  * (swarm_store_set_node_desired_mode(), Task 3 -- what GET /api/v1/nodes'
  * "power_mode"/"power_mode_pending" fields, added alongside this handler,
- * report). Either field may be omitted; at least one of a valid "name" or
- * a valid "power_mode" must be present, same as the name-only contract
- * this handler had before M7. power_mode is validated FIRST and before any
- * store write, so a bad power_mode never leaves a partially-applied rename
- * behind (400 "bad power_mode", body untouched) -- unknown mac is checked
- * by the store calls themselves and reported as 404 either way. 128 bytes
+ * report). Either field may be omitted entirely; but a field that IS
+ * present must be well-formed -- a present-but-wrong-type "name" or
+ * "power_mode" always 400s (see the two checks below), it is never
+ * silently ignored just because the other field is valid. At least one of
+ * a valid "name" or a valid "power_mode" must be present, same as the
+ * name-only contract this handler had before M7. Both fields are
+ * validated before any store write, so a bad field never leaves a
+ * partially-applied rename/mode-change behind (400, body untouched) --
+ * unknown mac is checked by the store calls themselves and reported as 404
+ * either way. 128 bytes
  * comfortably covers the worst case (a full 24-byte SWARM_NODE_NAME_LEN
  * name plus a "battery_15"/"battery_60" power_mode in the same body, ~61
  * bytes of JSON) with headroom. */
@@ -563,7 +567,24 @@ static esp_err_t node_update_post(httpd_req_t *req, const uint8_t mac[6])
         }
         have_mode = true;
     }
-    bool have_name = cJSON_IsString(name);
+    /* Symmetric with power_mode above: a PRESENT-but-wrong-type field is a
+     * malformed request (400), not "not requested" -- only outright
+     * absence (cJSON_GetObjectItem returning NULL) means the caller didn't
+     * intend to touch that field at all. This was the pre-M7 contract for
+     * "name" (this route unconditionally 400'd "invalid name" whenever the
+     * body's "name" wasn't a string) and adding power_mode must not weaken
+     * it: a present-but-malformed name must 400 even when a valid
+     * power_mode also came along in the same body, exactly like a
+     * present-but-malformed power_mode above 400s regardless of "name". */
+    bool have_name = false;
+    if (name != NULL) {
+        if (!cJSON_IsString(name)) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid name");
+            return ESP_OK;
+        }
+        have_name = true;
+    }
 
     if (!have_mode && !have_name) {
         cJSON_Delete(json);
