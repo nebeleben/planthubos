@@ -28,16 +28,30 @@ static bool nul_terminated(const char *buf, size_t len)
     return memchr(buf, '\0', len) != NULL;
 }
 
-/* org/bucket/token end up unescaped in a URL query string (org, bucket) or
- * an HTTP header value (token) when influx.c builds the write request --
- * restricting them to a safe charset up front is simpler and just as
- * correct as escaping later. */
+/* org/bucket end up unescaped in a URL query string when influx.c builds
+ * the write request -- restricting them to a safe charset up front is
+ * simpler and just as correct as escaping later. */
 static bool charset_ok(const char *s)
 {
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         bool ok = (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
                   (*p >= '0' && *p <= '9') || *p == '_' || *p == '-';
         if (!ok) return false;
+    }
+    return true;
+}
+
+/* token ends up unescaped in an HTTP header value, so unlike org/bucket the
+ * rule can't be a narrow charset -- a real InfluxDB v2 token is base64 and
+ * routinely contains '/', '+', and a trailing '=' (often "=="), all of
+ * which the old charset_ok() rejected, making every genuine token invalid.
+ * The actual header-injection risk is CR/LF (or any other control
+ * character) letting the token value inject extra header lines, so the
+ * rule here is just: printable ASCII, no control characters. */
+static bool token_charset_ok(const char *s)
+{
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < 0x20 || *p > 0x7E) return false;
     }
     return true;
 }
@@ -114,7 +128,7 @@ esp_err_t integr_config_set(const integr_config_t *c)
         if (!url_ok || c->influx.org[0] == '\0' || c->influx.bucket[0] == '\0' ||
             c->influx.token[0] == '\0' ||
             !charset_ok(c->influx.org) || !charset_ok(c->influx.bucket) ||
-            !charset_ok(c->influx.token)) {
+            !token_charset_ok(c->influx.token)) {
             return ESP_ERR_INVALID_ARG;
         }
     }

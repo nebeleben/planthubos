@@ -46,6 +46,20 @@ int main(void)
     assert(lineproto_append(buf, sizeof buf, &off, &q));
     assert(strstr(buf, "name=a\\=b\\,c ") != NULL);
 
+    /* backslash in a tag value is itself escaped */
+    off = 0;
+    strcpy(q.name, "a\\b");
+    assert(lineproto_append(buf, sizeof buf, &off, &q));
+    assert(strstr(buf, "name=a\\\\b ") != NULL);
+
+    /* an embedded control char (newline) is replaced with '_', not escaped
+     * or passed through -- letting it through would corrupt the line
+     * boundary for the rest of the batch. */
+    off = 0;
+    strcpy(q.name, "a\nb");
+    assert(lineproto_append(buf, sizeof buf, &off, &q));
+    assert(strstr(buf, "name=a_b ") != NULL);
+
     printf("test_lineproto: OK\n");
     return 0;
 }

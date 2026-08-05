@@ -42,6 +42,16 @@ int main(void)
 
     assert(!mqtt_json_discovery(j, sizeof j, "h", "m", "", "bogus"));
 
+    /* a name containing a double quote must not break the JSON: both the
+     * "name" field and dev.name escape it. */
+    assert(mqtt_json_discovery(j, sizeof j, "PlantHub-7814", "80EACA892563", "a\"b", "temp"));
+    assert(strstr(j, "\"name\":\"a\\\"b temp\"") != NULL);
+    assert(strstr(j, "\"dev\":{\"ids\":[\"planthub_80EACA892563\"],\"name\":\"a\\\"b\",") != NULL);
+
+    /* a name containing a backslash and a control char is escaped too. */
+    assert(mqtt_json_discovery(j, sizeof j, "PlantHub-7814", "80EACA892563", "a\\b\tc", "temp"));
+    assert(strstr(j, "\"name\":\"a\\\\b\\u0009c temp\"") != NULL);
+
     printf("test_mqtt_json: OK\n");
     return 0;
 }

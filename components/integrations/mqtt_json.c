@@ -132,6 +132,41 @@ static const metric_info_t *find_metric(const char *metric)
     return NULL;
 }
 
+/* Escapes src for embedding as the body of a JSON string (caller supplies
+ * the surrounding quotes): '"' and '\' become \" / \\, and any control
+ * character (<0x20) becomes \u00XX. Without this, a sensor name containing
+ * either character (typed by a user into the webui, not validated against
+ * any charset -- see app_config's sensor-name setter) would land unescaped
+ * in hand-rolled JSON here, producing a malformed discovery payload that HA
+ * silently drops. dst is always NUL-terminated; if src would not fit, the
+ * output is truncated at a whole-escape-unit boundary rather than
+ * overflowing dst -- a truncated but well-formed name beats no discovery
+ * config at all. */
+static void json_escape(const char *src, char *dst, size_t dst_cap)
+{
+    if (dst_cap == 0) return;
+    size_t pos = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        char unit[8];   /* longest unit is "\u00XX" -- 6 chars + NUL */
+        size_t ulen;
+        if (*p == '"' || *p == '\\') {
+            unit[0] = '\\';
+            unit[1] = (char)*p;
+            ulen = 2;
+        } else if (*p < 0x20) {
+            snprintf(unit, sizeof unit, "\\u%04x", (unsigned)*p);
+            ulen = 6;
+        } else {
+            unit[0] = (char)*p;
+            ulen = 1;
+        }
+        if (pos + ulen >= dst_cap) break;   /* leave room for the NUL below */
+        memcpy(dst + pos, unit, ulen);
+        pos += ulen;
+    }
+    dst[pos] = '\0';
+}
+
 bool mqtt_json_discovery(char *out, size_t cap, const char *hub, const char *mac12,
                           const char *sensor_name, const char *metric)
 {
@@ -143,8 +178,12 @@ bool mqtt_json_discovery(char *out, size_t cap, const char *hub, const char *mac
     size_t pos = 0;
     int n;
 
-    /* Use mac12 if sensor_name is empty */
-    const char *display_name = (sensor_name && *sensor_name) ? sensor_name : mac12;
+    /* Use mac12 if sensor_name is empty; either way, escape before it goes
+     * into either JSON string field below (mac12 never needs escaping, but
+     * running it through json_escape too keeps this branch-free). */
+    const char *raw_display_name = (sensor_name && *sensor_name) ? sensor_name : mac12;
+    char display_name[6 * 32 + 1];   /* worst case: every byte of a 32-char name becomes \u00XX */
+    json_escape(raw_display_name, display_name, sizeof display_name);
 
     /* Start with opening brace */
     n = snprintf(out + pos, cap - pos, "{");
