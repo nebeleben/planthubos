@@ -53,3 +53,7 @@ $CC -Wall -Wextra -Werror -I../../components/integrations/include \
 $CC -Wall -Wextra -Werror -I../../components/ble_collector/include \
     test_battery_sched.c ../../components/ble_collector/battery_sched.c -o test_battery_sched
 ./test_battery_sched
+
+$CC -Wall -Wextra -Werror -I../../components/swarm/include \
+    test_batt_cycle.c ../../components/swarm/batt_cycle.c -o test_batt_cycle
+./test_batt_cycle
