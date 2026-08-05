@@ -478,6 +478,21 @@ esp_err_t swarm_start_main(void)
     return ESP_OK;
 }
 
+/* M7: power_mode's wire string. Shared naming (not shared code) with
+ * api_v1.c's POST .../{MAC12} parser, which maps the same three strings
+ * back to swarm_power_mode_t -- kept as two small, independent tables
+ * rather than a cross-component header, since the enum is tiny/stable and
+ * not worth the extra coupling. */
+static const char *power_mode_str(swarm_power_mode_t m)
+{
+    switch (m) {
+    case SWARM_PM_BATTERY_15: return "battery_15";
+    case SWARM_PM_BATTERY_60: return "battery_60";
+    case SWARM_PM_ALWAYS_ON:
+    default:                  return "always_on";
+    }
+}
+
 int swarm_node_list_json(char *buf, size_t cap)
 {
     node_stat_t snap[SWARM_MAX_NODES];
@@ -569,6 +584,27 @@ int swarm_node_list_json(char *buf, size_t cap)
         cJSON_AddBoolToObject(o, "reported_mode_valid", mode_valid);
         if (mode_valid) cJSON_AddNumberToObject(o, "reported_mode", stat->reported_mode);
         else cJSON_AddNullToObject(o, "reported_mode");
+        /* M7: "power_mode" is the node's DESIRED mode (swarm_store's
+         * per-node table, set by POST /api/v1/nodes/{MAC12}
+         * {"power_mode":...}) -- deliberately NOT reported_mode above. This
+         * is the field the UI's power-mode control edits, so it must show
+         * operator intent immediately, even before any CHECKIN confirms the
+         * node actually picked it up; reported_mode/reported_mode_valid
+         * above remain the only source of truth for what the node itself
+         * last said. "power_mode_pending" is how the UI knows a desired
+         * change hasn't been confirmed by the node yet: true when the most
+         * recent CHECKIN's mode differs from desired, OR when this node
+         * hasn't checked in at all this boot and desired isn't ALWAYS_ON --
+         * a fresh non-ALWAYS_ON desire always needs at least one more
+         * checkin to take effect. ALWAYS_ON is excluded from that second
+         * case because it is the node's own power-on default: an
+         * ALWAYS_ON-desired node that has simply never needed to check in
+         * yet is not "pending" anything. */
+        swarm_power_mode_t desired = swarm_store_node_desired_mode(mac);
+        cJSON_AddStringToObject(o, "power_mode", power_mode_str(desired));
+        bool pending = mode_valid ? (stat->reported_mode != (uint8_t)desired)
+                                   : (desired != SWARM_PM_ALWAYS_ON);
+        cJSON_AddBoolToObject(o, "power_mode_pending", pending);
         /* "buffered": Task 5's RAM ring (swarm.c's forward_task) tracks a
          * NODE's own undelivered-reading backlog, but that state lives only
          * on the node itself -- there is no wire message carrying a
