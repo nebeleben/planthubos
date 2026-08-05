@@ -17,7 +17,16 @@ typedef enum {
     SWARM_MSG_OTA_CHUNK  = 8,
     SWARM_MSG_OTA_STATUS = 9,
     SWARM_MSG_OTA_ABORT  = 10,
+    SWARM_MSG_CHECKIN    = 11,
+    SWARM_MSG_CHECKIN_ACK = 12,
 } swarm_msg_t;
+
+/* Checkin commands (CHECKIN_ACK.command) */
+enum {
+    SWARM_CHECKIN_CMD_NONE       = 0,
+    SWARM_CHECKIN_CMD_SET_MODE   = 1,   /* arg = SWARM_PM_* */
+    SWARM_CHECKIN_CMD_STAY_AWAKE = 2,   /* arg = 0 */
+};
 
 /* Node -> broadcast, plaintext. Sender MAC comes from the ESP-NOW receive
  * metadata, so it is deliberately not repeated in the payload. */
@@ -128,6 +137,24 @@ typedef struct __attribute__((packed)) {
     uint8_t type;
     uint8_t target_mac[6];
 } swarm_forget_t;
+
+/* Node -> hub, unicast, encrypted. Battery nodes report their current power mode
+ * (SWARM_PM_* from power_modes.h, Task 3), plus a monotonic wake counter for diagnostics. */
+typedef struct __attribute__((packed)) {
+    uint8_t  version;      /* SWARM_PROTO_VERSION */
+    uint8_t  type;         /* SWARM_MSG_CHECKIN */
+    uint8_t  power_mode;   /* SWARM_PM_*: the node's CURRENT (reported) mode */
+    uint32_t wake_counter; /* monotonic per NVS, diagnostic only */
+} swarm_checkin_t;         /* 7 bytes */
+
+/* Hub -> node, unicast, encrypted. Hub's reply to CHECKIN; carries command/arg
+ * for the node to execute (e.g., change power mode, stay awake). */
+typedef struct __attribute__((packed)) {
+    uint8_t version;
+    uint8_t type;          /* SWARM_MSG_CHECKIN_ACK */
+    uint8_t command;       /* SWARM_CHECKIN_CMD_* */
+    uint8_t arg;
+} swarm_checkin_ack_t;     /* 4 bytes */
 
 /* Hub -> node, unicast, encrypted (an OTA session only ever targets an
  * already-adopted node, i.e. an existing encrypted peer -- unlike pairing
@@ -245,6 +272,8 @@ bool swarm_decode_reading(const uint8_t *buf, size_t len, swarm_reading_t *out);
 bool swarm_decode_ping(const uint8_t *buf, size_t len, swarm_ping_t *out);
 bool swarm_decode_pong(const uint8_t *buf, size_t len, swarm_pong_t *out);
 bool swarm_decode_forget(const uint8_t *buf, size_t len, swarm_forget_t *out);
+bool swarm_decode_checkin(const uint8_t *buf, size_t len, swarm_checkin_t *out);
+bool swarm_decode_checkin_ack(const uint8_t *buf, size_t len, swarm_checkin_ack_t *out);
 bool swarm_decode_ota_begin(const uint8_t *buf, size_t len, swarm_ota_begin_t *out);
 bool swarm_decode_ota_chunk(const uint8_t *buf, size_t len, swarm_ota_chunk_t *out);
 bool swarm_decode_ota_status(const uint8_t *buf, size_t len, swarm_ota_status_t *out);
@@ -255,6 +284,8 @@ size_t swarm_encode_reading(const swarm_reading_t *in, uint8_t *out, size_t cap)
 size_t swarm_encode_ping(const swarm_ping_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_pong(const swarm_pong_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_forget(const swarm_forget_t *in, uint8_t *out, size_t cap);
+size_t swarm_encode_checkin(const swarm_checkin_t *in, uint8_t *out, size_t cap);
+size_t swarm_encode_checkin_ack(const swarm_checkin_ack_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_ota_begin(const swarm_ota_begin_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_ota_chunk(const swarm_ota_chunk_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_ota_status(const swarm_ota_status_t *in, uint8_t *out, size_t cap);

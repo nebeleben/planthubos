@@ -21,6 +21,8 @@ static size_t expected_len(int type)
     case SWARM_MSG_PING:       return sizeof(swarm_ping_t);
     case SWARM_MSG_PONG:       return sizeof(swarm_pong_t);
     case SWARM_MSG_FORGET:     return sizeof(swarm_forget_t);
+    case SWARM_MSG_CHECKIN:    return sizeof(swarm_checkin_t);
+    case SWARM_MSG_CHECKIN_ACK: return sizeof(swarm_checkin_ack_t);
     case SWARM_MSG_OTA_BEGIN:  return sizeof(swarm_ota_begin_t);
     case SWARM_MSG_OTA_STATUS: return sizeof(swarm_ota_status_t);
     case SWARM_MSG_OTA_ABORT:  return sizeof(swarm_ota_abort_t);
@@ -71,6 +73,12 @@ bool swarm_decode_pong(const uint8_t *buf, size_t len, swarm_pong_t *out)
 
 bool swarm_decode_forget(const uint8_t *buf, size_t len, swarm_forget_t *out)
 { return decode_into(buf, len, SWARM_MSG_FORGET, out, sizeof(*out)); }
+
+bool swarm_decode_checkin(const uint8_t *buf, size_t len, swarm_checkin_t *out)
+{ return decode_into(buf, len, SWARM_MSG_CHECKIN, out, sizeof(*out)); }
+
+bool swarm_decode_checkin_ack(const uint8_t *buf, size_t len, swarm_checkin_ack_t *out)
+{ return decode_into(buf, len, SWARM_MSG_CHECKIN_ACK, out, sizeof(*out)); }
 
 bool swarm_decode_ota_begin(const uint8_t *buf, size_t len, swarm_ota_begin_t *out)
 { return decode_into(buf, len, SWARM_MSG_OTA_BEGIN, out, sizeof(*out)); }
@@ -134,6 +142,12 @@ size_t swarm_encode_pong(const swarm_pong_t *in, uint8_t *out, size_t cap)
 { return encode_from(in, sizeof(*in), out, cap); }
 
 size_t swarm_encode_forget(const swarm_forget_t *in, uint8_t *out, size_t cap)
+{ return encode_from(in, sizeof(*in), out, cap); }
+
+size_t swarm_encode_checkin(const swarm_checkin_t *in, uint8_t *out, size_t cap)
+{ return encode_from(in, sizeof(*in), out, cap); }
+
+size_t swarm_encode_checkin_ack(const swarm_checkin_ack_t *in, uint8_t *out, size_t cap)
 { return encode_from(in, sizeof(*in), out, cap); }
 
 size_t swarm_encode_ota_begin(const swarm_ota_begin_t *in, uint8_t *out, size_t cap)

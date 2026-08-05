@@ -274,6 +274,35 @@ int main(void)
     oversize.len = SWARM_OTA_CHUNK_DATA + 1;
     assert(swarm_encode_ota_chunk(&oversize, buf, sizeof(buf)) == 0);
 
+    /* M7: CHECKIN round-trip */
+    {
+        swarm_checkin_t c = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_CHECKIN,
+                              .power_mode = 2, .wake_counter = 12345 };
+        uint8_t buf[16];
+        size_t n = swarm_encode_checkin(&c, buf, sizeof buf);
+        assert(n == 7);
+        swarm_checkin_t out;
+        assert(swarm_decode_checkin(buf, n, &out));
+        assert(out.power_mode == 2 && out.wake_counter == 12345);
+        assert(!swarm_decode_checkin(buf, n - 1, &out));       /* short */
+        buf[0] = 99;
+        assert(!swarm_decode_checkin(buf, n, &out));           /* bad version */
+    }
+    /* M7: CHECKIN_ACK round-trip */
+    {
+        swarm_checkin_ack_t a = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_CHECKIN_ACK,
+                                  .command = SWARM_CHECKIN_CMD_SET_MODE, .arg = 1 };
+        uint8_t buf[8];
+        size_t n = swarm_encode_checkin_ack(&a, buf, sizeof buf);
+        assert(n == 4);
+        swarm_checkin_ack_t out;
+        assert(swarm_decode_checkin_ack(buf, n, &out));
+        assert(out.command == SWARM_CHECKIN_CMD_SET_MODE && out.arg == 1);
+        assert(!swarm_decode_checkin_ack(buf, 3, &out));
+        buf[1] = SWARM_MSG_CHECKIN;                            /* wrong type */
+        assert(!swarm_decode_checkin_ack(buf, n, &out));
+    }
+
     printf("test_swarm_frame: OK\n");
     return 0;
 }
