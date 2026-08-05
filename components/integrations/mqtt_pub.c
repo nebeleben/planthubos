@@ -8,11 +8,23 @@
  *
  * Callback discipline (PlanV1 global constraint, restated here because it's
  * the one thing this file must never get wrong): data_event_handler() runs
- * on the default esp_event loop task. It must not publish or otherwise
- * block that task -- it copies the 6-byte sensor MAC into s_queue and
- * returns immediately. All MQTT publish traffic (state AND discovery)
- * happens exclusively on the dedicated mqtt_pub task below, which is the
- * only thing that ever calls esp_mqtt_client_publish(). */
+ * on the default esp_event loop task, and mqtt_event_handler() runs on
+ * esp-mqtt's own task (esp-mqtt invokes its registered event handler inline
+ * from its event loop, not from a separate dispatcher task) -- neither may
+ * block or do any real work. data_event_handler() copies the 6-byte sensor
+ * MAC into s_queue and returns immediately. mqtt_event_handler()'s
+ * MQTT_EVENT_CONNECTED case does the same now: it publishes only the one
+ * small retained "online" message directly (cheap: a single publish, no
+ * NVS, no registry walk), clears the discovery bitmap, and posts a
+ * RESYNC_DISCOVERY control message to s_queue rather than looping over the
+ * registry and publishing discovery configs itself. That loop used to run
+ * inline on esp-mqtt's task on every (re)connect -- up to 16 cold NVS name
+ * reads plus up to 80 QoS-1 publishes, on a stack esp-mqtt sized for its
+ * own needs, not this component's. All of that work (state publishes AND
+ * discovery, whether triggered by a queued sensor update or by
+ * RESYNC_DISCOVERY) now happens exclusively on the dedicated mqtt_pub task
+ * below, which is the only thing that ever calls esp_mqtt_client_publish()
+ * for state/discovery traffic, on its own 4096-byte stack sized for it. */
 #include "integrations.h"
 #include "integr_config.h"
 #include "integr_private.h"
@@ -49,16 +61,36 @@ static const char *TAG = "mqtt_pub";
 static const char *const METRICS[] = { "temp", "moisture", "lux", "conductivity", "battery" };
 #define METRIC_COUNT (sizeof(METRICS) / sizeof(METRICS[0]))
 
+/* s_queue items: a tagged union rather than a bare MAC, so the same queue
+ * can carry both a per-sensor state update (from data_event_handler(), the
+ * default esp_event loop task) and a RESYNC_DISCOVERY control message (from
+ * mqtt_event_handler()'s MQTT_EVENT_CONNECTED case, esp-mqtt's task) --
+ * both without either producer blocking or doing publish/NVS work itself.
+ * mac is meaningful only for MQTT_PUB_MSG_STATE_UPDATE. */
+typedef enum {
+    MQTT_PUB_MSG_STATE_UPDATE,
+    MQTT_PUB_MSG_RESYNC_DISCOVERY,
+} mqtt_pub_msg_type_t;
+
+typedef struct {
+    mqtt_pub_msg_type_t type;
+    uint8_t              mac[6];
+} mqtt_pub_msg_t;
+
 static esp_mqtt_client_handle_t s_client;
-static QueueHandle_t            s_queue;      /* items: uint8_t mac[6] */
+static QueueHandle_t            s_queue;      /* items: mqtt_pub_msg_t */
 static char                     s_hub[16];
 
 /* Per-registry-slot state, indexed by the same slot data_core_snapshot()'s
  * registry_t reports (registry_find() gives the index). Both arrays are
- * written only by mqtt_pub_task() / the MQTT_EVENT_CONNECTED handler, both
- * of which run on tasks the esp-mqtt/esp_event framework itself serialises
- * against this file's other entry point (data_event_handler(), which never
- * touches them) -- no separate mutex needed. */
+ * written only from mqtt_pub_task() -- discovery-sent is set there when a
+ * discovery config actually goes out (whether triggered by a queued state
+ * update or a RESYNC_DISCOVERY message), and cleared by
+ * mqtt_event_handler()'s MQTT_EVENT_CONNECTED case on a different task
+ * (esp-mqtt's), but only via memset() immediately before it enqueues the
+ * RESYNC_DISCOVERY message that follows -- the queue send/receive pair is a
+ * release/acquire, so mqtt_pub_task is guaranteed to observe that memset
+ * before it next touches either array. No separate mutex needed. */
 static bool    s_discovery_sent[REGISTRY_MAX_SENSORS];
 static int64_t s_last_pub_us[REGISTRY_MAX_SENSORS];
 
@@ -132,22 +164,50 @@ static void publish_state(const sensor_entry_t *e)
     esp_mqtt_client_publish(s_client, topic, json, 0, 0, 1);
 }
 
-/* The one task that ever calls esp_mqtt_client_publish(). Drains s_queue,
- * throttles to one state publish per sensor per 30s, and sends discovery
- * first for any sensor whose bitmap slot hasn't seen it this MQTT session.
- * registry_t (~1KB) lives on this task's own stack -- fine per the plan,
- * this is the one place in the component that does it. */
+/* Publishes discovery configs for every sensor currently in the registry
+ * and marks their bitmap slots sent -- runs on mqtt_pub_task in response to
+ * a RESYNC_DISCOVERY message, so mqtt_pub_task() itself doesn't redundantly
+ * resend them the first time each sensor's next state publish comes
+ * through. registry_t (~1KB) lives on mqtt_pub_task's own stack here, same
+ * as in mqtt_pub_task() below -- both are fine on its 4096-byte stack. */
+static void publish_all_discovery(void)
+{
+    registry_t snap;
+    data_core_snapshot(&snap);
+    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
+        if (!snap.sensors[i].in_use) continue;
+        publish_discovery(snap.sensors[i].mac);
+        s_discovery_sent[i] = true;
+    }
+}
+
+/* The one task that ever calls esp_mqtt_client_publish() for state/discovery
+ * traffic. Drains s_queue: a STATE_UPDATE throttles to one state publish
+ * per sensor per 30s and sends discovery first for any sensor whose bitmap
+ * slot hasn't seen it this MQTT session; a RESYNC_DISCOVERY (posted by
+ * mqtt_event_handler() right after MQTT_EVENT_CONNECTED, see the file
+ * header) walks the whole registry and (re)sends discovery for every
+ * sensor in it -- both the per-sensor NVS name read/discovery publishes and
+ * this full-registry walk used to happen inline on esp-mqtt's own task;
+ * they happen here now instead. registry_t (~1KB) lives on this task's own
+ * stack -- fine per the plan, this is the one place in the component that
+ * does it. */
 static void mqtt_pub_task(void *arg)
 {
     (void)arg;
-    uint8_t mac[6];
+    mqtt_pub_msg_t msg;
     registry_t snap;
 
     for (;;) {
-        if (xQueueReceive(s_queue, mac, portMAX_DELAY) != pdTRUE) continue;
+        if (xQueueReceive(s_queue, &msg, portMAX_DELAY) != pdTRUE) continue;
+
+        if (msg.type == MQTT_PUB_MSG_RESYNC_DISCOVERY) {
+            publish_all_discovery();
+            continue;
+        }
 
         data_core_snapshot(&snap);
-        int idx = registry_find(&snap, mac);
+        int idx = registry_find(&snap, msg.mac);
         if (idx < 0) continue;   /* defensive: shouldn't happen, registry entries are never removed */
 
         int64_t now = esp_timer_get_time();
@@ -155,7 +215,7 @@ static void mqtt_pub_task(void *arg)
         s_last_pub_us[idx] = now;
 
         if (!s_discovery_sent[idx]) {
-            publish_discovery(mac);
+            publish_discovery(msg.mac);
             s_discovery_sent[idx] = true;
         }
         publish_state(&snap.sensors[idx]);
@@ -171,25 +231,13 @@ static void data_event_handler(void *handler_args, esp_event_base_t base, int32_
     (void)handler_args; (void)base; (void)event_id;
     if (!s_queue || !event_data) return;
 
-    if (xQueueSend(s_queue, event_data, 0) != pdTRUE) {
-        uint8_t discard[6];
-        (void)xQueueReceive(s_queue, discard, 0);
-        (void)xQueueSend(s_queue, event_data, 0);
-    }
-}
+    mqtt_pub_msg_t msg = { .type = MQTT_PUB_MSG_STATE_UPDATE };
+    memcpy(msg.mac, event_data, sizeof(msg.mac));
 
-/* Publishes discovery configs for every sensor currently in the registry
- * and marks their bitmap slots sent -- called right after CONNECTED, per
- * the plan, so mqtt_pub_task() doesn't redundantly resend them the first
- * time each sensor's next state publish comes through. */
-static void publish_all_discovery(void)
-{
-    registry_t snap;
-    data_core_snapshot(&snap);
-    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
-        if (!snap.sensors[i].in_use) continue;
-        publish_discovery(snap.sensors[i].mac);
-        s_discovery_sent[i] = true;
+    if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
+        mqtt_pub_msg_t discard;
+        (void)xQueueReceive(s_queue, &discard, 0);
+        (void)xQueueSend(s_queue, &msg, 0);
     }
 }
 
@@ -207,9 +255,23 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         }
         /* Fresh MQTT session: reconnects included (per the plan -- esp-mqtt's
          * own auto-reconnect stays on; re-sending retained configs on every
-         * reconnect is idempotent and cheap). */
+         * reconnect is idempotent and cheap). This handler runs on
+         * esp-mqtt's own task (see the file header) and must not block or
+         * do real work itself, so unlike the old shape it does not walk the
+         * registry or publish discovery here -- it only clears the bitmap
+         * and hands off to mqtt_pub_task via RESYNC_DISCOVERY. Non-blocking
+         * send: if s_queue is momentarily full, this reconnect's resync is
+         * simply skipped -- the *next* reconnect (or a first-seen sensor's
+         * own state publish, which sends its discovery unconditionally) is
+         * always another opportunity, so nothing here can justify blocking
+         * esp-mqtt's task to guarantee delivery. */
         memset(s_discovery_sent, 0, sizeof(s_discovery_sent));
-        publish_all_discovery();
+        if (s_queue) {
+            mqtt_pub_msg_t msg = { .type = MQTT_PUB_MSG_RESYNC_DISCOVERY };
+            if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "mqtt_pub queue full; skipping this reconnect's discovery resync");
+            }
+        }
         break;
     }
     case MQTT_EVENT_DISCONNECTED:
@@ -227,7 +289,7 @@ static esp_err_t start_mqtt(const integr_config_t *cfg)
 {
     app_config_hub_name(s_hub);
 
-    s_queue = xQueueCreate(MQTT_PUB_QUEUE_DEPTH, 6);
+    s_queue = xQueueCreate(MQTT_PUB_QUEUE_DEPTH, sizeof(mqtt_pub_msg_t));
     if (!s_queue) {
         ESP_LOGE(TAG, "xQueueCreate failed");
         return ESP_ERR_NO_MEM;
