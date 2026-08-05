@@ -139,7 +139,7 @@ typedef struct __attribute__((packed)) {
 } swarm_forget_t;
 
 /* Node -> hub, unicast, encrypted. Battery nodes report their current power mode
- * (SWARM_PM_* from power_modes.h, Task 3), plus a monotonic wake counter for diagnostics. */
+ * (SWARM_PM_* from swarm_store.h, Task 3), plus a monotonic wake counter for diagnostics. */
 typedef struct __attribute__((packed)) {
     uint8_t  version;      /* SWARM_PROTO_VERSION */
     uint8_t  type;         /* SWARM_MSG_CHECKIN */

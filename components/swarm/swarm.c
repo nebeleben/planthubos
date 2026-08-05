@@ -9,6 +9,7 @@
 #include "swarm_store.h"
 #include "swarm_frame.h"
 #include "swarm_buf.h"
+#include "batt_cycle.h"
 #include "node_ota.h"
 #include "node_ota_recv.h"
 #include "espnow_link.h"
@@ -46,6 +47,13 @@ typedef struct {
     uint32_t last_seen_s;
     uint32_t frames_rx;
     int8_t   rssi;
+    /* M7: the node's own last-reported power mode (SWARM_PM_*, swarm_store.h),
+     * from its most recent accepted CHECKIN -- see checkin_task() below.
+     * reported_mode_valid is false until the first CHECKIN this boot (a node
+     * that has never checked in reports nothing, same "unknown, not a
+     * guess" reasoning as rssi/last_seen_s being null until first heard). */
+    uint8_t  reported_mode;
+    bool     reported_mode_valid;
 } node_stat_t;
 
 static node_stat_t       s_stats[SWARM_MAX_NODES];
@@ -81,6 +89,53 @@ static void record_stat(const uint8_t src[6], int rssi)
     s_frames_rx_total++;
 
     xSemaphoreGive(s_stats_mutex);
+}
+
+/* Called from checkin_task() (below), never from the ESP-NOW receive
+ * callback -- unlike record_stat(), which the CHECKIN branch of hub_rx_cb
+ * calls directly (same as READING) to refresh frames_rx/last_seen_s/rssi
+ * before this frame is even queued. By the time checkin_task() runs, that
+ * call has already created/refreshed this node's slot, so the lookup here
+ * is expected to always find one; a miss (defensively handled as a silent
+ * no-op) would only mean the slot table is somehow full (SWARM_MAX_NODES
+ * exceeded), same corner case record_stat() itself already tolerates. */
+static void record_checkin_mode(const uint8_t mac[6], uint8_t mode)
+{
+    xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
+    for (int i = 0; i < SWARM_MAX_NODES; i++) {
+        if (s_stats[i].in_use && memcmp(s_stats[i].mac, mac, 6) == 0) {
+            s_stats[i].reported_mode = mode;
+            s_stats[i].reported_mode_valid = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_stats_mutex);
+}
+
+/* Hub: node_ota.c's node_ota_start() (Task 4) consults this to decide
+ * whether a push should park (NODE_OTA_ST_PENDING_WAKE) rather than stream
+ * immediately -- a node that last reported a battery mode is presumed
+ * asleep between checkins, so streaming to it right away would talk to
+ * nobody. Returns false (mode_out untouched) when this node has never sent
+ * an accepted CHECKIN this boot -- callers must treat that as "unknown",
+ * not as "ALWAYS_ON confirmed", same reasoning as the JSON's
+ * reported_mode_valid below. Safe to call from any task: same short,
+ * bounded, allocation-free scan under s_stats_mutex as every other
+ * accessor in this file. */
+bool swarm_node_reported_mode(const uint8_t mac[6], uint8_t *mode_out)
+{
+    if (!mac || !mode_out || !s_stats_mutex) return false;
+    bool found = false;
+    xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
+    for (int i = 0; i < SWARM_MAX_NODES; i++) {
+        if (s_stats[i].in_use && memcmp(s_stats[i].mac, mac, 6) == 0 && s_stats[i].reported_mode_valid) {
+            *mode_out = s_stats[i].reported_mode;
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_stats_mutex);
+    return found;
 }
 
 /* A node-forwarded reading enters through exactly the same door as a
@@ -133,6 +188,106 @@ static bool is_paired_node(const uint8_t mac[6])
         if (swarm_store_node_at(i, stored, NULL) && memcmp(stored, mac, 6) == 0) return true;
     }
     return false;
+}
+
+/* ---------------- Hub side: CHECKIN reconciliation (M7) ----------------
+ *
+ * hub_rx_cb (the ESP-NOW receive callback, WiFi driver task) must never
+ * send, write NVS, or block -- same project-wide rule as every other
+ * deferred-work path in this file (record_stat()'s own comment, pairing.c's
+ * pong_task/forget_task). CHECKIN's ack additionally needs
+ * batt_reconcile() (pure, cheap) and node_ota_notify_checkin() (RAM-only,
+ * non-blocking) evaluated per item, plus an espnow_link_send() -- all of
+ * that belongs on a dedicated task, not the callback, exactly like
+ * pairing.c's pong_task is the reference for "callback queues, task
+ * sends". */
+typedef struct {
+    uint8_t         mac[6];
+    swarm_checkin_t checkin;
+} checkin_item_t;
+
+#define CHECKIN_QUEUE_LEN 4
+
+static QueueHandle_t s_checkin_queue;
+static TaskHandle_t  s_checkin_task;
+
+static void checkin_task(void *arg)
+{
+    (void)arg;
+    checkin_item_t item;
+    for (;;) {
+        if (xQueueReceive(s_checkin_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+
+        /* hub_rx_cb already called record_stat() for this item before
+         * queuing it (same as READING) -- this only adds the self-reported
+         * mode on top, so GET /api/v1/nodes (Task 6) and node_ota_start()
+         * (node_ota.c, via swarm_node_reported_mode()) both see it. */
+        record_checkin_mode(item.mac, item.checkin.power_mode);
+
+        uint8_t desired = (uint8_t)swarm_store_node_desired_mode(item.mac);
+        bool ota_pending = node_ota_pending_for(item.mac);
+        batt_cmd_t cmd = batt_reconcile(desired, item.checkin.power_mode, ota_pending);
+
+        if (cmd.command == SWARM_CHECKIN_CMD_STAY_AWAKE) {
+            /* Releases a parked OTA session targeting this node, if one
+             * exists (node_ota.c's NODE_OTA_ST_PENDING_WAKE) -- a no-op
+             * otherwise. The STAY_AWAKE ack below is sent regardless: the
+             * node keeps its radio on either way (Task 5), whether or not
+             * there actually was a session waiting for it. */
+            node_ota_notify_checkin(item.mac);
+        }
+
+        swarm_checkin_ack_t ack = {
+            .version = SWARM_PROTO_VERSION,
+            .type = SWARM_MSG_CHECKIN_ACK,
+            .command = cmd.command,
+            .arg = cmd.arg,
+        };
+        uint8_t buf[sizeof(ack)];
+        size_t n = swarm_encode_checkin_ack(&ack, buf, sizeof(buf));
+        if (n == 0) {
+            ESP_LOGE(TAG, "CHECKIN_ACK for " MACSTR ": failed to encode", MAC2STR(item.mac));
+            continue;
+        }
+
+        /* Unicast -- unlike PAIR_ACK/PONG/FORGET, a checked-in node is
+         * already an adopted, encrypted ESP-NOW peer (is_paired_node()
+         * gated this in hub_rx_cb before it was ever queued), so there is
+         * no AP-association/no-peer-yet reason to broadcast here. A send
+         * failure is logged and dropped, not retried: the node will check
+         * in again next cycle (or is already awake waiting, per Task 5),
+         * and reconciliation is naturally idempotent -- batt_reconcile()
+         * recomputes the right command from scratch every time, so a
+         * missed ack just delays convergence by one checkin, it never
+         * leaves the node in a wrong state permanently. */
+        esp_err_t err = espnow_link_send(item.mac, buf, n);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "CHECKIN_ACK -> " MACSTR " failed (%s), dropped -- reconciliation "
+                          "self-heals next checkin", MAC2STR(item.mac), esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "CHECKIN_ACK -> " MACSTR ": command=%u arg=%u (desired=%u reported=%u ota_pending=%d)",
+                     MAC2STR(item.mac), cmd.command, cmd.arg, desired, item.checkin.power_mode, ota_pending);
+        }
+    }
+}
+
+/* Idempotent; safe to call more than once. Must run before any CHECKIN can
+ * be answered -- swarm_start_main() calls this right after espnow_link_init()
+ * so the responder exists from hub boot onward, same eager-init reasoning as
+ * pairing_hub_init()'s own doc comment (a battery node may check in at any
+ * time, independent of any operator action). */
+static esp_err_t ensure_checkin_task(void)
+{
+    if (s_checkin_task) return ESP_OK;
+    if (!s_checkin_queue) s_checkin_queue = xQueueCreate(CHECKIN_QUEUE_LEN, sizeof(checkin_item_t));
+    if (!s_checkin_queue) return ESP_ERR_NO_MEM;
+    BaseType_t ok = xTaskCreate(checkin_task, "swarm_checkin", 3072, NULL, 3, &s_checkin_task);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "ensure_checkin_task: xTaskCreate failed");
+        s_checkin_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, int rssi)
@@ -210,6 +365,36 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
         if (swarm_decode_ota_status(data, (size_t)len, &st)) node_ota_handle_status(src_mac, &st);
         return;
     }
+    if (type == SWARM_MSG_CHECKIN) {
+        /* Node -> hub, unicast, encrypted (M7): same pairing/spoofing
+         * reasoning as READING above -- ESP-NOW hands this callback any
+         * frame from any MAC in range, so is_paired_node() is the gate that
+         * keeps an unpaired device from injecting a CHECKIN and steering
+         * this hub's reconciliation logic. record_stat() is called here,
+         * synchronously, same as READING -- by the time checkin_task()
+         * (below) picks this item off the queue, this node's stats slot is
+         * guaranteed to already exist for record_checkin_mode() to update.
+         * Everything past that (batt_reconcile(), node_ota_notify_checkin(),
+         * the espnow_link_send() ack) is deferred to checkin_task(): this
+         * callback only ever queues, never sends -- see ensure_checkin_task()'s
+         * doc comment and pairing.c's pong_task, the reference for this
+         * exact pattern. A full/missing queue just drops this one CHECKIN;
+         * the node retries on its own schedule (Task 5), so nothing is lost
+         * permanently. */
+        if (!is_paired_node(src_mac)) return;
+        swarm_checkin_t c;
+        if (!swarm_decode_checkin(data, (size_t)len, &c)) return;
+        record_stat(src_mac, rssi);
+
+        checkin_item_t item;
+        memcpy(item.mac, src_mac, 6);
+        item.checkin = c;
+        if (!s_checkin_queue || xQueueSend(s_checkin_queue, &item, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "CHECKIN from " MACSTR ": no checkin task available or queue full, dropping",
+                     MAC2STR(src_mac));
+        }
+        return;
+    }
     /* PAIR_REQ/PAIR_ACK, PING/PONG, FORGET or anything unrecognised:
      * pairing_handle_frame already filters to the types it understands and
      * silently ignores everything else, so handing it anything that isn't a
@@ -271,6 +456,19 @@ esp_err_t swarm_start_main(void)
     err = pairing_hub_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "pairing_hub_init failed: %s -- PING liveness probes will go unanswered",
+                 esp_err_to_name(err));
+    }
+
+    /* Same eager-init reasoning as pairing_hub_init() just above: a battery
+     * node (M7) may check in at any time, independent of any operator
+     * action, so the responder must already exist. Failure is logged but
+     * not fatal to bringing the hub up -- see ensure_checkin_task()'s own
+     * comment; without it, CHECKIN frames are simply dropped at the queue
+     * send in hub_rx_cb, same graceful-degradation shape as every other
+     * "responder unavailable" case in this file. */
+    err = ensure_checkin_task();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ensure_checkin_task failed: %s -- CHECKIN frames will go unanswered",
                  esp_err_to_name(err));
     }
 
@@ -356,6 +554,19 @@ int swarm_node_list_json(char *buf, size_t cap)
         cJSON_AddNumberToObject(o, "frames_rx", stat ? stat->frames_rx : 0);
         if (stat) cJSON_AddNumberToObject(o, "rssi", stat->rssi);
         else cJSON_AddNullToObject(o, "rssi");
+        /* M7: the node's own last-reported power mode (SWARM_PM_*), from its
+         * most recent accepted CHECKIN this boot -- see checkin_task()/
+         * record_checkin_mode() above. reported_mode_valid is false (and
+         * reported_mode null) until that first CHECKIN, same "unknown, not
+         * a guess" reasoning as last_seen_s/rssi being null before this node
+         * has ever been heard from at all -- a node can be a known/paired
+         * ALWAYS_ON device that simply hasn't checked in yet (it never needs
+         * to, if it never sleeps), so reported_mode_valid=false must not be
+         * read as "reported ALWAYS_ON". */
+        bool mode_valid = stat && stat->reported_mode_valid;
+        cJSON_AddBoolToObject(o, "reported_mode_valid", mode_valid);
+        if (mode_valid) cJSON_AddNumberToObject(o, "reported_mode", stat->reported_mode);
+        else cJSON_AddNullToObject(o, "reported_mode");
         /* "buffered": Task 5's RAM ring (swarm.c's forward_task) tracks a
          * NODE's own undelivered-reading backlog, but that state lives only
          * on the node itself -- there is no wire message carrying a

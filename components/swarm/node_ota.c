@@ -19,6 +19,7 @@
  * NODE_OTA_ERR_IMAGE_LEN rather than ever streaming the full ~1.6MB
  * partition guessing at a length. */
 #include "node_ota.h"
+#include "swarm.h"
 #include "swarm_store.h"
 #include "espnow_link.h"
 
@@ -131,10 +132,20 @@ static SemaphoreHandle_t s_mutex;
 static ota_session_t     s_session;
 static TaskHandle_t      s_task;
 
+/* M7: gives the parked task (node_ota_task(), NODE_OTA_ST_PENDING_WAKE
+ * branch) something to block on that isn't a busy-poll. Binary, starts
+ * empty (xSemaphoreCreateBinary()) -- given exactly once per park period,
+ * by whichever of node_ota_notify_checkin()/node_ota_abort() releases it
+ * first (see both below); the task itself disambiguates which happened by
+ * checking abort_requested after waking, not by which caller gave it, so a
+ * near-simultaneous checkin+abort can never be misread. */
+static SemaphoreHandle_t s_park_sem;
+
 static bool ensure_state(void)
 {
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
-    return s_mutex != NULL;
+    if (!s_park_sem) s_park_sem = xSemaphoreCreateBinary();
+    return s_mutex != NULL && s_park_sem != NULL;
 }
 
 void node_ota_progress(node_ota_progress_t *out)
@@ -215,9 +226,55 @@ esp_err_t node_ota_abort(void)
     if (!ensure_state()) return ESP_ERR_NO_MEM;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool active = s_session.pub.active;
+    bool parked = active && s_session.pub.state == NODE_OTA_ST_PENDING_WAKE;
     if (active) s_session.abort_requested = true;
     xSemaphoreGive(s_mutex);
+    /* Wake a parked task immediately rather than leaving it blocked until a
+     * checkin that may be minutes away -- or never comes, if the operator
+     * is aborting precisely because they don't want to wait for one. Only
+     * given when actually parked: giving it unconditionally would leave a
+     * stray count sitting on the semaphore for a session that isn't (or is
+     * no longer) parked, which a LATER session's park could then read as an
+     * immediate, spurious release. The woken task tells this apart from a
+     * genuine checkin release purely by checking abort_requested -- see
+     * node_ota_task()'s NODE_OTA_ST_PENDING_WAKE branch. */
+    if (parked) xSemaphoreGive(s_park_sem);
     return active ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+/* Called by swarm.c's checkin_task() on every accepted CHECKIN -- see
+ * node_ota.h for the full contract. */
+bool node_ota_notify_checkin(const uint8_t mac[6])
+{
+    if (!mac || !s_mutex) return false;
+    bool release = false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_session.pub.active && s_session.pub.state == NODE_OTA_ST_PENDING_WAKE
+        && memcmp(s_session.pub.mac, mac, 6) == 0) {
+        release = true;
+    }
+    xSemaphoreGive(s_mutex);
+    /* Outside the critical section, same as node_ota_abort()'s give above --
+     * xSemaphoreGive() is itself safe to call unlocked, and holding s_mutex
+     * across it would gain nothing (the park semaphore has its own,
+     * independent synchronisation). A repeat CHECKIN for a mac that already
+     * triggered a release (state has since moved past PENDING_WAKE) simply
+     * finds release == false here -- this can only ever give the semaphore
+     * once per park period. */
+    if (release) xSemaphoreGive(s_park_sem);
+    return release;
+}
+
+/* Used by swarm.c's checkin_task() to decide whether to answer a CHECKIN
+ * with STAY_AWAKE -- see node_ota.h for the full contract. */
+bool node_ota_pending_for(const uint8_t mac[6])
+{
+    if (!mac || !s_mutex) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool pending = s_session.pub.active && s_session.pub.state == NODE_OTA_ST_PENDING_WAKE
+                   && memcmp(s_session.pub.mac, mac, 6) == 0;
+    xSemaphoreGive(s_mutex);
+    return pending;
 }
 
 /* Ends the session: updates the published state/err, sends a best-effort
@@ -339,9 +396,41 @@ static void node_ota_task(void *arg)
 {
     (void)arg;
     uint8_t mac[6];
+    uint8_t initial_state;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     memcpy(mac, s_session.pub.mac, 6);
+    initial_state = s_session.pub.state;
     xSemaphoreGive(s_mutex);
+
+    /* M7 park (NODE_OTA_ST_PENDING_WAKE): node_ota_start() below decided
+     * this target is presumed asleep between checkins and set this state
+     * before spawning this task, rather than sending OTA_BEGIN and
+     * streaming into the void. Block here -- before touching the partition,
+     * before hashing, before OTA_BEGIN ever goes out -- until
+     * node_ota_notify_checkin() (called from swarm.c's checkin_task() on
+     * this node's next CHECKIN) or node_ota_abort() releases the semaphore.
+     * Checking abort_requested AFTER waking, rather than trusting "we woke
+     * up" to mean "released by a checkin", is what makes this correct
+     * regardless of which of the two callers actually gave the semaphore --
+     * see both of their comments. An abort while parked ends the session
+     * FAILED/ABORTED with notify_node=false: the node was never told a
+     * session was starting (no OTA_BEGIN sent yet), so there is nothing on
+     * its side to notify. */
+    if (initial_state == NODE_OTA_ST_PENDING_WAKE) {
+        ESP_LOGI(TAG, "node OTA for " MACSTR ": parked (battery node), waiting for its next "
+                      "CHECKIN before streaming", MAC2STR(mac));
+        xSemaphoreTake(s_park_sem, portMAX_DELAY);
+        if (abort_was_requested()) {
+            ESP_LOGW(TAG, "node OTA for " MACSTR ": abort requested while parked", MAC2STR(mac));
+            finish_session(mac, OTA_ST_FAILED, NODE_OTA_ERR_ABORTED, false, 0);
+            goto done;
+        }
+        ESP_LOGI(TAG, "node OTA for " MACSTR ": released by CHECKIN, node is awake -- streaming now",
+                 MAC2STR(mac));
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_session.pub.state = OTA_ST_RECEIVING;
+        xSemaphoreGive(s_mutex);
+    }
 
     const esp_partition_t *part = esp_ota_get_running_partition();
     if (!part) {
@@ -425,6 +514,20 @@ static void node_ota_task(void *arg)
     }
 
     {
+        /* M7: for a session that was parked above, this starts the
+         * NODE_OTA_TOTAL_TIMEOUT_US (10 minute) clock at RELEASE, not at
+         * park -- this line only runs once OTA_BEGIN has actually gone out,
+         * which for a parked session is after the park block above already
+         * returned. An unparked session behaves exactly as before M7
+         * (nothing between node_ota_task() starting and here). This is
+         * deliberate, not an oversight: a park can legitimately last far
+         * longer than 10 minutes (a battery node on the 60-minute mode may
+         * not check in again for up to an hour), and none of that waiting
+         * time should count against the streaming budget. The node's own
+         * 12-minute stay-awake cap (spec Section 10) is what bounds a
+         * RELEASED session from here -- it independently guarantees the
+         * node stays listening for at least as long as this 10-minute timer
+         * could ever need. */
         int64_t started_us = esp_timer_get_time();
         int consecutive_stalls = 0;
         uint32_t send_backoff_ms = 0;
@@ -747,11 +850,61 @@ esp_err_t node_ota_start(const uint8_t node_mac[6])
         return ESP_ERR_NOT_FOUND;
     }
 
+    /* M7: park instead of streaming immediately when the target is presumed
+     * asleep between checkins -- either the operator has assigned it a
+     * battery mode (swarm_store_node_desired_mode(), Task 3 -- the mode it
+     * SHOULD be running, which may not have reached the node yet), or the
+     * node's own last CHECKIN already reported one (swarm_node_reported_mode(),
+     * swarm.c -- the mode it actually IS running). Either alone is enough:
+     * a freshly-assigned battery mode not yet acknowledged, or a node still
+     * reporting its old battery mode while a desired-mode change is in
+     * flight, both mean "streaming right now would very likely talk to a
+     * node with its radio off". A node this hub has never heard a CHECKIN
+     * from (have_reported == false) is not treated as battery just because
+     * it's silent -- swarm_node_reported_mode() returning false is
+     * "unknown", not "confirmed ALWAYS_ON" NOR "confirmed battery"; only
+     * the desired-mode half of the OR can still trigger a park for such a
+     * node. Calling into swarm_store/swarm.c while holding s_mutex here
+     * follows the same precedent as the known-node check just above (also
+     * a swarm_store call made inside this same critical section); neither
+     * of those layers ever calls back into node_ota.c, so there is no
+     * lock-ordering hazard. */
+    swarm_power_mode_t desired_mode = swarm_store_node_desired_mode(node_mac);
+    uint8_t reported_mode = SWARM_PM_ALWAYS_ON;
+    bool have_reported = swarm_node_reported_mode(node_mac, &reported_mode);
+    bool reported_is_battery = have_reported && reported_mode != SWARM_PM_ALWAYS_ON;
+    bool should_park = (desired_mode != SWARM_PM_ALWAYS_ON) || reported_is_battery;
+
     memset(&s_session, 0, sizeof(s_session));
     s_session.pub.active = true;
     memcpy(s_session.pub.mac, node_mac, 6);
-    s_session.pub.state = OTA_ST_RECEIVING;
+    s_session.pub.state = should_park ? NODE_OTA_ST_PENDING_WAKE : OTA_ST_RECEIVING;
     s_session.pub.started_s = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    /* Defensive drain, not expected to ever find anything: every give of
+     * this semaphore is matched by exactly one take, by the one task that
+     * was ever parked and blocking on it (see s_park_sem's own comment) --
+     * but if that invariant were ever violated by a future bug, a stray
+     * leftover count here would make THIS brand-new park resolve itself
+     * instantly, without any real CHECKIN ever having arrived. Cheap
+     * insurance against that failure mode being silent. Deliberately done
+     * BEFORE releasing s_mutex below, still inside the same critical
+     * section as marking the session active/parked above: node_ota_abort()
+     * and node_ota_notify_checkin() both read s_session.pub.active/state
+     * under s_mutex before ever giving this semaphore (see both), so
+     * releasing s_mutex first would open a window where one of them could
+     * observe this brand-new session as active+parked, give the semaphore
+     * for IT, and have that genuine release erased by this drain -- leaving
+     * the about-to-be-created task blocked forever on a semaphore nothing
+     * will ever give again. Draining first, while still holding s_mutex,
+     * makes that ordering impossible: neither caller can observe this
+     * session at all until s_mutex is released, which only happens after
+     * the drain below completes. (s_park_sem is a distinct semaphore from
+     * s_mutex, and nothing else ever holds s_park_sem while attempting to
+     * take s_mutex, so taking it here cannot deadlock.) */
+    if (should_park) {
+        while (xSemaphoreTake(s_park_sem, 0) == pdTRUE) { /* drain any stale count */ }
+    }
     xSemaphoreGive(s_mutex);
 
     BaseType_t ok = xTaskCreate(node_ota_task, "node_ota", 4096, NULL, 5, &s_task);
@@ -765,6 +918,7 @@ esp_err_t node_ota_start(const uint8_t node_mac[6])
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "node OTA session started for " MACSTR, MAC2STR(node_mac));
+    ESP_LOGI(TAG, "node OTA session started for " MACSTR " (%s)", MAC2STR(node_mac),
+             should_park ? "parked, waiting for next CHECKIN" : "streaming now");
     return ESP_OK;
 }

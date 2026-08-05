@@ -1,5 +1,6 @@
 #pragma once
 #include "esp_err.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -49,6 +50,17 @@ int swarm_node_list_json(char *buf, size_t cap);
 /* Hub: total SWARM_MSG_READING frames ingested from nodes since boot
  * (verification aid; also the "frames_rx_total" field of the JSON above). */
 uint32_t swarm_frames_rx(void);
+
+/* Hub (M7): the given node's last self-reported power mode (SWARM_PM_*,
+ * swarm_store.h), from its most recent accepted CHECKIN this boot -- the
+ * same RAM stats slot GET /api/v1/nodes' "reported_mode"/"reported_mode_valid"
+ * fields come from (swarm_node_list_json()). Returns false (mode_out
+ * untouched) if this node has never checked in this boot -- callers must
+ * treat that as unknown, not as "reported ALWAYS_ON". node_ota.c's
+ * node_ota_start() uses this to decide whether a push should park
+ * (NODE_OTA_ST_PENDING_WAKE) rather than stream immediately. Safe to call
+ * from any task. */
+bool swarm_node_reported_mode(const uint8_t mac[6], uint8_t *mode_out);
 
 /* Hub: called when a node is forgotten (api_v1.c's DELETE handler) -- clears
  * that MAC's per-node RAM stats slot (frames_rx/last_seen_s/rssi), if it has
