@@ -794,6 +794,28 @@ static void signal_node_healthy(const char *reason)
     xQueueSend(s_health_queue, buf, 0);
 }
 
+/* M7 Task 5 fix (code review): a SYNCHRONOUS variant of signal_node_healthy(),
+ * used only by the two SET_MODE reboot sites below (always_on_checkin_task()
+ * and swarm_node_battery_cycle()). Those need the OTA rollback-guard
+ * confirmation to have actually happened BEFORE esp_restart() reboots the
+ * device -- signal_node_healthy()'s normal path only queues a request for
+ * health_confirm_task to pick up whenever it's next scheduled, which could
+ * easily lose the race against an esp_restart() called right after it.
+ * Still routed through the same function-pointer indirection (s_health_cb)
+ * as signal_node_healthy(), never a direct call into ota_post.h -- see
+ * swarm_node_set_health_cb()'s own doc comment in swarm.h for why a direct
+ * dependency on webserver/ota_post.h from this component would be circular
+ * (webserver already depends on swarm via api_v1.c). ota_post.h documents
+ * ota_rollback_guard_node_confirm() -- what s_health_cb is wired to, in
+ * main.c -- as safe to call from any task and idempotent past the first
+ * successful confirm, so calling it directly here, on this dedicated task,
+ * rather than via the queue, is safe. A no-op (s_health_cb is NULL) on a
+ * hub, which never registers a callback. */
+static void confirm_health_before_restart(const char *reason)
+{
+    if (s_health_cb) s_health_cb(reason);
+}
+
 static void node_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, int rssi)
 {
     int type = swarm_frame_type(data, (size_t)len);
@@ -1193,6 +1215,19 @@ static bool do_checkin_round(uint8_t mode, uint32_t wake_counter, swarm_checkin_
     return send_checkin_and_wait_ack(mode, wake_counter, ack_out);
 }
 
+/* M7 Task 5 fix (code review): shared by both SET_MODE reboot sites below
+ * and the rollback-sleep gate further down -- a single place for the
+ * esp_ota_get_running_partition()/esp_ota_get_state_partition() pair
+ * instead of three copies of the same two calls. */
+static bool running_image_pending_verify(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    return running != NULL
+        && esp_ota_get_state_partition(running, &ota_state) == ESP_OK
+        && ota_state == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
 /* ---------------- Node side: always-on periodic checkin (M7 Task 5, spec §4/§6) ----------------
  *
  * A battery node's own checkin cycle (swarm_node_battery_cycle(), below)
@@ -1227,9 +1262,35 @@ static void always_on_checkin_task(void *arg)
         if (!send_checkin_and_wait_ack(SWARM_PM_ALWAYS_ON, swarm_store_wake_counter(), &ack)) continue;
 
         if (ack.command == SWARM_CHECKIN_CMD_SET_MODE) {
-            ESP_LOGW(TAG, "always-on CHECKIN_ACK: SET_MODE %u -- persisting and rebooting into the new mode",
+            esp_err_t serr = swarm_store_set_power_mode((swarm_power_mode_t)ack.arg);
+            if (serr != ESP_OK) {
+                /* Code review fix (issue 6): only reboot once the new mode
+                 * is actually persisted -- rebooting on an unpersisted
+                 * write would come back up still ALWAYS_ON, having thrown
+                 * away the reboot for nothing. Not persisted is not lost:
+                 * the hub keeps re-sending SET_MODE on every future checkin
+                 * until reported/desired agree (batt_reconcile() is
+                 * idempotent, per checkin_task()'s own comment), so simply
+                 * not rebooting this round is enough -- just loop back
+                 * around to the next periodic checkin. */
+                ESP_LOGE(TAG, "always-on CHECKIN_ACK: SET_MODE %u -- failed to persist (%s), not "
+                              "rebooting; the hub will re-send this command", ack.arg, esp_err_to_name(serr));
+                continue;
+            }
+            /* Code review fix (issue 3): a deliberate SET_MODE reboot rolls
+             * back a good PENDING_VERIFY image exactly like an unconfirmed
+             * sleep-triggered reset would (the bootloader reverts any
+             * PENDING_VERIFY image that was never explicitly confirmed
+             * before the next boot) -- so confirm synchronously, right
+             * here, before rebooting, mirroring the rollback-sleep rule's
+             * own reasoning in swarm_node_battery_cycle() below. */
+            if (running_image_pending_verify()) {
+                ESP_LOGW(TAG, "always-on CHECKIN_ACK: SET_MODE %u -- running image is PENDING_VERIFY, "
+                              "confirming before rebooting", ack.arg);
+                confirm_health_before_restart("mode change");
+            }
+            ESP_LOGW(TAG, "always-on CHECKIN_ACK: SET_MODE %u -- persisted, rebooting into the new mode",
                      ack.arg);
-            swarm_store_set_power_mode((swarm_power_mode_t)ack.arg);
             esp_restart();
         }
         /* NONE or STAY_AWAKE: an always-on node is already awake with
@@ -1243,30 +1304,68 @@ static void always_on_checkin_task(void *arg)
 
 /* ---------------- Node side: battery-mode wake cycle (M7 Task 5, spec §4) ---------------- */
 
-#define BATT_STAY_AWAKE_IDLE_LIMIT 10u   /* consecutive idle 1s polls before giving up on STAY_AWAKE */
+/* Code review fix (issue 1): pace + bound for the PENDING_VERIFY retry loop
+ * in swarm_node_battery_cycle() below -- see that loop's own comment for
+ * the full "unpaced CHECKIN storm" rationale. 5s between passes, 24 passes
+ * (~2 minutes total) before giving up and forcing the ALWAYS_ON fallback. */
+#define BATT_PENDING_VERIFY_RETRY_DELAY_MS 5000u
+#define BATT_PENDING_VERIFY_MAX_RETRIES    24u
+
+/* Code review fix (issue 2): a session can legitimately take a while to
+ * even START after the STAY_AWAKE ack -- the hub's own hash pass over the
+ * image is ~1-1.5s, and node_ota_recv.c's handle_begin() calls
+ * esp_ota_begin() before it ever sets active=true, which erases the target
+ * partition first (~3-5s on this hardware) -- together that can eat most of
+ * a naive 10-consecutive-idle-second budget before node_ota_recv_active()
+ * ever reports true even once, making a slow-erase part deep-sleep mid-
+ * handshake deterministically, not as a rare edge case. Splitting the wait
+ * into two budgets fixes that: a longer grace period during which "not
+ * active yet" is expected and not counted at all, THEN the original
+ * consecutive-idle rule, but only once a session has actually been
+ * observed active at least once (so it is now answering "did it end?", a
+ * question the pre-fix code was also asking too early). */
+#define BATT_STAY_AWAKE_NO_SESSION_GRACE_S 60u  /* no session observed active yet -- generous
+                                                  * next to hub-hash (~1-1.5s) + node erase
+                                                  * (~3-5s) so a slow-erase part is not
+                                                  * mistaken for "never coming" */
+#define BATT_STAY_AWAKE_IDLE_LIMIT         10u  /* consecutive idle 1s polls, AFTER a session
+                                                  * has been observed active, before assuming
+                                                  * it ended without a reboot */
 
 /* Blocks up to BATT_STAY_AWAKE_CAP_S while node_ota_recv reports an active
  * session (spec §6's node-side stay-awake cap: "the OTA session's 10-minute
  * total timeout plus the checkin-to-start gap"). STAY_AWAKE's ack means the
  * hub just released a session it had parked pending this node's wake (see
- * checkin_task()'s node_ota_notify_checkin() call on the hub side). Polls
- * once a second: BATT_STAY_AWAKE_IDLE_LIMIT consecutive idle polls (no
- * active session observed) means the session either never actually started
- * or already ended without a reboot -- failed/aborted, per the brief -- so
- * this gives up and resumes the normal cycle. A genuine SUCCESS instead
- * reboots the node from inside node_ota_recv.c itself (finalize_session()'s
- * esp_restart()), which ends this whole task along with everything else,
- * so that outcome is never observed here directly -- there is nothing left
- * to "resume" in that case. */
+ * checkin_task()'s node_ota_notify_checkin() call on the hub side). Two
+ * phases, per the review fix above: before any session has been observed
+ * active, "not active" just means "not started yet" and is tolerated for up
+ * to BATT_STAY_AWAKE_NO_SESSION_GRACE_S; once one HAS been observed active,
+ * BATT_STAY_AWAKE_IDLE_LIMIT consecutive idle polls means it ended without a
+ * reboot -- failed/aborted, per the brief -- so this gives up and resumes
+ * the normal cycle. A genuine SUCCESS instead reboots the node from inside
+ * node_ota_recv.c itself (finalize_session()'s esp_restart()), which ends
+ * this whole task along with everything else, so that outcome is never
+ * observed here directly -- there is nothing left to "resume" in that
+ * case. */
 static void battery_stay_awake_wait(void)
 {
     uint32_t elapsed_s = 0;
     uint32_t idle_consecutive = 0;
+    bool session_seen = false;
     while (elapsed_s < BATT_STAY_AWAKE_CAP_S) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         elapsed_s++;
         if (node_ota_recv_active()) {
+            session_seen = true;
             idle_consecutive = 0;
+            continue;
+        }
+        if (!session_seen) {
+            if (elapsed_s >= BATT_STAY_AWAKE_NO_SESSION_GRACE_S) {
+                ESP_LOGW(TAG, "STAY_AWAKE: no OTA session observed active within %us of the ack, "
+                              "giving up and resuming the wake cycle", (unsigned)BATT_STAY_AWAKE_NO_SESSION_GRACE_S);
+                return;
+            }
             continue;
         }
         idle_consecutive++;
@@ -1278,6 +1377,33 @@ static void battery_stay_awake_wait(void)
     }
     ESP_LOGW(TAG, "STAY_AWAKE: cap of %us reached without the OTA session completing, resuming the wake cycle",
              (unsigned)BATT_STAY_AWAKE_CAP_S);
+}
+
+/* Code review fix (issue 1 pacing bound / issue 4): shared by both
+ * fallback sites in swarm_node_battery_cycle() below -- the original
+ * failed-wake-limit fallback, and the new PENDING_VERIFY retry-cap
+ * fallback the pacing fix below adds. Persists ALWAYS_ON AND resets the
+ * failed-wake counter to 0 together: leaving the counter at whatever
+ * value triggered the fallback (e.g. BATT_FAILED_WAKE_LIMIT) would mean a
+ * later hub-issued SET_MODE back into a battery mode re-trips this same
+ * fallback after just ONE subsequent failed wake, instead of getting a
+ * fresh run at the full limit the way a newly-configured battery node
+ * would -- the counter is documented (spec §4) to reset "on any
+ * successful checkin", and re-entering a battery mode fresh is exactly
+ * that case. */
+static void battery_enter_always_on_fallback(const char *reason)
+{
+    ESP_LOGW(TAG, "battery cycle: falling back to ALWAYS_ON (%s) so this node stays reachable", reason);
+    esp_err_t perr = swarm_store_set_power_mode(SWARM_PM_ALWAYS_ON);
+    if (perr != ESP_OK) {
+        ESP_LOGE(TAG, "battery cycle: failed to persist the ALWAYS_ON fallback (%s); this node may "
+                      "stay stuck in its battery cycle", esp_err_to_name(perr));
+    }
+    esp_err_t ferr = swarm_store_set_failed_wakes(0);
+    if (ferr != ESP_OK) {
+        ESP_LOGW(TAG, "battery cycle: failed to reset the failed-wake counter after fallback (%s)",
+                 esp_err_to_name(ferr));
+    }
 }
 
 esp_err_t swarm_node_battery_cycle(void)
@@ -1310,6 +1436,13 @@ esp_err_t swarm_node_battery_cycle(void)
      * while this task simply waits -- no separate scan logic needed here. */
     vTaskDelay(pdMS_TO_TICKS(BATT_SCAN_WINDOW_S * 1000));
 
+    /* Code review fix (issue 1): bounds the PENDING_VERIFY retry loop
+     * further down. Counts only passes that actually hit that branch (not
+     * every loop iteration), paced BATT_PENDING_VERIFY_RETRY_DELAY_MS apart
+     * -- see that block's own comment for why an unpaced, unbounded retry
+     * here was a real problem (a CHECKIN storm, not just a busy loop). */
+    uint32_t pending_verify_retries = 0;
+
     for (;;) {
         /* Steps 3+4 (spec §4): checkin, ack handling, wake-success
          * bookkeeping. Looped only when the rollback-sleep gate below
@@ -1329,9 +1462,36 @@ esp_err_t swarm_node_battery_cycle(void)
                  * mode) from a clean boot -- instead of this function
                  * having to unwind and restart its own already-live
                  * scan/forward state in place. */
-                ESP_LOGW(TAG, "CHECKIN_ACK: SET_MODE %u -- persisting and rebooting", ack.arg);
-                swarm_store_set_power_mode((swarm_power_mode_t)ack.arg);
-                esp_restart();
+                esp_err_t serr = swarm_store_set_power_mode((swarm_power_mode_t)ack.arg);
+                if (serr != ESP_OK) {
+                    /* Code review fix (issue 6): only reboot once the new
+                     * mode is actually persisted -- rebooting on an
+                     * unpersisted write would come back up still in THIS
+                     * mode, having thrown away the reboot for nothing. Not
+                     * persisted is not lost: the hub keeps re-sending
+                     * SET_MODE on every future checkin until reported/desired
+                     * agree (batt_reconcile() is idempotent), so simply not
+                     * rebooting this round -- falling through to the normal
+                     * bookkeeping/sleep below -- is enough. */
+                    ESP_LOGE(TAG, "CHECKIN_ACK: SET_MODE %u -- failed to persist (%s), not rebooting; "
+                                  "the hub will re-send this command", ack.arg, esp_err_to_name(serr));
+                } else {
+                    /* Code review fix (issue 3): a deliberate SET_MODE
+                     * reboot rolls back a good PENDING_VERIFY image exactly
+                     * like an unconfirmed sleep-triggered reset would (the
+                     * bootloader reverts any PENDING_VERIFY image that was
+                     * never explicitly confirmed before the next boot) --
+                     * so confirm synchronously, right here, before
+                     * rebooting, same reasoning as the rollback-sleep rule
+                     * just below in this same function. */
+                    if (running_image_pending_verify()) {
+                        ESP_LOGW(TAG, "CHECKIN_ACK: SET_MODE %u -- running image is PENDING_VERIFY, "
+                                      "confirming before rebooting", ack.arg);
+                        confirm_health_before_restart("mode change");
+                    }
+                    ESP_LOGW(TAG, "CHECKIN_ACK: SET_MODE %u -- persisted, rebooting", ack.arg);
+                    esp_restart();
+                }
             } else if (ack.command == SWARM_CHECKIN_CMD_STAY_AWAKE) {
                 ESP_LOGI(TAG, "CHECKIN_ACK: STAY_AWAKE -- waiting up to %us for a parked OTA session",
                          (unsigned)BATT_STAY_AWAKE_CAP_S);
@@ -1355,9 +1515,9 @@ esp_err_t swarm_node_battery_cycle(void)
             }
         }
         if (fallback) {
-            ESP_LOGW(TAG, "battery cycle: %" PRIu32 " consecutive failed wakes/rounds, falling back "
-                          "to ALWAYS_ON so this node stays reachable", new_failed);
-            swarm_store_set_power_mode(SWARM_PM_ALWAYS_ON);
+            char reason[40];
+            snprintf(reason, sizeof(reason), "%" PRIu32 " consecutive failed wakes/rounds", new_failed);
+            battery_enter_always_on_fallback(reason);
             return ESP_OK;
         }
 
@@ -1374,15 +1534,39 @@ esp_err_t swarm_node_battery_cycle(void)
          * accounting just above with THIS round's own outcome, so a hub
          * that is truly gone (not just quiet on health signals) still
          * converges on the ALWAYS_ON fallback above rather than spinning
-         * forever -- that fallback is the escape hatch this rule leans on. */
-        const esp_partition_t *running = esp_ota_get_running_partition();
-        esp_ota_img_states_t ota_state;
-        bool pending_verify = running != NULL
-            && esp_ota_get_state_partition(running, &ota_state) == ESP_OK
-            && ota_state == ESP_OTA_IMG_PENDING_VERIFY;
-        if (pending_verify) {
-            ESP_LOGW(TAG, "battery cycle: running image is still PENDING_VERIFY; not sleeping, "
-                          "retrying the checkin instead");
+         * forever -- that fallback is the escape hatch this rule leans on.
+         *
+         * Code review fix (issue 1, blocking): the above escape hatch does
+         * NOT cover a reachable hub whose acks keep succeeding while the
+         * image never actually leaves PENDING_VERIFY -- e.g.
+         * ensure_health_task() failed to start back in swarm_start_node(),
+         * or ota_rollback_guard_node_confirm()'s flash write keeps failing
+         * (see the companion fix to that function's latch bug). got_ack
+         * stays true every round in that case, so batt_failed_wake_next()
+         * above never trips its own fallback, and without pacing this
+         * spun as fast as one CHECKIN round per network round-trip --
+         * roughly 25-40 CHECKINs/second, forever, not merely a busy loop
+         * but a radio storm this node's own hub had to absorb. Fixed with
+         * its own pace (BATT_PENDING_VERIFY_RETRY_DELAY_MS between passes)
+         * and its own bound (BATT_PENDING_VERIFY_MAX_RETRIES passes, ~2
+         * minutes total): exhausting it forces the SAME ALWAYS_ON fallback
+         * as a truly-gone hub, on the reasoning that an image that cannot
+         * confirm itself after two full minutes of successful hub contact
+         * is not going to start doing so by spinning faster. */
+        if (running_image_pending_verify()) {
+            pending_verify_retries++;
+            if (pending_verify_retries > BATT_PENDING_VERIFY_MAX_RETRIES) {
+                char reason[56];
+                snprintf(reason, sizeof(reason), "PENDING_VERIFY unconfirmed after %" PRIu32 " retries",
+                         pending_verify_retries);
+                battery_enter_always_on_fallback(reason);
+                return ESP_OK;
+            }
+            ESP_LOGW(TAG, "battery cycle: running image is still PENDING_VERIFY (retry %" PRIu32 "/%u); "
+                          "not sleeping, waiting %us before retrying the checkin",
+                     pending_verify_retries, (unsigned)BATT_PENDING_VERIFY_MAX_RETRIES,
+                     (unsigned)(BATT_PENDING_VERIFY_RETRY_DELAY_MS / 1000));
+            vTaskDelay(pdMS_TO_TICKS(BATT_PENDING_VERIFY_RETRY_DELAY_MS));
             continue;
         }
 

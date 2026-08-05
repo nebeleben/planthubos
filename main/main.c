@@ -192,8 +192,26 @@ void app_main(void)
      * swarm_node_battery_cycle()'s precondition. */
     if (node_started && swarm_store_power_mode() != SWARM_PM_ALWAYS_ON) {
         if (xTaskCreate(batt_cycle_task, "batt_cycle", 4096, NULL, 2, NULL) != pdPASS) {
+            /* Code review fix (issue 5): without this, the node keeps
+             * running (nothing else here fails), but sends no CHECKIN at
+             * all -- swarm.c's always_on_checkin_task() gates its own
+             * periodic checkin on power_mode == ALWAYS_ON, which the stored
+             * mode here still isn't, so it stays silent too. That would
+             * leave this node unmanageable (no way for the hub to ever
+             * reach it with a mode change) until someone physically
+             * recovers it. Persisting ALWAYS_ON here makes the stored mode
+             * match what the node is actually doing (running always-on,
+             * task-creation failure notwithstanding), so the always-on
+             * task's gate now matches reality and starts checking in --
+             * giving the hub a path to re-deliver a battery mode later. */
             ESP_LOGE(TAG, "failed to create batt_cycle task; node will run always-on "
-                          "despite its configured battery mode");
+                          "despite its configured battery mode -- persisting ALWAYS_ON "
+                          "so it still sends periodic checkins");
+            esp_err_t perr = swarm_store_set_power_mode(SWARM_PM_ALWAYS_ON);
+            if (perr != ESP_OK) {
+                ESP_LOGE(TAG, "also failed to persist the ALWAYS_ON fallback (%s); this node may be "
+                              "unreachable until physically recovered", esp_err_to_name(perr));
+            }
         }
     }
 
