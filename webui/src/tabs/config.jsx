@@ -254,76 +254,80 @@ export function ConfigTab() {
       )}
       {otaMsg && <p class="hint">{otaMsg}</p>}
 
-      <h2>Integrations</h2>
-      {cfgLoadError && (
-        <p class="error">
-          Couldn't load current settings — retry.{' '}
-          <button type="button" onClick={refreshConfig}>Retry</button>
-        </p>
+      {st.role !== 'node' && (
+        <div>
+          <h2>Integrations</h2>
+          {cfgLoadError && (
+            <p class="error">
+              Couldn't load current settings — retry.{' '}
+              <button type="button" onClick={refreshConfig}>Retry</button>
+            </p>
+          )}
+          <form onSubmit={doSaveIntegrations}>
+            <fieldset>
+              <legend>MQTT</legend>
+              <label>
+                <input type="checkbox" checked={mqtt.enabled}
+                       onChange={(e) => setMqtt((m) => ({ ...m, enabled: e.currentTarget.checked }))} />
+                {' '}Enabled
+              </label>
+              <label>
+                Broker URI
+                <input value={mqtt.uri} placeholder="mqtt://host:1883"
+                       onInput={(e) => setMqtt((m) => ({ ...m, uri: e.currentTarget.value }))} />
+              </label>
+              <label>
+                Username
+                <input value={mqtt.user}
+                       onInput={(e) => setMqtt((m) => ({ ...m, user: e.currentTarget.value }))} />
+              </label>
+              <label>
+                Password
+                <input type="password" value={mqtt.pass}
+                       placeholder={cfg?.mqtt?.pass_set ? 'saved' : ''}
+                       onInput={(e) => setMqtt((m) => ({ ...m, pass: e.currentTarget.value }))} />
+              </label>
+            </fieldset>
+
+            <fieldset>
+              <legend>InfluxDB</legend>
+              <label>
+                <input type="checkbox" checked={influx.enabled}
+                       onChange={(e) => setInflux((i) => ({ ...i, enabled: e.currentTarget.checked }))} />
+                {' '}Enabled
+              </label>
+              <label>
+                URL
+                <input value={influx.url} placeholder="http://host:8086"
+                       onInput={(e) => setInflux((i) => ({ ...i, url: e.currentTarget.value }))} />
+              </label>
+              <label>
+                Org
+                <input value={influx.org} placeholder="my-org"
+                       onInput={(e) => setInflux((i) => ({ ...i, org: e.currentTarget.value }))} />
+              </label>
+              <label>
+                Bucket
+                <input value={influx.bucket} placeholder="my-bucket"
+                       onInput={(e) => setInflux((i) => ({ ...i, bucket: e.currentTarget.value }))} />
+              </label>
+              <label>
+                Token
+                <input type="password" value={influx.token}
+                       placeholder={cfg?.influx?.token_set ? 'saved' : ''}
+                       onInput={(e) => setInflux((i) => ({ ...i, token: e.currentTarget.value }))} />
+              </label>
+            </fieldset>
+
+            <p>
+              <button type="submit" disabled={busy === 'config' || !cfgLoaded}>
+                {busy === 'config' ? 'Saving…' : 'Save integrations'}
+              </button>
+            </p>
+          </form>
+          {cfgMsg && <p class="hint">{cfgMsg}</p>}
+        </div>
       )}
-      <form onSubmit={doSaveIntegrations}>
-        <fieldset>
-          <legend>MQTT</legend>
-          <label>
-            <input type="checkbox" checked={mqtt.enabled}
-                   onChange={(e) => setMqtt((m) => ({ ...m, enabled: e.currentTarget.checked }))} />
-            {' '}Enabled
-          </label>
-          <label>
-            Broker URI
-            <input value={mqtt.uri} placeholder="mqtt://host:1883"
-                   onInput={(e) => setMqtt((m) => ({ ...m, uri: e.currentTarget.value }))} />
-          </label>
-          <label>
-            Username
-            <input value={mqtt.user}
-                   onInput={(e) => setMqtt((m) => ({ ...m, user: e.currentTarget.value }))} />
-          </label>
-          <label>
-            Password
-            <input type="password" value={mqtt.pass}
-                   placeholder={cfg?.mqtt?.pass_set ? 'saved' : ''}
-                   onInput={(e) => setMqtt((m) => ({ ...m, pass: e.currentTarget.value }))} />
-          </label>
-        </fieldset>
-
-        <fieldset>
-          <legend>InfluxDB</legend>
-          <label>
-            <input type="checkbox" checked={influx.enabled}
-                   onChange={(e) => setInflux((i) => ({ ...i, enabled: e.currentTarget.checked }))} />
-            {' '}Enabled
-          </label>
-          <label>
-            URL
-            <input value={influx.url} placeholder="http://host:8086"
-                   onInput={(e) => setInflux((i) => ({ ...i, url: e.currentTarget.value }))} />
-          </label>
-          <label>
-            Org
-            <input value={influx.org} placeholder="my-org"
-                   onInput={(e) => setInflux((i) => ({ ...i, org: e.currentTarget.value }))} />
-          </label>
-          <label>
-            Bucket
-            <input value={influx.bucket} placeholder="my-bucket"
-                   onInput={(e) => setInflux((i) => ({ ...i, bucket: e.currentTarget.value }))} />
-          </label>
-          <label>
-            Token
-            <input type="password" value={influx.token}
-                   placeholder={cfg?.influx?.token_set ? 'saved' : ''}
-                   onInput={(e) => setInflux((i) => ({ ...i, token: e.currentTarget.value }))} />
-          </label>
-        </fieldset>
-
-        <p>
-          <button type="submit" disabled={busy === 'config' || !cfgLoaded}>
-            {busy === 'config' ? 'Saving…' : 'Save integrations'}
-          </button>
-        </p>
-      </form>
-      {cfgMsg && <p class="hint">{cfgMsg}</p>}
 
       {st.role !== 'node' && (
         <div>

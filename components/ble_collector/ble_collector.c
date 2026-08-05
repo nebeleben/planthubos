@@ -2,6 +2,7 @@
 #include "data_core.h"
 #include "mibeacon.h"
 #include "battery_sched.h"
+#include "ble_collector_internal.h"
 #include "swarm_store.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -31,20 +32,8 @@ static const char *TAG = "ble_collector";
 static batt_entry_t s_batt_tab[BATT_MAX_SENSORS];
 static SemaphoreHandle_t s_batt_mutex;
 
-/* Implemented below; called from battery_poll.c after a poll attempt ends
- * (success, failure, timeout, disconnect) to resume the passive scan that
- * was paused for the connect/read/terminate cycle. Not part of
- * ble_collector.h -- the poller is an internal implementation detail of
- * this component, never used outside it. */
-void ble_collector_resume_scan(void);
-
-/* Implemented in battery_poll.c; starts the 60s poll-kickoff timer and
- * poller task operating on tab, guarding every access to it with
- * batt_mutex (the same handle as s_batt_mutex above -- created here,
- * before nimble_port_freertos_init() below, so it exists before gap_event
- * could possibly run). Same "internal, no header" reasoning as
- * ble_collector_resume_scan() above. */
-void battery_poll_start(batt_entry_t *tab, SemaphoreHandle_t batt_mutex);
+/* battery_poll_start() and ble_collector_resume_scan() -- see
+ * ble_collector_internal.h for both declarations. */
 
 static int gap_event(struct ble_gap_event *event, void *arg);
 

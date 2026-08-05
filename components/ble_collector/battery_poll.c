@@ -17,6 +17,7 @@
  * need.
  */
 #include "battery_sched.h"
+#include "ble_collector_internal.h"
 #include "data_core.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -28,6 +29,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include <string.h>
+#include <stdint.h>
 
 static const char *TAG = "battery_poll";
 
@@ -46,10 +48,7 @@ static const char *TAG = "battery_poll";
     BLE_UUID128_DECLARE(0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, \
                          0x00, 0x10, 0x00, 0x00, 0x02, 0x1a, 0x00, 0x00)
 
-/* Implemented in ble_collector.c: resumes the passive scan a poll attempt
- * paused for its connect/read/terminate cycle. Not a public header -- this
- * poller is an internal implementation detail of ble_collector. */
-extern void ble_collector_resume_scan(void);
+/* ble_collector_resume_scan() -- see ble_collector_internal.h. */
 
 typedef enum {
     POLL_MSG_TICK,      /* 60s timer fired: consider starting a poll */
@@ -61,21 +60,46 @@ typedef struct {
     poll_msg_type_t type;
     uint8_t mac[6];
     uint8_t battery_pct;
+    uint32_t generation;   /* the poll this message belongs to -- see s_poll_generation below */
 } poll_msg_t;
 
 static batt_entry_t *s_tab;
 static SemaphoreHandle_t s_batt_mutex;    /* guards every s_tab access -- shared with ble_collector.c */
 static QueueHandle_t s_queue;
 
-/* All of the following are touched only on poll_task: set when a poll
- * attempt starts (handle_tick) and cleared on POLL_MSG_DONE or by the
- * watchdog, both handled in poll_task's own loop -- no cross-task access,
- * so no lock needed for these (contrast s_tab above). */
+/* s_in_flight and s_inflight_started_s are touched only on poll_task: set
+ * when a poll attempt starts (handle_tick) and cleared on POLL_MSG_DONE or
+ * by the watchdog, both handled in poll_task's own loop -- no cross-task
+ * access, so no lock needed for these (contrast s_tab above).
+ *
+ * s_conn_handle and s_got_result are NOT poll_task-only, despite an earlier
+ * version of this comment claiming otherwise: s_conn_handle is written by
+ * poll_gap_event and s_got_result by read_cb, and both of those run on the
+ * NimBLE host task, a different task from poll_task. What actually makes
+ * that safe is s_poll_generation below, not single-task ownership -- without
+ * it, a read_cb/DONE that's still in flight when a watchdog abort ends a
+ * poll (see handle_watchdog) could deliver its RESULT/DONE after poll_task
+ * has already moved on to a new poll for a different sensor, misattributing
+ * a battery value to the wrong s_tab entry or wrongly clearing s_in_flight
+ * for that newer poll.
+ *
+ * s_polling_mac is written by poll_task (handle_tick) and only read by
+ * read_cb on the host task to build its RESULT message -- safe without a
+ * lock because ble_gap_connect() can't deliver a CONNECT event (and hence
+ * read_cb can't run) for a new peer until handle_tick has already finished
+ * writing s_polling_mac for that peer. */
 static bool s_in_flight;
 static uint8_t s_polling_mac[6];   /* which s_tab entry the in-flight poll is for */
 static bool s_got_result;          /* read_cb already queued a value for this poll */
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint32_t s_inflight_started_s;
+
+/* Bumped by handle_tick each time it starts a poll, then snapshotted into
+ * the ble_gap_connect() cb_arg (poll_gap_event and, via that, read_cb both
+ * receive it) and carried in every poll_msg_t. poll_task discards any
+ * POLL_MSG_RESULT/POLL_MSG_DONE whose generation doesn't match the current
+ * value -- see the comment above s_conn_handle for why that matters. */
+static uint32_t s_poll_generation;
 
 static uint32_t now_s(void)
 {
@@ -88,6 +112,17 @@ static void post_simple(poll_msg_type_t type)
     xQueueSend(s_queue, &msg, 0);
 }
 
+/* Like post_simple(POLL_MSG_DONE), but stamped with the generation of the
+ * poll this DONE belongs to, so a stale one (e.g. a disconnect callback
+ * that fires after handle_watchdog has already aborted the poll and a new
+ * one has since started) gets discarded by poll_task instead of clearing
+ * s_in_flight for the wrong poll. */
+static void post_done(uint32_t generation)
+{
+    poll_msg_t msg = { .type = POLL_MSG_DONE, .generation = generation };
+    xQueueSend(s_queue, &msg, 0);
+}
+
 /* ble_gattc_read_by_uuid callback -- runs on the NimBLE host task. Fires
  * once per matching attribute (status 0) and once more with status
  * BLE_HS_EDONE when the procedure completes (attr NULL); MiFlora has a
@@ -96,12 +131,13 @@ static void post_simple(poll_msg_type_t type)
 static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                     struct ble_gatt_attr *attr, void *arg)
 {
+    uint32_t generation = (uint32_t)(uintptr_t)arg;
     if (error->status == 0 && attr != NULL) {
         uint16_t len = OS_MBUF_PKTLEN(attr->om);
         uint8_t val = 0;
         if (len >= 1 && os_mbuf_copydata(attr->om, 0, 1, &val) == 0 && val <= 100) {
             s_got_result = true;
-            poll_msg_t msg = { .type = POLL_MSG_RESULT, .battery_pct = val };
+            poll_msg_t msg = { .type = POLL_MSG_RESULT, .battery_pct = val, .generation = generation };
             memcpy(msg.mac, s_polling_mac, 6);
             xQueueSend(s_queue, &msg, 0);
         } else {
@@ -123,12 +159,15 @@ static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 
 static int poll_gap_event(struct ble_gap_event *event, void *arg)
 {
+    uint32_t generation = (uint32_t)(uintptr_t)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
+            /* Pass the same generation through: read_cb needs it to stamp
+             * the POLL_MSG_RESULT it may queue. */
             int rc = ble_gattc_read_by_uuid(event->connect.conn_handle, 1, 0xffff,
-                                             MIFLORA_BATT_UUID, read_cb, NULL);
+                                             MIFLORA_BATT_UUID, read_cb, arg);
             if (rc != 0) {
                 ESP_LOGI(TAG, "battery read_by_uuid failed to start: %d", rc);
                 ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
@@ -138,12 +177,12 @@ static int poll_gap_event(struct ble_gap_event *event, void *arg)
              * with the same nonzero status -- both just retry in an hour
              * (last_attempt_s is already set). */
             ESP_LOGI(TAG, "battery poll connect failed/timed out: %d", event->connect.status);
-            post_simple(POLL_MSG_DONE);
+            post_done(generation);
             ble_collector_resume_scan();
         }
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
-        post_simple(POLL_MSG_DONE);
+        post_done(generation);
         ble_collector_resume_scan();
         return 0;
     default:
@@ -171,6 +210,8 @@ static void handle_tick(void)
 
     s_got_result = false;
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    s_poll_generation++;
+    uint32_t generation = s_poll_generation;
 
     int rc = ble_gap_disc_cancel();
     if (rc != 0 && rc != BLE_HS_EALREADY) {
@@ -179,7 +220,8 @@ static void handle_tick(void)
 
     s_in_flight = true;
     s_inflight_started_s = now;
-    rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer, POLL_CONN_TIMEOUT_MS, NULL, poll_gap_event, NULL);
+    rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer, POLL_CONN_TIMEOUT_MS, NULL, poll_gap_event,
+                         (void *)(uintptr_t)generation);
     if (rc != 0) {
         ESP_LOGI(TAG, "battery poll connect failed to start: %d", rc);
         s_in_flight = false;
@@ -250,9 +292,24 @@ static void poll_task(void *arg)
             continue;
         }
         switch (msg.type) {
-        case POLL_MSG_TICK:   handle_tick(); break;
-        case POLL_MSG_RESULT: handle_result(&msg); break;
-        case POLL_MSG_DONE:   s_in_flight = false; s_conn_handle = BLE_HS_CONN_HANDLE_NONE; break;
+        case POLL_MSG_TICK:
+            handle_tick();
+            break;
+        case POLL_MSG_RESULT:
+            /* Discard a RESULT left over from a poll poll_task has already
+             * moved past (superseded by a new tick, or watchdog-aborted and
+             * then superseded) -- s_polling_mac may by now belong to a
+             * different sensor than the one read_cb captured it for. */
+            if (msg.generation != s_poll_generation) break;
+            handle_result(&msg);
+            break;
+        case POLL_MSG_DONE:
+            /* Same staleness check: a DONE for an already-superseded poll
+             * must not clear s_in_flight/s_conn_handle for the current one. */
+            if (msg.generation != s_poll_generation) break;
+            s_in_flight = false;
+            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            break;
         }
     }
 }
