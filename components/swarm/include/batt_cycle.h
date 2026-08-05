@@ -23,7 +23,11 @@ batt_cmd_t batt_reconcile(uint8_t desired_mode, uint8_t reported_mode, bool ota_
 
 /* Node side: microseconds to deep-sleep after a wake that consumed
  * awake_ms. Never returns less than 10 seconds' worth (a pathological
- * over-long wake must not busy-loop the node). */
+ * over-long wake must not busy-loop the node).
+ *
+ * PRECONDITION: callers must not invoke this for power_mode = ALWAYS_ON (0).
+ * The 10s floor it would return is a safety artifact, not a sleep schedule;
+ * ALWAYS_ON means the node never sleeps. Task 5 gates on power_mode != ALWAYS_ON. */
 uint64_t batt_sleep_us(uint8_t power_mode, uint32_t awake_ms);
 
 /* Node side: failed-wake bookkeeping (spec §4). Given the persisted
