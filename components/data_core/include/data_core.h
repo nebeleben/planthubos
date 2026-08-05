@@ -2,6 +2,7 @@
 #include "esp_err.h"
 #include "esp_event.h"
 #include "registry.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 ESP_EVENT_DECLARE_BASE(PLANTHUB_DATA_EVENT);
@@ -47,3 +48,16 @@ void      data_core_snapshot(registry_t *out);
  * this follows the exact locking pattern data_core_submit_from() and
  * data_core_snapshot() already use. */
 void      data_core_clear_node_attribution(const uint8_t node_mac[6]);
+
+/* A MiFlora battery poll result (battery_poll.c, M6): applies pct to mac's
+ * registry entry (creating it if this is the sensor's first appearance)
+ * via registry_set_battery(), NOT registry_update_from() -- see that
+ * function's doc comment for why a battery read must bypass the frame_cnt
+ * dedup path entirely rather than being wrapped in a synthetic mibeacon_t
+ * and passed through data_core_submit_from(). Posts DATA_EVENT_SENSOR_UPDATE
+ * on success, same as data_core_submit_from() does on a merge.
+ * Returns false only when the registry is full and mac wasn't already
+ * present -- callers must not advance their own success/backoff state
+ * (e.g. a scheduler's last_ok_s) when this returns false, or a reading
+ * that was actually dropped would wrongly stop being retried. */
+bool      data_core_submit_battery(const uint8_t mac[6], uint8_t pct);

@@ -1,7 +1,13 @@
 #include "ble_collector.h"
 #include "data_core.h"
 #include "mibeacon.h"
+#include "battery_sched.h"
+#include "ble_collector_internal.h"
+#include "swarm_store.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -13,6 +19,21 @@ static const char *TAG = "ble_collector";
 #define XIAOMI_SVC_UUID 0xFE95
 /* GAP scan units are 0.625 ms */
 #define SCAN_UNITS(ms) ((uint16_t)((ms) * 1000 / 625))
+
+/* Directly-heard sensors, candidates for the daily battery poll (see
+ * battery_poll.c). Written from this file's gap_event (NimBLE host task)
+ * and from battery_poll.c's poller task (a distinct FreeRTOS task) -- two
+ * genuinely different tasks, so every access to s_batt_tab, on either side,
+ * must hold s_batt_mutex. This mirrors data_core.c's s_mutex around
+ * s_registry, which IS how that file's registry access across tasks is
+ * actually made safe -- not, as an earlier version of this comment wrongly
+ * claimed, something that comes for free just because gap_event happens to
+ * run on the same host task data_core_submit() is often called from. */
+static batt_entry_t s_batt_tab[BATT_MAX_SENSORS];
+static SemaphoreHandle_t s_batt_mutex;
+
+/* battery_poll_start() and ble_collector_resume_scan() -- see
+ * ble_collector_internal.h for both declarations. */
 
 static int gap_event(struct ble_gap_event *event, void *arg);
 
@@ -28,6 +49,11 @@ static void start_scan(void)
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         ESP_LOGE(TAG, "ble_gap_disc failed: %d", rc);
     }
+}
+
+void ble_collector_resume_scan(void)
+{
+    start_scan();
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg)
@@ -56,6 +82,17 @@ static int gap_event(struct ble_gap_event *event, void *arg)
              * wrapper already uses for callers with no RSSI at all. */
             int8_t rssi = (event->disc.rssi == 127) ? 0 : event->disc.rssi;
             data_core_submit_from(&m, NULL, rssi, 0);
+
+            /* Direct reception (this file only ever handles the hub's own
+             * radio, never a node relay): record it as a battery-poll
+             * candidate. Address captured verbatim from the GAP event --
+             * ble_addr_t's byte order does not match m.mac's, so it must
+             * never be reconstructed from the MiBeacon MAC. s_batt_tab is
+             * shared with battery_poll.c's poller task -- always locked. */
+            uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+            xSemaphoreTake(s_batt_mutex, portMAX_DELAY);
+            batt_sched_seen(s_batt_tab, m.mac, event->disc.addr.type, event->disc.addr.val, now_s);
+            xSemaphoreGive(s_batt_mutex);
         }
         return 0;
     }
@@ -92,8 +129,25 @@ esp_err_t ble_collector_start(void)
         ESP_LOGE(TAG, "nimble_port_init: %s", esp_err_to_name(err));
         return err;
     }
+
+    /* Created before nimble_port_freertos_init() below starts the host
+     * task -- gap_event (which locks this) must never be able to run
+     * before the mutex exists. */
+    s_batt_mutex = xSemaphoreCreateMutex();
+    if (!s_batt_mutex) {
+        ESP_LOGE(TAG, "battery table mutex alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
     nimble_port_freertos_init(host_task);
+
+    /* Node role: battery polling connects out and would fight ESP-NOW
+     * timing on the node's single radio. Scanning/relaying (above) still
+     * runs on both roles; only the poll timer/task is hub-only. */
+    if (swarm_store_role() != SWARM_ROLE_NODE) {
+        battery_poll_start(s_batt_tab, s_batt_mutex);
+    }
     return ESP_OK;
 }

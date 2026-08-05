@@ -85,6 +85,24 @@ int registry_update(registry_t *r, const mibeacon_t *m, uint32_t now_s)
     return registry_update_from(r, m, now_s, NULL, 0);
 }
 
+int registry_set_battery(registry_t *r, const uint8_t mac[6], uint8_t pct, uint32_t now_s)
+{
+    int idx = registry_find(r, mac);
+    if (idx < 0) {
+        for (int i = 0; i < REGISTRY_MAX_SENSORS && idx < 0; i++)
+            if (!r->sensors[i].in_use) idx = i;
+        if (idx < 0) return -1;
+        memset(&r->sensors[idx], 0, sizeof(r->sensors[idx]));
+        r->sensors[idx].in_use = true;
+        memcpy(r->sensors[idx].mac, mac, 6);
+    }
+    sensor_entry_t *e = &r->sensors[idx];
+    e->last_seen_s = now_s;
+    e->latest.has_battery = true;
+    e->latest.battery_pct = pct;
+    return 1;
+}
+
 int registry_clear_attribution(registry_t *r, const uint8_t node_mac[6])
 {
     int n = 0;

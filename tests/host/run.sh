@@ -41,3 +41,15 @@ $CC -Wall -Wextra -Werror -I../../components/swarm/include \
 $CC -Wall -Wextra -Werror -I../../components/swarm/include \
     test_swarm_buf.c ../../components/swarm/swarm_buf.c -o test_swarm_buf
 ./test_swarm_buf
+
+$CC -Wall -Wextra -Werror -I../../components/integrations/include \
+    test_lineproto.c ../../components/integrations/lineproto.c -o test_lineproto
+./test_lineproto
+
+$CC -Wall -Wextra -Werror -I../../components/integrations/include \
+    test_mqtt_json.c ../../components/integrations/mqtt_json.c -o test_mqtt_json
+./test_mqtt_json
+
+$CC -Wall -Wextra -Werror -I../../components/ble_collector/include \
+    test_battery_sched.c ../../components/ble_collector/battery_sched.c -o test_battery_sched
+./test_battery_sched

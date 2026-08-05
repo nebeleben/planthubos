@@ -11,6 +11,7 @@
 #include "swarm_store.h"
 #include "node_ota.h"
 #include "pairing.h"
+#include "integr_config.h"
 #include "espnow_link.h"
 #include "cJSON.h"
 #include "esp_littlefs.h"
@@ -25,7 +26,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "api_v1";
-#define FW_VERSION "0.7.0"
+#define FW_VERSION "0.8.0"
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -815,6 +816,118 @@ static esp_err_t role_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* GET /api/v1/config -- unauthenticated, like every GET in this file.
+ * Secrets (mqtt.pass, influx.token) are never echoed -- only *_set booleans,
+ * so the webui can show "a secret is already saved" without ever pulling it
+ * back down to the browser. */
+static esp_err_t config_get(httpd_req_t *req)
+{
+    integr_config_t cfg;
+    integr_config_get(&cfg);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
+    cJSON_AddBoolToObject(mqtt, "enabled", cfg.mqtt.enabled);
+    cJSON_AddStringToObject(mqtt, "uri", cfg.mqtt.uri);
+    cJSON_AddStringToObject(mqtt, "user", cfg.mqtt.user);
+    cJSON_AddBoolToObject(mqtt, "pass_set", cfg.mqtt.pass[0] != '\0');
+
+    cJSON *influx = cJSON_AddObjectToObject(root, "influx");
+    cJSON_AddBoolToObject(influx, "enabled", cfg.influx.enabled);
+    cJSON_AddStringToObject(influx, "url", cfg.influx.url);
+    cJSON_AddStringToObject(influx, "org", cfg.influx.org);
+    cJSON_AddStringToObject(influx, "bucket", cfg.influx.bucket);
+    cJSON_AddBoolToObject(influx, "token_set", cfg.influx.token[0] != '\0');
+
+    return send_json(req, root);
+}
+
+static esp_err_t config_send_invalid(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"error\":\"invalid config\"}");
+    return ESP_OK;
+}
+
+/* POST /api/v1/config -- merge semantics: start from the current config; a
+ * present section ("mqtt"/"influx") replaces its non-secret fields
+ * wholesale (missing keys within a present section fall back to the
+ * zero value, matching a full-section resubmit from the webui form); an
+ * absent section leaves that whole section untouched. mqtt.pass and
+ * influx.token only replace the stored secret when present AND non-empty --
+ * there is no clear-secret path in v1 (disable the integration instead).
+ * Config changes apply on next boot only (integrations_start() runs once at
+ * boot); no live restart of esp-mqtt/influx tasks is attempted here. */
+static esp_err_t config_post(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    /* Worst case (both sections, full field lengths, JSON-escaped) is well
+     * under this; oversized bodies get 413 below rather than truncated. */
+    char body[1536];
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return ESP_OK;
+    }
+    if (req->content_len > sizeof(body) - 1) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
+        return ESP_OK;
+    }
+
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(body);
+    if (!json) return config_send_invalid(req);
+
+    integr_config_t cfg;
+    integr_config_get(&cfg);
+
+    const cJSON *mqtt_j = cJSON_GetObjectItem(json, "mqtt");
+    if (cJSON_IsObject(mqtt_j)) {
+        cfg.mqtt.enabled = cJSON_IsTrue(cJSON_GetObjectItem(mqtt_j, "enabled"));
+        const cJSON *uri = cJSON_GetObjectItem(mqtt_j, "uri");
+        strlcpy(cfg.mqtt.uri, cJSON_IsString(uri) ? uri->valuestring : "", sizeof(cfg.mqtt.uri));
+        const cJSON *user = cJSON_GetObjectItem(mqtt_j, "user");
+        strlcpy(cfg.mqtt.user, cJSON_IsString(user) ? user->valuestring : "", sizeof(cfg.mqtt.user));
+        const cJSON *pass = cJSON_GetObjectItem(mqtt_j, "pass");
+        if (cJSON_IsString(pass) && pass->valuestring[0] != '\0')
+            strlcpy(cfg.mqtt.pass, pass->valuestring, sizeof(cfg.mqtt.pass));
+    }
+
+    const cJSON *influx_j = cJSON_GetObjectItem(json, "influx");
+    if (cJSON_IsObject(influx_j)) {
+        cfg.influx.enabled = cJSON_IsTrue(cJSON_GetObjectItem(influx_j, "enabled"));
+        const cJSON *url = cJSON_GetObjectItem(influx_j, "url");
+        strlcpy(cfg.influx.url, cJSON_IsString(url) ? url->valuestring : "", sizeof(cfg.influx.url));
+        const cJSON *org = cJSON_GetObjectItem(influx_j, "org");
+        strlcpy(cfg.influx.org, cJSON_IsString(org) ? org->valuestring : "", sizeof(cfg.influx.org));
+        const cJSON *bucket = cJSON_GetObjectItem(influx_j, "bucket");
+        strlcpy(cfg.influx.bucket, cJSON_IsString(bucket) ? bucket->valuestring : "", sizeof(cfg.influx.bucket));
+        const cJSON *token = cJSON_GetObjectItem(influx_j, "token");
+        if (cJSON_IsString(token) && token->valuestring[0] != '\0')
+            strlcpy(cfg.influx.token, token->valuestring, sizeof(cfg.influx.token));
+    }
+    cJSON_Delete(json);
+
+    if (integr_config_set(&cfg) != ESP_OK) return config_send_invalid(req);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"restart_required\":true}");
+    return ESP_OK;
+}
+
 void api_v1_register(httpd_handle_t server)
 {
     httpd_uri_t status = { .uri = "/api/v1/status", .method = HTTP_GET, .handler = status_get };
@@ -855,4 +968,8 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &role));
     httpd_uri_t pair_retry = { .uri = "/api/v1/pair/retry", .method = HTTP_POST, .handler = pair_retry_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &pair_retry));
+    httpd_uri_t config_g = { .uri = "/api/v1/config", .method = HTTP_GET, .handler = config_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &config_g));
+    httpd_uri_t config_p = { .uri = "/api/v1/config", .method = HTTP_POST, .handler = config_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &config_p));
 }

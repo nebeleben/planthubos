@@ -1,0 +1,23 @@
+menu "PlantHub Integrations"
+
+config PLANTHUB_INFLUX_TLS
+    bool "Enable HTTPS for the InfluxDB client"
+    default n
+    help
+        A policy switch, not a build switch: when enabled,
+        integr_config_set() accepts https:// URLs in the Influx config
+        in addition to http://. It does NOT gate anything at build
+        time -- esp_http_client and esp-tls link into the firmware
+        either way in this IDF config, so leaving this off does not
+        save flash.
+
+        Enabling it today buys you an HTTPS client with NO certificate
+        verification wired up: no CA bundle, no pinning. The transport
+        is encrypted but the server is not authenticated, which is not
+        meaningfully stronger than the plain-http trusted-LAN model
+        this project otherwise assumes (PlanV1 3.7). Certificate-bundle
+        wiring is future work; until it lands, prefer http:// and only
+        turn this on if you understand and accept that gap. The MQTT
+        client is unaffected either way (always plain mqtt:// in v1).
+
+endmenu

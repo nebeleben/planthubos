@@ -4,6 +4,7 @@
 #include "esp_event.h"
 #include "esp_littlefs.h"
 #include "app_config.h"
+#include "integr_config.h"
 #include "claim.h"
 #include "wifi_manager.h"
 #include "webserver.h"
@@ -14,12 +15,14 @@
 #include "ota_post.h"
 #include "swarm.h"
 #include "swarm_store.h"
+#include "integrations.h"
 
 static const char *TAG = "planthub";
 
 void app_main(void)
 {
     ESP_ERROR_CHECK(app_config_init());
+    ESP_ERROR_CHECK(integr_config_init());
     ESP_ERROR_CHECK(claim_init());
     factory_reset_button_start();
     char name[16];
@@ -134,6 +137,8 @@ void app_main(void)
              * swarm_start_main() as the only addition. */
             esp_err_t serr = swarm_start_main();
             if (serr != ESP_OK) ESP_LOGE(TAG, "swarm (main) start failed (%s)", esp_err_to_name(serr));
+            esp_err_t ierr = integrations_start();
+            if (ierr != ESP_OK) ESP_LOGE(TAG, "integrations start failed (%s); continuing without them", esp_err_to_name(ierr));
         }
         /* role == NODE only reaches here when swarm_store_pair_failed() is
          * true: the portal is shown so the user can see what happened and
