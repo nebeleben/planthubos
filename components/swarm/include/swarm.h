@@ -106,3 +106,20 @@ void swarm_broadcast_forget(const uint8_t mac[6]);
  * so the reverse dependency would be circular -- main.c, which depends on
  * both, does the wiring. */
 void swarm_node_set_health_cb(void (*cb)(const char *reason));
+
+/* Battery-mode wake cycle (spec §4). Called from main.c's node-paired
+ * branch INSTEAD OF returning to a plain always-on run, when
+ * swarm_store_power_mode() != SWARM_PM_ALWAYS_ON. Runs the bounded wake
+ * (scan/forward via the already-started node machinery), sends CHECKIN,
+ * applies the ack, and either deep-sleeps (never returns) or returns
+ * ESP_OK meaning "continue as always-on" (mode changed / fallback /
+ * stay-awake ended). Requires swarm_start_node() to have succeeded.
+ *
+ * Threading: main.c runs this from its own dedicated "batt_cycle" task
+ * (app_main() itself must still return), never directly from app_main --
+ * see main.c's own comment on that task for why. This function performs
+ * NVS writes (wake counter, failed wakes, power mode) and blocking sends,
+ * neither of which is safe on node_rx_cb (the ESP-NOW receive callback,
+ * WiFi driver task) -- that callback's only involvement is queuing a
+ * decoded CHECKIN_ACK for this function to pick up. */
+esp_err_t swarm_node_battery_cycle(void);

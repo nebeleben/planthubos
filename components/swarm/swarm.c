@@ -24,6 +24,8 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_ota_ops.h"
+#include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -697,6 +699,28 @@ static QueueHandle_t s_fwd_queue;
 static uint8_t       s_hub_mac[6];   /* set once in swarm_start_node(); MAC never
                                        * changes across a resync, only the channel does */
 
+/* ---------------- Node side: CHECKIN_ACK hand-off (M7 Task 5) ----------------
+ *
+ * node_rx_cb (the ESP-NOW receive callback, WiFi driver task) must never
+ * block or touch NVS -- same project-wide rule as every other deferred-work
+ * path in this file. A CHECKIN_ACK's consumer (swarm_node_battery_cycle(),
+ * on its own dedicated task, and the always-on periodic checkin below, on
+ * ITS own task) does real work with it (persist mode/counters, esp_restart(),
+ * esp_deep_sleep()), so the callback's only job is decode + a cheap RAM-only
+ * source check against the stored hub MAC + a non-blocking send onto this
+ * depth-1 queue. Depth 1 is enough: this node has at most one CHECKIN
+ * outstanding at a time (whichever of the two checkin paths above is
+ * currently active for this boot's power mode), and both consumers drain
+ * any stale entry before sending a fresh CHECKIN, so an ack left over from a
+ * previous, already-timed-out wait can never be misread as the answer to a
+ * later one. Created eagerly, in swarm_start_node() below, before
+ * espnow_link_init() hands node_rx_cb its first frame -- same eager-init
+ * reasoning as s_health_queue above (a CHECKIN_ACK could arrive as soon as
+ * the receive callback is live, including for the always-on periodic
+ * checkin, which needs this queue even when the battery-cycle task is never
+ * created at all). */
+static QueueHandle_t s_checkin_ack_queue;
+
 /* ---------------- Node side: OTA rollback-guard health signal (M5c) ----------------
  *
  * ota_post.h's ota_rollback_guard_node_confirm() performs a flash write
@@ -794,6 +818,40 @@ static void node_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, i
     if (type == SWARM_MSG_OTA_ABORT) {
         swarm_ota_abort_t ab;
         if (swarm_decode_ota_abort(data, (size_t)len, &ab)) node_ota_recv_handle_abort(src_mac, &ab);
+        return;
+    }
+
+    if (type == SWARM_MSG_CHECKIN_ACK) {
+        /* M7 Task 5: decode, source-check against the stored hub MAC (same
+         * short, bounded, allocation-free RAM-cache read already used for
+         * this exact check elsewhere on this path -- see the PONG branch
+         * just below), then a non-blocking send onto the depth-1 queue
+         * above. Nothing else past that happens here -- see that queue's
+         * own comment for why the actual command handling is deferred.
+         *
+         * Node-side OTA rollback-guard health signal (spec §4): "the
+         * existing node health signal (first delivered reading, or a
+         * received ack) confirms it" -- spec §4's own wording extends the
+         * M5c health criteria (forward_task()'s first delivered reading, or
+         * a PONG, both wired below/elsewhere) to a received CHECKIN_ACK
+         * too, same reasoning as the PONG branch just below: this is proof
+         * the hub's application layer just processed a frame from this
+         * node. This closes a real gap for a battery node -- unlike an
+         * always-on node, a battery wake never sends PING (no resync unless
+         * a checkin actually fails), so without this, a node with nothing
+         * local to forward (no sensors currently in range) would have NO
+         * way to ever confirm an OTA'd image via the criteria M5c
+         * originally shipped, and swarm_node_battery_cycle()'s
+         * rollback-sleep retry loop (below) would spin forever on an
+         * always-succeeding-but-never-confirmed checkin. */
+        swarm_checkin_ack_t ack;
+        if (swarm_decode_checkin_ack(data, (size_t)len, &ack)) {
+            uint8_t hub_mac[6];
+            if (swarm_store_hub(hub_mac, NULL, NULL) && memcmp(src_mac, hub_mac, 6) == 0) {
+                signal_node_healthy("CHECKIN_ACK received");
+                if (s_checkin_ack_queue) xQueueSend(s_checkin_ack_queue, &ack, 0);
+            }
+        }
         return;
     }
 
@@ -1071,6 +1129,280 @@ static void forward_task(void *arg)
  * volatile, this-boot-only change) stops it -- app_config's own stored
  * credentials are never touched here, so they still work if this device
  * is later switched back to a main hub. */
+
+/* ---------------- Node side: CHECKIN send/wait, shared by both checkin
+ * paths below (M7 Task 5) ---------------- */
+
+/* Builds and sends one CHECKIN frame reporting `mode`/`wake_counter`, then
+ * waits up to BATT_CHECKIN_WAIT_MS for the CHECKIN_ACK node_rx_cb queues in
+ * response (see s_checkin_ack_queue's own comment above). Drains any stale
+ * entry first -- a previous wait that already gave up (returned false
+ * below, or a resync round below it) may have left one behind, and that
+ * must never be mistaken for the answer to THIS send. Returns true (and
+ * fills *ack_out) only for a genuine ack received after this call's own
+ * send; false on a send failure or a timed-out wait. Blocking
+ * (espnow_link_send() and the queue wait both block), so this must only
+ * ever run on a dedicated task, never node_rx_cb -- both callers below
+ * satisfy that (swarm_node_battery_cycle()'s own task, and
+ * always_on_checkin_task() below). */
+static bool send_checkin_and_wait_ack(uint8_t mode, uint32_t wake_counter, swarm_checkin_ack_t *ack_out)
+{
+    if (s_checkin_ack_queue) {
+        swarm_checkin_ack_t stale;
+        while (xQueueReceive(s_checkin_ack_queue, &stale, 0) == pdTRUE) { /* drain leftovers */ }
+    }
+
+    swarm_checkin_t c = {
+        .version = SWARM_PROTO_VERSION,
+        .type = SWARM_MSG_CHECKIN,
+        .power_mode = mode,
+        .wake_counter = wake_counter,
+    };
+    uint8_t buf[sizeof(c)];
+    size_t n = swarm_encode_checkin(&c, buf, sizeof(buf));
+    if (n == 0) {
+        ESP_LOGE(TAG, "CHECKIN: failed to encode");
+        return false;
+    }
+
+    esp_err_t err = espnow_link_send(s_hub_mac, buf, n);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "CHECKIN send failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    if (!s_checkin_ack_queue) return false;
+    return xQueueReceive(s_checkin_ack_queue, ack_out, pdMS_TO_TICKS(BATT_CHECKIN_WAIT_MS)) == pdTRUE;
+}
+
+/* One checkin round (spec §4 step 3 / failure-honesty paragraph): send +
+ * wait, and on no ack, one bounded resync attempt -- the existing
+ * single-sweep channel resync, same call forward_task() itself falls back
+ * to after repeated send failures -- followed by exactly one more send +
+ * wait. A battery node must never burn its wake budget sweeping repeatedly
+ * (spec §4's own "failure honesty" wording); still no ack after that one
+ * retry means this checkin round counts failed. */
+static bool do_checkin_round(uint8_t mode, uint32_t wake_counter, swarm_checkin_ack_t *ack_out)
+{
+    if (send_checkin_and_wait_ack(mode, wake_counter, ack_out)) return true;
+
+    ESP_LOGW(TAG, "CHECKIN: no ack, attempting one bounded resync before counting this round failed");
+    esp_err_t rerr = pairing_node_resync_channel();
+    ESP_LOGI(TAG, "battery-cycle resync: %s", esp_err_to_name(rerr));
+
+    return send_checkin_and_wait_ack(mode, wake_counter, ack_out);
+}
+
+/* ---------------- Node side: always-on periodic checkin (M7 Task 5, spec §4/§6) ----------------
+ *
+ * A battery node's own checkin cycle (swarm_node_battery_cycle(), below)
+ * only exists while power_mode != ALWAYS_ON. Without an equivalent for an
+ * ALWAYS_ON node, a hub-side desired-mode change (an operator switching
+ * this node to a battery mode from the webui) would have no way to ever
+ * reach it -- the "makes mode changes deliverable" requirement this task
+ * exists to close (Global Constraints). Runs unconditionally from
+ * swarm_start_node() below, for every paired node regardless of mode, and
+ * re-checks the CURRENT power mode on every tick rather than gating once at
+ * task-create time -- that also covers the one case a node's mode can
+ * change WITHOUT a reboot: swarm_node_battery_cycle()'s own failed-wake
+ * ALWAYS_ON fallback (below) sets the mode and simply returns, no
+ * esp_restart(). From that moment this task is what keeps mode changes
+ * deliverable again, exactly as if the node had been ALWAYS_ON from boot. */
+static void always_on_checkin_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(BATT_ALWAYS_ON_CHECKIN_S * 1000));
+
+        if (swarm_store_power_mode() != SWARM_PM_ALWAYS_ON) {
+            /* A battery-mode node's own cycle owns checkins for as long as
+             * it stays in that mode -- a second, competing CHECKIN from
+             * here too would just double up on the hub's reconciliation
+             * for no benefit, and race send_checkin_and_wait_ack()'s
+             * single-outstanding-checkin assumption (the depth-1 queue). */
+            continue;
+        }
+
+        swarm_checkin_ack_t ack;
+        if (!send_checkin_and_wait_ack(SWARM_PM_ALWAYS_ON, swarm_store_wake_counter(), &ack)) continue;
+
+        if (ack.command == SWARM_CHECKIN_CMD_SET_MODE) {
+            ESP_LOGW(TAG, "always-on CHECKIN_ACK: SET_MODE %u -- persisting and rebooting into the new mode",
+                     ack.arg);
+            swarm_store_set_power_mode((swarm_power_mode_t)ack.arg);
+            esp_restart();
+        }
+        /* NONE or STAY_AWAKE: an always-on node is already awake with
+         * nothing to skip sleeping for, so STAY_AWAKE needs no special
+         * handling here -- batt_reconcile() only ever emits it for a node
+         * whose REPORTED mode is a battery one with a pending OTA (hub.c's
+         * checkin_task()/node_ota.c's node_ota_start()), which this branch,
+         * reporting ALWAYS_ON, never triggers. */
+    }
+}
+
+/* ---------------- Node side: battery-mode wake cycle (M7 Task 5, spec §4) ---------------- */
+
+#define BATT_STAY_AWAKE_IDLE_LIMIT 10u   /* consecutive idle 1s polls before giving up on STAY_AWAKE */
+
+/* Blocks up to BATT_STAY_AWAKE_CAP_S while node_ota_recv reports an active
+ * session (spec §6's node-side stay-awake cap: "the OTA session's 10-minute
+ * total timeout plus the checkin-to-start gap"). STAY_AWAKE's ack means the
+ * hub just released a session it had parked pending this node's wake (see
+ * checkin_task()'s node_ota_notify_checkin() call on the hub side). Polls
+ * once a second: BATT_STAY_AWAKE_IDLE_LIMIT consecutive idle polls (no
+ * active session observed) means the session either never actually started
+ * or already ended without a reboot -- failed/aborted, per the brief -- so
+ * this gives up and resumes the normal cycle. A genuine SUCCESS instead
+ * reboots the node from inside node_ota_recv.c itself (finalize_session()'s
+ * esp_restart()), which ends this whole task along with everything else,
+ * so that outcome is never observed here directly -- there is nothing left
+ * to "resume" in that case. */
+static void battery_stay_awake_wait(void)
+{
+    uint32_t elapsed_s = 0;
+    uint32_t idle_consecutive = 0;
+    while (elapsed_s < BATT_STAY_AWAKE_CAP_S) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        elapsed_s++;
+        if (node_ota_recv_active()) {
+            idle_consecutive = 0;
+            continue;
+        }
+        idle_consecutive++;
+        if (idle_consecutive >= BATT_STAY_AWAKE_IDLE_LIMIT) {
+            ESP_LOGI(TAG, "STAY_AWAKE: no active OTA session for %" PRIu32 "s, resuming the wake cycle",
+                     idle_consecutive);
+            return;
+        }
+    }
+    ESP_LOGW(TAG, "STAY_AWAKE: cap of %us reached without the OTA session completing, resuming the wake cycle",
+             (unsigned)BATT_STAY_AWAKE_CAP_S);
+}
+
+esp_err_t swarm_node_battery_cycle(void)
+{
+    int64_t wake_start_us = esp_timer_get_time();
+
+    uint8_t mode = (uint8_t)swarm_store_power_mode();
+    if (mode == SWARM_PM_ALWAYS_ON) {
+        /* Defensive: main.c's caller already gates on this before creating
+         * the task this function runs on, but batt_sleep_us()'s documented
+         * precondition ("callers must not invoke this for power_mode =
+         * ALWAYS_ON") makes re-checking here, rather than trusting the
+         * caller blindly, worth the one extra branch. */
+        return ESP_OK;
+    }
+
+    /* Step 1 (spec §4): increment + persist the NVS wake counter. Once per
+     * wake, here at the top -- NOT inside the retry loop below, which only
+     * repeats the checkin/ack/bookkeeping steps, never the wake itself. */
+    uint32_t wake_counter = swarm_store_wake_counter() + 1;
+    esp_err_t cerr = swarm_store_set_wake_counter(wake_counter);
+    if (cerr != ESP_OK) {
+        ESP_LOGW(TAG, "battery cycle: failed to persist wake counter (%s), continuing anyway",
+                 esp_err_to_name(cerr));
+    }
+
+    /* Step 2 (spec §4): scan window. Readings collect and forward through
+     * the already-running scan -> ring -> forward_task() machinery
+     * (started by swarm_start_node(), a precondition of this function)
+     * while this task simply waits -- no separate scan logic needed here. */
+    vTaskDelay(pdMS_TO_TICKS(BATT_SCAN_WINDOW_S * 1000));
+
+    for (;;) {
+        /* Steps 3+4 (spec §4): checkin, ack handling, wake-success
+         * bookkeeping. Looped only when the rollback-sleep gate below
+         * blocks sleeping -- see that block's own comment for why re-running
+         * this on every such retry (rather than just re-checking the gate)
+         * is what lets the failed-wake fallback act as its escape hatch. */
+        swarm_checkin_ack_t ack;
+        bool got_ack = do_checkin_round(mode, wake_counter, &ack);
+
+        if (got_ack) {
+            if (ack.command == SWARM_CHECKIN_CMD_SET_MODE) {
+                /* Wake-is-a-boot (spec §4's own section title): persisting
+                 * the new mode and rebooting, rather than switching modes
+                 * in place, means the very next boot lands back in main.c's
+                 * node-paired branch and re-derives everything (radio,
+                 * forward_task, and this function's own gating on the new
+                 * mode) from a clean boot -- instead of this function
+                 * having to unwind and restart its own already-live
+                 * scan/forward state in place. */
+                ESP_LOGW(TAG, "CHECKIN_ACK: SET_MODE %u -- persisting and rebooting", ack.arg);
+                swarm_store_set_power_mode((swarm_power_mode_t)ack.arg);
+                esp_restart();
+            } else if (ack.command == SWARM_CHECKIN_CMD_STAY_AWAKE) {
+                ESP_LOGI(TAG, "CHECKIN_ACK: STAY_AWAKE -- waiting up to %us for a parked OTA session",
+                         (unsigned)BATT_STAY_AWAKE_CAP_S);
+                battery_stay_awake_wait();
+            }
+            /* NONE: nothing further to do before the bookkeeping below. */
+        }
+
+        /* Wake success = a CHECKIN_ACK was received, any command (spec §4
+         * step 4). Persisted only when the counter actually changed --
+         * avoids an NVS write every single round for no behavioural
+         * difference (e.g. already-0 on repeated successes). */
+        uint32_t persisted_failed = swarm_store_failed_wakes();
+        bool fallback = false;
+        uint32_t new_failed = batt_failed_wake_next(persisted_failed, got_ack, &fallback);
+        if (new_failed != persisted_failed) {
+            esp_err_t ferr = swarm_store_set_failed_wakes(new_failed);
+            if (ferr != ESP_OK) {
+                ESP_LOGW(TAG, "battery cycle: failed to persist failed-wake counter (%s)",
+                         esp_err_to_name(ferr));
+            }
+        }
+        if (fallback) {
+            ESP_LOGW(TAG, "battery cycle: %" PRIu32 " consecutive failed wakes/rounds, falling back "
+                          "to ALWAYS_ON so this node stays reachable", new_failed);
+            swarm_store_set_power_mode(SWARM_PM_ALWAYS_ON);
+            return ESP_OK;
+        }
+
+        /* Rollback-sleep rule (spec §4, verbatim rationale): "an OTA'd
+         * image boots PENDING_VERIFY; the existing node health signal
+         * (first delivered reading, or a received ack) confirms it -- both
+         * happen within the first wake's window, before the first sleep.
+         * If neither happens (hub gone at exactly the wrong moment), the
+         * node must not sleep with an unconfirmed image (the next wake's
+         * reset would roll back a good image): an unconfirmed image keeps
+         * the node awake retrying until confirmed or the failed-wake
+         * fallback triggers." The "loop back" above is exactly that
+         * retrying: every extra round here also re-runs the failed-wake
+         * accounting just above with THIS round's own outcome, so a hub
+         * that is truly gone (not just quiet on health signals) still
+         * converges on the ALWAYS_ON fallback above rather than spinning
+         * forever -- that fallback is the escape hatch this rule leans on. */
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        esp_ota_img_states_t ota_state;
+        bool pending_verify = running != NULL
+            && esp_ota_get_state_partition(running, &ota_state) == ESP_OK
+            && ota_state == ESP_OTA_IMG_PENDING_VERIFY;
+        if (pending_verify) {
+            ESP_LOGW(TAG, "battery cycle: running image is still PENDING_VERIFY; not sleeping, "
+                          "retrying the checkin instead");
+            continue;
+        }
+
+        /* Step 6 (spec §4): sleep for the remainder of the period.
+         * awake_ms is measured from this function's own entry, per the
+         * brief -- batt_sleep_us()'s precondition (never ALWAYS_ON) is
+         * already satisfied by the early return above, since `mode` cannot
+         * have changed since then (the only way it could is SET_MODE,
+         * which reboots immediately, above, or the fallback, which returns
+         * immediately, above -- neither falls through to here). */
+        int64_t awake_us = esp_timer_get_time() - wake_start_us;
+        uint32_t awake_ms = (uint32_t)(awake_us / 1000);
+        ESP_LOGI(TAG, "battery cycle: sleeping (mode=%u wake=%" PRIu32 " awake=%" PRIu32 "ms)",
+                 mode, wake_counter, awake_ms);
+        esp_deep_sleep(batt_sleep_us(mode, awake_ms));
+        /* esp_deep_sleep() never returns -- the next execution of this
+         * device is a fresh boot through app_main(), not a return here. */
+    }
+}
+
 static esp_err_t radio_only_wifi_start(void)
 {
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
@@ -1140,6 +1472,14 @@ esp_err_t swarm_start_node(void)
                       "health signal will never fire this boot", esp_err_to_name(herr));
     }
 
+    /* Same "must exist before node_rx_cb can call it" reasoning as the two
+     * queues/tasks just above -- see s_checkin_ack_queue's own comment. */
+    if (!s_checkin_ack_queue) s_checkin_ack_queue = xQueueCreate(1, sizeof(swarm_checkin_ack_t));
+    if (!s_checkin_ack_queue) {
+        ESP_LOGE(TAG, "swarm_start_node: failed to create CHECKIN_ACK queue; CHECKIN acks will "
+                      "never be delivered this boot");
+    }
+
     esp_err_t err = radio_only_wifi_start();
     if (err != ESP_OK) return err;
 
@@ -1197,6 +1537,17 @@ esp_err_t swarm_start_node(void)
     if (xTaskCreate(forward_task, "swarm_fwd", 4096, NULL, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create forward task");
         return ESP_ERR_NO_MEM;
+    }
+
+    /* M7 Task 5 (spec §4/§6): started unconditionally for every paired
+     * node, not only battery-configured ones -- see the task's own comment
+     * for why an ALWAYS_ON node needs this too. Failure here is logged, not
+     * fatal to starting as a node: forwarding/pairing/OTA all still work,
+     * only a desired-mode change from the hub would go undelivered until
+     * this node's next reboot. */
+    if (xTaskCreate(always_on_checkin_task, "swarm_ao_checkin", 3072, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create always-on checkin task; hub-initiated mode changes "
+                      "will not be delivered until this node next reboots");
     }
 
     err = esp_event_handler_register(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE, on_sensor_update, NULL);

@@ -96,6 +96,14 @@ typedef struct {
 static QueueHandle_t s_queue;
 static TaskHandle_t  s_task;
 
+/* M7 Task 5: mirrors recv_session_t.active for node_ota_recv_active()
+ * (see node_ota_recv.h) -- written only from node_ota_recv_task() below, at
+ * the same points s_session.active itself is assigned, so it is never out
+ * of step by more than the instant between the two statements on this same
+ * task. Read (without a lock -- see the header comment) from swarm.c's
+ * battery-cycle task. */
+static volatile bool s_active_flag;
+
 /* Task-owned only (node_ota_recv_task() is the sole reader/writer) -- no
  * mutex needed, same reasoning as swarm.c's s_buf: a single owner needs
  * none. The receive callback never touches this struct, only the queue
@@ -326,6 +334,7 @@ static void handle_begin(recv_session_t *s, const uint8_t src[6], const swarm_ot
 
     memset(s, 0, sizeof(*s));
     s->active = true;
+    s_active_flag = true;
     s->handle = handle;
     s->part = part;
     s->total_len = begin->total_len;
@@ -359,6 +368,7 @@ static void finalize_session(recv_session_t *s, const uint8_t src[6])
         ESP_LOGE(TAG, "OTA finalize for " MACSTR ": esp_ota_end failed: %s", MAC2STR(src), esp_err_to_name(eerr));
         mbedtls_sha256_free(&s->sha_ctx);
         s->active = false;
+        s_active_flag = false;
         send_status(src, s->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_END_FAILED, s->next_offset);
         return;
     }
@@ -369,6 +379,7 @@ static void finalize_session(recv_session_t *s, const uint8_t src[6])
     if (memcmp(digest, s->sha256_expected, sizeof(digest)) != 0) {
         ESP_LOGE(TAG, "OTA finalize for " MACSTR ": streamed sha256 does not match OTA_BEGIN's", MAC2STR(src));
         s->active = false;
+        s_active_flag = false;
         /* esp_ota_end() already succeeded and finalized the handle above --
          * there is no abortable handle left at this point (esp_ota_abort()
          * is only valid on a handle that hasn't been esp_ota_end()'d yet).
@@ -385,6 +396,7 @@ static void finalize_session(recv_session_t *s, const uint8_t src[6])
         ESP_LOGE(TAG, "OTA finalize for " MACSTR ": esp_ota_set_boot_partition failed: %s",
                  MAC2STR(src), esp_err_to_name(berr));
         s->active = false;
+        s_active_flag = false;
         send_status(src, s->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_SET_BOOT_FAILED, s->next_offset);
         return;
     }
@@ -415,6 +427,7 @@ static void finalize_session(recv_session_t *s, const uint8_t src[6])
     }
 
     s->active = false;
+    s_active_flag = false;
     ESP_LOGW(TAG, "node OTA complete (from " MACSTR "), restarting to boot %s after %d DONE retransmissions",
              MAC2STR(src), s->part->label, NODE_OTA_RECV_DONE_RETRANSMITS);
     /* Retransmit the terminal DONE status (fix, M5c hardware round 4, defect
@@ -523,6 +536,7 @@ static void handle_chunk(recv_session_t *s, const uint8_t src[6], const swarm_ot
             esp_ota_abort(s->handle);
             mbedtls_sha256_free(&s->sha_ctx);
             s->active = false;
+            s_active_flag = false;
             send_status(src, s->session_id, OTA_ST_FAILED, NODE_OTA_RECV_ERR_WRITE_FAILED, s->next_offset);
             return;
         }
@@ -593,6 +607,7 @@ static void handle_abort(recv_session_t *s, const uint8_t src[6], const swarm_ot
     esp_ota_abort(s->handle);
     mbedtls_sha256_free(&s->sha_ctx);
     s->active = false;
+    s_active_flag = false;
 }
 
 /* Self-aborts `s` if it has been active for more than NODE_OTA_RECV_IDLE_TIMEOUT_MS
@@ -618,6 +633,7 @@ static void check_idle_timeout(recv_session_t *s)
     esp_ota_abort(s->handle);
     mbedtls_sha256_free(&s->sha_ctx);
     s->active = false;
+    s_active_flag = false;
 }
 
 /* Heartbeat status (fix, M5c hardware round 9). Every failure mode this
@@ -690,4 +706,9 @@ esp_err_t node_ota_recv_init(void)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+bool node_ota_recv_active(void)
+{
+    return s_active_flag;
 }
