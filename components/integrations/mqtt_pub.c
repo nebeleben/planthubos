@@ -24,7 +24,8 @@
  * discovery, whether triggered by a queued sensor update or by
  * RESYNC_DISCOVERY) now happens exclusively on the dedicated mqtt_pub task
  * below, which is the only thing that ever calls esp_mqtt_client_publish()
- * for state/discovery traffic, on its own 4096-byte stack sized for it. */
+ * for state/discovery traffic, on its own stack sized for it (see
+ * MQTT_PUB_TASK_STACK). */
 #include "integrations.h"
 #include "integr_config.h"
 #include "integr_private.h"
@@ -47,7 +48,16 @@
 static const char *TAG = "mqtt_pub";
 
 #define MQTT_PUB_QUEUE_DEPTH     8
-#define MQTT_PUB_TASK_STACK      4096
+/* 8192, not the plan's 4096 (M6 hardware round 1): moving the discovery
+ * resync onto this task (the M1 final-review fix) put a ~1.2KB registry_t
+ * snapshot plus the 640B discovery buffer, topic/name scratch and
+ * esp-mqtt's publish path on this stack all at once, and the 4096 sizing
+ * predates that move. On hardware the first CONNECTED -> resync overflowed
+ * it instantly: a "Stack protection fault" panic in task mqtt_pub the
+ * moment the broker accepted the connection, crash-looping the whole hub
+ * (observed as the broker logging connect -> "connection closed by
+ * client" every ~15s while the LWT flapped online/offline). */
+#define MQTT_PUB_TASK_STACK      8192
 #define MQTT_PUB_TASK_PRIO       3
 /* Per-sensor state-publish throttle -- see the plan. A dropped/skipped
  * publish here is never lost data, just deferred to the sensor's next
@@ -169,7 +179,8 @@ static void publish_state(const sensor_entry_t *e)
  * a RESYNC_DISCOVERY message, so mqtt_pub_task() itself doesn't redundantly
  * resend them the first time each sensor's next state publish comes
  * through. registry_t (~1KB) lives on mqtt_pub_task's own stack here, same
- * as in mqtt_pub_task() below -- both are fine on its 4096-byte stack. */
+ * as in mqtt_pub_task() below -- both are fine on its stack (see
+ * MQTT_PUB_TASK_STACK's comment for the sizing history). */
 static void publish_all_discovery(void)
 {
     registry_t snap;
