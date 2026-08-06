@@ -136,3 +136,20 @@ bool node_ota_notify_checkin(const uint8_t mac[6]);
  * parked (state == NODE_OTA_ST_PENDING_WAKE). Idempotent, RAM-only, safe to
  * call from any task. */
 bool node_ota_pending_for(const uint8_t mac[6]);
+
+/* M7 final-review fix (F1/F2): companion to node_ota_pending_for() above --
+ * true iff a session targeting `mac` is currently ACTIVELY STREAMING
+ * (pub.active, any state other than the parked pseudo-state), as opposed to
+ * pending's "parked, not yet streaming". swarm.c's checkin_task() ORs the
+ * two together as batt_reconcile()'s ota_pending input so STAY_AWAKE keeps
+ * winning over SET_MODE for the whole lifetime of a session -- not only
+ * while parked -- covering two failure modes a parked-only check misses:
+ * (a) an always-on node's periodic checkin landing a SET_MODE ack (and
+ * esp_restart()) while this hub is mid-stream to it would abort the
+ * transfer; (b) a battery node that misses the STAY_AWAKE ack that released
+ * its park would otherwise see node_ota_pending_for() already false (the
+ * session moved past PENDING_WAKE the instant it was released) and could
+ * deep-sleep on its very next checkin while the hub is still streaming to
+ * it. Idempotent, RAM-only, s_mutex-guarded, safe to call from any task --
+ * same discipline as node_ota_pending_for(). */
+bool node_ota_active_for(const uint8_t mac[6]);

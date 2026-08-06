@@ -41,6 +41,26 @@
 
 static const char *TAG = "swarm";
 
+/* M7 final-review fix (F8): batt_cycle.c's batt_reconcile() (this component,
+ * but built without visibility into swarm_frame.h/swarm_store.h) hard-codes
+ * bare 0/1/2 literals for both the command it returns and the modes it
+ * compares, tied to SWARM_CHECKIN_CMD_* / SWARM_PM_* only by comment (see
+ * batt_cycle.h's own doc comment on batt_reconcile()). This file #includes
+ * both real enums (swarm_frame.h, swarm_store.h) alongside batt_cycle.h, so
+ * it's the one place that can actually check the comment's claim at compile
+ * time -- a future reordering of either enum would otherwise silently
+ * desync from batt_cycle.c's literals with no compiler diagnostic anywhere.
+ * batt_cycle.c's literals: command 0=NONE/1=SET_MODE/2=STAY_AWAKE
+ * (batt_reconcile()'s three `result.command = N` assignments); mode
+ * 0=ALWAYS_ON/1=BATTERY_15/2=BATTERY_60 (period_table[]'s three entries,
+ * indexed by power_mode). */
+_Static_assert(SWARM_CHECKIN_CMD_NONE == 0, "batt_cycle.c's command literal 0 means NONE");
+_Static_assert(SWARM_CHECKIN_CMD_SET_MODE == 1, "batt_cycle.c's command literal 1 means SET_MODE");
+_Static_assert(SWARM_CHECKIN_CMD_STAY_AWAKE == 2, "batt_cycle.c's command literal 2 means STAY_AWAKE");
+_Static_assert(SWARM_PM_ALWAYS_ON == 0, "batt_cycle.c's period_table[0]/mode literal 0 means ALWAYS_ON");
+_Static_assert(SWARM_PM_BATTERY_15 == 1, "batt_cycle.c's period_table[1]/mode literal 1 means BATTERY_15");
+_Static_assert(SWARM_PM_BATTERY_60 == 2, "batt_cycle.c's period_table[2]/mode literal 2 means BATTERY_60");
+
 /* ---------------- Hub side: ingestion + per-node RAM stats ---------------- */
 
 typedef struct {
@@ -227,7 +247,25 @@ static void checkin_task(void *arg)
         record_checkin_mode(item.mac, item.checkin.power_mode);
 
         uint8_t desired = (uint8_t)swarm_store_node_desired_mode(item.mac);
-        bool ota_pending = node_ota_pending_for(item.mac);
+        /* M7 final-review fix (F1/F2): OR in node_ota_active_for() alongside
+         * the original parked-only node_ota_pending_for() check, so
+         * batt_reconcile()'s STAY_AWAKE-over-SET_MODE priority keeps applying
+         * for this node's ENTIRE session, not only while it's parked waiting
+         * to start. Parked-only missed two cases: (a) an always-on node's
+         * own periodic checkin (always_on_checkin_task()) landing a SET_MODE
+         * ack -- and the esp_restart() that follows -- while this hub is
+         * mid-stream to it would abort the transfer; that node already
+         * treats STAY_AWAKE as a no-op (see always_on_checkin_task()'s own
+         * comment), so widening the condition here is enough to suppress the
+         * reboot. (b) a battery node whose STAY_AWAKE ack (sent the moment
+         * node_ota_notify_checkin() releases its park) is lost in the air:
+         * node_ota_pending_for() alone would already read false by then (the
+         * session left PENDING_WAKE the instant it was released), so its
+         * next checkin could get NONE/SET_MODE instead and deep-sleep out
+         * from under an in-flight stream. node_ota_active_for() stays true
+         * through that whole window, so a retried checkin still gets
+         * STAY_AWAKE. */
+        bool ota_pending = node_ota_pending_for(item.mac) || node_ota_active_for(item.mac);
         batt_cmd_t cmd = batt_reconcile(desired, item.checkin.power_mode, ota_pending);
 
         if (cmd.command == SWARM_CHECKIN_CMD_STAY_AWAKE) {

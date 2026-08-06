@@ -277,6 +277,23 @@ bool node_ota_pending_for(const uint8_t mac[6])
     return pending;
 }
 
+/* M7 final-review fix (F1/F2): see node_ota.h for the full contract and why
+ * checkin_task() needs this alongside node_ota_pending_for(). Deliberately
+ * just pub.active + mac match, with no state check -- this is a superset of
+ * node_ota_pending_for() (true while parked too), which is fine: the two are
+ * only ever consulted ORed together (`pending || active`), so the overlap
+ * while parked is inert. What matters is that it stays true across the
+ * PENDING_WAKE -> OTA_ST_RECEIVING transition, unlike node_ota_pending_for(),
+ * which goes false the instant a parked session is released. */
+bool node_ota_active_for(const uint8_t mac[6])
+{
+    if (!mac || !s_mutex) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool active = s_session.pub.active && memcmp(s_session.pub.mac, mac, 6) == 0;
+    xSemaphoreGive(s_mutex);
+    return active;
+}
+
 /* Ends the session: updates the published state/err, sends a best-effort
  * OTA_ABORT to the node when `notify_node` (never for a clean DONE, since
  * the node isn't waiting on anything further there), clears `active` so a
