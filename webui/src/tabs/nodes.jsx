@@ -34,22 +34,44 @@ function macPath(mac) {
 const PM_ALWAYS_ON = 0, PM_BATTERY_15 = 1, PM_BATTERY_60 = 2
 
 // Wire strings for "power_mode" (swarm.c's power_mode_str()), and the labels this tab
-// shows for them -- both in the selector below and as the small "beside last-seen" hint.
+// shows for them in the selector below.
 const POWER_MODE_LABELS = {
   always_on: 'always on',
   battery_15: 'battery 15 min',
   battery_60: 'battery 60 min',
 }
 
+// Final-review fix (F4): the small "beside last-seen" hint used to show the DESIRED
+// mode (n.power_mode) -- but that's what the operator just ASKED for, not what the
+// node is actually doing. A node still genuinely always-on, with a battery_60 change
+// pending, showed "battery 60 min" there: exactly the label that makes prolonged
+// silence from a now-sleeping node look normal, defeating the one thing this hint is
+// for. Keyed by the numeric reported_mode (PM_*) rather than power_mode's wire
+// strings, reusing the same label text above; "—" when reported_mode_valid is false
+// (never checked in this boot -- see pendingHint()'s comment for why that must not be
+// presented as any particular mode, reported or otherwise).
+const REPORTED_MODE_LABELS = {
+  [PM_ALWAYS_ON]: POWER_MODE_LABELS.always_on,
+  [PM_BATTERY_15]: POWER_MODE_LABELS.battery_15,
+  [PM_BATTERY_60]: POWER_MODE_LABELS.battery_60,
+}
+
 // While power_mode_pending, the node hasn't yet confirmed the desired mode via a
 // CHECKIN, so it's still running whatever cadence it last reported (reported_mode) --
 // that OLD cadence, not the new desired one (n.power_mode), bounds how soon the
 // change can land, so the desired mode plays no part in this decision at all.
-// reported_mode_valid=false (never checked in this boot) is treated the same as
-// ALWAYS_ON: swarm_store.h's fresh-node default is ALWAYS_ON, so an unconfirmed node
-// is presumed to still be on that (short) cadence rather than a stale battery one.
+// reported_mode_valid=false (never checked in this boot) does NOT justify claiming
+// any time bound (final-review fix F3): swarm_store.h's fresh-node default really is
+// ALWAYS_ON, but that's the node's PERSISTED state, not necessarily what it's
+// currently running -- after a hub reboot wipes this RAM-only stat, a battery_60 node
+// mid-cycle is still bound by its real 60-minute cadence, and claiming "≤ a few
+// minutes" for it would be a false promise. So an unconfirmed node gets no bound
+// claimed at all, only the honest "next checkin" -- whenever that turns out to be.
 function pendingHint(n) {
-  if (!n.reported_mode_valid || n.reported_mode === PM_ALWAYS_ON) {
+  if (!n.reported_mode_valid) {
+    return "applies at the node's next checkin"
+  }
+  if (n.reported_mode === PM_ALWAYS_ON) {
     return "applies at the node's next checkin (≤ a few minutes)"
   }
   return n.reported_mode === PM_BATTERY_15
@@ -302,9 +324,7 @@ function Row({ n, fwVersion, onSaved, onForgotten, onPowerModeSaved }) {
       <td class="mono">{n.mac}</td>
       <td>
         {n.last_seen_s != null ? fmtAgo(n.last_seen_s) : 'never'}
-        {n.power_mode && (
-          <span class="hint"> · {POWER_MODE_LABELS[n.power_mode] || n.power_mode}</span>
-        )}
+        <span class="hint"> · {n.reported_mode_valid ? (REPORTED_MODE_LABELS[n.reported_mode] || n.reported_mode) : '—'}</span>
       </td>
       <td>{n.frames_rx}</td>
       <td>{n.rssi != null ? `${n.rssi} dBm` : '–'}</td>
