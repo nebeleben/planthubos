@@ -7,14 +7,20 @@ import { NetworkTab } from './tabs/network.jsx'
 import { NodesTab } from './tabs/nodes.jsx'
 import { RoleTab } from './tabs/role.jsx'
 
-const ALL_TABS = ['Dashboard', 'Devices', 'History', 'Nodes', 'Config', 'Network']
+// M8 Task 8: plants are now the primary surface, so the old "Dashboard"/
+// "Devices" labels are renamed to "Plants"/"Probes" -- a sensor is just a
+// probe now (sensors_json.c's demoted GET /api/v1/sensors comment), and
+// "Devices" also now hosts plant create/rename/delete alongside the probe
+// pool, which "Probes" no longer misdescribes. Every other tab name is
+// unchanged.
+const ALL_TABS = ['Plants', 'Probes', 'History', 'Nodes', 'Config', 'Network']
 
 function Placeholder({ name }) {
   return <p class="placeholder">{name} — coming in a later milestone.</p>
 }
 
 export function App() {
-  const [tab, setTab] = useState('Dashboard')
+  const [tab, setTab] = useState('Plants')
   // Optimistically 'main' so an existing hub (the overwhelmingly common
   // case) renders its tabs immediately instead of flashing a loading state
   // -- only a device that has never chosen a role (fresh out of the box)
@@ -30,7 +36,7 @@ export function App() {
         // An unpaired node reaching the webui at all means it's sitting in
         // its portal after a failed pairing attempt (a paired node runs no
         // web server, and a searching one hasn't set up webserver either)
-        // -- Dashboard/Devices/History are all empty and pointless there,
+        // -- Plants/Probes/History are all empty and pointless there,
         // so land the user straight on the Config tab, where the retry /
         // switch-back-to-main controls live.
         if (r === 'node' && !st.paired) setTab('Config')
@@ -76,8 +82,8 @@ export function App() {
         </nav>
       </header>
       <main>
-        {tab === 'Dashboard' ? <DashboardTab /> :
-         tab === 'Devices' ? <DevicesTab /> :
+        {tab === 'Plants' ? <DashboardTab /> :
+         tab === 'Probes' ? <DevicesTab /> :
          tab === 'History' ? <HistoryTab /> :
          tab === 'Nodes' ? <NodesTab /> :
          tab === 'Config' ? <ConfigTab /> :
