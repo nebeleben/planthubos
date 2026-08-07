@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static const char *TAG = "plants";
 #define NS "planthub"
@@ -241,12 +242,17 @@ static void load_blob(nvs_handle_t h, plants_table_t *out)
  *
  * Executor half of plants_migrate.h's pure planner: discovers what the
  * pre-M8 sensor-keyed world left lying around, hands it to
- * plants_migrate_plan() (which mutates s_table in place), then performs
- * the renames/NVS-name deletions the returned actions describe. Runs once,
- * synchronously, from plants_init() -- strictly before any other task can
- * reach s_table (plants_init() is called synchronously from app_main()
- * before sampler_start()/webserver_start()), so this touches s_table and
- * s_storage_base directly, unlocked, same as load_blob() just above.
+ * plants_migrate_plan() (which mutates a table in place), then performs
+ * the renames/NVS-name deletions the returned actions describe. Runs once
+ * from plants_init() -- but NOT before other tasks can reach s_table: in
+ * main.c, webserver_start() and wifi_manager_start() both run BEFORE
+ * plants_init() in the hub-role boot sequence, so the HTTP server is
+ * already live and api_v1.c's history_get -> plants_resolve_or_create()
+ * bridge can legitimately race this function's table access (an earlier
+ * revision of this comment claimed otherwise -- it was wrong). See
+ * plants_run_migration() below for the s_mutex hold this requires around
+ * plants_migrate_plan(), matching every other mutator's two-phase
+ * discipline (file-top locking-invariant comment).
  *
  * Discovery has two independent legs, per the design spec's "for each
  * sensor with an NVS name OR an existing ring, create a plant":
@@ -409,10 +415,39 @@ static void migrate_scan_names(migrate_input_t *ins, int *n)
     }
 }
 
+static bool path_exists(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+/* Renames one legacy ring file to its P<id> name, unless the destination
+ * is already occupied -- which the persist-before-execute ordering in
+ * plants_run_migration() should make impossible in the ordinary case, but
+ * a prior crash mid-migration (or manual tampering) could still leave a
+ * P<id> file behind for an id this run is about to reuse... except ids are
+ * never reused (plants_table.h), so a collision here always means
+ * something unexpected is on disk. Either way, silently clobbering it
+ * would be a silent cross-plant history overwrite -- log and keep the
+ * legacy file untouched instead; it stays discoverable (still MAC-named)
+ * for a future migration attempt or manual recovery. */
+static void migrate_rename_one(const char *oldp, const char *newp)
+{
+    if (path_exists(newp)) {
+        ESP_LOGW(TAG, "migration: %s already exists; leaving %s in place rather than "
+                      "overwriting it", newp, oldp);
+        return;
+    }
+    if (rename(oldp, newp) != 0) {
+        ESP_LOGW(TAG, "migration: rename %s -> %s failed: %s", oldp, newp, strerror(errno));
+    }
+}
+
 /* Executes one planned action: rename() the ring files that exist, delete
  * the NVS name key on a successful move_name. Per spec: log a failure and
  * continue -- never let one bad file/key abort the rest of the boot's
- * migration. */
+ * migration. Table access happens above in plants_run_migration(), not
+ * here -- this function only touches the filesystem and NVS. */
 static void migrate_execute_action(const migrate_action_t *a)
 {
     char mac_hex[13];
@@ -423,17 +458,13 @@ static void migrate_execute_action(const migrate_action_t *a)
         char oldp[128], newp[128];
         snprintf(oldp, sizeof(oldp), "%s/%s_raw.bin", s_storage_base, mac_hex);
         snprintf(newp, sizeof(newp), "%s/P%u_raw.bin", s_storage_base, a->plant_id);
-        if (rename(oldp, newp) != 0) {
-            ESP_LOGW(TAG, "migration: rename %s -> %s failed: %s", oldp, newp, strerror(errno));
-        }
+        migrate_rename_one(oldp, newp);
     }
     if (a->rename_hourly && s_storage_base) {
         char oldp[128], newp[128];
         snprintf(oldp, sizeof(oldp), "%s/%s_hr.bin", s_storage_base, mac_hex);
         snprintf(newp, sizeof(newp), "%s/P%u_hr.bin", s_storage_base, a->plant_id);
-        if (rename(oldp, newp) != 0) {
-            ESP_LOGW(TAG, "migration: rename %s -> %s failed: %s", oldp, newp, strerror(errno));
-        }
+        migrate_rename_one(oldp, newp);
     }
     if (a->move_name) {
         esp_err_t err = app_config_clear_sensor_name(a->mac);
@@ -448,7 +479,43 @@ static void migrate_execute_action(const migrate_action_t *a)
 
 /* Runs from plants_init(), between the blob load and the summary log
  * below. s_table already holds whatever load_blob() found (normally
- * empty; plants_migrate_plan() skips any mac already in it either way). */
+ * empty; plants_migrate_plan() skips any mac already in it either way).
+ *
+ * Ordering is deliberately persist-BEFORE-execute, not the more obvious
+ * "do the renames, then save what happened" -- plants_migrate_plan()
+ * already mutates the table (new plants, names, next_id) the moment it
+ * returns, so persist_table() commits that mutation to flash immediately,
+ * and only THEN do the actual rename()/NVS-delete side effects run.
+ *
+ * The failure story this avoids: rename-then-persist leaves a window
+ * where a crash after a successful rename (+ NVS name-key erase) but
+ * before the trailing persist_table() reverts the table on reboot -- the
+ * P<id> files that already got renamed no longer match the legacy
+ * MAC-named-file scan (they're already renamed away), and the NVS name is
+ * already erased, so that plant's entire history is permanently orphaned
+ * with nothing left pointing to it. Worse: next_id also reverts to
+ * whatever it was before, so the next boot's migration re-allocates that
+ * SAME id to whichever mac it processes next -- not necessarily the same
+ * one, since directory iteration order is not guaranteed stable across
+ * boots -- and THAT mac's rename() silently overwrites the orphaned
+ * P<id> file with a completely different mac's history: a silent
+ * cross-plant history overwrite, violating plants_table.h's
+ * never-reused-id invariant.
+ *
+ * Persist-first bounds the damage from a mid-migration crash to, at
+ * worst, one file left stuck under its legacy MAC name: the table (and
+ * therefore next_id) is already durable on flash before any rename runs,
+ * so a re-run's plants_migrate_plan() finds that mac already known via
+ * find_mac() and skips it outright -- dead weight, never touched again,
+ * never clobbered.
+ *
+ * If persist_table() itself fails, none of the actions run this boot:
+ * executing them anyway would let files move (and NVS names disappear)
+ * out from under a table that never reached flash, which is exactly the
+ * unrecoverable case above waiting to happen on the next crash. s_table's
+ * RAM copy still reflects the plan -- same "RAM can run ahead of flash on
+ * a failed commit" contract as every other mutator in this file -- and
+ * the migration simply retries from scratch next boot. */
 static void plants_run_migration(void)
 {
     static migrate_input_t inputs[MIGRATE_MAX_INPUTS];
@@ -459,19 +526,31 @@ static void plants_run_migration(void)
     migrate_scan_names(inputs, &n_inputs);
     if (n_inputs == 0) return;
 
+    /* Phase 1 (RAM only, s_mutex held) -- same two-phase split as
+     * plants_rename()/plants_assign()/plants_create()/plants_delete()
+     * above: plants_migrate_plan() only ever touches *t (the `in`/`out`
+     * arrays are this function's own local buffers, never shared), so the
+     * lock only needs to span this one call, not the file/NVS work below. */
     migrate_action_t actions[PLANTS_MAX];
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
     int n_actions = plants_migrate_plan(&s_table, inputs, n_inputs, actions, PLANTS_MAX);
+    xSemaphoreGive(s_mutex);
     if (n_actions == 0) return;
+
+    /* Phase 2: persist BEFORE executing any action -- see this function's
+     * own comment above for why. */
+    esp_err_t err = persist_table();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "migration: failed to persist the plant table (%s) before executing any "
+                      "action -- skipping execution this boot rather than renaming/erasing "
+                      "state out from under a table that never reached flash; RAM already "
+                      "reflects the plan and this will retry from scratch next boot",
+                 esp_err_to_name(err));
+        return;
+    }
 
     for (int i = 0; i < n_actions; i++) {
         migrate_execute_action(&actions[i]);
-    }
-
-    esp_err_t err = persist_table();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "migration: failed to persist the plant table (%s); RAM already reflects "
-                      "the migration and will not revert until the next successful write or a "
-                      "reboot", esp_err_to_name(err));
     }
     ESP_LOGI(TAG, "migration: %d plant(s) migrated from sensor-keyed state", n_actions);
 }
