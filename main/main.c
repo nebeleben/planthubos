@@ -16,8 +16,32 @@
 #include "swarm.h"
 #include "swarm_store.h"
 #include "integrations.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "planthub";
+
+/* M7 Task 5: wrapper task for swarm_node_battery_cycle() (spec §4). That
+ * function either deep-sleeps (esp_deep_sleep() never returns) or returns
+ * ESP_OK meaning "continue as always-on" -- app_main() itself must still
+ * return promptly (it always has), so the cycle cannot run inline on
+ * app_main's own task/stack. Instead it runs here, on its own dedicated
+ * task created just below, in the node-paired branch, only when
+ * swarm_store_power_mode() != SWARM_PM_ALWAYS_ON. 4096 bytes, not the
+ * default 2048: swarm_node_battery_cycle() calls into espnow_link_send()
+ * and the BLE-adjacent scan/forward machinery already running on other
+ * tasks is live throughout, so the smaller default stack is not enough
+ * headroom here. A return from swarm_node_battery_cycle() means "fall
+ * through to today's always-on behaviour" -- for a node, that behaviour is
+ * simply everything swarm_start_node()/ble_collector_start() already
+ * started continuing to run untouched, so this task has nothing further to
+ * do but delete itself. */
+static void batt_cycle_task(void *arg)
+{
+    (void)arg;
+    swarm_node_battery_cycle();
+    vTaskDelete(NULL);
+}
 
 void app_main(void)
 {
@@ -82,6 +106,13 @@ void app_main(void)
      * and task-6 ("choosing node sweeps for a hub"): search first, and
      * only fall back to the portal once a search has actually failed. */
     bool node_should_search = (role == SWARM_ROLE_NODE) && !node_paired && !swarm_store_pair_failed();
+    /* M7 Task 5: separate from node_paired -- that stays true even when
+     * swarm_start_node() below fails and this boot falls back to the
+     * portal instead, but swarm_node_battery_cycle()'s precondition is
+     * specifically "swarm_start_node() has succeeded". Gating the
+     * battery-cycle task on node_paired alone would create it against a
+     * node that never actually started its ESP-NOW/forward machinery. */
+    bool node_started = false;
 
     if (node_paired) {
         /* Node, already paired to a hub: no web server, no storage sampler,
@@ -101,6 +132,7 @@ void app_main(void)
         ota_rollback_guard_start_node();
         swarm_node_set_health_cb(ota_rollback_guard_node_confirm);
         esp_err_t nerr = swarm_start_node();
+        node_started = (nerr == ESP_OK);
         if (nerr != ESP_OK) {
             /* Without this fallback a device that fails here is completely
              * inert: no webserver, no wifi_manager, no ESP-NOW -- silent
@@ -148,6 +180,40 @@ void app_main(void)
 
     esp_err_t ble_err = ble_collector_start();
     if (ble_err != ESP_OK) ESP_LOGE(TAG, "BLE collector failed to start (%s); running without BLE", esp_err_to_name(ble_err));
+
+    /* M7 Task 5 (spec §4): a battery-mode paired node runs its wake cycle
+     * (scan -> checkin -> sleep) instead of just sitting always-on -- see
+     * batt_cycle_task()'s own comment above for why this needs its own
+     * task. Added here, after ble_collector_start() (not earlier in the
+     * node_paired branch above), so BLE scanning is already live before the
+     * cycle's scan window starts consuming it. Gated on node_started, not
+     * node_paired -- see node_started's own comment above: only a node
+     * whose swarm_start_node() actually succeeded satisfies
+     * swarm_node_battery_cycle()'s precondition. */
+    if (node_started && swarm_store_power_mode() != SWARM_PM_ALWAYS_ON) {
+        if (xTaskCreate(batt_cycle_task, "batt_cycle", 4096, NULL, 2, NULL) != pdPASS) {
+            /* Code review fix (issue 5): without this, the node keeps
+             * running (nothing else here fails), but sends no CHECKIN at
+             * all -- swarm.c's always_on_checkin_task() gates its own
+             * periodic checkin on power_mode == ALWAYS_ON, which the stored
+             * mode here still isn't, so it stays silent too. That would
+             * leave this node unmanageable (no way for the hub to ever
+             * reach it with a mode change) until someone physically
+             * recovers it. Persisting ALWAYS_ON here makes the stored mode
+             * match what the node is actually doing (running always-on,
+             * task-creation failure notwithstanding), so the always-on
+             * task's gate now matches reality and starts checking in --
+             * giving the hub a path to re-deliver a battery mode later. */
+            ESP_LOGE(TAG, "failed to create batt_cycle task; node will run always-on "
+                          "despite its configured battery mode -- persisting ALWAYS_ON "
+                          "so it still sends periodic checkins");
+            esp_err_t perr = swarm_store_set_power_mode(SWARM_PM_ALWAYS_ON);
+            if (perr != ESP_OK) {
+                ESP_LOGE(TAG, "also failed to persist the ALWAYS_ON fallback (%s); this node may be "
+                              "unreachable until physically recovered", esp_err_to_name(perr));
+            }
+        }
+    }
 
     /* Sampler appends to /storage every CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN
      * minutes; starting it against a failed mount would just fail forever,

@@ -48,6 +48,21 @@ void node_ota_recv_handle_begin(const uint8_t src[6], const swarm_ota_begin_t *b
 void node_ota_recv_handle_chunk(const uint8_t src[6], const swarm_ota_chunk_t *chunk);
 void node_ota_recv_handle_abort(const uint8_t src[6], const swarm_ota_abort_t *ab);
 
+/* M7 Task 5: whether a receive session is currently active. Consumed by
+ * swarm.c's swarm_node_battery_cycle() (a THIRD task, distinct from both
+ * node_rx_cb's WiFi driver task and node_ota_recv_task() above) to poll,
+ * once a second, whether a STAY_AWAKE wake should keep waiting for an OTA
+ * push to finish. recv_session_t itself stays exactly as task-owned-only as
+ * this file's header comment already documents -- this getter reads a
+ * separate, single bool written only from node_ota_recv_task() at the same
+ * points s_session.active itself changes, never the struct. No lock: a
+ * plain bool read/write is indivisible on this target, and the only
+ * consumer polls at 1s granularity expecting eventual, not immediate,
+ * consistency (see swarm.c's stay-awake wait loop) -- a stale read is
+ * corrected on the very next poll, one second later, which is harmless at
+ * this timescale. Safe to call from any task. */
+bool node_ota_recv_active(void);
+
 /* Node's own OTA_STATUS.err codes (the numberspace node_ota.h's
  * node_ota_progress_t.err comment defers to "the node side's to define,
  * Task 5"). Sent verbatim in a FAILED OTA_STATUS; the hub surfaces it

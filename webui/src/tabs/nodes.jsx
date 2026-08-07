@@ -19,10 +19,64 @@ function fmtAgo(ageS) {
 
 // swarm_frame.h's OTA_ST_* enum, mirrored here for the GET .../ota "state" field
 // (OTA_ST_IDLE=0, OTA_ST_RECEIVING=1 are only ever seen via prog.active, not by value).
-const OTA_DONE = 2, OTA_FAILED = 3
+// 4 is node_ota.h's NODE_OTA_ST_PENDING_WAKE (M7) -- a hub-side-only pseudo-state for
+// a battery node's push parked until its next checkin, reported like any other OTA_ST_*
+// value but only ever seen together with prog.active=true (never as a terminal state).
+const OTA_DONE = 2, OTA_FAILED = 3, OTA_QUEUED = 4
 
 function macPath(mac) {
   return mac.replaceAll(':', '')
+}
+
+// swarm_store.h's SWARM_PM_* enum, mirrored here for the GET /api/v1/nodes entry's
+// "reported_mode" field (the node's own last-CHECKIN-reported mode -- as opposed to
+// "power_mode", which is hub-side DESIRED state and is a string, not this numeric enum).
+const PM_ALWAYS_ON = 0, PM_BATTERY_15 = 1, PM_BATTERY_60 = 2
+
+// Wire strings for "power_mode" (swarm.c's power_mode_str()), and the labels this tab
+// shows for them in the selector below.
+const POWER_MODE_LABELS = {
+  always_on: 'always on',
+  battery_15: 'battery 15 min',
+  battery_60: 'battery 60 min',
+}
+
+// Final-review fix (F4): the small "beside last-seen" hint used to show the DESIRED
+// mode (n.power_mode) -- but that's what the operator just ASKED for, not what the
+// node is actually doing. A node still genuinely always-on, with a battery_60 change
+// pending, showed "battery 60 min" there: exactly the label that makes prolonged
+// silence from a now-sleeping node look normal, defeating the one thing this hint is
+// for. Keyed by the numeric reported_mode (PM_*) rather than power_mode's wire
+// strings, reusing the same label text above; "—" when reported_mode_valid is false
+// (never checked in this boot -- see pendingHint()'s comment for why that must not be
+// presented as any particular mode, reported or otherwise).
+const REPORTED_MODE_LABELS = {
+  [PM_ALWAYS_ON]: POWER_MODE_LABELS.always_on,
+  [PM_BATTERY_15]: POWER_MODE_LABELS.battery_15,
+  [PM_BATTERY_60]: POWER_MODE_LABELS.battery_60,
+}
+
+// While power_mode_pending, the node hasn't yet confirmed the desired mode via a
+// CHECKIN, so it's still running whatever cadence it last reported (reported_mode) --
+// that OLD cadence, not the new desired one (n.power_mode), bounds how soon the
+// change can land, so the desired mode plays no part in this decision at all.
+// reported_mode_valid=false (never checked in this boot) does NOT justify claiming
+// any time bound (final-review fix F3): swarm_store.h's fresh-node default really is
+// ALWAYS_ON, but that's the node's PERSISTED state, not necessarily what it's
+// currently running -- after a hub reboot wipes this RAM-only stat, a battery_60 node
+// mid-cycle is still bound by its real 60-minute cadence, and claiming "≤ a few
+// minutes" for it would be a false promise. So an unconfirmed node gets no bound
+// claimed at all, only the honest "next checkin" -- whenever that turns out to be.
+function pendingHint(n) {
+  if (!n.reported_mode_valid) {
+    return "applies at the node's next checkin"
+  }
+  if (n.reported_mode === PM_ALWAYS_ON) {
+    return "applies at the node's next checkin (≤ a few minutes)"
+  }
+  return n.reported_mode === PM_BATTERY_15
+    ? "applies at the node's next checkin (≤ 15 min)"
+    : "applies at the node's next checkin (≤ 60 min)"
 }
 
 // Per-node OTA push control: an Update button that starts the hub-side push
@@ -143,6 +197,10 @@ function OtaControl({ mac, fwVersion }) {
   }
 
   const active = prog?.active
+  // Queued (state 4): the push is parked hub-side waiting for the node's next wake,
+  // so prog.sent/total aren't moving yet -- a 0% bar there would read as stalled
+  // rather than as "hasn't started because the node is asleep".
+  const queued = active && prog.state === OTA_QUEUED
   const pct = active && prog.total ? Math.min(100, Math.round((100 * prog.sent) / prog.total)) : 0
 
   return (
@@ -152,19 +210,61 @@ function OtaControl({ mac, fwVersion }) {
           {acting ? '…' : 'Update'}
         </button>
       )}
-      {active && (
+      {active && queued && (
+        <span class="hint">queued — starts at the node's next wake</span>
+      )}
+      {active && !queued && (
         <>
           <progress max="100" value={pct} />
           <span class="hint">{pct}%</span>
-          <button onClick={doAbort} disabled={acting}>{acting ? '…' : 'Abort'}</button>
         </>
       )}
+      {active && <button onClick={doAbort} disabled={acting}>{acting ? '…' : 'Abort'}</button>}
       {msg && <span class="error">{msg}</span>}
     </span>
   )
 }
 
-function Row({ n, fwVersion, onSaved, onForgotten }) {
+// Per-node power-mode control: a three-option select that POSTs
+// {"power_mode": ...} ALONE on change (per Task 6's contract -- resending name
+// isn't needed and isn't sent). Controlled straight off `n.power_mode` rather
+// than buffered local state (contrast Row's `name` field, which has an
+// explicit Save button): there's no separate save step here, the select's
+// onChange IS the save, so the parent's node list is the only source of truth.
+function PowerModeControl({ n, onSaved }) {
+  const [state, setState] = useState('idle') // idle | saving | error | unauth
+
+  async function onChange(e) {
+    const mode = e.currentTarget.value
+    setState('saving')
+    try {
+      const res = await fetch(`/api/v1/nodes/${macPath(n.mac)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ power_mode: mode }),
+      })
+      if (res.ok) { setState('idle'); onSaved(n.mac, mode) }
+      else setState(res.status === 401 ? 'unauth' : 'error')
+    } catch {
+      setState('error')
+    }
+  }
+
+  return (
+    <span class="power-mode-control">
+      <select value={n.power_mode} disabled={state === 'saving'} onChange={onChange}>
+        <option value="always_on">{POWER_MODE_LABELS.always_on}</option>
+        <option value="battery_15">{POWER_MODE_LABELS.battery_15}</option>
+        <option value="battery_60">{POWER_MODE_LABELS.battery_60}</option>
+      </select>
+      {n.power_mode_pending && <span class="hint">{pendingHint(n)}</span>}
+      {state === 'error' && <span class="error">failed</span>}
+      {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
+    </span>
+  )
+}
+
+function Row({ n, fwVersion, onSaved, onForgotten, onPowerModeSaved }) {
   const [name, setName] = useState(n.name || '')
   const [state, setState] = useState('idle') // idle | saving | saved | error | unauth
   const [forgetting, setForgetting] = useState(false)
@@ -222,9 +322,15 @@ function Row({ n, fwVersion, onSaved, onForgotten }) {
         </form>
       </td>
       <td class="mono">{n.mac}</td>
-      <td>{n.last_seen_s != null ? fmtAgo(n.last_seen_s) : 'never'}</td>
+      <td>
+        {n.last_seen_s != null ? fmtAgo(n.last_seen_s) : 'never'}
+        <span class="hint"> · {n.reported_mode_valid ? (REPORTED_MODE_LABELS[n.reported_mode] || n.reported_mode) : '—'}</span>
+      </td>
       <td>{n.frames_rx}</td>
       <td>{n.rssi != null ? `${n.rssi} dBm` : '–'}</td>
+      <td>
+        <PowerModeControl n={n} onSaved={onPowerModeSaved} />
+      </td>
       <td>
         <OtaControl mac={n.mac} fwVersion={fwVersion} />
       </td>
@@ -305,6 +411,17 @@ export function NodesTab() {
     setNodes((prev) => prev.filter((n) => n.mac !== mac))
   }
 
+  // Optimistically flips power_mode_pending to true: right after a successful
+  // POST, the node's last-reported mode almost certainly still differs from
+  // the newly-desired one (matching swarm.c's own pending computation), so
+  // this avoids a dead window showing neither the old nor the pending state
+  // until the next 10s background poll (refreshNodes) catches up. reported_mode/
+  // reported_mode_valid are left untouched -- those only ever change via a real
+  // CHECKIN, never via this operator-initiated POST.
+  function onPowerModeSaved(mac, power_mode) {
+    setNodes((prev) => prev.map((n) => (n.mac === mac ? { ...n, power_mode, power_mode_pending: true } : n)))
+  }
+
   async function doAddNode() {
     setBusy('pair')
     try {
@@ -346,11 +463,12 @@ export function NodesTab() {
       ) : (
         <table class="devices">
           <thead>
-            <tr><th>Name</th><th>MAC</th><th>Last seen</th><th>Frames</th><th>RSSI</th><th>Firmware</th><th></th></tr>
+            <tr><th>Name</th><th>MAC</th><th>Last seen</th><th>Frames</th><th>RSSI</th><th>Power mode</th><th>Firmware</th><th></th></tr>
           </thead>
           <tbody>
             {nodes.map((n) => (
-              <Row key={n.mac} n={n} fwVersion={fwVersion} onSaved={onSaved} onForgotten={onForgotten} />
+              <Row key={n.mac} n={n} fwVersion={fwVersion} onSaved={onSaved} onForgotten={onForgotten}
+                   onPowerModeSaved={onPowerModeSaved} />
             ))}
           </tbody>
         </table>

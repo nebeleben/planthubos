@@ -70,8 +70,18 @@ void ota_rollback_guard_start_node(void)
 void ota_rollback_guard_node_confirm(const char *reason)
 {
     if (!s_node_pending || s_node_confirmed) return;
-    s_node_confirmed = true;
+    /* Fix (code review, M5c-era latent bug): this used to latch
+     * s_node_confirmed = true BEFORE calling
+     * esp_ota_mark_app_valid_cancel_rollback(), so a transient flash
+     * failure on that call was recorded as a success -- every LATER health
+     * signal this boot (another delivered reading, another PONG, another
+     * CHECKIN_ACK) then hit the s_node_confirmed guard above and silently
+     * did nothing, leaving the image genuinely unconfirmed with no way to
+     * retry short of a reboot. Only latch on ESP_OK, so a failure here
+     * still leaves s_node_confirmed false and the next health signal gets
+     * a real second attempt. */
     esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    if (err == ESP_OK) s_node_confirmed = true;
     ESP_LOGW(TAG, "node healthy (%s), image confirmed (rollback cancelled): %s",
              reason ? reason : "?", esp_err_to_name(err));
 }

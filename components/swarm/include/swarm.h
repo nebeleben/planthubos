@@ -1,5 +1,6 @@
 #pragma once
 #include "esp_err.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -50,6 +51,17 @@ int swarm_node_list_json(char *buf, size_t cap);
  * (verification aid; also the "frames_rx_total" field of the JSON above). */
 uint32_t swarm_frames_rx(void);
 
+/* Hub (M7): the given node's last self-reported power mode (SWARM_PM_*,
+ * swarm_store.h), from its most recent accepted CHECKIN this boot -- the
+ * same RAM stats slot GET /api/v1/nodes' "reported_mode"/"reported_mode_valid"
+ * fields come from (swarm_node_list_json()). Returns false (mode_out
+ * untouched) if this node has never checked in this boot -- callers must
+ * treat that as unknown, not as "reported ALWAYS_ON". node_ota.c's
+ * node_ota_start() uses this to decide whether a push should park
+ * (NODE_OTA_ST_PENDING_WAKE) rather than stream immediately. Safe to call
+ * from any task. */
+bool swarm_node_reported_mode(const uint8_t mac[6], uint8_t *mode_out);
+
 /* Hub: called when a node is forgotten (api_v1.c's DELETE handler) -- clears
  * that MAC's per-node RAM stats slot (frames_rx/last_seen_s/rssi), if it has
  * one, under the same mutex record_stat() uses. Without this, a forgotten
@@ -94,3 +106,20 @@ void swarm_broadcast_forget(const uint8_t mac[6]);
  * so the reverse dependency would be circular -- main.c, which depends on
  * both, does the wiring. */
 void swarm_node_set_health_cb(void (*cb)(const char *reason));
+
+/* Battery-mode wake cycle (spec §4). Called from main.c's node-paired
+ * branch INSTEAD OF returning to a plain always-on run, when
+ * swarm_store_power_mode() != SWARM_PM_ALWAYS_ON. Runs the bounded wake
+ * (scan/forward via the already-started node machinery), sends CHECKIN,
+ * applies the ack, and either deep-sleeps (never returns) or returns
+ * ESP_OK meaning "continue as always-on" (mode changed / fallback /
+ * stay-awake ended). Requires swarm_start_node() to have succeeded.
+ *
+ * Threading: main.c runs this from its own dedicated "batt_cycle" task
+ * (app_main() itself must still return), never directly from app_main --
+ * see main.c's own comment on that task for why. This function performs
+ * NVS writes (wake counter, failed wakes, power mode) and blocking sends,
+ * neither of which is safe on node_rx_cb (the ESP-NOW receive callback,
+ * WiFi driver task) -- that callback's only involvement is queuing a
+ * decoded CHECKIN_ACK for this function to pick up. */
+esp_err_t swarm_node_battery_cycle(void);

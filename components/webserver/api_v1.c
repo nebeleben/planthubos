@@ -26,7 +26,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "api_v1";
-#define FW_VERSION "0.8.0"
+#define FW_VERSION "0.9.0"
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -497,10 +497,41 @@ static esp_err_t nodes_pair_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* POST /api/v1/nodes/{MAC12} body {"name":"..."} -- rename (empty clears). */
-static esp_err_t node_rename_post(httpd_req_t *req, const uint8_t mac[6])
+/* M7: power_mode's wire string -> swarm_power_mode_t. Mirrors (does not
+ * share code with) swarm.c's power_mode_str() -- see that function's
+ * comment for why this stays a small independent table rather than a
+ * shared header. Only the three exact strings below are accepted; anything
+ * else (wrong type, typo, unknown value) returns false so the caller can
+ * answer 400 "bad power_mode" per the HTTP contract. */
+static bool power_mode_from_str(const char *s, swarm_power_mode_t *out)
 {
-    char body[64];
+    if (!s) return false;
+    if (strcmp(s, "always_on") == 0)  { *out = SWARM_PM_ALWAYS_ON;  return true; }
+    if (strcmp(s, "battery_15") == 0) { *out = SWARM_PM_BATTERY_15; return true; }
+    if (strcmp(s, "battery_60") == 0) { *out = SWARM_PM_BATTERY_60; return true; }
+    return false;
+}
+
+/* POST /api/v1/nodes/{MAC12} body {"name":"...","power_mode":"..."} --
+ * rename (empty name clears) and/or set the node's DESIRED power mode
+ * (swarm_store_set_node_desired_mode(), Task 3 -- what GET /api/v1/nodes'
+ * "power_mode"/"power_mode_pending" fields, added alongside this handler,
+ * report). Either field may be omitted entirely; but a field that IS
+ * present must be well-formed -- a present-but-wrong-type "name" or
+ * "power_mode" always 400s (see the two checks below), it is never
+ * silently ignored just because the other field is valid. At least one of
+ * a valid "name" or a valid "power_mode" must be present, same as the
+ * name-only contract this handler had before M7. Both fields are
+ * validated before any store write, so a bad field never leaves a
+ * partially-applied rename/mode-change behind (400, body untouched) --
+ * unknown mac is checked by the store calls themselves and reported as 404
+ * either way. 128 bytes
+ * comfortably covers the worst case (a full 24-byte SWARM_NODE_NAME_LEN
+ * name plus a "battery_15"/"battery_60" power_mode in the same body, ~61
+ * bytes of JSON) with headroom. */
+static esp_err_t node_update_post(httpd_req_t *req, const uint8_t mac[6])
+{
+    char body[128];
     if (req->content_len == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
         return ESP_OK;
@@ -524,8 +555,46 @@ static esp_err_t node_rename_post(httpd_req_t *req, const uint8_t mac[6])
 
     cJSON *json = cJSON_Parse(body);
     const cJSON *name = cJSON_GetObjectItem(json, "name");
-    esp_err_t err = cJSON_IsString(name) ? swarm_store_set_node_name(mac, name->valuestring)
-                                         : ESP_ERR_INVALID_ARG;
+    const cJSON *pm = cJSON_GetObjectItem(json, "power_mode");
+
+    swarm_power_mode_t mode = SWARM_PM_ALWAYS_ON;
+    bool have_mode = false;
+    if (pm != NULL) {
+        if (!cJSON_IsString(pm) || !power_mode_from_str(pm->valuestring, &mode)) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad power_mode");
+            return ESP_OK;
+        }
+        have_mode = true;
+    }
+    /* Symmetric with power_mode above: a PRESENT-but-wrong-type field is a
+     * malformed request (400), not "not requested" -- only outright
+     * absence (cJSON_GetObjectItem returning NULL) means the caller didn't
+     * intend to touch that field at all. This was the pre-M7 contract for
+     * "name" (this route unconditionally 400'd "invalid name" whenever the
+     * body's "name" wasn't a string) and adding power_mode must not weaken
+     * it: a present-but-malformed name must 400 even when a valid
+     * power_mode also came along in the same body, exactly like a
+     * present-but-malformed power_mode above 400s regardless of "name". */
+    bool have_name = false;
+    if (name != NULL) {
+        if (!cJSON_IsString(name)) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid name");
+            return ESP_OK;
+        }
+        have_name = true;
+    }
+
+    if (!have_mode && !have_name) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid name");
+        return ESP_OK;
+    }
+
+    esp_err_t err = ESP_OK;
+    if (have_name) err = swarm_store_set_node_name(mac, name->valuestring);
+    if (err == ESP_OK && have_mode) err = swarm_store_set_node_desired_mode(mac, mode);
     cJSON_Delete(json);
 
     if (err == ESP_ERR_NOT_FOUND) {
@@ -623,7 +692,7 @@ static esp_err_t node_post_dispatch(httpd_req_t *req)
 
     if (strcmp(suffix, "/ota") == 0) return node_ota_start_post(req, mac);
     if (strcmp(suffix, "/ota/abort") == 0) return node_ota_abort_post(req, mac);
-    return node_rename_post(req, mac);
+    return node_update_post(req, mac);
 }
 
 /* GET /api/v1/nodes/{MAC12}/ota -- progress of the hub-wide node_ota.c
@@ -647,6 +716,14 @@ static esp_err_t node_ota_get(httpd_req_t *req)
     node_ota_progress(&p);
     bool for_this_node = p.state != OTA_ST_IDLE && memcmp(p.mac, mac, 6) == 0;
 
+    /* M7: p.state carries NODE_OTA_ST_PENDING_WAKE (4, node_ota.h) verbatim
+     * when node_ota_start() parked this session waiting for the target
+     * battery node's next CHECKIN -- it lives in the same uint8_t as the
+     * wire OTA_ST_* values (swarm_frame.h, which only defines 0-3) and
+     * needs no extra mapping here to reach the client as "state":4. This
+     * handler intentionally has no opinion on what state 4 MEANS to a
+     * human; that wording belongs to the UI (Task 7), same as every other
+     * numeric state value already returned here. */
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "active", for_this_node && p.active);
     cJSON_AddNumberToObject(root, "state", for_this_node ? p.state : OTA_ST_IDLE);

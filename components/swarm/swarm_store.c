@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
+#include <inttypes.h>
 #include <string.h>
 
 static const char *TAG = "swarm_store";
@@ -13,6 +14,13 @@ static const char *TAG = "swarm_store";
 #define KEY_NODES "sw_nodes"
 #define KEY_PFAIL "sw_pfail"
 #define KEY_OTADONE "sw_otadn"
+/* Node side (M7): this device's OWN power mode + battery bookkeeping --
+ * see swarm_store.h. Deliberately separate scalar keys, not folded into
+ * any blob, so each can be updated independently on every checkin without
+ * rewriting the others. */
+#define KEY_PM  "sw_pm"
+#define KEY_FWK "sw_fwk"
+#define KEY_WKC "sw_wkc"
 
 typedef struct __attribute__((packed)) {
     uint8_t mac[6];
@@ -33,6 +41,8 @@ typedef struct __attribute__((packed)) {
     uint8_t mac[6];
     uint8_t lmk[SWARM_LMK_LEN];
     char    name[SWARM_NODE_NAME_LEN + 1];  /* "" = unset */
+    uint8_t desired_mode;  /* SWARM_PM_*; appended at the end for format 2 --
+                             * see the migration in load_nodes_blob() below. */
 } node_entry_t;
 
 typedef struct __attribute__((packed)) {
@@ -56,6 +66,23 @@ typedef struct __attribute__((packed)) {
     uint8_t count;
     node_entry_v0_t n[SWARM_STORE_V0_MAX_NODES];
 } nodes_blob_v0_t;
+
+/* Format 1's on-disk layout (M5b/M5c, pre-M7): identical to node_entry_t/
+ * nodes_blob_t above minus the trailing desired_mode byte. A blob with
+ * exactly this length (and format byte 1) is the format-1 -> format-2
+ * migration trigger -- see load_nodes_blob() below. Kept private to this
+ * translation unit, same reasoning as nodes_blob_v0_t above. */
+typedef struct __attribute__((packed)) {
+    uint8_t mac[6];
+    uint8_t lmk[SWARM_LMK_LEN];
+    char    name[SWARM_NODE_NAME_LEN + 1];
+} node_entry_v1_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t format;
+    uint8_t count;
+    node_entry_v1_t n[SWARM_MAX_NODES];
+} nodes_blob_v1_t;
 
 /* ---------------- Locking invariant (M5c) ----------------
  *
@@ -138,6 +165,9 @@ static nodes_blob_t s_nodes;
 static bool s_pair_failed;
 static bool s_ota_done_set;
 static ota_done_blob_t s_ota_done;
+static swarm_power_mode_t s_power_mode;
+static uint32_t s_failed_wakes;
+static uint32_t s_wake_counter;
 
 static esp_err_t write_blob(const char *key, const void *data, size_t len)
 {
@@ -267,31 +297,98 @@ static esp_err_t persist_pair_failed(void)
     return err;
 }
 
-/* Loads the KEY_NODES blob into *out, migrating an M5a-format blob in
- * place if that's what's stored.
+static esp_err_t persist_power_mode(void)
+{
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    swarm_power_mode_t m = s_power_mode;
+    xSemaphoreGive(s_mutex);
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, KEY_PM, (uint8_t)m);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreGive(s_nvs_mutex);
+    return err;
+}
+
+static esp_err_t persist_failed_wakes(void)
+{
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint32_t n = s_failed_wakes;
+    xSemaphoreGive(s_mutex);
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_u32(h, KEY_FWK, n);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreGive(s_nvs_mutex);
+    return err;
+}
+
+static esp_err_t persist_wake_counter(void)
+{
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint32_t n = s_wake_counter;
+    xSemaphoreGive(s_mutex);
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_u32(h, KEY_WKC, n);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreGive(s_nvs_mutex);
+    return err;
+}
+
+/* Loads the KEY_NODES blob into *out, migrating an M5a-format (v0) or
+ * format-1 (M5b/M5c, pre-M7) blob in place if that's what's stored.
  *
- * M5a accepted this blob on exact-length match only, and raising
- * SWARM_MAX_NODES from 4 to 6 changes that length (a longer fixed-size
- * array), so the naive "wrong length -> treat as absent" fallback that
- * already existed here for corrupt/foreign data would, without this
+ * M5a accepted this blob on exact-length match only, and each subsequent
+ * layout change (M5b/M5c raising SWARM_MAX_NODES 4->6; M7 appending
+ * desired_mode) changes that length again (a longer fixed-size array or a
+ * wider entry), so the naive "wrong length -> treat as absent" fallback
+ * that already existed here for corrupt/foreign data would, without this
  * function, also silently discard every already-paired node's table on
- * the very first boot after this upgrade. Three cases, decided purely by
- * the blob's on-disk LENGTH (an M5a blob carries no format byte to key
- * off instead):
+ * the very first boot after each upgrade. Four cases, decided purely by
+ * the blob's on-disk LENGTH (an M5a/v0 blob carries no format byte to key
+ * off instead; v1 and the current format both do):
  *
- *   1. Length == sizeof(nodes_blob_t) (current format): read it and check
- *      the leading format byte. A match is loaded as-is. A MISMATCH means
- *      some future format bumped this again without a migration branch
- *      landing here yet, or on-flash corruption -- either way the layout
- *      cannot be trusted, so it is discarded (loudly) rather than risk
- *      misreading node MACs/LMKs from a different shape as real ones.
- *   2. Length == sizeof(nodes_blob_v0_t) (M5a's exact shape, no format
- *      byte): read with the OLD parser, copy every entry across (name
- *      left empty -- M5a had no names), and immediately persist the
- *      result in the new format. This is the migration: a device
- *      carrying an M5a blob keeps its pairing, gains an empty name per
- *      node, and never has to re-pair.
- *   3. Anything else (including "key absent", the fresh-install case):
+ *   1. Length == sizeof(nodes_blob_t) (current format, 2): read it and
+ *      check the leading format byte. A match is loaded as-is. A
+ *      MISMATCH means some future format bumped this again without a
+ *      migration branch landing here yet, or on-flash corruption --
+ *      either way the layout cannot be trusted, so it is discarded
+ *      (loudly) rather than risk misreading node MACs/LMKs from a
+ *      different shape as real ones.
+ *   2. Length == sizeof(nodes_blob_v1_t) (format 1's exact shape): same
+ *      format-byte check as case 1 (expecting 1, not the current format),
+ *      same discard-loudly-on-mismatch reasoning. A match is the M7
+ *      migration: read with the OLD (v1) parser, copy mac/lmk/name across
+ *      unchanged, default desired_mode = SWARM_PM_ALWAYS_ON for every
+ *      entry (a pre-M7 device never had a mode to remember, and
+ *      ALWAYS_ON is the same "never sleeps" behaviour it already had),
+ *      and immediately persist the result as format 2. A device carrying
+ *      a format-1 blob keeps every node's mac/lmk/name intact and never
+ *      has to re-pair.
+ *   3. Length == sizeof(nodes_blob_v0_t) (M5a's exact shape, no format
+ *      byte): read with the OLD (v0) parser, copy every entry across
+ *      (name left empty -- M5a had no names; desired_mode defaulted to
+ *      SWARM_PM_ALWAYS_ON, same as case 2), and immediately persist the
+ *      result in the current format. A device carrying an M5a blob keeps
+ *      its pairing, gains an empty name and ALWAYS_ON mode per node, and
+ *      never has to re-pair.
+ *   4. Anything else (including "key absent", the fresh-install case):
  *      start with an empty table. This matches M5a's own behaviour for a
  *      blob it didn't recognise.
  *
@@ -334,6 +431,53 @@ static void load_nodes_blob(nvs_handle_t h, nodes_blob_t *out)
         return;
     }
 
+    if (len == sizeof(nodes_blob_v1_t)) {
+        nodes_blob_v1_t old;
+        size_t rlen = sizeof(old);
+        if (nvs_get_blob(h, KEY_NODES, &old, &rlen) != ESP_OK || rlen != sizeof(old)) {
+            ESP_LOGW(TAG, "format-1 nodes blob read failed; starting with an empty node table");
+            return;
+        }
+        if (old.format != 1) {
+            ESP_LOGE(TAG, "nodes blob has unknown format byte %u (expected 1) at the "
+                          "format-1 length -- DISCARDING it rather than trusting an "
+                          "unrecognised layout; every paired node is lost until re-paired",
+                     old.format);
+            return;
+        }
+        uint8_t n = old.count;
+        if (n > SWARM_MAX_NODES) n = SWARM_MAX_NODES;  /* defensive */
+        ESP_LOGW(TAG, "migrating format-1 node table (%u node(s)) to format %u",
+                 n, (unsigned)SWARM_STORE_FORMAT);
+
+        nodes_blob_t migrated;
+        memset(&migrated, 0, sizeof(migrated));
+        migrated.format = SWARM_STORE_FORMAT;
+        migrated.count = n;
+        for (uint8_t i = 0; i < n; i++) {
+            memcpy(migrated.n[i].mac, old.n[i].mac, 6);
+            memcpy(migrated.n[i].lmk, old.n[i].lmk, SWARM_LMK_LEN);
+            memcpy(migrated.n[i].name, old.n[i].name, sizeof(migrated.n[i].name));
+            migrated.n[i].desired_mode = SWARM_PM_ALWAYS_ON;
+        }
+
+        esp_err_t werr = write_blob(KEY_NODES, &migrated, sizeof(migrated));
+        if (werr != ESP_OK) {
+            /* Same tradeoff as the v0 migration below: keep the migrated
+             * data in RAM for this boot even though the flash write
+             * failed -- losing the pairing THIS boot despite having just
+             * proven we could read it would be strictly worse. The next
+             * successful write (a rename, a forget, a mode change, a
+             * fresh pairing) persists it. */
+            ESP_LOGE(TAG, "failed to persist migrated node table: %s (kept in RAM for this "
+                          "boot only; will retry on the next write)", esp_err_to_name(werr));
+        } else {
+            ESP_LOGI(TAG, "node table migration complete, %u node(s) preserved", n);
+        }
+        *out = migrated;
+        return;
+    }
+
     if (len == sizeof(nodes_blob_v0_t)) {
         nodes_blob_v0_t old;
         size_t rlen = sizeof(old);
@@ -354,7 +498,9 @@ static void load_nodes_blob(nvs_handle_t h, nodes_blob_t *out)
         for (uint8_t i = 0; i < n; i++) {
             memcpy(migrated.n[i].mac, old.n[i].mac, 6);
             memcpy(migrated.n[i].lmk, old.n[i].lmk, SWARM_LMK_LEN);
-            /* migrated.n[i].name stays "" -- M5a had no names to carry over */
+            /* migrated.n[i].name stays "" (M5a had no names to carry over)
+             * and migrated.n[i].desired_mode stays SWARM_PM_ALWAYS_ON (0,
+             * from the memset above) -- M5a had no modes either. */
         }
 
         esp_err_t werr = write_blob(KEY_NODES, &migrated, sizeof(migrated));
@@ -373,9 +519,10 @@ static void load_nodes_blob(nvs_handle_t h, nodes_blob_t *out)
         return;
     }
 
-    ESP_LOGW(TAG, "nodes blob has unrecognised length %d (expected %d for the current format or "
-                  "%d for M5a); starting with an empty node table",
-             (int)len, (int)sizeof(nodes_blob_t), (int)sizeof(nodes_blob_v0_t));
+    ESP_LOGW(TAG, "nodes blob has unrecognised length %d (expected %d for the current format, "
+                  "%d for format 1, or %d for M5a); starting with an empty node table",
+             (int)len, (int)sizeof(nodes_blob_t), (int)sizeof(nodes_blob_v1_t),
+             (int)sizeof(nodes_blob_v0_t));
 }
 
 esp_err_t swarm_store_init(void)
@@ -394,6 +541,9 @@ esp_err_t swarm_store_init(void)
     s_pair_failed = false;
     s_ota_done_set = false;
     memset(&s_ota_done, 0, sizeof(s_ota_done));
+    s_power_mode = SWARM_PM_ALWAYS_ON;
+    s_failed_wakes = 0;
+    s_wake_counter = 0;
 
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return ESP_OK;  /* fresh NVS = defaults */
@@ -438,15 +588,34 @@ esp_err_t swarm_store_init(void)
                      && ota_done_len == sizeof(s_ota_done);
     if (!s_ota_done_set) memset(&s_ota_done, 0, sizeof(s_ota_done));
 
+    /* Node side (M7): own power mode + battery bookkeeping -- see
+     * swarm_store.h. Absent (fresh install, or a device that predates M7)
+     * just means "nothing learned yet"; the defaults set above already
+     * match what a pre-M7 device did (never sleeps, no wakes recorded). */
+    uint8_t pm_byte;
+    if (nvs_get_u8(h, KEY_PM, &pm_byte) == ESP_OK) {
+        if (SWARM_PM_VALID(pm_byte)) {
+            s_power_mode = (swarm_power_mode_t)pm_byte;
+        } else {
+            ESP_LOGW(TAG, "invalid stored power mode byte %u; defaulting to ALWAYS_ON", pm_byte);
+        }
+    }
+    uint32_t fwk;
+    if (nvs_get_u32(h, KEY_FWK, &fwk) == ESP_OK) s_failed_wakes = fwk;
+    uint32_t wkc;
+    if (nvs_get_u32(h, KEY_WKC, &wkc) == ESP_OK) s_wake_counter = wkc;
+
     nvs_close(h);
     /* hub_channel logged unconditionally (0 when !hub_paired) so a stored
      * channel is visible at a glance at every boot, not just inferred from
      * a separate pairing-time log line -- makes a hub/node channel
      * mismatch obvious in the console. */
     ESP_LOGI(TAG, "role=%d hub_paired=%d hub_channel=%u hub_country=%s nodes=%d pair_failed=%d "
-                  "completed_ota_session=%d",
+                  "completed_ota_session=%d power_mode=%u failed_wakes=%" PRIu32
+                  " wake_counter=%" PRIu32,
              s_role, s_hub_set, s_hub.channel, s_hub_cc_set ? s_hub_cc : "(default)",
-             s_nodes.count, s_pair_failed, s_ota_done_set);
+             s_nodes.count, s_pair_failed, s_ota_done_set, s_power_mode, s_failed_wakes,
+             s_wake_counter);
     return ESP_OK;
 }
 
@@ -582,6 +751,77 @@ esp_err_t swarm_store_clear_hub(void)
     return err;
 }
 
+swarm_power_mode_t swarm_store_power_mode(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    swarm_power_mode_t m = s_power_mode;
+    xSemaphoreGive(s_mutex);
+    return m;
+}
+
+esp_err_t swarm_store_set_power_mode(swarm_power_mode_t m)
+{
+    if (!SWARM_PM_VALID(m)) return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_power_mode = m;
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = persist_power_mode();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_power_mode(%d): NVS write failed (%s); RAM cache already "
+                      "reflects the new mode and will not revert until the next successful "
+                      "write or a reboot", m, esp_err_to_name(err));
+    }
+    return err;
+}
+
+uint32_t swarm_store_failed_wakes(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint32_t n = s_failed_wakes;
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+esp_err_t swarm_store_set_failed_wakes(uint32_t n)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_failed_wakes = n;
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = persist_failed_wakes();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_failed_wakes(%" PRIu32 "): NVS write failed (%s); RAM "
+                      "cache already reflects the new count and will not revert until the next "
+                      "successful write or a reboot", n, esp_err_to_name(err));
+    }
+    return err;
+}
+
+uint32_t swarm_store_wake_counter(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint32_t n = s_wake_counter;
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+esp_err_t swarm_store_set_wake_counter(uint32_t n)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_wake_counter = n;
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = persist_wake_counter();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_wake_counter(%" PRIu32 "): NVS write failed (%s); RAM "
+                      "cache already reflects the new count and will not revert until the next "
+                      "successful write or a reboot", n, esp_err_to_name(err));
+    }
+    return err;
+}
+
 int swarm_store_node_count(void)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -712,6 +952,47 @@ esp_err_t swarm_store_forget_node(const uint8_t mac[6])
     return err;
 }
 
+swarm_power_mode_t swarm_store_node_desired_mode(const uint8_t mac[6])
+{
+    if (!mac) return SWARM_PM_ALWAYS_ON;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    swarm_power_mode_t m = SWARM_PM_ALWAYS_ON;  /* unknown mac -> same default as a fresh node */
+    for (int i = 0; i < s_nodes.count; i++) {
+        if (memcmp(s_nodes.n[i].mac, mac, 6) == 0) { m = (swarm_power_mode_t)s_nodes.n[i].desired_mode; break; }
+    }
+    xSemaphoreGive(s_mutex);
+    return m;
+}
+
+esp_err_t swarm_store_set_node_desired_mode(const uint8_t mac[6], swarm_power_mode_t m)
+{
+    if (!mac) return ESP_ERR_INVALID_ARG;
+    if (!SWARM_PM_VALID(m)) return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    nodes_blob_t blob = s_nodes;
+    blob.format = SWARM_STORE_FORMAT;
+    int idx = -1;
+    for (int i = 0; i < blob.count; i++) {
+        if (memcmp(blob.n[i].mac, mac, 6) == 0) { idx = i; break; }
+    }
+    if (idx < 0) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_NOT_FOUND;
+    }
+    blob.n[idx].desired_mode = (uint8_t)m;
+    s_nodes = blob;
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = persist_nodes();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_node_desired_mode: NVS write failed (%s); RAM cache "
+                      "already reflects the new mode and will not revert until the next "
+                      "successful write or a reboot", esp_err_to_name(err));
+    }
+    return err;
+}
+
 esp_err_t swarm_store_clear_nodes(void)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -758,7 +1039,7 @@ esp_err_t swarm_store_set_pair_failed(bool failed)
 
 esp_err_t swarm_store_reset_all(void)
 {
-    /* Best-effort across all five: keep going and report the first failure
+    /* Best-effort across all eight: keep going and report the first failure
      * rather than bailing out partway and leaving some cleared and some
      * not -- a factory reset should end up as close to fully-clean as
      * possible even if one NVS write hiccups. */
@@ -767,10 +1048,16 @@ esp_err_t swarm_store_reset_all(void)
     esp_err_t e3 = swarm_store_clear_nodes();
     esp_err_t e4 = swarm_store_set_pair_failed(false);
     esp_err_t e5 = swarm_store_clear_completed_ota_session();
+    esp_err_t e6 = swarm_store_set_power_mode(SWARM_PM_ALWAYS_ON);
+    esp_err_t e7 = swarm_store_set_failed_wakes(0);
+    esp_err_t e8 = swarm_store_set_wake_counter(0);
     if (err == ESP_OK) err = e2;
     if (err == ESP_OK) err = e3;
     if (err == ESP_OK) err = e4;
     if (err == ESP_OK) err = e5;
+    if (err == ESP_OK) err = e6;
+    if (err == ESP_OK) err = e7;
+    if (err == ESP_OK) err = e8;
     return err;
 }
 

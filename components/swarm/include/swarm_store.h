@@ -24,8 +24,24 @@
  * silently wiped every already-paired node's table on upgrade (a longer
  * fixed-size array changes the blob's length). See swarm_store.c for the
  * migration that reads an M5a-format blob (no format byte, exact old
- * length) with the old parser and rewrites it in this format. */
-#define SWARM_STORE_FORMAT 1
+ * length) with the old parser and rewrites it in this format.
+ *
+ * 2 (M7): node_entry_t gained a trailing desired_mode byte (see
+ * swarm_power_mode_t below). swarm_store.c migrates a format-1 blob in
+ * place, same shape as the format-0 (M5a) migration -- see load_nodes_blob(). */
+#define SWARM_STORE_FORMAT 2
+
+/* Power mode a battery node runs under (M7). ALWAYS_ON never sleeps and is
+ * the default for both a brand-new own-device mode and an unknown node's
+ * desired mode -- a node/hub that has never heard otherwise behaves exactly
+ * like a pre-M7 device. BATTERY_15/60 are the two checkin-interval presets;
+ * see batt_cycle.h's batt_period_s() for the actual seconds each maps to. */
+typedef enum {
+    SWARM_PM_ALWAYS_ON  = 0,
+    SWARM_PM_BATTERY_15 = 1,
+    SWARM_PM_BATTERY_60 = 2,
+} swarm_power_mode_t;
+#define SWARM_PM_VALID(m) ((m) <= SWARM_PM_BATTERY_60)
 
 /* Node display name: up to this many bytes, NUL-terminated in the buffer
  * callers pass to swarm_store_node_name(). Empty means unset. */
@@ -68,6 +84,21 @@ esp_err_t swarm_store_clear_hub(void);
 bool swarm_store_hub_country(char out[3]);
 esp_err_t swarm_store_set_hub_country(const char cc[3]);
 
+/* Node side (M7): this device's OWN power mode + battery bookkeeping.
+ * Deliberately separate NVS keys from KEY_HUB/KEY_NODES -- this is state
+ * about the device itself, not about its pairing to a hub, so it survives
+ * independently and is what node_ota.c/node_ota_recv.c's checkin path
+ * (Task 5) reads/writes every wake. Defaults when nothing is stored yet:
+ * ALWAYS_ON, 0 failed wakes, 0 wake_counter -- a node that has never set
+ * any of these behaves exactly like a pre-M7 device. set_power_mode()
+ * rejects a value SWARM_PM_VALID() disagrees with (ESP_ERR_INVALID_ARG). */
+swarm_power_mode_t swarm_store_power_mode(void);
+esp_err_t swarm_store_set_power_mode(swarm_power_mode_t m);
+uint32_t  swarm_store_failed_wakes(void);
+esp_err_t swarm_store_set_failed_wakes(uint32_t n);
+uint32_t  swarm_store_wake_counter(void);
+esp_err_t swarm_store_set_wake_counter(uint32_t n);
+
 /* Hub side: paired nodes (single node in M5a; table grows to SWARM_MAX_NODES
  * in M5b). */
 int swarm_store_node_count(void);
@@ -92,6 +123,18 @@ bool swarm_store_node_name(const uint8_t mac[6], char out[SWARM_NODE_NAME_LEN + 
  * own state. ESP_ERR_NOT_FOUND if mac isn't in the table. */
 esp_err_t swarm_store_forget_node(const uint8_t mac[6]);
 
+/* Hub side (M7): per-node desired power mode, persisted as part of the
+ * node's table entry (node_entry_t.desired_mode, format 2 -- see
+ * SWARM_STORE_FORMAT above). This is what the hub's checkin-ack path
+ * (Task 6) reconciles a node's reported mode against. The getter returns
+ * SWARM_PM_ALWAYS_ON for a mac not in the table, matching a freshly-added
+ * node's default (mirrors swarm_store_node_name()'s "" default -- an
+ * unknown/never-set node behaves like a pre-M7 always-on one). The setter
+ * rejects a value SWARM_PM_VALID() disagrees with (ESP_ERR_INVALID_ARG)
+ * and returns ESP_ERR_NOT_FOUND if mac isn't paired. */
+swarm_power_mode_t swarm_store_node_desired_mode(const uint8_t mac[6]);
+esp_err_t swarm_store_set_node_desired_mode(const uint8_t mac[6], swarm_power_mode_t m);
+
 /* Node side: true once a pairing search (pairing_node_start(), driven by
  * swarm_start_node_search()) has run to completion and failed/timed out.
  * An unpaired node checks this at boot to decide whether to actively sweep
@@ -102,10 +145,11 @@ bool      swarm_store_pair_failed(void);
 esp_err_t swarm_store_set_pair_failed(bool failed);
 
 /* Factory reset: returns this device to a fresh, role-unset state --
- * clears role, the stored hub peer, the node table and the pair-failed
- * flag. Used by claim.c's physical reset button so a node (which may run
- * no web server at all once paired) is always recoverable without
- * reflashing. */
+ * clears role, the stored hub peer, the node table, the pair-failed flag,
+ * and (M7) this device's own power mode + battery bookkeeping (mode,
+ * failed_wakes, wake_counter -- all back to their ALWAYS_ON/0/0 defaults).
+ * Used by claim.c's physical reset button so a node (which may run no web
+ * server at all once paired) is always recoverable without reflashing. */
 esp_err_t swarm_store_reset_all(void);
 
 /* Node side: identifies the most recently node_ota_recv.c-completed OTA
