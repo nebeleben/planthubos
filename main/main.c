@@ -16,6 +16,7 @@
 #include "swarm.h"
 #include "swarm_store.h"
 #include "integrations.h"
+#include "plants.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -169,6 +170,20 @@ void app_main(void)
              * swarm_start_main() as the only addition. */
             esp_err_t serr = swarm_start_main();
             if (serr != ESP_OK) ESP_LOGE(TAG, "swarm (main) start failed (%s)", esp_err_to_name(serr));
+
+            /* M8 Task 2: hub-only plant registry, NVS-backed -- see
+             * plants.h. Hub role only (nodes keep no plants), so this lives
+             * inside the role != NODE branch rather than up at the
+             * littlefs/data_core block above. storage_base mirrors
+             * sampler_start()'s own storage_ok gating just below: NULL when
+             * the littlefs mount failed, so plants_delete()'s ring-file
+             * cleanup degrades to a no-op instead of failing. Never fails
+             * boot on its own account (see plants.h) -- log-and-continue,
+             * same treatment as littlefs/timekeeper above, not
+             * ESP_ERROR_CHECK. */
+            esp_err_t perr = plants_init(storage_ok ? "/storage" : NULL);
+            if (perr != ESP_OK) ESP_LOGE(TAG, "plants_init failed (%s); plant registry unavailable", esp_err_to_name(perr));
+
             esp_err_t ierr = integrations_start();
             if (ierr != ESP_OK) ESP_LOGE(TAG, "integrations start failed (%s); continuing without them", esp_err_to_name(ierr));
         }
