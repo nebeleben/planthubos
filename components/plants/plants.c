@@ -1,10 +1,13 @@
 #include "plants.h"
+#include "plants_migrate.h"
 #include "storage.h"
 #include "timekeeper.h"
+#include "app_config.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
+#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -234,6 +237,245 @@ static void load_blob(nvs_handle_t h, plants_table_t *out)
     *out = t;
 }
 
+/* ---------------- One-boot migration (M8 Task 4) ----------------
+ *
+ * Executor half of plants_migrate.h's pure planner: discovers what the
+ * pre-M8 sensor-keyed world left lying around, hands it to
+ * plants_migrate_plan() (which mutates s_table in place), then performs
+ * the renames/NVS-name deletions the returned actions describe. Runs once,
+ * synchronously, from plants_init() -- strictly before any other task can
+ * reach s_table (plants_init() is called synchronously from app_main()
+ * before sampler_start()/webserver_start()), so this touches s_table and
+ * s_storage_base directly, unlocked, same as load_blob() just above.
+ *
+ * Discovery has two independent legs, per the design spec's "for each
+ * sensor with an NVS name OR an existing ring, create a plant":
+ *   1. Legacy ring files directly under storage_base, named
+ *      "<MAC12>_raw.bin" / "<MAC12>_hr.bin" -- the MAC-keyed naming
+ *      storage.c used before M8 Task 3's P<id>-rekey (that task's own
+ *      commit message: "key history rings by plant id"; NOT "_hourly.bin"
+ *      -- tier_path() has only ever emitted "_hr.bin", the same suffix
+ *      Task 3's report flagged plants_delete() for getting wrong once
+ *      already).
+ *   2. NVS sensor-name keys with no matching ring file at all (a sensor
+ *      that was named but never sampled/never had history). app_config.c's
+ *      name_key() keys these "nm_<MAC12>" in the shared "planthub"
+ *      namespace -- an enumerable, recognisable prefix -- so these are NOT
+ *      skipped: nvs_entry_find() walks every "nm_" key, and any mac not
+ *      already found via leg 1 gets an input entry with has_raw/has_hourly
+ *      false, has_name true (planner creates a plant, no renames).
+ *
+ * Idempotent by construction: after a successful migration the MAC-named
+ * files are gone (renamed away) and the NVS name keys are erased, so a
+ * second boot's discovery finds nothing and plants_migrate_plan() also
+ * skips any mac defensively already present in the table -- either way,
+ * `in` ends up empty or every mac in it is already known, so 0 actions. */
+
+#define MIGRATE_MAX_INPUTS 32   /* generous headroom over PLANTS_MAX (16) */
+
+static int hex_val(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void hex12_to_mac(const char *hex12, uint8_t mac[6])
+{
+    for (int i = 0; i < 6; i++) {
+        mac[i] = (uint8_t)((hex_val(hex12[i * 2]) << 4) | hex_val(hex12[i * 2 + 1]));
+    }
+}
+
+/* True iff `s` is exactly 12 upper-case hex characters -- the
+ * "^[0-9A-F]{12}" half of the legacy ring filename shape. */
+static bool is_upper_hex12(const char *s)
+{
+    for (int i = 0; i < 12; i++) {
+        if (hex_val(s[i]) < 0) return false;
+    }
+    return true;
+}
+
+typedef enum { LEGACY_NONE, LEGACY_RAW, LEGACY_HR } legacy_kind_t;
+
+/* Matches "<MAC12>_raw.bin" / "<MAC12>_hr.bin" (storage.c's pre-Task-3
+ * naming) and extracts the mac. Anything else -- including this boot's own
+ * "P<id>_raw.bin"/"P<id>_hr.bin" files -- is LEGACY_NONE. */
+static legacy_kind_t match_legacy_ring_name(const char *fname, uint8_t mac_out[6])
+{
+    size_t len = strlen(fname);
+    if (len < 14 || fname[12] != '_' || !is_upper_hex12(fname)) return LEGACY_NONE;
+
+    const char *suffix = fname + 13;
+    legacy_kind_t kind;
+    if (strcmp(suffix, "raw.bin") == 0) kind = LEGACY_RAW;
+    else if (strcmp(suffix, "hr.bin") == 0) kind = LEGACY_HR;
+    else return LEGACY_NONE;
+
+    hex12_to_mac(fname, mac_out);
+    return kind;
+}
+
+static migrate_input_t *migrate_find_or_add(migrate_input_t *ins, int *n, const uint8_t mac[6])
+{
+    for (int i = 0; i < *n; i++) {
+        if (memcmp(ins[i].mac, mac, 6) == 0) return &ins[i];
+    }
+    if (*n >= MIGRATE_MAX_INPUTS) return NULL;
+    migrate_input_t *e = &ins[*n];
+    memset(e, 0, sizeof(*e));
+    memcpy(e->mac, mac, 6);
+    (*n)++;
+    return e;
+}
+
+/* Leg 1: scan storage_base for legacy ring files, one input entry per
+ * distinct mac with has_raw/has_hourly set from whichever files exist. */
+static void migrate_scan_ring_files(migrate_input_t *ins, int *n)
+{
+    if (!s_storage_base) return;   /* no filesystem: nothing to scan */
+
+    DIR *d = opendir(s_storage_base);
+    if (!d) {
+        /* ENOENT for a fresh/empty storage dir is normal and not logged;
+         * anything else (permission, mount trouble) is worth a line. */
+        if (errno != ENOENT) {
+            ESP_LOGW(TAG, "migration: opendir(%s) failed: %s", s_storage_base, strerror(errno));
+        }
+        return;
+    }
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        uint8_t mac[6];
+        legacy_kind_t kind = match_legacy_ring_name(de->d_name, mac);
+        if (kind == LEGACY_NONE) continue;
+
+        migrate_input_t *in = migrate_find_or_add(ins, n, mac);
+        if (!in) {
+            ESP_LOGW(TAG, "migration: too many distinct legacy macs discovered; dropping %s", de->d_name);
+            continue;
+        }
+        if (kind == LEGACY_RAW) in->has_raw = true;
+        else in->has_hourly = true;
+    }
+    closedir(d);
+}
+
+/* Leg 2: fill in `has_name`/`name` for every mac leg 1 already found, then
+ * enumerate NVS "nm_<MAC12>" keys (app_config.c's name_key() scheme, in the
+ * shared "planthub" namespace) for named-but-fileless macs leg 1 never
+ * saw. */
+static void migrate_scan_names(migrate_input_t *ins, int *n)
+{
+    char name[33];
+    for (int i = 0; i < *n; i++) {
+        if (app_config_get_sensor_name(ins[i].mac, name)) {
+            ins[i].has_name = true;
+            strlcpy(ins[i].name, name, sizeof(ins[i].name));
+        }
+    }
+
+    nvs_iterator_t it = NULL;
+    esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, NS, NVS_TYPE_STR, &it);
+    while (err == ESP_OK) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+
+        /* "nm_" + 12 hex chars, exactly -- app_config.c's name_key(). */
+        if (strncmp(info.key, "nm_", 3) == 0 && strlen(info.key) == 15 &&
+            is_upper_hex12(info.key + 3)) {
+            uint8_t mac[6];
+            hex12_to_mac(info.key + 3, mac);
+
+            if (migrate_find_or_add(ins, n, mac) == NULL && *n >= MIGRATE_MAX_INPUTS) {
+                ESP_LOGW(TAG, "migration: too many distinct legacy macs discovered "
+                              "(NVS-name-only); dropping nm_%s", info.key + 3);
+            }
+        }
+        err = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+
+    /* migrate_find_or_add() above may have just created fresh entries for
+     * NVS-name-only macs (has_name still false, from the memset in
+     * migrate_find_or_add()) -- fill those in exactly like leg 1's macs. */
+    for (int i = 0; i < *n; i++) {
+        if (!ins[i].has_name && app_config_get_sensor_name(ins[i].mac, name)) {
+            ins[i].has_name = true;
+            strlcpy(ins[i].name, name, sizeof(ins[i].name));
+        }
+    }
+}
+
+/* Executes one planned action: rename() the ring files that exist, delete
+ * the NVS name key on a successful move_name. Per spec: log a failure and
+ * continue -- never let one bad file/key abort the rest of the boot's
+ * migration. */
+static void migrate_execute_action(const migrate_action_t *a)
+{
+    char mac_hex[13];
+    snprintf(mac_hex, sizeof(mac_hex), "%02X%02X%02X%02X%02X%02X",
+             a->mac[0], a->mac[1], a->mac[2], a->mac[3], a->mac[4], a->mac[5]);
+
+    if (a->rename_raw && s_storage_base) {
+        char oldp[128], newp[128];
+        snprintf(oldp, sizeof(oldp), "%s/%s_raw.bin", s_storage_base, mac_hex);
+        snprintf(newp, sizeof(newp), "%s/P%u_raw.bin", s_storage_base, a->plant_id);
+        if (rename(oldp, newp) != 0) {
+            ESP_LOGW(TAG, "migration: rename %s -> %s failed: %s", oldp, newp, strerror(errno));
+        }
+    }
+    if (a->rename_hourly && s_storage_base) {
+        char oldp[128], newp[128];
+        snprintf(oldp, sizeof(oldp), "%s/%s_hr.bin", s_storage_base, mac_hex);
+        snprintf(newp, sizeof(newp), "%s/P%u_hr.bin", s_storage_base, a->plant_id);
+        if (rename(oldp, newp) != 0) {
+            ESP_LOGW(TAG, "migration: rename %s -> %s failed: %s", oldp, newp, strerror(errno));
+        }
+    }
+    if (a->move_name) {
+        esp_err_t err = app_config_clear_sensor_name(a->mac);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "migration: failed to clear NVS name for %s: %s", mac_hex, esp_err_to_name(err));
+        }
+    }
+
+    ESP_LOGI(TAG, "migration: mac %s -> plant %u (raw=%d hourly=%d name=%d)",
+             mac_hex, a->plant_id, a->rename_raw, a->rename_hourly, a->move_name);
+}
+
+/* Runs from plants_init(), between the blob load and the summary log
+ * below. s_table already holds whatever load_blob() found (normally
+ * empty; plants_migrate_plan() skips any mac already in it either way). */
+static void plants_run_migration(void)
+{
+    static migrate_input_t inputs[MIGRATE_MAX_INPUTS];
+    memset(inputs, 0, sizeof(inputs));
+    int n_inputs = 0;
+
+    migrate_scan_ring_files(inputs, &n_inputs);
+    migrate_scan_names(inputs, &n_inputs);
+    if (n_inputs == 0) return;
+
+    migrate_action_t actions[PLANTS_MAX];
+    int n_actions = plants_migrate_plan(&s_table, inputs, n_inputs, actions, PLANTS_MAX);
+    if (n_actions == 0) return;
+
+    for (int i = 0; i < n_actions; i++) {
+        migrate_execute_action(&actions[i]);
+    }
+
+    esp_err_t err = persist_table();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "migration: failed to persist the plant table (%s); RAM already reflects "
+                      "the migration and will not revert until the next successful write or a "
+                      "reboot", esp_err_to_name(err));
+    }
+    ESP_LOGI(TAG, "migration: %d plant(s) migrated from sensor-keyed state", n_actions);
+}
+
 esp_err_t plants_init(const char *storage_base)
 {
     s_mutex = xSemaphoreCreateMutex();
@@ -256,8 +498,7 @@ esp_err_t plants_init(const char *storage_base)
      * plants_table_init()'s empty defaults, same as swarm_store_init()'s
      * "fresh NVS = defaults" fallback. */
 
-    /* Task 4: the one-boot plant migration hook lands here (no-op until
-     * then; plants_migrate.c is currently a stub). */
+    plants_run_migration();
 
     int count = 0;
     for (int i = 0; i < PLANTS_MAX; i++) {
