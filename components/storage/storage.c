@@ -17,6 +17,15 @@ static cache_t s_cache[CACHE_SLOTS];
 
 void storage_reset_cache(void) { memset(s_cache, 0, sizeof(s_cache)); }
 
+void storage_drop(uint8_t plant_id)
+{
+    for (int i = 0; i < CACHE_SLOTS; i++) {
+        if (s_cache[i].used && s_cache[i].plant_id == plant_id) {
+            s_cache[i].used = false;
+        }
+    }
+}
+
 static uint32_t tier_cap(storage_tier_t t) { return t == STORAGE_TIER_RAW ? STORAGE_RAW_CAP : STORAGE_HOURLY_CAP; }
 
 static void tier_path(char *out, size_t n, const char *base, uint8_t plant_id, storage_tier_t t)

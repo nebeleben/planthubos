@@ -66,6 +66,24 @@ static void sample_once(void)
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000);
     uint32_t interval_s = CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN * 60;
 
+    /* Self-healing sweep (M8 Task 6 review fix -- MEDIUM 3b, also closes
+     * Task 5's deferred "16-slot cache never frees a claimed slot" note):
+     * plant ids are never reused (plants_table.h), so a deleted plant's
+     * s_agg slot would otherwise sit claimed forever -- past PLANTS_MAX
+     * (16) lifetime create/delete cycles, every slot would be permanently
+     * pinned to a dead id and hourly aggregation would silently stop for
+     * any newer plant. Free any slot whose plant no longer exists in THIS
+     * tick's snapshot before sampling; bounded PLANTS_MAX iterations,
+     * allocation-free, same cost shape as the rest of this per-tick work.
+     * Deliberately no plants -> sampler dependency beyond what already
+     * exists here: plants_table_find_id() is a pure function over the
+     * snapshot already taken above. */
+    for (int i = 0; i < PLANTS_MAX; i++) {
+        if (s_agg_used[i] && plants_table_find_id(&plant_snap, s_agg_plant_id[i]) < 0) {
+            s_agg_used[i] = false;
+        }
+    }
+
     /* Plants are the unit of sampling (M8 Task 5): walk the plant table, not
      * the sensor registry. A plant with no assigned probe (mac_valid ==
      * false) is skipped outright -- it has nothing to sample, per spec. */

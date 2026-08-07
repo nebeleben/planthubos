@@ -317,14 +317,23 @@ static void hist_row(void *vctx, uint32_t epoch, const storage_rec_t *rec)
 }
 
 /* Parses a decimal plant id from the start of s: one or more ASCII digits,
- * stopping at '/' or the string's end; must start with a nonzero digit and
- * fit in a uint8_t (plant ids are 1-based, plants_table.h). 0 doubles as
+ * stopping at '/', '?' or the string's end; must start with a nonzero digit
+ * and fit in a uint8_t (plant ids are 1-based, plants_table.h). 0 doubles as
  * this function's own "didn't parse" sentinel, the same convention
  * plants_table.h's own 0=none/full return values already use. On success,
- * *tail_out (when non-NULL) is set to the byte right after the digits
- * (either '/' or the terminating NUL) so callers can dispatch on whatever
- * trailing path segment follows -- same shape node_post_dispatch's suffix
- * handling below uses for mac-keyed routes. */
+ * *tail_out (when non-NULL) is set to the byte right after the digits --
+ * '/', '?' or the terminating NUL -- so callers can dispatch on whatever
+ * trailing path segment follows, same shape node_post_dispatch's suffix
+ * handling below uses for mac-keyed routes.
+ *
+ * Stopping at '?' too (not just '/'/NUL) matters here in a way it doesn't
+ * for parse_mac12(): esp_http_server's req->uri KEEPS the query string
+ * (verified against this repo's installed IDF), so
+ * "/api/v1/plants/3?foo=bar" would otherwise fail to parse an id at all --
+ * *p would land on '?', neither '/' nor NUL, and the old strict check
+ * rejected that outright. Every caller below must in turn treat a
+ * *tail_out starting with '?' the same as an empty/absent suffix -- see
+ * plants_history_get()/plants_post_dispatch()/plants_delete_delete(). */
 static uint8_t parse_plant_id(const char *s, const char **tail_out)
 {
     if (*s < '1' || *s > '9') return 0;   /* must start with a nonzero digit */
@@ -335,7 +344,7 @@ static uint8_t parse_plant_id(const char *s, const char **tail_out)
         if (v > 255) return 0;
         p++;
     }
-    if (*p != '\0' && *p != '/') return 0;
+    if (*p != '\0' && *p != '/' && *p != '?') return 0;
     if (tail_out) *tail_out = p;
     return (uint8_t)v;
 }
@@ -386,7 +395,15 @@ static esp_err_t plants_history_get(httpd_req_t *req)
     const char *tail = req->uri + strlen("/api/v1/plants/");
     const char *suffix = NULL;
     uint8_t id = parse_plant_id(tail, &suffix);
-    if (id == 0 || suffix == NULL || strcmp(suffix, "/history") != 0) {
+    /* CRITICAL fix (review): req->uri retains the query string in this
+     * IDF, so "/api/v1/plants/3/history?tier=hourly" left suffix as
+     * "/history?tier=hourly" -- a bare strcmp() against "/history" 404'd
+     * every request that actually used tier/from/to, leaving the query
+     * parsing below unreachable in practice. Match the "/history" prefix
+     * and require whatever follows it to be either nothing or a query
+     * string, not an exact-string match. */
+    if (id == 0 || suffix == NULL || strncmp(suffix, "/history", 8) != 0 ||
+        (suffix[8] != '\0' && suffix[8] != '?')) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
         return ESP_OK;
     }
@@ -595,7 +612,14 @@ static esp_err_t plants_probe_post(httpd_req_t *req, uint8_t id)
  * either a bare id (rename) or an id + "/probe" (assign), both parsed and
  * dispatched right here. Auth is checked once here, not in either
  * sub-handler, mirroring node_post_dispatch's own single top-of-function
- * check. */
+ * check.
+ *
+ * Suffix matching tolerates a trailing query string ('?...') on either
+ * branch, same fix as plants_history_get() above -- req->uri keeps it, so
+ * "/3/probe?x=y" or "/3?x=y" must not be treated as an unrecognised suffix.
+ * A real-world POST is unlikely to carry a query string, but being
+ * consistent here costs nothing and avoids the exact trap that made the
+ * history route's tier/from/to parsing unreachable. */
 static esp_err_t plants_post_dispatch(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
@@ -607,8 +631,9 @@ static esp_err_t plants_post_dispatch(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad id");
         return ESP_OK;
     }
-    if (strcmp(suffix, "/probe") == 0) return plants_probe_post(req, id);
-    if (suffix[0] == '\0') return plants_rename_post(req, id);
+    if (strncmp(suffix, "/probe", 6) == 0 && (suffix[6] == '\0' || suffix[6] == '?'))
+        return plants_probe_post(req, id);
+    if (suffix[0] == '\0' || suffix[0] == '?') return plants_rename_post(req, id);
     httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
     return ESP_OK;
 }
@@ -617,15 +642,26 @@ static esp_err_t plants_post_dispatch(httpd_req_t *req)
  * files (plants_delete()); its sensor, if any, becomes unassigned (its
  * registry entry is untouched -- deleting a plant is not the same as
  * forgetting a sensor, which stays discoverable and can be assigned to a
- * different/new plant afterwards). */
+ * different/new plant afterwards).
+ *
+ * MEDIUM fix (review): the suffix after the id used to be silently
+ * discarded, so DELETE /api/v1/plants/3/anything deleted plant 3 -- a
+ * destructive route accepting an arbitrary trailing path. Require the
+ * suffix be empty or query-string-only, exactly like plants_post_dispatch()
+ * above; anything else 404s rather than deleting. */
 static esp_err_t plants_delete_delete(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
 
     const char *tail = req->uri + strlen("/api/v1/plants/");
-    uint8_t id = parse_plant_id(tail, NULL);
+    const char *suffix = NULL;
+    uint8_t id = parse_plant_id(tail, &suffix);
     if (id == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad id");
+        return ESP_OK;
+    }
+    if (suffix[0] != '\0' && suffix[0] != '?') {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
         return ESP_OK;
     }
     esp_err_t err = plants_delete(id);

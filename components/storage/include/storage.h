@@ -31,3 +31,19 @@ int  storage_query(const char *base, uint8_t plant_id, storage_tier_t tier,
                    storage_resolve_fn resolve, void *rctx,
                    storage_row_fn row, void *ctx);
 void storage_reset_cache(void);
+
+/* Frees plant_id's write-cursor cache slot(s) (both tiers, if present) for
+ * reuse by a different plant id. Plant ids are never reused (plants_table.h)
+ * and the per-tier cache is small and fixed-size (CACHE_SLOTS, storage.c) --
+ * without this, deleting a plant would permanently strand its slot(s), and
+ * repeated create/delete cycles past CACHE_SLOTS/2 distinct ids would
+ * eventually leave no free slot for ANY plant's appends, live or not (a
+ * cache_get() miss returns NULL, and storage_append() then fails outright).
+ * Does NOT touch the on-disk ring files themselves -- callers that also
+ * want those gone (e.g. plants_delete()) remove them separately; a later
+ * storage_append() for the same id (which shouldn't happen, ids aren't
+ * reused, but is harmless if it somehow did) would simply re-scan the file
+ * for its write cursor, same as after storage_reset_cache(). Safe to call
+ * for an id with no cached slot (a plant that never appended anything) --
+ * a no-op. */
+void storage_drop(uint8_t plant_id);

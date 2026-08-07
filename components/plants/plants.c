@@ -774,6 +774,16 @@ esp_err_t plants_delete(uint8_t id)
     }
 
     remove_ring_files(id);
+    /* Frees id's storage.c write-cursor cache slot(s) for reuse by a future
+     * plant (M8 Task 6 review fix -- MEDIUM 3a). Ids are never reused
+     * (plants_table.h), so without this a deleted plant's slot(s) sit
+     * claimed forever -- storage.c's per-tier cache is small and fixed-size
+     * (CACHE_SLOTS), so enough create/delete cycles would eventually leave
+     * no free slot for ANY plant's appends, live or not. Not gated on
+     * s_storage_base (unlike remove_ring_files() above): this only touches
+     * storage.c's in-RAM cache, not the filesystem, and storage_drop() is a
+     * safe no-op for an id with no cached slot either way. */
+    storage_drop(id);
     /* plants_last_values()'s RAM cache is dropped here too: ids are never
      * reused (plants_table.h), so this id will never be looked up again as
      * a live plant, but a stray caller holding onto a stale id must still
@@ -824,9 +834,10 @@ bool plants_last_values(uint8_t id, int16_t *temp_dc, uint8_t *moisture,
     xSemaphoreTake(s_lv_mutex, portMAX_DELAY);
     int idx = lv_cache_find(id);
     if (idx >= 0) {
+        /* Every cached slot is a genuine hit (see below -- a miss is never
+         * written), so there's nothing left to check beyond "is it there". */
         last_values_cache_t c = s_last_values[idx];
         xSemaphoreGive(s_lv_mutex);
-        if (!c.found) return false;
         if (temp_dc)       *temp_dc = c.temp_dc;
         if (moisture)      *moisture = c.moisture_pct;
         if (lux)           *lux = c.lux;
@@ -848,41 +859,50 @@ bool plants_last_values(uint8_t id, int16_t *temp_dc, uint8_t *moisture,
                       lv_resolve, NULL, lv_row, &scan);
     }
 
-    /* Cache the result -- found or not -- keyed by id, so a plant that
-     * genuinely has no history (e.g. never had a probe assigned) doesn't
-     * re-scan its non-existent ring file on every call. Per plants.h, this
-     * is deliberately a first-read-wins cache with no periodic refresh:
-     * plants_last_values() exists to serve probe-less plants (see plants.h),
-     * whose ring, once populated, only ever changes via plants_delete()
-     * (which drops this cache entry too, above). */
-    xSemaphoreTake(s_lv_mutex, portMAX_DELAY);
-    idx = lv_cache_find(id);
-    if (idx < 0) {
-        for (int i = 0; i < LAST_VALUES_CACHE_CAP; i++) {
-            if (!s_last_values[i].used) { idx = i; break; }
+    /* Cache ONLY a genuine hit obtained under a synced clock (M8 Task 6
+     * review fix -- MEDIUM 2). This used to cache found=false too ("found
+     * or not", keyed by id) on the theory that a plant with genuinely no
+     * history shouldn't re-scan its non-existent ring file forever. That
+     * reasoning breaks the moment the clock isn't synced yet: every record
+     * in the ring becomes momentarily unresolvable (lv_resolve() ->
+     * timekeeper_resolve() fails for every row, storage_query() skips them
+     * all -- see storage.c), so scan.found comes back false for a plant
+     * that has REAL history, and the old first-read-wins cache pinned that
+     * false result for the rest of the boot -- a GET that merely raced NTP
+     * would permanently blank a probe-less plant's last values, exactly
+     * the "nothing is blanked" guarantee plants.h promises. Not caching a
+     * miss (synced or not) costs at most a repeat scan of one plant's raw
+     * ring on the next call -- bounded and cheap -- versus a wrong answer
+     * that sticks until reboot. */
+    if (scan.found && timekeeper_synced()) {
+        xSemaphoreTake(s_lv_mutex, portMAX_DELAY);
+        idx = lv_cache_find(id);
+        if (idx < 0) {
+            for (int i = 0; i < LAST_VALUES_CACHE_CAP; i++) {
+                if (!s_last_values[i].used) { idx = i; break; }
+            }
         }
-    }
-    if (idx >= 0) {
-        last_values_cache_t *c = &s_last_values[idx];
-        c->used = true;
-        c->id = id;
-        c->found = scan.found;
-        if (scan.found) {
+        if (idx >= 0) {
+            last_values_cache_t *c = &s_last_values[idx];
+            c->used = true;
+            c->id = id;
+            c->found = true;
             c->temp_dc = scan.rec.temp_dc;
             c->moisture_pct = scan.rec.moisture_pct;
             c->lux = scan.rec.lux;
             c->conductivity_us = scan.rec.conductivity_us;
             c->battery_pct = scan.rec.battery_pct;
             c->epoch = scan.epoch;
+        } else {
+            /* Cache exhausted -- cannot happen in practice (capacity ==
+             * PLANTS_MAX and plants_delete() always frees its slot), but if
+             * it ever does this call still answers correctly, it just
+             * re-scans storage on every future call for this id instead of
+             * caching. */
+            ESP_LOGW(TAG, "plants_last_values(%u): last-values cache full; not caching this result", id);
         }
-    } else {
-        /* Cache exhausted -- cannot happen in practice (capacity ==
-         * PLANTS_MAX and plants_delete() always frees its slot), but if it
-         * ever does this call still answers correctly, it just re-scans
-         * storage on every future call for this id instead of caching. */
-        ESP_LOGW(TAG, "plants_last_values(%u): last-values cache full; not caching this result", id);
+        xSemaphoreGive(s_lv_mutex);
     }
-    xSemaphoreGive(s_lv_mutex);
 
     if (!scan.found) return false;
     if (temp_dc)       *temp_dc = scan.rec.temp_dc;

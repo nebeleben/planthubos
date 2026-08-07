@@ -117,6 +117,35 @@ int main(void)
     assert(rows.epochs[0] == 1000100 && rows.epochs[1] == 1000200);
     for (int i = 1; i < rows.n; i++) assert(rows.epochs[i] > rows.epochs[i - 1]);
 
+    /* storage_drop(): CACHE_SLOTS exhaustion + reuse (M8 Task 6 review fix
+     * -- MEDIUM 3a). Ids are never reused (plants_table.h), so without
+     * storage_drop() a deleted plant's cache slot(s) sit claimed forever;
+     * fill every one of the 32 slots (16 distinct plant ids x 2 tiers),
+     * confirm a 17th distinct id has nowhere to go (the "kills ALL future
+     * appends" failure mode the review found), then storage_drop() one busy
+     * id and confirm a DIFFERENT plant id's append now succeeds by reusing
+     * the freed slot. */
+    storage_reset_cache();
+    for (uint8_t pid = 100; pid < 100 + 16; pid++) {
+        storage_rec_t r = mk(1, 1, 111);
+        assert(storage_append(dir, pid, STORAGE_TIER_RAW, &r) == 0);
+        assert(storage_append(dir, pid, STORAGE_TIER_HOURLY, &r) == 0);
+    }
+    storage_rec_t over = mk(1, 1, 111);
+    assert(storage_append(dir, 200, STORAGE_TIER_RAW, &over) == -1);
+
+    storage_drop(100);   /* frees plant 100's raw + hourly slots */
+    assert(storage_append(dir, 200, STORAGE_TIER_RAW, &over) == 0);
+
+    /* storage_drop() only touches the cache, never the on-disk file: plant
+     * 100's earlier raw record is still there, untouched by the drop. */
+    rows.n = 0;
+    assert(storage_query(dir, 100, STORAGE_TIER_RAW, 0, 0xFFFFFFFFu, resolve, NULL, row, &rows) == 1);
+    assert(rows.epochs[0] == 1000001);
+
+    /* dropping an id with no cached slot at all is a safe no-op */
+    storage_drop(250);
+
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
     system(cmd);
