@@ -628,6 +628,20 @@ uint8_t plants_resolve_or_create(const uint8_t mac[6])
 void plants_snapshot(plants_table_t *out)
 {
     if (!out) return;
+    /* Same "uninitialised registry" guard as plants_resolve_or_create()
+     * above (M8 Task 6, forward note from Task 2's review): s_mutex is NULL
+     * until plants_init() has run, which only happens on the hub role --
+     * but webserver_start() (and therefore every GET /api/v1/plants
+     * request) runs on every role, including a NODE that fell back to its
+     * setup portal after a failed pairing attempt. Without this,
+     * that portal's plants routes would xSemaphoreTake() a NULL handle
+     * (FreeRTOS asserts/crashes on that) instead of getting the same safe
+     * "no plants" answer every other reader here gives -- an empty,
+     * freshly plants_table_init()'d table is exactly that answer. */
+    if (!s_mutex) {
+        plants_table_init(out);
+        return;
+    }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *out = s_table;
     xSemaphoreGive(s_mutex);
@@ -636,6 +650,11 @@ void plants_snapshot(plants_table_t *out)
 esp_err_t plants_rename(uint8_t id, const char *name)
 {
     if (!name || strlen(name) > PLANT_NAME_LEN) return ESP_ERR_INVALID_ARG;
+    /* Same uninitialised-registry guard as plants_snapshot() above: with no
+     * plant table loaded, every id is "unknown" -- the same answer
+     * plants_table_rename() gives for an id that just isn't present, so
+     * this reuses that exact return value rather than inventing a new one. */
+    if (!s_mutex) return ESP_ERR_NOT_FOUND;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool ok = plants_table_rename(&s_table, id, name);
@@ -653,6 +672,9 @@ esp_err_t plants_rename(uint8_t id, const char *name)
 
 esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null)
 {
+    /* Same uninitialised-registry guard as plants_rename() above. */
+    if (!s_mutex) return ESP_ERR_NOT_FOUND;
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool ok = plants_table_assign(&s_table, id, mac_or_null);
     xSemaphoreGive(s_mutex);
@@ -669,6 +691,14 @@ esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null)
 
 uint8_t plants_create(void)
 {
+    /* Same uninitialised-registry guard as plants_rename() above -- reuses
+     * 0, this function's own existing "can't create" contract (normally
+     * "table full"; here "no table at all" reads the same way to a caller,
+     * and the API layer's 409 "plant table full" response is an honest
+     * enough answer for a route that genuinely cannot create a plant right
+     * now either way). */
+    if (!s_mutex) return 0;
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     uint8_t id = plants_table_create(&s_table, NULL);
     xSemaphoreGive(s_mutex);
@@ -724,6 +754,13 @@ static void remove_ring_files(uint8_t id)
 
 esp_err_t plants_delete(uint8_t id)
 {
+    /* Same uninitialised-registry guard as plants_rename()/plants_assign()
+     * above. remove_ring_files()/lv_cache_drop() below are both no-ops in
+     * this state too (s_storage_base is NULL until plants_init() runs, and
+     * s_lv_mutex is NULL so lv_cache_drop() would itself need the same
+     * guard -- moot here since we return before reaching it). */
+    if (!s_mutex) return ESP_ERR_NOT_FOUND;
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool ok = plants_table_delete(&s_table, id);
     xSemaphoreGive(s_mutex);

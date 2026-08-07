@@ -231,14 +231,30 @@ static esp_err_t wifi_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* GET /api/v1/sensors -- demoted (M8 Task 6, spec §4) to the probe pool:
+ * radio diagnostics only (mac/battery/rssi/via/last_seen_s), plus which
+ * plant (if any) each mac is currently assigned to. Per-sensor history and
+ * rename are gone -- a sensor is just a probe now; plants are the primary
+ * entity (see plants_get() below). Unauthenticated, like every GET here.
+ *
+ * plants_snapshot() is safe to call even when plants_init() never ran (see
+ * its own doc comment) -- a pair-failed-portal NODE's webserver hits this
+ * route too, and gets an all-unassigned probe pool rather than a crash. */
 static esp_err_t sensors_get(httpd_req_t *req)
 {
     static registry_t snap;   /* 16 entries is too big for the stack; guarded by httpd single-call-per-uri */
+    static plants_table_t table;
     data_core_snapshot(&snap);
+    plants_snapshot(&table);
+    uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(root, "sensors");
     for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
-        if (snap.sensors[i].in_use) cJSON_AddItemToArray(arr, sensor_json(&snap.sensors[i]));
+        if (!snap.sensors[i].in_use) continue;
+        int pidx = plants_table_find_mac(&table, snap.sensors[i].mac);
+        uint8_t plant_id = pidx >= 0 ? table.p[pidx].id : 0;
+        cJSON_AddItemToArray(arr, probe_json(&snap.sensors[i], plant_id, now_uptime_s));
     }
     return send_json(req, root);
 }
@@ -300,29 +316,84 @@ static void hist_row(void *vctx, uint32_t epoch, const storage_rec_t *rec)
         c->failed = true;
 }
 
-static esp_err_t history_get(httpd_req_t *req)
+/* Parses a decimal plant id from the start of s: one or more ASCII digits,
+ * stopping at '/' or the string's end; must start with a nonzero digit and
+ * fit in a uint8_t (plant ids are 1-based, plants_table.h). 0 doubles as
+ * this function's own "didn't parse" sentinel, the same convention
+ * plants_table.h's own 0=none/full return values already use. On success,
+ * *tail_out (when non-NULL) is set to the byte right after the digits
+ * (either '/' or the terminating NUL) so callers can dispatch on whatever
+ * trailing path segment follows -- same shape node_post_dispatch's suffix
+ * handling below uses for mac-keyed routes. */
+static uint8_t parse_plant_id(const char *s, const char **tail_out)
 {
-    /* URI: /api/v1/sensors/{MAC12}/history */
-    const char *macs = req->uri + strlen("/api/v1/sensors/");
-    uint8_t mac[6];
-    if (!parse_mac12(macs, mac)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
-        return ESP_OK;
+    if (*s < '1' || *s > '9') return 0;   /* must start with a nonzero digit */
+    unsigned long v = 0;
+    const char *p = s;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (unsigned long)(*p - '0');
+        if (v > 255) return 0;
+        p++;
     }
-    if (!strstr(req->uri, "/history")) {
+    if (*p != '\0' && *p != '/') return 0;
+    if (tail_out) *tail_out = p;
+    return (uint8_t)v;
+}
+
+/* GET /api/v1/plants -- the primary list (M8 Task 6, spec §4).
+ * Unauthenticated, like every GET here. plants_snapshot() is safe to call
+ * even when plants_init() never ran (see its own doc comment in plants.c)
+ * -- a pair-failed-portal NODE's webserver reaches this route too (Task 2's
+ * review forward note), and gets an empty "plants":[] array rather than a
+ * crash. */
+static esp_err_t plants_get(httpd_req_t *req)
+{
+    static plants_table_t table;   /* too big for the httpd task stack; guarded by httpd single-call-per-uri */
+    static registry_t snap;
+    plants_snapshot(&table);
+    data_core_snapshot(&snap);
+    uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    uint32_t now_epoch = timekeeper_now();
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "plants");
+    for (int i = 0; i < PLANTS_MAX; i++) {
+        if (!table.p[i].in_use) continue;
+        cJSON_AddItemToArray(arr, plant_json(&table.p[i], &snap, now_uptime_s, now_epoch));
+    }
+    return send_json(req, root);
+}
+
+/* GET /api/v1/plants/{id}/history?tier=&from=&to= -- replaces the old
+ * /api/v1/sensors/{MAC12}/history bridge (M8 Task 3's interim wiring,
+ * carried through Task 5); moved verbatim (resolve_shim/hist_ctx_t/hist_row
+ * above are unchanged, just re-keyed here from a resolved mac to the URL's
+ * own id) rather than duplicated, since storage.c's rings have been
+ * plant-id keyed since Task 3 -- this is the non-bridged form.
+ *
+ * Deliberately does NOT auto-create. This is an open, unauthenticated GET,
+ * and the Task 3 review's BINDING finding is that plants_resolve_or_create()
+ * must never be driven by a request-supplied identifier: an attacker could
+ * otherwise exhaust the 16-slot plant table for free by GETting
+ * /api/v1/plants/{1..255}/history for ids nobody ever created (the exact
+ * hole the old mac-keyed bridge in history_get carried, and why this Task
+ * removes that route rather than reworking it in place). An id the table
+ * doesn't currently hold -- never assigned, or a plant that was since
+ * deleted (ids are never reused, plants_table.h) -- just 404s, same answer
+ * an unknown mac gave under the old bridge. */
+static esp_err_t plants_history_get(httpd_req_t *req)
+{
+    const char *tail = req->uri + strlen("/api/v1/plants/");
+    const char *suffix = NULL;
+    uint8_t id = parse_plant_id(tail, &suffix);
+    if (id == 0 || suffix == NULL || strcmp(suffix, "/history") != 0) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
         return ESP_OK;
     }
 
-    /* M8 TASK 5/6 rework this properly: storage.c's rings are plant-id
-     * keyed since Task 3, but this route is still mac-keyed (its URI is
-     * /api/v1/sensors/{MAC12}/history) -- this is the minimal correct
-     * bridge (resolve, or auto-create, the mac's plant id), not the real
-     * plant-first history route Tasks 5/6 land. 0 means the plant table is
-     * full (see plants_resolve_or_create): there is no plant id to key this
-     * mac's history by, so treat it the same as "unknown sensor". */
-    uint8_t plant_id = plants_resolve_or_create(mac);
-    if (plant_id == 0) {
+    plants_table_t table;
+    plants_snapshot(&table);
+    if (plants_table_find_id(&table, id) < 0) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
         return ESP_OK;
     }
@@ -347,7 +418,7 @@ static esp_err_t history_get(httpd_req_t *req)
 
     if (synced) {
         hist_ctx_t ctx = { .req = req, .first = true, .failed = false };
-        storage_query("/storage", plant_id, tier, from, to, resolve_shim, NULL, hist_row, &ctx);
+        storage_query("/storage", id, tier, from, to, resolve_shim, NULL, hist_row, &ctx);
         /* A chunk send already failed (client/socket gone) -- don't send the
          * trailing chunks over a dead connection, and return non-OK so
          * esp_http_server closes the session instead of believing it's
@@ -359,30 +430,45 @@ static esp_err_t history_get(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t sensor_post(httpd_req_t *req)
+/* POST /api/v1/plants {} -- pre-create an empty, probe-less plant (e.g.
+ * before its physical sensor even exists yet -- plants_create() never
+ * takes a mac, only plants_assign()/the .../probe route below does). No
+ * body fields are read (the spec's contract is a literal `{}`); nothing to
+ * validate, mirroring nodes_pair_post's body-ignoring POST above. 409
+ * {"error":"plant table full"} when all 16 (PLANTS_MAX) slots are taken. */
+static esp_err_t plants_create_post(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
-
-    /* URI: /api/v1/sensors/{MAC12} */
-    uint8_t mac[6];
-    if (!parse_mac12(req->uri + strlen("/api/v1/sensors/"), mac)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
+    uint8_t id = plants_create();
+    if (id == 0) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"plant table full\"}");
         return ESP_OK;
     }
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", id);
+    return send_json(req, root);
+}
+
+/* POST /api/v1/plants/{id} {"name":...} -- rename. Same body-reading idiom
+ * every mutating POST handler in this file uses (role_post et al: fixed
+ * stack buffer, explicit content_len bounds, 413 on oversize). Auth is
+ * already checked by plants_post_dispatch() below before this is ever
+ * reached. */
+static esp_err_t plants_rename_post(httpd_req_t *req, uint8_t id)
+{
     char body[128];
     if (req->content_len == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
         return ESP_OK;
     }
     if (req->content_len > sizeof(body) - 1) {
-        /* esp_http_server's httpd_err_code_t has no 413 entry in this IDF
-         * version; set the status line/body manually. */
         httpd_resp_set_status(req, "413 Payload Too Large");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
         return ESP_OK;
     }
-
     size_t received = 0;
     while (received < req->content_len) {
         int r = httpd_req_recv(req, body + received, req->content_len - received);
@@ -393,13 +479,167 @@ static esp_err_t sensor_post(httpd_req_t *req)
         received += (size_t)r;
     }
     body[received] = '\0';
+
     cJSON *json = cJSON_Parse(body);
     const cJSON *name = cJSON_GetObjectItem(json, "name");
-    esp_err_t err = cJSON_IsString(name) ? app_config_set_sensor_name(mac, name->valuestring)
-                                         : ESP_ERR_INVALID_ARG;
-    cJSON_Delete(json);
-    if (err != ESP_OK) {
+    if (!cJSON_IsString(name)) {
+        cJSON_Delete(json);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid name");
+        return ESP_OK;
+    }
+    esp_err_t err = plants_rename(id, name->valuestring);
+    cJSON_Delete(json);
+
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown plant");
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        /* Covers plants_rename()'s ESP_ERR_INVALID_ARG (name too long, >32
+         * chars) and a persist_table() NVS-write failure alike -- same
+         * "collapse into 400" convention node_update_post above uses for
+         * swarm_store_set_node_name()'s non-NOT_FOUND errors. */
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid name");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* POST /api/v1/plants/{id}/probe {"mac":"MAC12"|null} -- assign, move, or
+ * unassign id's probe (plants_table_assign()'s semantics, plants_table.h:
+ * a mac currently assigned elsewhere is MOVED here, not duplicated; a plant
+ * that already has a probe has it REPLACED; mac == NULL unassigns).
+ *
+ * Unlike plants_resolve_or_create() (NEVER fed a request-supplied mac --
+ * see plants_history_get()'s comment above and the Task 3 review's binding
+ * table-exhaustion finding it cites), this endpoint deliberately DOES
+ * accept any well-formed mac from the request body, including one the
+ * radio has never heard: that's the whole point of being able to
+ * pre-assign a replacement probe before it has ever transmitted a reading
+ * (see sensors_json.c's plant_json(), "pending" probe branch). This is
+ * safe specifically because the route is authenticated (checked once by
+ * plants_post_dispatch() before this is ever reached) -- an attacker can't
+ * hit it for free the way an open GET could -- and it can't even grow the
+ * plant table: plants_table_assign() only ever (re)points an EXISTING
+ * plant's mac field, it never creates a plant. 404 unknown plant, 400 bad
+ * mac. */
+static esp_err_t plants_probe_post(httpd_req_t *req, uint8_t id)
+{
+    char body[64];
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return ESP_OK;
+    }
+    if (req->content_len > sizeof(body) - 1) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(body);
+    const cJSON *mac_j = cJSON_GetObjectItem(json, "mac");
+    uint8_t mac[6];
+    const uint8_t *mac_ptr = NULL;
+    bool ok_body;
+    if (mac_j != NULL && cJSON_IsNull(mac_j)) {
+        ok_body = true;   /* mac_ptr stays NULL: unassign */
+    } else if (mac_j != NULL && cJSON_IsString(mac_j) && parse_mac12(mac_j->valuestring, mac)) {
+        mac_ptr = mac;
+        ok_body = true;
+    } else {
+        ok_body = false;
+    }
+    cJSON_Delete(json);
+    if (!ok_body) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
+        return ESP_OK;
+    }
+
+    esp_err_t err = plants_assign(id, mac_ptr);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown plant");
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* POST /api/v1/plants/{id}[/probe] -- rename or assign a probe, both under
+ * the SAME registered wildcard route ("/api/v1/plants/" + wildcard), for
+ * the exact ESP-IDF wildcard-registration reason node_post_dispatch's own
+ * long comment above explains in full: only one wildcard template can ever be
+ * registered per method under a given prefix -- a second, more specific
+ * one would be rejected outright at registration time, since the existing
+ * wildcard already "covers" it. Unlike nodes, there's no separate reserved
+ * exact-path route competing for this prefix (no "/api/v1/plants/pair"
+ * equivalent needing to win over the wildcard the way nodes_pair_post's
+ * "/api/v1/nodes/pair" does) -- every POST under "/api/v1/plants/" is
+ * either a bare id (rename) or an id + "/probe" (assign), both parsed and
+ * dispatched right here. Auth is checked once here, not in either
+ * sub-handler, mirroring node_post_dispatch's own single top-of-function
+ * check. */
+static esp_err_t plants_post_dispatch(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/plants/");
+    const char *suffix = NULL;
+    uint8_t id = parse_plant_id(tail, &suffix);
+    if (id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad id");
+        return ESP_OK;
+    }
+    if (strcmp(suffix, "/probe") == 0) return plants_probe_post(req, id);
+    if (suffix[0] == '\0') return plants_rename_post(req, id);
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+    return ESP_OK;
+}
+
+/* DELETE /api/v1/plants/{id} -- deletes the plant and its history ring
+ * files (plants_delete()); its sensor, if any, becomes unassigned (its
+ * registry entry is untouched -- deleting a plant is not the same as
+ * forgetting a sensor, which stays discoverable and can be assigned to a
+ * different/new plant afterwards). */
+static esp_err_t plants_delete_delete(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/plants/");
+    uint8_t id = parse_plant_id(tail, NULL);
+    if (id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad id");
+        return ESP_OK;
+    }
+    esp_err_t err = plants_delete(id);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown plant");
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        /* Unlike rename/probe's "collapse into 400" convention: there is no
+         * client-input interpretation of a delete failure here (the id was
+         * valid, plants_table_delete() itself is infallible for a known id)
+         * -- only a persist_table() NVS-write failure reaches this branch,
+         * a genuine server-side problem. */
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "delete failed");
         return ESP_OK;
     }
     httpd_resp_set_type(req, "application/json");
@@ -1027,12 +1267,34 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &scan));
     httpd_uri_t wifi = { .uri = "/api/v1/wifi", .method = HTTP_POST, .handler = wifi_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi));
+    /* Demoted probe pool (M8 Task 6, spec §4) -- diagnostics only; no
+     * per-sensor history or rename routes anymore (removed, see
+     * plants_history_get()'s comment for why the history route in
+     * particular isn't just re-registered under this prefix). */
     httpd_uri_t sensors = { .uri = "/api/v1/sensors", .method = HTTP_GET, .handler = sensors_get };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensors));
-    httpd_uri_t history = { .uri = "/api/v1/sensors/*", .method = HTTP_GET, .handler = history_get };
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &history));
-    httpd_uri_t rename = { .uri = "/api/v1/sensors/*", .method = HTTP_POST, .handler = sensor_post };
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rename));
+
+    /* Plants: the primary surface (M8 Task 6, spec §4). "/api/v1/plants"
+     * (exact) and its wildcarded "/api/v1/plants/" + "*" form are distinct
+     * URI templates to ESP-IDF's matcher -- same non-collision already
+     * relied on above for exact "/api/v1/nodes" vs its own wildcarded form
+     * -- so registration order between them doesn't matter; each wildcard
+     * method (GET/POST/DELETE) gets its own single dispatch point below,
+     * same pattern as the nodes routes' three separate wildcard
+     * handlers. */
+    httpd_uri_t plants = { .uri = "/api/v1/plants", .method = HTTP_GET, .handler = plants_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &plants));
+    httpd_uri_t plants_create = { .uri = "/api/v1/plants", .method = HTTP_POST, .handler = plants_create_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &plants_create));
+    httpd_uri_t plants_history = { .uri = "/api/v1/plants/*", .method = HTTP_GET, .handler = plants_history_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &plants_history));
+    /* Handles rename ("/{id}") and probe assign ("/{id}/probe") -- both
+     * under this one route, per plants_post_dispatch()'s comment. */
+    httpd_uri_t plants_post = { .uri = "/api/v1/plants/*", .method = HTTP_POST, .handler = plants_post_dispatch };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &plants_post));
+    httpd_uri_t plants_del = { .uri = "/api/v1/plants/*", .method = HTTP_DELETE, .handler = plants_delete_delete };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &plants_del));
+
     httpd_uri_t timep = { .uri = "/api/v1/time", .method = HTTP_POST, .handler = time_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &timep));
     httpd_uri_t claimu = { .uri = "/api/v1/claim", .method = HTTP_POST, .handler = claim_post };

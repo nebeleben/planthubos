@@ -35,13 +35,20 @@ esp_err_t plants_init(const char *storage_base /* "/storage", or NULL when stora
  * TASK CONTEXT ONLY (may write NVS). 0 = table full (logged once/mac/boot). */
 uint8_t plants_resolve_or_create(const uint8_t mac[6]);
 
-/* Read-only snapshot for the API/MQTT/UI. */
+/* Read-only snapshot for the API/MQTT/UI. Safe to call before plants_init()
+ * has run (e.g. a NODE that fell back to its setup portal, which never
+ * calls plants_init() -- see plants_init()'s own doc comment): yields an
+ * empty plants_table_t rather than touching an uninitialised mutex. */
 void plants_snapshot(plants_table_t *out);
 
-/* Mutations (persisting; ESP_ERR_NOT_FOUND for unknown id / INVALID_ARG). */
+/* Mutations (persisting; ESP_ERR_NOT_FOUND for unknown id / INVALID_ARG).
+ * Like plants_snapshot() above, every one of these is also safe to call
+ * before plants_init() has run -- they answer exactly as if the id given
+ * doesn't exist (ESP_ERR_NOT_FOUND, or 0 for plants_create()'s "full"
+ * contract), never touching an uninitialised mutex. */
 esp_err_t plants_rename(uint8_t id, const char *name);
 esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null);
-uint8_t   plants_create(void);                       /* 0 = full */
+uint8_t   plants_create(void);                       /* 0 = full (or uninitialised) */
 esp_err_t plants_delete(uint8_t id);                 /* also deletes P<id> ring files */
 
 /* Probe-less last values: the plant's last history record (ring tail),
