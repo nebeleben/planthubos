@@ -29,6 +29,16 @@
 static const char *TAG = "api_v1";
 #define FW_VERSION "0.10.0"
 
+/* Shared by sensors_get() and plants_get() below (final M8 review, L5):
+ * each used to hold its own private `static registry_t` + `static
+ * plants_table_t` pair (~2.25KB combined, doubled for no reason). Safe to
+ * share one file-static pair between them: esp_http_server invokes exactly
+ * one registered handler at a time on the single httpd task (this is why
+ * each was `static` -- too big for that task's stack -- in the first
+ * place), so there is never a concurrent writer to race. */
+static registry_t s_api_reg_snap;
+static plants_table_t s_api_plant_snap;
+
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
     char *body = cJSON_PrintUnformatted(root);
@@ -242,19 +252,19 @@ static esp_err_t wifi_post(httpd_req_t *req)
  * route too, and gets an all-unassigned probe pool rather than a crash. */
 static esp_err_t sensors_get(httpd_req_t *req)
 {
-    static registry_t snap;   /* 16 entries is too big for the stack; guarded by httpd single-call-per-uri */
-    static plants_table_t table;
-    data_core_snapshot(&snap);
-    plants_snapshot(&table);
+    /* s_api_reg_snap/s_api_plant_snap: too big for the httpd task stack;
+     * shared with plants_get() below, see their declaration comment (L5). */
+    data_core_snapshot(&s_api_reg_snap);
+    plants_snapshot(&s_api_plant_snap);
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(root, "sensors");
     for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
-        if (!snap.sensors[i].in_use) continue;
-        int pidx = plants_table_find_mac(&table, snap.sensors[i].mac);
-        uint8_t plant_id = pidx >= 0 ? table.p[pidx].id : 0;
-        cJSON_AddItemToArray(arr, probe_json(&snap.sensors[i], plant_id, now_uptime_s));
+        if (!s_api_reg_snap.sensors[i].in_use) continue;
+        int pidx = plants_table_find_mac(&s_api_plant_snap, s_api_reg_snap.sensors[i].mac);
+        uint8_t plant_id = pidx >= 0 ? s_api_plant_snap.p[pidx].id : 0;
+        cJSON_AddItemToArray(arr, probe_json(&s_api_reg_snap.sensors[i], plant_id, now_uptime_s));
     }
     return send_json(req, root);
 }
@@ -354,21 +364,41 @@ static uint8_t parse_plant_id(const char *s, const char **tail_out)
  * even when plants_init() never ran (see its own doc comment in plants.c)
  * -- a pair-failed-portal NODE's webserver reaches this route too (Task 2's
  * review forward note), and gets an empty "plants":[] array rather than a
- * crash. */
+ * crash.
+ *
+ * Also drives the auto-create sweep (final M8 review, M3): with the old
+ * sensor<->plant API bridge gone (DoS rule, see plants_history_get()'s
+ * comment above) and MQTT off by default, the sampler's periodic tick used
+ * to be the ONLY driver of plant auto-creation -- a fresh hub could show
+ * "No plants yet" for up to CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN minutes even
+ * with a probe already reporting. plants_adopt_from_registry() is safe to
+ * call from here specifically because `s_api_reg_snap` below is itself a
+ * registry SNAPSHOT (data_core_snapshot()), never anything request-supplied
+ * -- the DoS rule stays airtight: an unauthenticated caller still can't seed
+ * a plant from data it controls, it can only nudge an already-live sensor's
+ * plant into existing sooner. httpd task context; sanctioned lazy driver
+ * per plants_adopt_from_registry()'s own doc comment in plants.h. */
 static esp_err_t plants_get(httpd_req_t *req)
 {
-    static plants_table_t table;   /* too big for the httpd task stack; guarded by httpd single-call-per-uri */
-    static registry_t snap;
-    plants_snapshot(&table);
-    data_core_snapshot(&snap);
+    /* s_api_plant_snap/s_api_reg_snap: too big for the httpd task stack;
+     * shared with sensors_get() above, see their declaration comment (L5). */
+    data_core_snapshot(&s_api_reg_snap);
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    plants_adopt_from_registry(&s_api_reg_snap, now_uptime_s,
+                                CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN * 60);
+
+    /* Re-snapshot AFTER the sweep above (not reusing an earlier one) so a
+     * plant it just created shows up in THIS response, not the next poll --
+     * the whole point of M3's latency fix. */
+    plants_snapshot(&s_api_plant_snap);
     uint32_t now_epoch = timekeeper_now();
 
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(root, "plants");
     for (int i = 0; i < PLANTS_MAX; i++) {
-        if (!table.p[i].in_use) continue;
-        cJSON_AddItemToArray(arr, plant_json(&table.p[i], &snap, now_uptime_s, now_epoch));
+        if (!s_api_plant_snap.p[i].in_use) continue;
+        cJSON_AddItemToArray(arr, plant_json(&s_api_plant_snap.p[i], &s_api_reg_snap, now_uptime_s, now_epoch));
     }
     return send_json(req, root);
 }

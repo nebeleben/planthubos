@@ -555,6 +555,28 @@ static void plants_run_migration(void)
     ESP_LOGI(TAG, "migration: %d plant(s) migrated from sensor-keyed state", n_actions);
 }
 
+/* plants_last_values() cache helpers -- see s_last_values' declaration
+ * comment for the slot-capacity argument. Moved ahead of
+ * plants_init()/plants_resolve_or_create()/plants_assign() (final M8 review,
+ * M1) so plants_assign() below can call lv_cache_drop() without a forward
+ * declaration -- it used to only be needed from plants_delete(), further
+ * down. */
+static int lv_cache_find(uint8_t id)
+{
+    for (int i = 0; i < LAST_VALUES_CACHE_CAP; i++) {
+        if (s_last_values[i].used && s_last_values[i].id == id) return i;
+    }
+    return -1;
+}
+
+static void lv_cache_drop(uint8_t id)
+{
+    xSemaphoreTake(s_lv_mutex, portMAX_DELAY);
+    int idx = lv_cache_find(id);
+    if (idx >= 0) s_last_values[idx].used = false;
+    xSemaphoreGive(s_lv_mutex);
+}
+
 esp_err_t plants_init(const char *storage_base)
 {
     s_mutex = xSemaphoreCreateMutex();
@@ -625,6 +647,29 @@ uint8_t plants_resolve_or_create(const uint8_t mac[6])
     return new_id;
 }
 
+/* See plants.h for the full derivation (H1+M3, final M8 review). Takes its
+ * own plants_snapshot() once up front -- not per-iteration -- since nothing
+ * in this loop's body mutates the table until plants_resolve_or_create()
+ * commits a new plant, and that new plant is correctly picked up starting
+ * the NEXT sweep, not this one (same one-tick-of-latency tradeoff the
+ * sampler's own version of this comment used to describe). */
+void plants_adopt_from_registry(const registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s)
+{
+    if (!reg) return;
+    plants_table_t plant_snap;
+    plants_snapshot(&plant_snap);
+    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
+        const sensor_entry_t *e = &reg->sensors[i];
+        if (!e->in_use) continue;
+        /* Liveness gate (H1): skip a probe that's gone dark rather than
+         * adopting it into an undeletable ghost plant -- see this
+         * function's doc comment in plants.h. */
+        if (now_uptime_s - e->last_seen_s > liveness_s) continue;
+        if (plants_table_find_mac(&plant_snap, e->mac) >= 0) continue;
+        plants_resolve_or_create(e->mac);
+    }
+}
+
 void plants_snapshot(plants_table_t *out)
 {
     if (!out) return;
@@ -676,6 +721,15 @@ esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null)
     if (!s_mutex) return ESP_ERR_NOT_FOUND;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    /* Capture which plant (if any) currently holds mac_or_null BEFORE the
+     * mutation below -- plants_table_assign()'s "assigning a mac already
+     * assigned elsewhere MOVES it" semantics (plants_table.h) means that
+     * plant loses its probe as a side effect of this one call, so its
+     * plants_last_values() cache entry needs dropping too, not just id's
+     * (final M8 review, M1). NULL mac_or_null (unassign) has nothing to
+     * look up here -- other_id stays 0. */
+    int other_idx = mac_or_null ? plants_table_find_mac(&s_table, mac_or_null) : -1;
+    uint8_t other_id = (other_idx >= 0) ? s_table.p[other_idx].id : 0;
     bool ok = plants_table_assign(&s_table, id, mac_or_null);
     xSemaphoreGive(s_mutex);
     if (!ok) return ESP_ERR_NOT_FOUND;
@@ -686,6 +740,15 @@ esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null)
                       "the new assignment and will not revert until the next successful write "
                       "or a reboot", id, esp_err_to_name(err));
     }
+    /* Drop BOTH the target plant's cache slot and the losing plant's (M1):
+     * without this, a last_values hit cached before this call could keep
+     * serving a plant's old probe reading after that plant is later
+     * unassigned -- exactly the stale pre-assignment tail plants_delete()'s
+     * own lv_cache_drop() already guards against for a deleted id. Done
+     * regardless of the persist result above, same as plants_delete(): the
+     * RAM table (and therefore what SHOULD be cached) already moved. */
+    lv_cache_drop(id);
+    if (other_id != 0 && other_id != id) lv_cache_drop(other_id);
     return err;
 }
 
@@ -711,24 +774,6 @@ uint8_t plants_create(void)
                       "reboot", esp_err_to_name(err));
     }
     return id;
-}
-
-/* plants_last_values() cache helpers -- see s_last_values' declaration
- * comment for the slot-capacity argument. */
-static int lv_cache_find(uint8_t id)
-{
-    for (int i = 0; i < LAST_VALUES_CACHE_CAP; i++) {
-        if (s_last_values[i].used && s_last_values[i].id == id) return i;
-    }
-    return -1;
-}
-
-static void lv_cache_drop(uint8_t id)
-{
-    xSemaphoreTake(s_lv_mutex, portMAX_DELAY);
-    int idx = lv_cache_find(id);
-    if (idx >= 0) s_last_values[idx].used = false;
-    xSemaphoreGive(s_lv_mutex);
 }
 
 /* Removes P<id>_raw.bin/P<id>_hr.bin under the base path recorded at

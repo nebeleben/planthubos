@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "plants_table.h"
+#include "registry.h"
 
 /* NVS-backed plant registry (M8 Task 2): a single blob keyed "plants" in
  * namespace "planthub" (shared with swarm_store.c -- see swarm_store.c's
@@ -50,6 +51,37 @@ esp_err_t plants_rename(uint8_t id, const char *name);
 esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null);
 uint8_t   plants_create(void);                       /* 0 = full (or uninitialised) */
 esp_err_t plants_delete(uint8_t id);                 /* also deletes P<id> ring files */
+
+/* Auto-create sweep (final M8 review, H1+M3): adopts every LIVE registry mac
+ * not already claimed by a plant into a new one (plants_resolve_or_create()),
+ * off a registry SNAPSHOT the caller already took -- `reg` must come from a
+ * registry snapshot (data_core_snapshot()), NEVER a request-supplied mac.
+ * That boundary is load-bearing, not stylistic: this is the only sanctioned
+ * driver of plant auto-creation, and every caller is either a periodic
+ * internal tick or an open, unauthenticated GET (api_v1.c's plants_get) --
+ * letting either seed the sweep from anything other than macs the radio
+ * itself has already put in the registry would let a remote caller grow the
+ * 16-slot plant table for free (the exact hole plants_history_get()'s
+ * comment in api_v1.c documents and removes elsewhere).
+ *
+ * Liveness-gated exactly like the sampler's own per-plant sampling loop
+ * (`now_uptime_s - e->last_seen_s > liveness_s` skips it): a LIVE unassigned
+ * probe still gets auto-adopted -- that is the zero-config spec's decision
+ * -- but a DEAD one no longer is. Without this gate, a probe that's been
+ * swapped out or physically removed still sits in the registry forever
+ * (registry.c never evicts an entry), so an unguarded sweep would re-adopt
+ * it into a fresh, undeletable ghost plant on every call, burning a
+ * never-reused id each time (plants_table.h) until the table permanently
+ * exhausts. Gating on liveness is also what makes "swap the probe, unassign
+ * the old plant" durable: once the dead mac goes stale it stops being
+ * eligible for re-adoption, instead of clawing its way back into a plant on
+ * the very next sweep.
+ *
+ * Bounded REGISTRY_MAX_SENSORS iterations, allocation-free (aside from the
+ * plants_snapshot()/plants_resolve_or_create() calls it already makes). Safe
+ * to call from any task context -- see plants_resolve_or_create()'s own
+ * TASK CONTEXT ONLY note, which this inherits. */
+void plants_adopt_from_registry(const registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s);
 
 /* Probe-less last values: the plant's last history record (ring tail),
  * read via storage_query() (storage.h) over the plant's own P<id>_raw.bin

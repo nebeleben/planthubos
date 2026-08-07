@@ -122,16 +122,14 @@ static void sample_once(void)
      * NEXT tick, not this one -- the plant loop above already ran -- which
      * is fine: the alternative (special-casing a just-created plant into
      * this tick) buys one sample interval of latency at the cost of real
-     * complexity. This is the only place the sampler auto-creates from, and
-     * it only ever does so from registry macs (never a request-supplied
-     * mac -- see the ledger's Task 3 binding note on why that boundary
-     * matters). */
-    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
-        const sensor_entry_t *e = &reg_snap.sensors[i];
-        if (!e->in_use) continue;
-        if (plants_table_find_mac(&plant_snap, e->mac) >= 0) continue;
-        plants_resolve_or_create(e->mac);
-    }
+     * complexity. Extracted to plants_adopt_from_registry() (final M8
+     * review, H1+M3) so api_v1.c's plants_get can drive the identical,
+     * liveness-gated sweep too instead of a fresh hub waiting up to
+     * interval_s for its first plant to appear -- see that function's doc
+     * comment in plants.h for the liveness gate and the DoS-rule boundary
+     * (registry-snapshot macs only, never a request-supplied one) both
+     * callers share. */
+    plants_adopt_from_registry(&reg_snap, now, interval_s);
 }
 
 static void sampler_task(void *arg)
