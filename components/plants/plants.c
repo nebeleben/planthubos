@@ -647,17 +647,23 @@ uint8_t plants_resolve_or_create(const uint8_t mac[6])
     return new_id;
 }
 
-/* See plants.h for the full derivation (H1+M3, final M8 review). Takes its
- * own plants_snapshot() once up front -- not per-iteration -- since nothing
- * in this loop's body mutates the table until plants_resolve_or_create()
- * commits a new plant, and that new plant is correctly picked up starting
- * the NEXT sweep, not this one (same one-tick-of-latency tradeoff the
- * sampler's own version of this comment used to describe). */
+/* See plants.h for the full derivation (H1+M3, final M8 review). Deliberately
+ * takes NO plants_table_t snapshot of its own (re-review fix: a 673-byte
+ * plants_table_t on the CALLER's stack is unsafe here -- unlike sample_once(),
+ * which keeps its own snapshots `static` for exactly this reason, this
+ * function is called from two different task contexts with two different
+ * stacks: the sampler task (4096 bytes) AND the httpd task, which has a
+ * documented exhaustion history. A shared `static` table would also race
+ * between those two tasks, since nothing serialises them against each
+ * other). plants_resolve_or_create() already does its own find-or-create
+ * atomically under s_mutex, so pre-checking plants_table_find_mac() against
+ * a locally-snapshotted table was redundant -- a benign double-check at
+ * best, a stale answer (racing a concurrent assign/delete) at worst.
+ * Bounded REGISTRY_MAX_SENSORS mutex-guarded lookups; no allocation, no
+ * caller-stack table. */
 void plants_adopt_from_registry(const registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s)
 {
     if (!reg) return;
-    plants_table_t plant_snap;
-    plants_snapshot(&plant_snap);
     for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
         const sensor_entry_t *e = &reg->sensors[i];
         if (!e->in_use) continue;
@@ -665,7 +671,6 @@ void plants_adopt_from_registry(const registry_t *reg, uint32_t now_uptime_s, ui
          * adopting it into an undeletable ghost plant -- see this
          * function's doc comment in plants.h. */
         if (now_uptime_s - e->last_seen_s > liveness_s) continue;
-        if (plants_table_find_mac(&plant_snap, e->mac) >= 0) continue;
         plants_resolve_or_create(e->mac);
     }
 }

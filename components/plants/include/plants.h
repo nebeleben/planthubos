@@ -77,10 +77,17 @@ esp_err_t plants_delete(uint8_t id);                 /* also deletes P<id> ring 
  * eligible for re-adoption, instead of clawing its way back into a plant on
  * the very next sweep.
  *
- * Bounded REGISTRY_MAX_SENSORS iterations, allocation-free (aside from the
- * plants_snapshot()/plants_resolve_or_create() calls it already makes). Safe
- * to call from any task context -- see plants_resolve_or_create()'s own
- * TASK CONTEXT ONLY note, which this inherits. */
+ * Bounded REGISTRY_MAX_SENSORS mutex-guarded plants_resolve_or_create()
+ * calls; allocation-free and -- deliberately -- takes NO plants_table_t
+ * snapshot of its own (re-review fix after H1+M3 landed): this function
+ * runs on two different task stacks (the sampler task, AND api_v1.c's
+ * plants_get on the httpd task, which has a documented exhaustion history),
+ * so a 673-byte plants_table_t local would be unsafe on either, and a
+ * shared `static` one would race between them. plants_resolve_or_create()
+ * already does its own find-or-create atomically under s_mutex, so there is
+ * nothing to pre-check a snapshot against. Safe to call from any task
+ * context -- see plants_resolve_or_create()'s own TASK CONTEXT ONLY note,
+ * which this inherits. */
 void plants_adopt_from_registry(const registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s);
 
 /* Probe-less last values: the plant's last history record (ring tail),
