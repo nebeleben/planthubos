@@ -192,7 +192,12 @@ export function DevicesTab() {
         body: '{}',
       })
       const data = await res.json().catch(() => ({}))
-      if (res.ok && data.ok) {
+      // Unlike rename/probe (which answer {"ok":true}), create's success
+      // body is {"id":N} with no "ok" field (api_v1.c's plants_create_post)
+      // -- checking data.ok here always failed even on a real success,
+      // leaving the newly created plant unrefreshed in the UI while it
+      // already existed server-side.
+      if (res.ok && data.id != null) {
         await refresh()
       } else if (res.status === 401) {
         alert('unauthorized — set the hub key in Config')

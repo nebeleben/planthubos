@@ -13,8 +13,6 @@ body { margin: 0; }
 .tile .readings { display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem 0.8rem; }
 .tile .val { font-size: 1.3rem; font-weight: 600; margin-right: 0.3rem; }
 .tile .unit { opacity: 0.6; font-size: 0.8rem; }
-.tile .seen { margin: 0.6rem 0 0; opacity: 0.55; font-size: 0.8rem; }
-.tile .via { margin: 0.2rem 0 0; opacity: 0.55; font-size: 0.78rem; }
 .probe-chip { margin: 0.6rem 0 0; opacity: 0.55; font-size: 0.8rem; }
 .probe-chip.pending { opacity: 0.7; font-style: italic; }
 td.via { opacity: 0.7; font-size: 0.85rem; white-space: nowrap; }
