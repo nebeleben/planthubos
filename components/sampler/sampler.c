@@ -3,6 +3,7 @@
 #include "storage.h"
 #include "hourly_agg.h"
 #include "timekeeper.h"
+#include "plants.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -65,15 +66,27 @@ static void sample_once(void)
         /* skip sensors that produced nothing since the last sample (dead battery / gone) */
         if (now - e->last_seen_s > interval_s) continue;
 
+        /* M8 TASK 5/6 rework this properly: storage.c's rings are plant-id
+         * keyed since Task 3, but the sampler still iterates the mac-keyed
+         * sensor registry -- this is the minimal correct bridge (resolve,
+         * or auto-create, the mac's plant id and skip the sample entirely
+         * when the plant table is full), not the real per-plant sampling
+         * model Tasks 5/6 land. */
+        uint8_t plant_id = plants_resolve_or_create(e->mac);
+        if (plant_id == 0) {
+            ESP_LOGW(TAG, "no plant id for sensor %d (plant table full); dropping sample", i);
+            continue;
+        }
+
         storage_rec_t rec = rec_from_entry(e, now);
-        if (storage_append(s_base, e->mac, STORAGE_TIER_RAW, &rec) != 0) {
+        if (storage_append(s_base, plant_id, STORAGE_TIER_RAW, &rec) != 0) {
             ESP_LOGW(TAG, "raw append failed for sensor %d", i);
             continue;
         }
         hourly_agg_t *agg = agg_for(e->mac);
         storage_rec_t hr;
         if (agg && hourly_agg_add(agg, &rec, &hr)) {
-            if (storage_append(s_base, e->mac, STORAGE_TIER_HOURLY, &hr) != 0)
+            if (storage_append(s_base, plant_id, STORAGE_TIER_HOURLY, &hr) != 0)
                 ESP_LOGW(TAG, "hourly append failed for sensor %d", i);
         }
     }

@@ -25,8 +25,8 @@ typedef enum { STORAGE_TIER_RAW, STORAGE_TIER_HOURLY } storage_tier_t;
 typedef bool (*storage_resolve_fn)(void *rctx, uint16_t boot_id, uint32_t rel_s, uint32_t *epoch_out);
 typedef void (*storage_row_fn)(void *ctx, uint32_t epoch, const storage_rec_t *rec);
 
-int  storage_append(const char *base, const uint8_t mac[6], storage_tier_t tier, const storage_rec_t *rec);
-int  storage_query(const char *base, const uint8_t mac[6], storage_tier_t tier,
+int  storage_append(const char *base, uint8_t plant_id, storage_tier_t tier, const storage_rec_t *rec);
+int  storage_query(const char *base, uint8_t plant_id, storage_tier_t tier,
                    uint32_t from_epoch, uint32_t to_epoch,
                    storage_resolve_fn resolve, void *rctx,
                    storage_row_fn row, void *ctx);

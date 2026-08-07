@@ -5,6 +5,7 @@
 #include "sensors_json.h"
 #include "storage.h"
 #include "timekeeper.h"
+#include "plants.h"
 #include "claim.h"
 #include "ota_post.h"
 #include "swarm.h"
@@ -313,6 +314,19 @@ static esp_err_t history_get(httpd_req_t *req)
         return ESP_OK;
     }
 
+    /* M8 TASK 5/6 rework this properly: storage.c's rings are plant-id
+     * keyed since Task 3, but this route is still mac-keyed (its URI is
+     * /api/v1/sensors/{MAC12}/history) -- this is the minimal correct
+     * bridge (resolve, or auto-create, the mac's plant id), not the real
+     * plant-first history route Tasks 5/6 land. 0 means the plant table is
+     * full (see plants_resolve_or_create): there is no plant id to key this
+     * mac's history by, so treat it the same as "unknown sensor". */
+    uint8_t plant_id = plants_resolve_or_create(mac);
+    if (plant_id == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+        return ESP_OK;
+    }
+
     char query[96] = "", val[16];
     httpd_req_get_url_query_str(req, query, sizeof(query));
     storage_tier_t tier = STORAGE_TIER_RAW;
@@ -333,7 +347,7 @@ static esp_err_t history_get(httpd_req_t *req)
 
     if (synced) {
         hist_ctx_t ctx = { .req = req, .first = true, .failed = false };
-        storage_query("/storage", mac, tier, from, to, resolve_shim, NULL, hist_row, &ctx);
+        storage_query("/storage", plant_id, tier, from, to, resolve_shim, NULL, hist_row, &ctx);
         /* A chunk send already failed (client/socket gone) -- don't send the
          * trailing chunks over a dead connection, and return non-OK so
          * esp_http_server closes the session instead of believing it's

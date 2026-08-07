@@ -45,19 +45,19 @@ uint8_t   plants_create(void);                       /* 0 = full */
 esp_err_t plants_delete(uint8_t id);                 /* also deletes P<id> ring files */
 
 /* Probe-less last values: the plant's last history record (ring tail),
- * cached in RAM after first read; invalidated by plants_delete. Returns
- * false when the plant has no history. Fields use storage.h NONE sentinels.
+ * read via storage_query() (storage.h) over the plant's own P<id>_raw.bin
+ * ring -- id-keyed since M8 Task 3, so this works for a plant with no
+ * assigned sensor, or one whose probe was unplugged/reassigned elsewhere,
+ * exactly the case this function exists to serve (a mac-keyed lookup would
+ * have no mac to query by, or would go stale the moment
+ * plants_table_assign() moves that mac to a different plant).
  *
- * TASK 3 REKEYS THIS: switch to plant_id. storage_query() (storage.h) is
- * still MAC-keyed today, not plant-keyed -- and a probe-less plant (exactly
- * the case this function exists to serve: a plant with no assigned sensor,
- * or one whose probe was unplugged) has no mac to query by at all. Querying
- * under whatever mac a plant last happened to have assigned would also go
- * silently stale/wrong the moment that mac is reassigned to a different
- * plant (plants_table_assign() allows exactly that move). Rather than ship
- * either a wrong answer or an answer that only works for currently-assigned
- * plants, this is stubbed to always return false until Task 3 rekeys
- * storage.c's on-disk files to plant_id and this can query directly. */
+ * Cached in RAM after first read (found or not), invalidated only by
+ * plants_delete() -- deliberately not refreshed on every call: a probe-less
+ * plant's ring is static (nothing appends to it once its probe is gone), so
+ * the first scan's result stays correct until the plant itself is deleted.
+ * Returns false when the plant has no history (id unknown, no ring file
+ * yet, or the ring is empty). Fields use storage.h NONE sentinels. */
 bool plants_last_values(uint8_t id, int16_t *temp_dc, uint8_t *moisture,
                         uint32_t *lux, uint16_t *conductivity, uint8_t *battery,
                         uint32_t *epoch_out);

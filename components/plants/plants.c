@@ -1,4 +1,6 @@
 #include "plants.h"
+#include "storage.h"
+#include "timekeeper.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -78,6 +80,30 @@ static SemaphoreHandle_t s_mutex;
 static SemaphoreHandle_t s_nvs_mutex;
 static plants_table_t s_table;
 static const char *s_storage_base;   /* "/storage", or NULL: see plants_init() */
+
+/* plants_last_values() RAM cache -- guarded by its own mutex, deliberately
+ * separate from s_mutex/s_nvs_mutex above: it is populated by a
+ * storage_query() file scan (real I/O), which must never run while holding
+ * a lock that plants_snapshot()/plants_resolve_or_create() etc. might be
+ * waiting on. One slot per currently-existing plant is always enough
+ * (PLANTS_MAX), because plants_delete() below drops a plant's cache slot
+ * (see lv_cache_drop()) in the same call that frees its plants_table.h
+ * slot for a new plant -- a deleted plant can never hold a cache slot
+ * hostage. */
+#define LAST_VALUES_CACHE_CAP PLANTS_MAX
+typedef struct {
+    bool     used;
+    uint8_t  id;
+    bool     found;             /* false = queried once, plant had no history */
+    int16_t  temp_dc;
+    uint8_t  moisture_pct;
+    uint32_t lux;
+    uint16_t conductivity_us;
+    uint8_t  battery_pct;
+    uint32_t epoch;
+} last_values_cache_t;
+static SemaphoreHandle_t s_lv_mutex;
+static last_values_cache_t s_last_values[LAST_VALUES_CACHE_CAP];
 
 /* "plant table full" is logged at most once per distinct mac per boot,
  * mirroring battery_sched.h's small fixed-size in_use table -- otherwise a
@@ -212,10 +238,12 @@ esp_err_t plants_init(const char *storage_base)
 {
     s_mutex = xSemaphoreCreateMutex();
     s_nvs_mutex = xSemaphoreCreateMutex();
-    if (!s_mutex || !s_nvs_mutex) return ESP_ERR_NO_MEM;
+    s_lv_mutex = xSemaphoreCreateMutex();
+    if (!s_mutex || !s_nvs_mutex || !s_lv_mutex) return ESP_ERR_NO_MEM;
 
     s_storage_base = storage_base;
     memset(s_full_logged, 0, sizeof(s_full_logged));
+    memset(s_last_values, 0, sizeof(s_last_values));
     plants_table_init(&s_table);
 
     nvs_handle_t h;
@@ -242,7 +270,16 @@ esp_err_t plants_init(const char *storage_base)
 
 uint8_t plants_resolve_or_create(const uint8_t mac[6])
 {
-    if (!mac) return 0;
+    /* s_mutex is NULL until plants_init() has run, which only happens on
+     * the hub role (main.c, M8 Task 2). webserver_start() -- and therefore
+     * this function's M8 Task 3 caller in api_v1.c's history_get -- runs on
+     * every role, including the portal fallback a NODE with a failed pairing
+     * attempt lands in (main.c's role != SWARM_ROLE_NODE guard around
+     * plants_init() skips it there). Without this check, a plant-less
+     * device hitting that route would xSemaphoreTake() a NULL handle
+     * instead of getting the same "no plant" answer plants_resolve_or_create
+     * gives for any other lookup failure. */
+    if (!mac || !s_mutex) return 0;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     int idx = plants_table_find_mac(&s_table, mac);
@@ -326,7 +363,25 @@ uint8_t plants_create(void)
     return id;
 }
 
-/* Removes P<id>_raw.bin/P<id>_hourly.bin under the base path recorded at
+/* plants_last_values() cache helpers -- see s_last_values' declaration
+ * comment for the slot-capacity argument. */
+static int lv_cache_find(uint8_t id)
+{
+    for (int i = 0; i < LAST_VALUES_CACHE_CAP; i++) {
+        if (s_last_values[i].used && s_last_values[i].id == id) return i;
+    }
+    return -1;
+}
+
+static void lv_cache_drop(uint8_t id)
+{
+    xSemaphoreTake(s_lv_mutex, portMAX_DELAY);
+    int idx = lv_cache_find(id);
+    if (idx >= 0) s_last_values[idx].used = false;
+    xSemaphoreGive(s_lv_mutex);
+}
+
+/* Removes P<id>_raw.bin/P<id>_hr.bin under the base path recorded at
  * plants_init() -- the plant-keyed layout Task 3 rekeys storage.c to.
  * Neither file may exist yet (a plant with no history, or before Task 3
  * lands), so ENOENT is silently ignored; any other error is only logged, as
@@ -341,7 +396,7 @@ static void remove_ring_files(uint8_t id)
     if (remove(path) != 0 && errno != ENOENT) {
         ESP_LOGW(TAG, "plants_delete(%u): failed to remove %s: %s", id, path, strerror(errno));
     }
-    snprintf(path, sizeof(path), "%s/P%u_hourly.bin", s_storage_base, id);
+    snprintf(path, sizeof(path), "%s/P%u_hr.bin", s_storage_base, id);
     if (remove(path) != 0 && errno != ENOENT) {
         ESP_LOGW(TAG, "plants_delete(%u): failed to remove %s: %s", id, path, strerror(errno));
     }
@@ -362,26 +417,122 @@ esp_err_t plants_delete(uint8_t id)
     }
 
     remove_ring_files(id);
-    /* plants_last_values()'s RAM cache (once Task 3 adds one) is
-     * invalidated here too -- moot today since that function is stubbed to
-     * always return false and caches nothing (see plants.h). */
+    /* plants_last_values()'s RAM cache is dropped here too: ids are never
+     * reused (plants_table.h), so this id will never be looked up again as
+     * a live plant, but a stray caller holding onto a stale id must still
+     * see "no history" rather than whatever was cached before the delete. */
+    lv_cache_drop(id);
     return err;
+}
+
+/* Same boot-table resolve api_v1.c's history_get wires storage_query's
+ * resolve_fn to (its resolve_shim there does the identical one-line
+ * forward) -- boot_id/rel_s -> wall-clock epoch is timekeeper's job, not
+ * storage.c's or plants.c's. */
+static bool lv_resolve(void *rctx, uint16_t boot_id, uint32_t rel_s, uint32_t *epoch_out)
+{
+    (void)rctx;
+    return timekeeper_resolve(boot_id, rel_s, epoch_out);
+}
+
+typedef struct {
+    bool          found;
+    uint32_t      epoch;
+    storage_rec_t rec;
+} lv_scan_ctx_t;
+
+/* storage_query() emits rows in ring order, strictly oldest-to-newest (see
+ * storage.c and test_storage.c's wraparound-order assertions) -- so simply
+ * overwriting on every call, with no comparison, leaves the newest row in
+ * *ctx once the scan completes. */
+static void lv_row(void *vctx, uint32_t epoch, const storage_rec_t *rec)
+{
+    lv_scan_ctx_t *c = vctx;
+    c->found = true;
+    c->epoch = epoch;
+    c->rec = *rec;
 }
 
 bool plants_last_values(uint8_t id, int16_t *temp_dc, uint8_t *moisture,
                         uint32_t *lux, uint16_t *conductivity, uint8_t *battery,
                         uint32_t *epoch_out)
 {
-    /* TASK 3 REKEYS THIS: switch to plant_id -- see plants.h for why this
-     * is stubbed rather than querying storage.c by the plant's assigned mac
-     * today. Outputs deliberately left untouched, same "false = untouched"
-     * contract as swarm_store_hub() etc. */
-    (void)id;
-    (void)temp_dc;
-    (void)moisture;
-    (void)lux;
-    (void)conductivity;
-    (void)battery;
-    (void)epoch_out;
-    return false;
+    /* Same "uninitialised registry" guard as plants_resolve_or_create()
+     * above -- s_lv_mutex is NULL until plants_init() (hub role only) has
+     * run. No caller reaches this yet (Task 3 does not wire one up), but
+     * the guard costs nothing and keeps this function safe to call from any
+     * role the moment Tasks 5/6 do wire it up. */
+    if (id == 0 || !s_lv_mutex) return false;
+
+    xSemaphoreTake(s_lv_mutex, portMAX_DELAY);
+    int idx = lv_cache_find(id);
+    if (idx >= 0) {
+        last_values_cache_t c = s_last_values[idx];
+        xSemaphoreGive(s_lv_mutex);
+        if (!c.found) return false;
+        if (temp_dc)       *temp_dc = c.temp_dc;
+        if (moisture)      *moisture = c.moisture_pct;
+        if (lux)           *lux = c.lux;
+        if (conductivity)  *conductivity = c.conductivity_us;
+        if (battery)       *battery = c.battery_pct;
+        if (epoch_out)     *epoch_out = c.epoch;
+        return true;
+    }
+    xSemaphoreGive(s_lv_mutex);
+
+    /* Cache miss: scan storage.c's raw ring for this plant id. Widest
+     * possible epoch range -- this call wants the ring tail, not a
+     * window -- and storage_query() itself tolerates a NULL/unmounted
+     * s_storage_base the same way it tolerates a plant with no ring file
+     * yet: fopen() fails, 0 rows emitted, "not found" below. */
+    lv_scan_ctx_t scan = { .found = false };
+    if (s_storage_base) {
+        storage_query(s_storage_base, id, STORAGE_TIER_RAW, 0, 0xFFFFFFFFu,
+                      lv_resolve, NULL, lv_row, &scan);
+    }
+
+    /* Cache the result -- found or not -- keyed by id, so a plant that
+     * genuinely has no history (e.g. never had a probe assigned) doesn't
+     * re-scan its non-existent ring file on every call. Per plants.h, this
+     * is deliberately a first-read-wins cache with no periodic refresh:
+     * plants_last_values() exists to serve probe-less plants (see plants.h),
+     * whose ring, once populated, only ever changes via plants_delete()
+     * (which drops this cache entry too, above). */
+    xSemaphoreTake(s_lv_mutex, portMAX_DELAY);
+    idx = lv_cache_find(id);
+    if (idx < 0) {
+        for (int i = 0; i < LAST_VALUES_CACHE_CAP; i++) {
+            if (!s_last_values[i].used) { idx = i; break; }
+        }
+    }
+    if (idx >= 0) {
+        last_values_cache_t *c = &s_last_values[idx];
+        c->used = true;
+        c->id = id;
+        c->found = scan.found;
+        if (scan.found) {
+            c->temp_dc = scan.rec.temp_dc;
+            c->moisture_pct = scan.rec.moisture_pct;
+            c->lux = scan.rec.lux;
+            c->conductivity_us = scan.rec.conductivity_us;
+            c->battery_pct = scan.rec.battery_pct;
+            c->epoch = scan.epoch;
+        }
+    } else {
+        /* Cache exhausted -- cannot happen in practice (capacity ==
+         * PLANTS_MAX and plants_delete() always frees its slot), but if it
+         * ever does this call still answers correctly, it just re-scans
+         * storage on every future call for this id instead of caching. */
+        ESP_LOGW(TAG, "plants_last_values(%u): last-values cache full; not caching this result", id);
+    }
+    xSemaphoreGive(s_lv_mutex);
+
+    if (!scan.found) return false;
+    if (temp_dc)       *temp_dc = scan.rec.temp_dc;
+    if (moisture)      *moisture = scan.rec.moisture_pct;
+    if (lux)           *lux = scan.rec.lux;
+    if (conductivity)  *conductivity = scan.rec.conductivity_us;
+    if (battery)       *battery = scan.rec.battery_pct;
+    if (epoch_out)      *epoch_out = scan.epoch;
+    return true;
 }
