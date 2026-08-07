@@ -38,7 +38,13 @@ function ProbeChip({ plant, elapsedS }) {
     return <p class="probe-chip pending">probe assigned — awaiting first reading</p>
   }
   const source = p.via ? `via ${p.via.name || p.via.mac}` : 'direct'
-  return <p class="probe-chip">{source} · {p.rssi} dBm{battery}</p>
+  // M8 final review fix (M2): show data age on the live chip too, not just
+  // the probe-less one below -- otherwise a probe that's still "attached"
+  // but hasn't actually reported in days (e.g. a dead battery the registry
+  // hasn't evicted) reads as fine forever. Same fmtAge/liveAge formatter,
+  // same plant.last_seen_s field plant_json() already populates on the
+  // live branch (sensors_json.c).
+  return <p class="probe-chip">{source} · {p.rssi} dBm{battery} · {fmtAge(liveAge(plant.last_seen_s, elapsedS))}</p>
 }
 
 function Card({ plant, elapsedS }) {
@@ -66,6 +72,17 @@ export function DashboardTab() {
   // assigned to any plant). Kept in a ref rather than state: it's an SSE
   // dispatch aid, not something that should trigger its own re-render.
   const knownMacsRef = useRef(new Set())
+  // H2 (final M8 review): SSE-driven refetch coalescing. Every SSE frame
+  // used to trigger its own immediate GET /plants (plus, for an unknown
+  // mac, a GET /sensors too) -- a burst of frames from several sensors
+  // reporting close together meant a burst of full refetches, each doing
+  // its own pre-sync per-request ring scan for every probe-less plant
+  // (plants_last_values()). One shared timer per mount, trailing-edge only:
+  // every message pushes it out another 3s rather than firing one per
+  // message, so a burst collapses into a single pair of fetches 3s after
+  // the LAST frame in the burst, not one pair per frame.
+  const debounceTimerRef = useRef(null)
+  const pendingSensorsRef = useRef(false)
 
   useEffect(() => {
     let alive = true
@@ -99,6 +116,21 @@ export function DashboardTab() {
         .then((d) => { if (alive) for (const s of d.sensors) knownMacsRef.current.add(s.mac) })
     }
 
+    // Trailing-edge debounce (H2): fires 3s after the LAST SSE frame in a
+    // burst, not once per frame. Whether ANY frame in the coalesced window
+    // named an unknown mac is tracked in pendingSensorsRef -- set on the
+    // triggering message (known-ness is evaluated then, off knownMacsRef's
+    // state at that instant), consumed once the timer actually fires -- so
+    // an unknown mac still refetches both lists, just after the same
+    // debounce window as everything else, instead of jumping the queue.
+    function flushRefetch() {
+      debounceTimerRef.current = null
+      const needSensors = pendingSensorsRef.current
+      pendingSensorsRef.current = false
+      fetchPlants().catch(() => {})
+      if (needSensors) fetchKnownSensors().catch(() => {})
+    }
+
     // The hub's SSE endpoint caps at 2 clients and answers a 3rd with a
     // plain HTTP 503, not a dropped connection -- and a non-200 response
     // permanently closes the browser's EventSource with no auto-reconnect.
@@ -110,8 +142,9 @@ export function DashboardTab() {
         const s = JSON.parse(ev.data)
         setReconnecting(false)
         const known = knownMacsRef.current.has(s.mac)
-        fetchPlants().catch(() => {})
-        if (!known) fetchKnownSensors().catch(() => {})
+        if (!known) pendingSensorsRef.current = true
+        if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current)
+        debounceTimerRef.current = setTimeout(flushRefetch, 3000)
       }
       es.onerror = () => {
         setReconnecting(true)
@@ -147,6 +180,7 @@ export function DashboardTab() {
       es && es.close()
       ticker && clearInterval(ticker)
       retryTimer && clearTimeout(retryTimer)
+      debounceTimerRef.current && clearTimeout(debounceTimerRef.current)
     }
   }, [])
 
