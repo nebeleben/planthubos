@@ -17,7 +17,8 @@
 #include "lineproto.h"
 #include "data_core.h"
 #include "registry.h"
-#include "app_config.h"
+#include "plants.h"
+#include "plants_table.h"
 #include "timekeeper.h"
 
 #include "esp_http_client.h"
@@ -45,31 +46,42 @@ static char s_batch[INFLUX_BATCH_CAP];
 static char s_url[INFLUX_URL_CAP];
 static char s_auth_header[INFLUX_AUTH_CAP];
 
-/* Snapshots the registry and appends every live (non-stale) sensor's
- * line-protocol line to s_batch. now_uptime_s is esp_timer-based uptime
- * seconds, the same clock last_seen_s is stamped in (see data_core.c);
- * epoch_s per point is computed by walking that age back off the real
- * wall-clock time. Returns the number of bytes written to s_batch (0 ==
- * nothing to send). */
+/* Snapshots the plants table and the registry, and appends every assigned
+ * plant's live (non-stale) reading as a line-protocol line to s_batch --
+ * unassigned plants (no probe) are skipped, as are assigned plants whose
+ * probe mac has no registry entry yet (never reported to the hub) or whose
+ * last report has aged out. now_uptime_s is esp_timer-based uptime seconds,
+ * the same clock last_seen_s is stamped in (see data_core.c); epoch_s per
+ * point is computed by walking that age back off the real wall-clock time.
+ * Returns the number of bytes written to s_batch (0 == nothing to send). */
 static size_t build_batch(void)
 {
-    registry_t snap;
-    data_core_snapshot(&snap);
+    plants_table_t plants_snap;
+    plants_snapshot(&plants_snap);
+
+    registry_t reg_snap;
+    data_core_snapshot(&reg_snap);
 
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
     uint32_t epoch_now = timekeeper_now();
     size_t off = 0;
 
-    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
-        const sensor_entry_t *e = &snap.sensors[i];
-        if (!e->in_use) continue;
+    for (int i = 0; i < PLANTS_MAX; i++) {
+        const plant_entry_t *pe = &plants_snap.p[i];
+        if (!pe->in_use || !pe->mac_valid) continue;   /* assigned only */
 
+        int ridx = registry_find(&reg_snap, pe->mac);
+        if (ridx < 0) continue;   /* probe never reported to this hub */
+
+        const sensor_entry_t *e = &reg_snap.sensors[ridx];
         uint32_t age_s = now_uptime_s - e->last_seen_s;
         if (age_s > DATA_CORE_MAX_AGE_S) continue;
 
         lp_point_t p = {0};
-        memcpy(p.mac, e->mac, sizeof(p.mac));
-        app_config_get_sensor_name(e->mac, p.name); /* leaves p.name "" if unset */
+        p.plant_id = pe->id;
+        strncpy(p.name, pe->name, sizeof(p.name) - 1);
+        snprintf(p.sensor_mac12, sizeof(p.sensor_mac12), "%02X%02X%02X%02X%02X%02X",
+                 pe->mac[0], pe->mac[1], pe->mac[2], pe->mac[3], pe->mac[4], pe->mac[5]);
 
         p.has_temp = e->latest.has_temp;
         p.temp_c = e->latest.temp_dc / 10.0f;
@@ -84,7 +96,7 @@ static size_t build_batch(void)
         p.epoch_s = (int64_t)epoch_now - (int64_t)age_s;
 
         if (!lineproto_append(s_batch, sizeof(s_batch), &off, &p)) {
-            ESP_LOGD(TAG, "line for sensor slot %d did not fit or had no fields; skipped", i);
+            ESP_LOGD(TAG, "line for plant %u did not fit or had no fields; skipped", pe->id);
         }
     }
 

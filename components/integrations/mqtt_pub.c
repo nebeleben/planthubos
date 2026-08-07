@@ -33,6 +33,8 @@
 #include "data_core.h"
 #include "registry.h"
 #include "app_config.h"
+#include "plants.h"
+#include "plants_table.h"
 
 #include "mqtt_client.h"
 #include "esp_event.h"
@@ -91,61 +93,63 @@ static esp_mqtt_client_handle_t s_client;
 static QueueHandle_t            s_queue;      /* items: mqtt_pub_msg_t */
 static char                     s_hub[16];
 
-/* Per-registry-slot state, indexed by the same slot data_core_snapshot()'s
- * registry_t reports (registry_find() gives the index). Both arrays are
- * written only from mqtt_pub_task() -- discovery-sent is set there when a
- * discovery config actually goes out (whether triggered by a queued state
- * update or a RESYNC_DISCOVERY message), and cleared by
- * mqtt_event_handler()'s MQTT_EVENT_CONNECTED case on a different task
- * (esp-mqtt's), but only via memset() immediately before it enqueues the
- * RESYNC_DISCOVERY message that follows -- the queue send/receive pair is a
- * release/acquire, so mqtt_pub_task is guaranteed to observe that memset
- * before it next touches either array. No separate mutex needed. */
-static bool    s_discovery_sent[REGISTRY_MAX_SENSORS];
-static int64_t s_last_pub_us[REGISTRY_MAX_SENSORS];
+/* Per-plants-table-slot state, indexed by the same slot plants_snapshot()'s
+ * plants_table_t reports (plants_table_find_id() gives the index) -- sized
+ * PLANTS_MAX (16), not REGISTRY_MAX_SENSORS: a plant id is bounded (1..255,
+ * never reused) but the table slot it currently occupies is what's bounded
+ * *and* stable enough to index an array with, exactly like registry slots
+ * were before this file went plant-centric. Unlike ids, slots CAN be reused
+ * (plants_delete() frees a slot for a future plants_create()), so
+ * s_slot_plant_id caches which plant id currently owns each slot: on a
+ * mismatch (msg.mac resolved to a plant id that doesn't match what this
+ * slot last published for), the slot has been reused by a different plant
+ * since we last saw it, and its throttle/discovery state is stale and must
+ * be reset before anything below trusts it.
+ *
+ * All four arrays are written only from mqtt_pub_task() -- discovery-sent
+ * is set there when a discovery config actually goes out (whether
+ * triggered by a queued state update or a RESYNC_DISCOVERY message), and
+ * cleared by mqtt_event_handler()'s MQTT_EVENT_CONNECTED case on a
+ * different task (esp-mqtt's), but only via memset() immediately before it
+ * enqueues the RESYNC_DISCOVERY message that follows -- the queue
+ * send/receive pair is a release/acquire, so mqtt_pub_task is guaranteed to
+ * observe that memset before it next touches any of these arrays. No
+ * separate mutex needed. */
+static bool    s_discovery_sent[PLANTS_MAX];
+static int64_t s_last_pub_us[PLANTS_MAX];
+static uint8_t s_slot_plant_id[PLANTS_MAX];              /* 0 = never published from this slot */
+static char    s_slot_name[PLANTS_MAX][PLANT_NAME_LEN + 1]; /* last name discovery was published with */
 
-static void mac_to_hex12(const uint8_t mac[6], char out[13])
-{
-    snprintf(out, 13, "%02X%02X%02X%02X%02X%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
-/* Publishes all 5 HA discovery configs (retained, qos 1) for one sensor,
+/* Publishes all 5 HA discovery configs (retained, qos 1) for one plant,
  * unconditionally -- not gated by latest.has_* (per the plan: a metric that
  * only starts appearing later would otherwise never get a discovery
  * config, and HA tolerates a config whose value template briefly yields
- * nothing). */
-static void publish_discovery(const uint8_t mac[6])
+ * nothing). name is the plant's current display name or "" (mqtt_json.h's
+ * mqtt_json_discovery() supplies the "Plant <id>" fallback). */
+static void publish_discovery(uint8_t plant_id, const char *name)
 {
     if (!s_client) return;
-
-    char mac12[13];
-    mac_to_hex12(mac, mac12);
-    char name[33] = "";
-    app_config_get_sensor_name(mac, name);
 
     char topic[TOPIC_BUF_SIZE];
     char json[DISC_JSON_BUF_SIZE];
     for (size_t i = 0; i < METRIC_COUNT; i++) {
-        if (!mqtt_topic_discovery(topic, sizeof(topic), mac12, METRICS[i])) {
-            ESP_LOGW(TAG, "discovery topic for %s/%s did not fit", mac12, METRICS[i]);
+        if (!mqtt_topic_discovery(topic, sizeof(topic), plant_id, METRICS[i])) {
+            ESP_LOGW(TAG, "discovery topic for plant %u/%s did not fit", plant_id, METRICS[i]);
             continue;
         }
-        if (!mqtt_json_discovery(json, sizeof(json), s_hub, mac12, name, METRICS[i])) {
-            ESP_LOGW(TAG, "discovery payload for %s/%s did not fit", mac12, METRICS[i]);
+        if (!mqtt_json_discovery(json, sizeof(json), s_hub, plant_id, name, METRICS[i])) {
+            ESP_LOGW(TAG, "discovery payload for plant %u/%s did not fit", plant_id, METRICS[i]);
             continue;
         }
         esp_mqtt_client_publish(s_client, topic, json, 0, 1, 1);
     }
 }
 
-/* Publishes the retained state payload for one registry entry, qos 0. */
-static void publish_state(const sensor_entry_t *e)
+/* Publishes the retained state payload for one plant, qos 0. e is the
+ * registry entry for the plant's currently-assigned probe. */
+static void publish_state(uint8_t plant_id, const sensor_entry_t *e)
 {
     if (!s_client) return;
-
-    char mac12[13];
-    mac_to_hex12(e->mac, mac12);
 
     mqtt_state_t st = {
         .has_temp         = e->latest.has_temp,
@@ -163,51 +167,63 @@ static void publish_state(const sensor_entry_t *e)
 
     char topic[TOPIC_BUF_SIZE];
     char json[STATE_JSON_BUF_SIZE];
-    if (!mqtt_topic_state(topic, sizeof(topic), s_hub, mac12)) {
-        ESP_LOGW(TAG, "state topic for %s did not fit", mac12);
+    if (!mqtt_topic_state(topic, sizeof(topic), s_hub, plant_id)) {
+        ESP_LOGW(TAG, "state topic for plant %u did not fit", plant_id);
         return;
     }
     if (!mqtt_json_state(json, sizeof(json), &st)) {
-        ESP_LOGW(TAG, "state payload for %s did not fit", mac12);
+        ESP_LOGW(TAG, "state payload for plant %u did not fit", plant_id);
         return;
     }
     esp_mqtt_client_publish(s_client, topic, json, 0, 0, 1);
 }
 
-/* Publishes discovery configs for every sensor currently in the registry
- * and marks their bitmap slots sent -- runs on mqtt_pub_task in response to
- * a RESYNC_DISCOVERY message, so mqtt_pub_task() itself doesn't redundantly
- * resend them the first time each sensor's next state publish comes
- * through. registry_t (~1KB) lives on mqtt_pub_task's own stack here, same
- * as in mqtt_pub_task() below -- both are fine on its stack (see
+/* Publishes discovery configs for every plant currently in the plants table
+ * (whether or not it has a probe assigned -- discovery just declares the HA
+ * entity, and per-plant state publishing already only happens once that
+ * plant has actually reported data) and marks their bitmap slots sent --
+ * runs on mqtt_pub_task in response to a RESYNC_DISCOVERY message, so
+ * mqtt_pub_task() itself doesn't redundantly resend them the first time
+ * each plant's next state publish comes through. plants_table_t lives on
+ * mqtt_pub_task's own stack here, same as registry_t/plants_table_t in
+ * mqtt_pub_task() below -- both are fine on its stack (see
  * MQTT_PUB_TASK_STACK's comment for the sizing history). */
 static void publish_all_discovery(void)
 {
-    registry_t snap;
-    data_core_snapshot(&snap);
-    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
-        if (!snap.sensors[i].in_use) continue;
-        publish_discovery(snap.sensors[i].mac);
+    plants_table_t snap;
+    plants_snapshot(&snap);
+    for (int i = 0; i < PLANTS_MAX; i++) {
+        if (!snap.p[i].in_use) continue;
+        publish_discovery(snap.p[i].id, snap.p[i].name);
         s_discovery_sent[i] = true;
+        s_slot_plant_id[i] = snap.p[i].id;
+        strncpy(s_slot_name[i], snap.p[i].name, PLANT_NAME_LEN);
+        s_slot_name[i][PLANT_NAME_LEN] = '\0';
     }
 }
 
 /* The one task that ever calls esp_mqtt_client_publish() for state/discovery
- * traffic. Drains s_queue: a STATE_UPDATE throttles to one state publish
- * per sensor per 30s and sends discovery first for any sensor whose bitmap
- * slot hasn't seen it this MQTT session; a RESYNC_DISCOVERY (posted by
+ * traffic. Drains s_queue: a STATE_UPDATE resolves the reporting mac to its
+ * plant (plants_resolve_or_create() -- task context, allowed; this is one
+ * of the sanctioned lazy-create call sites, since a DATA_EVENT mac is
+ * always a real registry mac by construction), throttles to one state
+ * publish per plant slot per 30s, and sends discovery first whenever that
+ * slot hasn't seen it this MQTT session OR the plant's name has changed
+ * since the cached one (a rename must re-publish discovery -- see
+ * s_slot_name's comment); a RESYNC_DISCOVERY (posted by
  * mqtt_event_handler() right after MQTT_EVENT_CONNECTED, see the file
- * header) walks the whole registry and (re)sends discovery for every
- * sensor in it -- both the per-sensor NVS name read/discovery publishes and
- * this full-registry walk used to happen inline on esp-mqtt's own task;
- * they happen here now instead. registry_t (~1KB) lives on this task's own
- * stack -- fine per the plan, this is the one place in the component that
- * does it. */
+ * header) walks the whole plants table and (re)sends discovery for every
+ * plant in it -- both the per-plant discovery publishes and this
+ * full-table walk used to happen inline on esp-mqtt's own task; they
+ * happen here now instead. registry_t/plants_table_t (~1KB each) live on
+ * this task's own stack -- fine per the plan, this is the one place in the
+ * component that does it. */
 static void mqtt_pub_task(void *arg)
 {
     (void)arg;
     mqtt_pub_msg_t msg;
-    registry_t snap;
+    registry_t reg_snap;
+    plants_table_t plants_snap;
 
     for (;;) {
         if (xQueueReceive(s_queue, &msg, portMAX_DELAY) != pdTRUE) continue;
@@ -217,19 +233,40 @@ static void mqtt_pub_task(void *arg)
             continue;
         }
 
-        data_core_snapshot(&snap);
-        int idx = registry_find(&snap, msg.mac);
-        if (idx < 0) continue;   /* defensive: shouldn't happen, registry entries are never removed */
+        uint8_t plant_id = plants_resolve_or_create(msg.mac);
+        if (plant_id == 0) continue;   /* plants table full; already logged once/mac/boot */
+
+        data_core_snapshot(&reg_snap);
+        int ridx = registry_find(&reg_snap, msg.mac);
+        if (ridx < 0) continue;   /* defensive: shouldn't happen, registry entries are never removed */
+
+        plants_snapshot(&plants_snap);
+        int slot = plants_table_find_id(&plants_snap, plant_id);
+        if (slot < 0) continue;   /* defensive: plants_resolve_or_create() just created/found it */
+
+        if (s_slot_plant_id[slot] != plant_id) {
+            /* Slot reused since we last saw it (or never seen) -- any
+             * cached throttle/discovery state for it belongs to a
+             * different plant and must not be trusted. */
+            s_slot_plant_id[slot] = plant_id;
+            s_last_pub_us[slot] = 0;
+            s_discovery_sent[slot] = false;
+            s_slot_name[slot][0] = '\0';
+        }
 
         int64_t now = esp_timer_get_time();
-        if (now - s_last_pub_us[idx] < MQTT_PUB_MIN_INTERVAL_US) continue;
-        s_last_pub_us[idx] = now;
+        if (now - s_last_pub_us[slot] < MQTT_PUB_MIN_INTERVAL_US) continue;
+        s_last_pub_us[slot] = now;
 
-        if (!s_discovery_sent[idx]) {
-            publish_discovery(msg.mac);
-            s_discovery_sent[idx] = true;
+        const char *name = plants_snap.p[slot].name;
+        bool name_changed = strncmp(s_slot_name[slot], name, PLANT_NAME_LEN) != 0;
+        if (!s_discovery_sent[slot] || name_changed) {
+            publish_discovery(plant_id, name);
+            s_discovery_sent[slot] = true;
+            strncpy(s_slot_name[slot], name, PLANT_NAME_LEN);
+            s_slot_name[slot][PLANT_NAME_LEN] = '\0';
         }
-        publish_state(&snap.sensors[idx]);
+        publish_state(plant_id, &reg_snap.sensors[ridx]);
     }
 }
 
