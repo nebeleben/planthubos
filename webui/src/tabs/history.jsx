@@ -46,19 +46,19 @@ function Chart({ points }) {
 }
 
 export function HistoryTab() {
-  const [sensors, setSensors] = useState([])
-  const [mac, setMac] = useState('')
+  const [plants, setPlants] = useState([])
+  const [plantId, setPlantId] = useState('')
   const [range, setRange] = useState('Day')
   const [points, setPoints] = useState(null)
   const [state, setState] = useState('loading') // loading | ready | unsynced | error
 
   useEffect(() => {
     const controller = new AbortController()
-    fetch('/api/v1/sensors', { signal: controller.signal })
+    fetch('/api/v1/plants', { signal: controller.signal })
       .then((r) => r.json())
       .then((d) => {
-        setSensors(d.sensors)
-        if (d.sensors.length > 0) setMac(d.sensors[0].mac)
+        setPlants(d.plants)
+        if (d.plants.length > 0) setPlantId(d.plants[0].id)
         else setState('ready')
       })
       .catch((err) => { if (err.name !== 'AbortError') setState('error') })
@@ -66,7 +66,7 @@ export function HistoryTab() {
   }, [])
 
   useEffect(() => {
-    if (!mac) return
+    if (!plantId) return
     setState('loading')
     const controller = new AbortController()
     const r = RANGES[range]
@@ -79,7 +79,10 @@ export function HistoryTab() {
         if (!st.time_synced) { setState('unsynced'); return }
         const to = st.epoch_s
         const from = to - r.seconds
-        const d = await fetch(`/api/v1/sensors/${mac.replaceAll(':', '')}/history?tier=${r.tier}`
+        // Only the path changed from the old /api/v1/sensors/{mac}/history
+        // bridge (M8 Task 6) -- tier/from/to and the response shape are
+        // identical.
+        const d = await fetch(`/api/v1/plants/${plantId}/history?tier=${r.tier}`
             + `&from=${from}&to=${to}`, { signal: controller.signal }).then((res) => res.json())
         if (!d.synced) { setState('unsynced'); return }
         setPoints(d.points)
@@ -89,13 +92,13 @@ export function HistoryTab() {
       }
     })()
     return () => controller.abort()
-  }, [mac, range])
+  }, [plantId, range])
 
   return (
     <div>
       <div class="hist-controls">
-        <select value={mac} onChange={(e) => setMac(e.currentTarget.value)}>
-          {sensors.map((s) => <option key={s.mac} value={s.mac}>{s.name || s.mac}</option>)}
+        <select value={plantId} onChange={(e) => setPlantId(e.currentTarget.value)}>
+          {plants.map((p) => <option key={p.id} value={p.id}>{p.name || `Plant ${p.id}`}</option>)}
         </select>
         {Object.keys(RANGES).map((k) => (
           <button key={k} class={k === range ? 'active' : ''} onClick={() => setRange(k)}>{k}</button>
@@ -104,7 +107,7 @@ export function HistoryTab() {
       {state === 'error' && <p class="error">Hub not reachable.</p>}
       {state === 'unsynced' && <p class="placeholder">Hub clock not synced yet — history becomes available once the hub learns the time (open this page once while online).</p>}
       {state === 'loading' && <p class="placeholder">Loading…</p>}
-      {state === 'ready' && sensors.length === 0 && <p class="placeholder">No sensors yet.</p>}
+      {state === 'ready' && plants.length === 0 && <p class="placeholder">No plants yet.</p>}
       {state === 'ready' && points && points.length === 0 && <p class="placeholder">No data in this range yet.</p>}
       {state === 'ready' && points && points.length > 0 && <Chart points={points} />}
     </div>

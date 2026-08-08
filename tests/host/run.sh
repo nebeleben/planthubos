@@ -57,3 +57,11 @@ $CC -Wall -Wextra -Werror -I../../components/ble_collector/include \
 $CC -Wall -Wextra -Werror -I../../components/swarm/include \
     test_batt_cycle.c ../../components/swarm/batt_cycle.c -o test_batt_cycle
 ./test_batt_cycle
+
+$CC -Wall -Wextra -Werror -I../../components/plants/include \
+    test_plants_table.c ../../components/plants/plants_table.c -o test_plants_table
+./test_plants_table
+
+$CC -Wall -Wextra -Werror -I../../components/plants/include \
+    test_plants_migrate.c ../../components/plants/plants_migrate.c ../../components/plants/plants_table.c -o test_plants_migrate
+./test_plants_migrate

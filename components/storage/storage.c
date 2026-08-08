@@ -8,7 +8,7 @@
 
 typedef struct {
     bool used;
-    uint8_t mac[6];
+    uint8_t plant_id;
     storage_tier_t tier;
     uint32_t next_idx;   /* next slot to write */
 } cache_t;
@@ -17,12 +17,20 @@ static cache_t s_cache[CACHE_SLOTS];
 
 void storage_reset_cache(void) { memset(s_cache, 0, sizeof(s_cache)); }
 
+void storage_drop(uint8_t plant_id)
+{
+    for (int i = 0; i < CACHE_SLOTS; i++) {
+        if (s_cache[i].used && s_cache[i].plant_id == plant_id) {
+            s_cache[i].used = false;
+        }
+    }
+}
+
 static uint32_t tier_cap(storage_tier_t t) { return t == STORAGE_TIER_RAW ? STORAGE_RAW_CAP : STORAGE_HOURLY_CAP; }
 
-static void tier_path(char *out, size_t n, const char *base, const uint8_t mac[6], storage_tier_t t)
+static void tier_path(char *out, size_t n, const char *base, uint8_t plant_id, storage_tier_t t)
 {
-    snprintf(out, n, "%s/%02X%02X%02X%02X%02X%02X_%s.bin", base,
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+    snprintf(out, n, "%s/P%u_%s.bin", base, plant_id,
              t == STORAGE_TIER_RAW ? "raw" : "hr");
 }
 
@@ -43,11 +51,11 @@ static bool rec_plausible(const storage_rec_t *r)
     return r->boot_id != EMPTY_BOOT && r->rel_s != 0xFFFFFFFFu && r->rel_s < 320000000u; /* ~10y uptime ceiling */
 }
 
-static cache_t *cache_get(const uint8_t mac[6], storage_tier_t tier)
+static cache_t *cache_get(uint8_t plant_id, storage_tier_t tier)
 {
     cache_t *free_slot = NULL;
     for (int i = 0; i < CACHE_SLOTS; i++) {
-        if (s_cache[i].used && s_cache[i].tier == tier && memcmp(s_cache[i].mac, mac, 6) == 0)
+        if (s_cache[i].used && s_cache[i].tier == tier && s_cache[i].plant_id == plant_id)
             return &s_cache[i];
         if (!s_cache[i].used && !free_slot) free_slot = &s_cache[i];
     }
@@ -96,20 +104,20 @@ static FILE *open_or_create(const char *path, uint32_t cap)
     return f;
 }
 
-int storage_append(const char *base, const uint8_t mac[6], storage_tier_t tier, const storage_rec_t *rec)
+int storage_append(const char *base, uint8_t plant_id, storage_tier_t tier, const storage_rec_t *rec)
 {
     uint32_t cap = tier_cap(tier);
     char path[128];
-    tier_path(path, sizeof(path), base, mac, tier);
+    tier_path(path, sizeof(path), base, plant_id, tier);
 
     FILE *f = open_or_create(path, cap);
     if (!f) return -1;
 
-    cache_t *c = cache_get(mac, tier);
+    cache_t *c = cache_get(plant_id, tier);
     if (!c) { fclose(f); return -1; }
     if (!c->used) {
         c->used = true;
-        memcpy(c->mac, mac, 6);
+        c->plant_id = plant_id;
         c->tier = tier;
         c->next_idx = scan_next_idx(f, cap);
     }
@@ -124,14 +132,14 @@ int storage_append(const char *base, const uint8_t mac[6], storage_tier_t tier, 
     return 0;
 }
 
-int storage_query(const char *base, const uint8_t mac[6], storage_tier_t tier,
+int storage_query(const char *base, uint8_t plant_id, storage_tier_t tier,
                   uint32_t from_epoch, uint32_t to_epoch,
                   storage_resolve_fn resolve, void *rctx,
                   storage_row_fn row, void *ctx)
 {
     uint32_t cap = tier_cap(tier);
     char path[128];
-    tier_path(path, sizeof(path), base, mac, tier);
+    tier_path(path, sizeof(path), base, plant_id, tier);
 
     FILE *f = fopen(path, "rb");
     if (!f) return 0;   /* no data yet */

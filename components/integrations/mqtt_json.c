@@ -2,9 +2,9 @@
 #include <stdio.h>
 #include <string.h>
 
-bool mqtt_topic_state(char *out, size_t cap, const char *hub, const char *mac12)
+bool mqtt_topic_state(char *out, size_t cap, const char *hub, uint8_t plant_id)
 {
-    int n = snprintf(out, cap, "planthub/%s/%s/state", hub, mac12);
+    int n = snprintf(out, cap, "planthub/%s/plant/%u/state", hub, (unsigned)plant_id);
     return n >= 0 && (size_t)n < cap;
 }
 
@@ -14,9 +14,10 @@ bool mqtt_topic_avail(char *out, size_t cap, const char *hub)
     return n >= 0 && (size_t)n < cap;
 }
 
-bool mqtt_topic_discovery(char *out, size_t cap, const char *mac12, const char *metric)
+bool mqtt_topic_discovery(char *out, size_t cap, uint8_t plant_id, const char *metric)
 {
-    int n = snprintf(out, cap, "homeassistant/sensor/planthub_%s_%s/config", mac12, metric);
+    int n = snprintf(out, cap, "homeassistant/sensor/planthub_plant_%u_%s/config",
+                      (unsigned)plant_id, metric);
     return n >= 0 && (size_t)n < cap;
 }
 
@@ -134,14 +135,13 @@ static const metric_info_t *find_metric(const char *metric)
 
 /* Escapes src for embedding as the body of a JSON string (caller supplies
  * the surrounding quotes): '"' and '\' become \" / \\, and any control
- * character (<0x20) becomes \u00XX. Without this, a sensor name containing
+ * character (<0x20) becomes \u00XX. Without this, a plant name containing
  * either character (typed by a user into the webui, not validated against
- * any charset -- see app_config's sensor-name setter) would land unescaped
- * in hand-rolled JSON here, producing a malformed discovery payload that HA
- * silently drops. dst is always NUL-terminated; if src would not fit, the
- * output is truncated at a whole-escape-unit boundary rather than
- * overflowing dst -- a truncated but well-formed name beats no discovery
- * config at all. */
+ * any charset -- see plants_rename()) would land unescaped in hand-rolled
+ * JSON here, producing a malformed discovery payload that HA silently
+ * drops. dst is always NUL-terminated; if src would not fit, the output is
+ * truncated at a whole-escape-unit boundary rather than overflowing dst --
+ * a truncated but well-formed name beats no discovery config at all. */
 static void json_escape(const char *src, char *dst, size_t dst_cap)
 {
     if (dst_cap == 0) return;
@@ -167,8 +167,8 @@ static void json_escape(const char *src, char *dst, size_t dst_cap)
     dst[pos] = '\0';
 }
 
-bool mqtt_json_discovery(char *out, size_t cap, const char *hub, const char *mac12,
-                          const char *sensor_name, const char *metric)
+bool mqtt_json_discovery(char *out, size_t cap, const char *hub, uint8_t plant_id,
+                          const char *plant_name, const char *metric)
 {
     const metric_info_t *info = find_metric(metric);
     if (info == NULL) {
@@ -178,10 +178,13 @@ bool mqtt_json_discovery(char *out, size_t cap, const char *hub, const char *mac
     size_t pos = 0;
     int n;
 
-    /* Use mac12 if sensor_name is empty; either way, escape before it goes
-     * into either JSON string field below (mac12 never needs escaping, but
-     * running it through json_escape too keeps this branch-free). */
-    const char *raw_display_name = (sensor_name && *sensor_name) ? sensor_name : mac12;
+    /* Fall back to "Plant <id>" when plant_name is empty; either way, run
+     * the result through json_escape before it goes into either JSON string
+     * field below (the fallback never needs escaping, but running it
+     * through json_escape too keeps this branch-free). */
+    char fallback[16];   /* "Plant " + up to 3 digits + NUL */
+    snprintf(fallback, sizeof fallback, "Plant %u", (unsigned)plant_id);
+    const char *raw_display_name = (plant_name && *plant_name) ? plant_name : fallback;
     char display_name[6 * 32 + 1];   /* worst case: every byte of a 32-char name becomes \u00XX */
     json_escape(raw_display_name, display_name, sizeof display_name);
 
@@ -196,12 +199,12 @@ bool mqtt_json_discovery(char *out, size_t cap, const char *hub, const char *mac
     pos += n;
 
     /* uniq_id */
-    n = snprintf(out + pos, cap - pos, "\"uniq_id\":\"planthub_%s_%s\",", mac12, metric);
+    n = snprintf(out + pos, cap - pos, "\"uniq_id\":\"planthub_plant_%u_%s\",", (unsigned)plant_id, metric);
     if (n < 0 || (size_t)n >= cap - pos) return false;
     pos += n;
 
     /* stat_t */
-    n = snprintf(out + pos, cap - pos, "\"stat_t\":\"planthub/%s/%s/state\",", hub, mac12);
+    n = snprintf(out + pos, cap - pos, "\"stat_t\":\"planthub/%s/plant/%u/state\",", hub, (unsigned)plant_id);
     if (n < 0 || (size_t)n >= cap - pos) return false;
     pos += n;
 
@@ -239,8 +242,8 @@ bool mqtt_json_discovery(char *out, size_t cap, const char *hub, const char *mac
     pos += n;
 
     /* dev object */
-    n = snprintf(out + pos, cap - pos, "\"dev\":{\"ids\":[\"planthub_%s\"],\"name\":\"%s\",\"mf\":\"PlantHub\",\"via_device\":\"%s\"}}",
-                 mac12, display_name, hub);
+    n = snprintf(out + pos, cap - pos, "\"dev\":{\"ids\":[\"planthub_plant_%u\"],\"name\":\"%s\",\"mf\":\"PlantHub\",\"via_device\":\"%s\"}}",
+                 (unsigned)plant_id, display_name, hub);
     if (n < 0 || (size_t)n >= cap - pos) return false;
     pos += n;
 

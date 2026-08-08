@@ -4,18 +4,21 @@
 #include <inttypes.h>
 #include "lineproto.h"
 
-/* Escape a tag value per Influx line protocol: comma, equals, space, and
- * backslash itself each become backslash + char. Any control character
- * (0x00-0x1F or 0x7F -- an embedded newline/CR/tab included) is replaced
- * with '_' outright rather than escaped: letting one through unescaped
- * would insert a real line break (or other control byte) into the tag
- * value, corrupting not just this tag but the line boundary for the rest
- * of the batch that follows it in the same write. */
-static size_t escape_tag_value(const char *src, char *dst, size_t dst_size)
+/* Escapes src for embedding as an Influx line-protocol STRING FIELD value
+ * (caller supplies the surrounding quotes): '"' and '\' are the only two
+ * characters line protocol requires escaped inside a string field, and each
+ * becomes backslash + itself. Any control character (0x00-0x1F or 0x7F --
+ * an embedded newline/CR/tab included) is replaced with '_' outright rather
+ * than escaped: this component's batch buffer is a sequence of '\n'-
+ * terminated lines (see lineproto_append() below and influx.c's build_batch()),
+ * so a real newline let through here would insert a literal line break into
+ * a quoted field, corrupting not just this field but the line boundary for
+ * the rest of the batch that follows it. */
+static void escape_string_field(const char *src, char *dst, size_t dst_size)
 {
     size_t pos = 0;
     for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
-        if (*p == ',' || *p == '=' || *p == ' ' || *p == '\\') {
+        if (*p == '"' || *p == '\\') {
             if (pos + 2 >= dst_size) break;
             dst[pos++] = '\\';
             dst[pos++] = (char)*p;
@@ -28,7 +31,6 @@ static size_t escape_tag_value(const char *src, char *dst, size_t dst_size)
         }
     }
     dst[pos] = '\0';
-    return pos;
 }
 
 bool lineproto_append(char *buf, size_t cap, size_t *off, const lp_point_t *p)
@@ -50,30 +52,14 @@ bool lineproto_append(char *buf, size_t cap, size_t *off, const lp_point_t *p)
     size_t pos = 0;
     int n;
 
-    /* Measurement and sensor tag (always present) */
+    /* Measurement and plant tag (always present; numeric, never needs
+     * line-protocol tag-value escaping) */
     n = snprintf(scratch + pos, sizeof(scratch) - pos,
-                    "plant,sensor=%02X%02X%02X%02X%02X%02X",
-                    p->mac[0], p->mac[1], p->mac[2],
-                    p->mac[3], p->mac[4], p->mac[5]);
+                    "plant,plant=%u ", (unsigned)p->plant_id);
     if (n < 0 || (size_t)n >= sizeof(scratch) - pos) return false;
     pos += (size_t)n;
 
-    /* Name tag (only if non-empty) */
-    if (p->name[0] != '\0') {
-        char escaped_name[128];
-        escape_tag_value(p->name, escaped_name, sizeof(escaped_name));
-        n = snprintf(scratch + pos, sizeof(scratch) - pos,
-                        ",name=%s", escaped_name);
-        if (n < 0 || (size_t)n >= sizeof(scratch) - pos) return false;
-        pos += (size_t)n;
-    }
-
-    /* Space before fields */
-    n = snprintf(scratch + pos, sizeof(scratch) - pos, " ");
-    if (n < 0 || (size_t)n >= sizeof(scratch) - pos) return false;
-    pos += (size_t)n;
-
-    /* Fields (only if corresponding flag is set) */
+    /* Fields (only if corresponding flag/value is set) */
     bool first = true;
     if (p->has_temp) {
         n = snprintf(scratch + pos, sizeof(scratch) - pos,
@@ -106,6 +92,28 @@ bool lineproto_append(char *buf, size_t cap, size_t *off, const lp_point_t *p)
     if (p->has_battery) {
         n = snprintf(scratch + pos, sizeof(scratch) - pos,
                         "%sbattery=%" PRIu8 "i", first ? "" : ",", p->battery_pct);
+        if (n < 0 || (size_t)n >= sizeof(scratch) - pos) return false;
+        pos += (size_t)n;
+        first = false;
+    }
+
+    /* name (string field, only if non-empty) */
+    if (p->name[0] != '\0') {
+        char escaped_name[128];
+        escape_string_field(p->name, escaped_name, sizeof(escaped_name));
+        n = snprintf(scratch + pos, sizeof(scratch) - pos,
+                        "%sname=\"%s\"", first ? "" : ",", escaped_name);
+        if (n < 0 || (size_t)n >= sizeof(scratch) - pos) return false;
+        pos += (size_t)n;
+        first = false;
+    }
+
+    /* sensor (string field: assigned probe's mac12, only if non-empty) */
+    if (p->sensor_mac12[0] != '\0') {
+        char escaped_sensor[32];
+        escape_string_field(p->sensor_mac12, escaped_sensor, sizeof(escaped_sensor));
+        n = snprintf(scratch + pos, sizeof(scratch) - pos,
+                        "%ssensor=\"%s\"", first ? "" : ",", escaped_sensor);
         if (n < 0 || (size_t)n >= sizeof(scratch) - pos) return false;
         pos += (size_t)n;
         first = false;

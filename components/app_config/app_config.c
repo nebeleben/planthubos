@@ -116,6 +116,17 @@ esp_err_t app_config_set_sensor_name(const uint8_t mac[6], const char *name)
     return err;
 }
 
+/* Named after app_config_clear_wifi()'s "clear" naming, but there is
+ * nothing to duplicate here: app_config_set_sensor_name() already erases
+ * the NVS key (and updates the RAM cache to "known absent") when handed an
+ * empty name -- this just gives that behaviour its own name for callers
+ * (M8 Task 4's migration) that want to delete a name outright rather than
+ * "set" one. */
+esp_err_t app_config_clear_sensor_name(const uint8_t mac[6])
+{
+    return app_config_set_sensor_name(mac, "");
+}
+
 bool app_config_get_sensor_name(const uint8_t mac[6], char out[33])
 {
     xSemaphoreTake(s_name_mutex, portMAX_DELAY);
