@@ -192,19 +192,29 @@ static void pack_blob(const plants_table_t *in, plants_blob_t *out)
     }
 }
 
+/* Unpacks straight into *out -- deliberately NOT via an intermediate local
+ * plants_table_t (a stack-overflow post-mortem fix: that local used to add
+ * a second ~673-byte frame stacked directly on top of the caller's own
+ * ~674-byte plants_blob_t local, and this function's two callers are both
+ * on the plants_init() hot path where a hardware crash-loop traced a "Stack
+ * protection fault" in this exact call chain, on the main task, right after
+ * a plants.bin-missing WARN -- see plants_init()'s top comment and this
+ * file's top-of-file comment for the full story). *out is always the
+ * caller's real destination (s_table, or an init-only static -- see
+ * load_file()/load_legacy_nvs_blob() below), never a value that needs to
+ * survive being overwritten mid-loop, so writing straight through has no
+ * correctness cost, only a stack-safety benefit. */
 static void unpack_blob(const plants_blob_t *blob, plants_table_t *out)
 {
-    plants_table_t t;
-    t.next_id = blob->next_id;
+    out->next_id = blob->next_id;
     for (int i = 0; i < PLANTS_MAX; i++) {
-        t.p[i].in_use = blob->p[i].in_use != 0;
-        t.p[i].id = blob->p[i].id;
-        t.p[i].mac_valid = blob->p[i].mac_valid != 0;
-        memcpy(t.p[i].mac, blob->p[i].mac, 6);
-        memcpy(t.p[i].name, blob->p[i].name, sizeof(t.p[i].name));
-        t.p[i].name[PLANT_NAME_LEN] = '\0';  /* defensive: guard against a corrupt non-terminated blob */
+        out->p[i].in_use = blob->p[i].in_use != 0;
+        out->p[i].id = blob->p[i].id;
+        out->p[i].mac_valid = blob->p[i].mac_valid != 0;
+        memcpy(out->p[i].mac, blob->p[i].mac, 6);
+        memcpy(out->p[i].name, blob->p[i].name, sizeof(out->p[i].name));
+        out->p[i].name[PLANT_NAME_LEN] = '\0';  /* defensive: guard against a corrupt non-terminated blob */
     }
-    *out = t;
 }
 
 /* Atomic write of one plants.bin: the full blob goes to a sibling .tmp file
@@ -214,10 +224,21 @@ static void unpack_blob(const plants_blob_t *blob, plants_table_t *out)
  * old complete file or the new complete one, never a partial write. Mirrors
  * boottab.c's write_all(); see that file's comment for the same rationale
  * in more detail. Caller (persist_table()) guarantees s_storage_base is
- * non-NULL. */
+ * non-NULL.
+ *
+ * path/tmp_path are `static`, not stack locals (post-mortem stack-safety
+ * fix -- see persist_table()'s comment): write_file() is only ever called
+ * from persist_table() while it holds s_persist_mutex for that function's
+ * ENTIRE body, so exactly one task is ever inside this function at a time
+ * no matter which of plants_resolve_or_create()/plants_rename()/
+ * plants_assign()/plants_create()/plants_delete() called it in -- including
+ * the sampler task, which only has a 4096-byte stack to begin with. Do not
+ * call write_file() from anywhere else without re-establishing that same
+ * guarantee first. */
 static esp_err_t write_file(const plants_blob_t *blob)
 {
-    char path[160], tmp_path[160];
+    static char path[128];
+    static char tmp_path[128];
     int n1 = snprintf(path, sizeof(path), "%s/%s", s_storage_base, PLANTS_FILE_NAME);
     int n2 = snprintf(tmp_path, sizeof(tmp_path), "%s/%s", s_storage_base, PLANTS_TMP_NAME);
     if (n1 < 0 || (size_t)n1 >= sizeof(path) || n2 < 0 || (size_t)n2 >= sizeof(tmp_path)) {
@@ -270,17 +291,40 @@ static esp_err_t write_file(const plants_blob_t *blob)
  * storage in practice, so this is only reachable if littlefs itself failed
  * to mount, already logged once at plants_init() time; there is nowhere to
  * write, and the RAM table remains the only copy for the rest of this
- * boot. */
+ * boot.
+ *
+ * snapshot/blob are `static`, not stack locals -- post-mortem stack-safety
+ * fix: s_persist_mutex is held for this function's ENTIRE body (the take
+ * above spans both the s_mutex snapshot copy AND write_file() below, not
+ * just part of it), so exactly one task is ever inside this critical
+ * section at a time, which is what makes two ~673/674-byte statics safe
+ * despite persist_table() being reachable from FOUR different task
+ * contexts (plants_resolve_or_create() off the sampler/BLE ingestion path,
+ * plants_rename()/plants_assign()/plants_create()/plants_delete() off the
+ * httpd task, plus MQTT-adjacent callers). Before this fix these were
+ * plain stack locals totalling ~1.3KB in a function reachable from the
+ * sampler task's 4096-byte stack under normal sampling load -- almost
+ * certainly a contributing cause of the ORIGINAL M8 hardware incident's
+ * crash (this file's top comment), independent of the NVS-GC blast radius
+ * that motivated moving off NVS in the first place. Safe to keep as
+ * `static` specifically BECAUSE persist_table() already serialises every
+ * caller through s_persist_mutex for unrelated reasons (closing the same
+ * two write-ordering gaps swarm_store.c's own comment documents) -- if
+ * that mutex's scope ever narrows to exclude part of this function, these
+ * must move back off `static` storage or gain their own lock. */
 static esp_err_t persist_table(void)
 {
     if (!s_storage_base) return ESP_OK;
 
     xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
+
+    static plants_table_t snapshot;
+    static plants_blob_t  blob;
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    plants_table_t snapshot = s_table;
+    snapshot = s_table;
     xSemaphoreGive(s_mutex);
 
-    plants_blob_t blob;
     pack_blob(&snapshot, &blob);
 
     esp_err_t err = write_file(&blob);
@@ -294,10 +338,19 @@ static esp_err_t persist_table(void)
  * wrong size, or an unrecognised format byte is loudly logged and left at
  * those defaults (empty table) rather than trusting a shape that cannot be
  * relied on -- never fails boot. Returns true iff a valid blob was loaded.
- * Caller (plants_init()) guarantees s_storage_base is non-NULL. */
+ * Caller (plants_init()) guarantees s_storage_base is non-NULL.
+ *
+ * path/blob are `static`, not stack locals (post-mortem stack-safety fix --
+ * see plants_init()'s top comment): load_file() only ever runs once,
+ * synchronously, from plants_init() on the main task, and has no other
+ * caller -- there is no concurrency to protect against here, only stack
+ * depth. This exact call chain (plants_init() -> load_file(), immediately
+ * followed on a miss by plants_adopt_legacy_nvs() -> load_legacy_nvs_blob())
+ * is where a hardware crash-loop hit a "Stack protection fault" on the main
+ * task, right after this function's own "not readable" WARN below. */
 static bool load_file(plants_table_t *out)
 {
-    char path[160];
+    static char path[128];
     int n = snprintf(path, sizeof(path), "%s/%s", s_storage_base, PLANTS_FILE_NAME);
     if (n < 0 || (size_t)n >= sizeof(path)) return false;
 
@@ -308,7 +361,7 @@ static bool load_file(plants_table_t *out)
         return false;
     }
 
-    plants_blob_t blob;
+    static plants_blob_t blob;
     size_t rlen = fread(&blob, 1, sizeof(blob), f);
     int extra = fgetc(f);   /* confirm the file isn't LONGER than expected, too */
     fclose(f);
@@ -339,8 +392,13 @@ static bool load_file(plants_table_t *out)
  * has its plant table sitting in NVS from its last boot, and that table
  * must not be silently dropped. Steady state never calls this again --
  * plants no longer writes NVS once plants.bin exists. Same
- * reset-to-defaults-on-any-failure contract as load_file() above. Returns
- * true iff a valid blob was loaded. */
+ * reset-to-defaults-on-any-failure contract as load_file() above.
+ *
+ * blob is `static`, not a stack local -- same post-mortem stack-safety fix
+ * as load_file() above, for the same reason: this function only ever runs
+ * once, synchronously, from plants_adopt_legacy_nvs() (itself only called
+ * from plants_init()), all on the main task. Returns true iff a valid blob
+ * was loaded. */
 static bool load_legacy_nvs_blob(nvs_handle_t h, plants_table_t *out)
 {
     size_t len = 0;
@@ -358,7 +416,7 @@ static bool load_legacy_nvs_blob(nvs_handle_t h, plants_table_t *out)
         return false;
     }
 
-    plants_blob_t blob;
+    static plants_blob_t blob;
     size_t rlen = sizeof(blob);
     if (nvs_get_blob(h, KEY_PLANTS, &blob, &rlen) != ESP_OK || rlen != sizeof(blob)) {
         ESP_LOGW(TAG, "plants: legacy NVS blob read failed at its expected length");
@@ -584,21 +642,27 @@ static void migrate_rename_one(const char *oldp, const char *newp)
  * the NVS name key on a successful move_name. Per spec: log a failure and
  * continue -- never let one bad file/key abort the rest of the boot's
  * migration. Table access happens above in plants_run_migration(), not
- * here -- this function only touches the filesystem and NVS. */
+ * here -- this function only touches the filesystem and NVS.
+ *
+ * oldp/newp are `static`, not stack locals (post-mortem stack-safety fix,
+ * same rationale as this file's other init-path buffers): this function is
+ * only ever called from plants_run_migration()'s single-threaded,
+ * once-per-boot loop, one action at a time, so a single shared pair is
+ * safe -- the rename_raw and rename_hourly blocks below never run
+ * concurrently with each other or with a later call. */
 static void migrate_execute_action(const migrate_action_t *a)
 {
     char mac_hex[13];
     snprintf(mac_hex, sizeof(mac_hex), "%02X%02X%02X%02X%02X%02X",
              a->mac[0], a->mac[1], a->mac[2], a->mac[3], a->mac[4], a->mac[5]);
 
+    static char oldp[128], newp[128];
     if (a->rename_raw && s_storage_base) {
-        char oldp[128], newp[128];
         snprintf(oldp, sizeof(oldp), "%s/%s_raw.bin", s_storage_base, mac_hex);
         snprintf(newp, sizeof(newp), "%s/P%u_raw.bin", s_storage_base, a->plant_id);
         migrate_rename_one(oldp, newp);
     }
     if (a->rename_hourly && s_storage_base) {
-        char oldp[128], newp[128];
         snprintf(oldp, sizeof(oldp), "%s/%s_hr.bin", s_storage_base, mac_hex);
         snprintf(newp, sizeof(newp), "%s/P%u_hr.bin", s_storage_base, a->plant_id);
         migrate_rename_one(oldp, newp);
@@ -668,8 +732,12 @@ static void plants_run_migration(void)
      * plants_rename()/plants_assign()/plants_create()/plants_delete()
      * above: plants_migrate_plan() only ever touches *t (the `in`/`out`
      * arrays are this function's own local buffers, never shared), so the
-     * lock only needs to span this one call, not the file/NVS work below. */
-    migrate_action_t actions[PLANTS_MAX];
+     * lock only needs to span this one call, not the file/NVS work below.
+     * `static`, not a stack local, matching `inputs` above -- same
+     * post-mortem stack-safety fix as this file's other init-path buffers:
+     * plants_run_migration() only ever runs once, synchronously, from
+     * plants_init(). */
+    static migrate_action_t actions[PLANTS_MAX];
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     int n_actions = plants_migrate_plan(&s_table, inputs, n_inputs, actions, PLANTS_MAX);
     xSemaphoreGive(s_mutex);
@@ -727,14 +795,21 @@ static void lv_cache_drop(uint8_t id)
  * If the file write fails, the NVS key is left in place so this retries
  * from scratch next boot -- see plants_run_migration()'s own persist-before-
  * execute comment above for the same reasoning applied to a different pair
- * of side effects. */
+ * of side effects.
+ *
+ * `legacy` below is `static`, not a stack local -- same post-mortem
+ * stack-safety fix as this file's other init-path buffers: this function
+ * only ever runs once, synchronously, from plants_init(). This exact
+ * function was the innermost frame of the call chain a hardware
+ * crash-loop hit a "Stack protection fault" in, on the main task -- see
+ * plants_init()'s top comment. */
 static void plants_adopt_legacy_nvs(void)
 {
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
         return;  /* fresh "planthub" namespace: nothing to adopt */
     }
-    plants_table_t legacy;
+    static plants_table_t legacy;
     plants_table_init(&legacy);
     bool have_legacy = load_legacy_nvs_blob(h, &legacy);
     nvs_close(h);
@@ -767,6 +842,45 @@ static void plants_adopt_legacy_nvs(void)
                   "legacy NVS key erased", s_storage_base, PLANTS_FILE_NAME);
 }
 
+/* ---------------- Stack-safety post-mortem (hardware bring-up, follow-up to the LittleFS fix) ----------------
+ *
+ * The first hardware run of the LittleFS fix above crash-looped: a "Stack
+ * protection fault" on the "main" task, MEPC decoding into
+ * snprintf/_svfprintf_r, firing immediately after load_file()'s
+ * "plants.bin not readable" WARN -- i.e. inside this function's post-load
+ * path (the plants_adopt_legacy_nvs() one-boot NVS-adoption call below).
+ * And because the crash landed BEFORE that path's file write, the legacy
+ * NVS key survived every reboot, so the crash repeated forever: a
+ * permanent boot loop with no self-recovery.
+ *
+ * Root cause: this whole load/adopt sequence stacked too much on the main
+ * task. load_file()'s ~674-byte plants_blob_t local, plants_adopt_legacy_nvs()'s
+ * ~673-byte plants_table_t local, load_legacy_nvs_blob()'s own ~674-byte
+ * plants_blob_t local, and (before this fix) unpack_blob()'s OWN ~673-byte
+ * intermediate copy were all simultaneously reachable in nested calls on
+ * top of whatever main.c's boot sequence already held on that same task's
+ * stack -- on top of which ESP_LOGW()'s own internal vsnprintf-family
+ * formatting (the snprintf/_svfprintf_r the fault decoded into) needed
+ * just enough more to tip it over. The pre-fix NVS path never had this
+ * problem: NVS's blob API reads straight into one caller-supplied buffer,
+ * no comparable nesting.
+ *
+ * Fix: every plants_table_t / plants_blob_t / migrate_action_t buffer
+ * reachable from this function -- load_file()'s and load_legacy_nvs_blob()'s
+ * blobs, plants_adopt_legacy_nvs()'s legacy table, plants_run_migration()'s
+ * actions array, migrate_execute_action()'s path buffers, and write_file()'s
+ * path buffers -- moved to `static` storage (each function's own doc
+ * comment says why that specific one is safe: either this function's
+ * single-invocation/single-task guarantee, or, for persist_table()/
+ * write_file(), s_persist_mutex now serialising the whole snapshot+write).
+ * unpack_blob()'s intermediate copy was removed outright rather than made
+ * static -- it never needed to exist. See persist_table()'s own comment: the
+ * exact same "big locals in a function reachable from a small task stack"
+ * shape also very likely explains the ORIGINAL M8 hardware incident's crash
+ * (the sampler task's 4096-byte stack, under normal sampling load), not
+ * just the NVS-GC blast radius that motivated this file's move off NVS in
+ * the first place -- two independent contributing causes to the same
+ * symptom, not one. */
 esp_err_t plants_init(const char *storage_base)
 {
     s_mutex = xSemaphoreCreateMutex();
