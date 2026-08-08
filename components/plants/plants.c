@@ -16,13 +16,42 @@
 static const char *TAG = "plants";
 #define NS "planthub"
 #define KEY_PLANTS "plants"
+#define PLANTS_FILE_NAME "plants.bin"
+#define PLANTS_TMP_NAME  "plants.tmp"
 
-/* On-disk format of the KEY_PLANTS blob. Bump this and add a migration
- * branch in load_blob() below whenever plant_entry_t's shape changes --
- * same reasoning as swarm_store.c's SWARM_STORE_FORMAT for the node table.
- * Deliberately NOT plants_table_t dumped raw: that struct's `bool` fields
- * and any compiler-inserted padding are not a stable on-disk shape, so this
- * mirror struct pins every field to an explicit width/order instead. */
+/* ---------------- Why this lives on LittleFS, not NVS (M8 hardware bring-up) ----------------
+ *
+ * plants.c used to persist this same blob to NVS, namespace "planthub", key
+ * "plants" -- the same namespace claim/wifi/swarm state lives in. Every
+ * mutation (rename, assign, create, delete, auto-create) wrote the full
+ * 674-byte blob, and NVS never overwrites a value in place: each write lands
+ * a fresh copy and the old one becomes garbage, reclaimed later by page GC.
+ * On actual hardware this produced 19 stale blob copies in the 24KB NVS
+ * partition within a single session -- a plant table that gets renamed/
+ * assigned/probed into existence is not a rare-write structure, unlike the
+ * claim/wifi/swarm state the partition was sized around -- forcing constant
+ * GC in the SAME partition that holds that other state. A crash mid-GC
+ * coincided with the hub's swarm role/node-table state reverting: NVS GC is
+ * an all-or-nothing sweep over the whole partition, so a plant-driven GC
+ * storm put swarm's own rarely-written state at risk of the same crash
+ * window, even though swarm never touches NVS anywhere near that often
+ * itself. Moving the frequent writer to its own file removes that blast
+ * radius entirely: LittleFS's per-file writes cannot trigger NVS GC, no
+ * matter how often plants.bin gets rewritten. See persist_table()/
+ * write_file() below for the new steady-state path, and plants_init() for
+ * the one-boot migration that adopts an existing M8-era NVS blob (nvs.h
+ * stays included for exactly that one-time path -- nothing else here
+ * touches NVS any more). */
+
+/* On-disk format of the plants.bin blob (identical layout to the old NVS
+ * blob this replaces, including the legacy KEY_PLANTS blob the one-boot
+ * migration in plants_init() reads). Bump this and add a migration branch
+ * in load_file()/load_legacy_nvs_blob() below whenever plant_entry_t's shape
+ * changes -- same reasoning as swarm_store.c's SWARM_STORE_FORMAT for the
+ * node table. Deliberately NOT plants_table_t dumped raw: that struct's
+ * `bool` fields and any compiler-inserted padding are not a stable on-disk
+ * shape, so this mirror struct pins every field to an explicit width/order
+ * instead. */
 #define PLANTS_BLOB_FORMAT 1
 
 typedef struct __attribute__((packed)) {
@@ -46,47 +75,48 @@ typedef struct __attribute__((packed)) {
  * -- read that comment first if you're touching this. Short version:
  *
  *   - s_mutex guards ONLY the in-RAM s_table -- every hold is a short,
- *     bounded, allocation-free struct copy/mutation, never flash I/O, and
- *     never held while also contending for s_nvs_mutex. plants_snapshot()
- *     and every other reader can therefore never be made to wait on a
- *     flash commit, no matter what else is happening concurrently.
+ *     bounded, allocation-free struct copy/mutation, never file I/O, and
+ *     never held while also contending for s_persist_mutex.
+ *     plants_snapshot() and every other reader can therefore never be made
+ *     to wait on a file write, no matter what else is happening
+ *     concurrently.
  *
- *   - s_nvs_mutex guards the actual NVS write + nvs_commit(), performed by
- *     persist_table() below. Every mutating call (plants_resolve_or_create,
- *     plants_rename, plants_assign, plants_create, plants_delete) follows
- *     the same shape: PHASE 1 (RAM, under s_mutex only) mutates s_table and
- *     releases s_mutex completely; PHASE 2 (persist_table()) takes
- *     s_nvs_mutex, briefly RE-takes s_mutex just long enough to copy the
- *     CURRENT s_table -- not whatever phase 1 computed, which may already
- *     be stale by the time phase 2 actually runs -- releases s_mutex,
- *     writes the blob, then releases s_nvs_mutex. This closes the same two
- *     gaps swarm_store.c's comment documents: a reader can never
- *     transitively wait on another writer's in-flight commit, and two
- *     concurrent writers' commits can never land out of order relative to
- *     RAM freshness (whichever one actually holds s_nvs_mutex at write time
- *     always writes the freshest RAM state, so flash only ever moves
- *     forward).
+ *   - s_persist_mutex guards the actual plants.bin write (write_file()'s
+ *     tmp-then-rename), performed by persist_table() below. Every mutating
+ *     call (plants_resolve_or_create, plants_rename, plants_assign,
+ *     plants_create, plants_delete) follows the same shape: PHASE 1 (RAM,
+ *     under s_mutex only) mutates s_table and releases s_mutex completely;
+ *     PHASE 2 (persist_table()) takes s_persist_mutex, briefly RE-takes
+ *     s_mutex just long enough to copy the CURRENT s_table -- not whatever
+ *     phase 1 computed, which may already be stale by the time phase 2
+ *     actually runs -- releases s_mutex, writes the blob, then releases
+ *     s_persist_mutex. This closes the same two gaps swarm_store.c's
+ *     comment documents: a reader can never transitively wait on another
+ *     writer's in-flight write, and two concurrent writers' writes can
+ *     never land out of order relative to RAM freshness (whichever one
+ *     actually holds s_persist_mutex at write time always writes the
+ *     freshest RAM state, so the file only ever moves forward).
  *
  *   - Consequence, same as swarm_store.c: the RAM cache can run ahead of
- *     flash if a commit fails (logged, never silently swallowed) -- it
+ *     the file if a write fails (logged, never silently swallowed) -- it
  *     remains the source of truth for the rest of THIS boot regardless. A
  *     reboot before a failed write's next retry reverts to whatever last
- *     actually committed.
+ *     actually landed on disk.
  *
  * plants_resolve_or_create() in particular is documented as TASK CONTEXT
  * ONLY (plants.h) -- unlike swarm_store's node lookups it is never called
  * from an ISR or a must-not-block callback, but it still sits on the
- * sampler/BLE ingestion path, so keeping its NVS write off the RAM mutex
+ * sampler/BLE ingestion path, so keeping its file write off the RAM mutex
  * (via the same two-phase split) still matters: a concurrent HTTP-triggered
- * rename's flash commit must never stall the next sensor sample's mac
+ * rename's file write must never stall the next sensor sample's mac
  * resolution. */
 static SemaphoreHandle_t s_mutex;
-static SemaphoreHandle_t s_nvs_mutex;
+static SemaphoreHandle_t s_persist_mutex;
 static plants_table_t s_table;
 static const char *s_storage_base;   /* "/storage", or NULL: see plants_init() */
 
 /* plants_last_values() RAM cache -- guarded by its own mutex, deliberately
- * separate from s_mutex/s_nvs_mutex above: it is populated by a
+ * separate from s_mutex/s_persist_mutex above: it is populated by a
  * storage_query() file scan (real I/O), which must never run while holding
  * a lock that plants_snapshot()/plants_resolve_or_create() etc. might be
  * waiting on. One slot per currently-existing plant is always enough
@@ -143,99 +173,206 @@ static void log_full_once(const uint8_t mac[6])
     }
 }
 
-static esp_err_t write_blob(const plants_blob_t *blob)
+/* Packs a live plants_table_t into the on-disk mirror shape (shared by
+ * persist_table() below), and the reverse for load_file()/
+ * load_legacy_nvs_blob() -- both blob sources (plants.bin and the legacy NVS
+ * key) use the exact same PLANTS_BLOB_FORMAT layout, so this pair is shared
+ * between them rather than duplicated. */
+static void pack_blob(const plants_table_t *in, plants_blob_t *out)
 {
-    nvs_handle_t h;
-    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
-    if (err != ESP_OK) return err;
-    err = nvs_set_blob(h, KEY_PLANTS, blob, sizeof(*blob));
-    if (err == ESP_OK) err = nvs_commit(h);
-    nvs_close(h);
-    return err;
+    memset(out, 0, sizeof(*out));
+    out->format = PLANTS_BLOB_FORMAT;
+    out->next_id = in->next_id;
+    for (int i = 0; i < PLANTS_MAX; i++) {
+        out->p[i].id = in->p[i].id;
+        out->p[i].in_use = in->p[i].in_use ? 1 : 0;
+        memcpy(out->p[i].mac, in->p[i].mac, 6);
+        out->p[i].mac_valid = in->p[i].mac_valid ? 1 : 0;
+        memcpy(out->p[i].name, in->p[i].name, sizeof(out->p[i].name));
+    }
+}
+
+static void unpack_blob(const plants_blob_t *blob, plants_table_t *out)
+{
+    plants_table_t t;
+    t.next_id = blob->next_id;
+    for (int i = 0; i < PLANTS_MAX; i++) {
+        t.p[i].in_use = blob->p[i].in_use != 0;
+        t.p[i].id = blob->p[i].id;
+        t.p[i].mac_valid = blob->p[i].mac_valid != 0;
+        memcpy(t.p[i].mac, blob->p[i].mac, 6);
+        memcpy(t.p[i].name, blob->p[i].name, sizeof(t.p[i].name));
+        t.p[i].name[PLANT_NAME_LEN] = '\0';  /* defensive: guard against a corrupt non-terminated blob */
+    }
+    *out = t;
+}
+
+/* Atomic write of one plants.bin: the full blob goes to a sibling .tmp file
+ * first, which is fflush()ed and fclose()d before rename()ing it over the
+ * real path. rename() is atomic on LittleFS (and on host filesystems, for
+ * the test harness), so a reader -- or a power loss -- only ever sees the
+ * old complete file or the new complete one, never a partial write. Mirrors
+ * boottab.c's write_all(); see that file's comment for the same rationale
+ * in more detail. Caller (persist_table()) guarantees s_storage_base is
+ * non-NULL. */
+static esp_err_t write_file(const plants_blob_t *blob)
+{
+    char path[160], tmp_path[160];
+    int n1 = snprintf(path, sizeof(path), "%s/%s", s_storage_base, PLANTS_FILE_NAME);
+    int n2 = snprintf(tmp_path, sizeof(tmp_path), "%s/%s", s_storage_base, PLANTS_TMP_NAME);
+    if (n1 < 0 || (size_t)n1 >= sizeof(path) || n2 < 0 || (size_t)n2 >= sizeof(tmp_path)) {
+        ESP_LOGE(TAG, "plants: storage_base path too long for plants.bin");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "plants: failed to open %s for writing: %s", tmp_path, strerror(errno));
+        return ESP_FAIL;
+    }
+    size_t written = fwrite(blob, 1, sizeof(*blob), f);
+    if (written != sizeof(*blob)) {
+        ESP_LOGE(TAG, "plants: short write to %s (%d of %d bytes)",
+                 tmp_path, (int)written, (int)sizeof(*blob));
+        fclose(f);
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
+    if (fflush(f) != 0) {
+        ESP_LOGE(TAG, "plants: fflush(%s) failed: %s", tmp_path, strerror(errno));
+        fclose(f);
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
+    if (fclose(f) != 0) {
+        ESP_LOGE(TAG, "plants: fclose(%s) failed: %s", tmp_path, strerror(errno));
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
+    if (rename(tmp_path, path) != 0) {
+        ESP_LOGE(TAG, "plants: rename %s -> %s failed: %s", tmp_path, path, strerror(errno));
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 /* Phase-2 persistence (see the locking invariant comment above): serialises
- * against other writers via s_nvs_mutex, re-reads the CURRENT s_table under
- * a brief s_mutex hold (never held during the flash step itself), packs it
- * into the on-disk mirror shape, then writes it. Callers must have already
- * completed their own RAM mutation under s_mutex and released it BEFORE
- * calling this -- it must never be called while still holding s_mutex. */
+ * against other writers via s_persist_mutex, re-reads the CURRENT s_table
+ * under a brief s_mutex hold (never held during the file write itself),
+ * packs it into the on-disk mirror shape, then writes it. Callers must have
+ * already completed their own RAM mutation under s_mutex and released it
+ * BEFORE calling this -- it must never be called while still holding
+ * s_mutex.
+ *
+ * storage_base == NULL (no filesystem -- see plants_init()) makes this a
+ * no-op returning ESP_OK: plants are hub-only and the hub always has
+ * storage in practice, so this is only reachable if littlefs itself failed
+ * to mount, already logged once at plants_init() time; there is nowhere to
+ * write, and the RAM table remains the only copy for the rest of this
+ * boot. */
 static esp_err_t persist_table(void)
 {
-    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    if (!s_storage_base) return ESP_OK;
+
+    xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     plants_table_t snapshot = s_table;
     xSemaphoreGive(s_mutex);
 
     plants_blob_t blob;
-    memset(&blob, 0, sizeof(blob));
-    blob.format = PLANTS_BLOB_FORMAT;
-    blob.next_id = snapshot.next_id;
-    for (int i = 0; i < PLANTS_MAX; i++) {
-        blob.p[i].id = snapshot.p[i].id;
-        blob.p[i].in_use = snapshot.p[i].in_use ? 1 : 0;
-        memcpy(blob.p[i].mac, snapshot.p[i].mac, 6);
-        blob.p[i].mac_valid = snapshot.p[i].mac_valid ? 1 : 0;
-        memcpy(blob.p[i].name, snapshot.p[i].name, sizeof(blob.p[i].name));
-    }
+    pack_blob(&snapshot, &blob);
 
-    esp_err_t err = write_blob(&blob);
-    xSemaphoreGive(s_nvs_mutex);
+    esp_err_t err = write_file(&blob);
+    xSemaphoreGive(s_persist_mutex);
     return err;
 }
 
-/* Loads the KEY_PLANTS blob into *out, which the caller has already reset
- * to plants_table_init() defaults -- every return path below (including
- * every failure) therefore leaves *out valid. Wrong length or an
- * unrecognised format byte is loudly logged and left at those defaults
- * (empty table) rather than trusting a shape that cannot be relied on --
- * same contract as swarm_store.c's load_nodes_blob() for its unrecognised
- * cases, minus the migration branches (nothing to migrate from yet: this is
- * the first on-disk format for plants). */
-static void load_blob(nvs_handle_t h, plants_table_t *out)
+/* Reads <storage_base>/plants.bin into *out, which the caller has already
+ * reset to plants_table_init() defaults -- every return path below
+ * (including every failure) therefore leaves *out valid. A missing file,
+ * wrong size, or an unrecognised format byte is loudly logged and left at
+ * those defaults (empty table) rather than trusting a shape that cannot be
+ * relied on -- never fails boot. Returns true iff a valid blob was loaded.
+ * Caller (plants_init()) guarantees s_storage_base is non-NULL. */
+static bool load_file(plants_table_t *out)
+{
+    char path[160];
+    int n = snprintf(path, sizeof(path), "%s/%s", s_storage_base, PLANTS_FILE_NAME);
+    if (n < 0 || (size_t)n >= sizeof(path)) return false;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        ESP_LOGW(TAG, "plants: %s not readable (%s); starting with an empty plant table",
+                 path, strerror(errno));
+        return false;
+    }
+
+    plants_blob_t blob;
+    size_t rlen = fread(&blob, 1, sizeof(blob), f);
+    int extra = fgetc(f);   /* confirm the file isn't LONGER than expected, too */
+    fclose(f);
+
+    if (rlen != sizeof(blob) || extra != EOF) {
+        ESP_LOGW(TAG, "plants: %s has unrecognised size (read %d bytes, expected %d); starting "
+                      "with an empty plant table", path, (int)rlen, (int)sizeof(blob));
+        return false;
+    }
+    if (blob.format != PLANTS_BLOB_FORMAT) {
+        ESP_LOGE(TAG, "plants: %s has unknown format byte %u (expected %u) -- DISCARDING it "
+                      "rather than trusting an unrecognised layout; every plant is lost until "
+                      "re-created", path, blob.format, (unsigned)PLANTS_BLOB_FORMAT);
+        return false;
+    }
+
+    unpack_blob(&blob, out);
+    return true;
+}
+
+/* ---------------- Legacy NVS blob (one-boot migration only) ----------------
+ *
+ * Reads the OLD KEY_PLANTS blob straight out of NVS -- the exact bytes an
+ * M8-era build last wrote there before this fix (see this file's top
+ * comment for the 19-stale-copies story behind moving off NVS). Called
+ * ONLY from plants_init()'s one-boot migration below, and only when
+ * plants.bin does not exist yet: a live rig upgrading past this fix still
+ * has its plant table sitting in NVS from its last boot, and that table
+ * must not be silently dropped. Steady state never calls this again --
+ * plants no longer writes NVS once plants.bin exists. Same
+ * reset-to-defaults-on-any-failure contract as load_file() above. Returns
+ * true iff a valid blob was loaded. */
+static bool load_legacy_nvs_blob(nvs_handle_t h, plants_table_t *out)
 {
     size_t len = 0;
     esp_err_t err = nvs_get_blob(h, KEY_PLANTS, NULL, &len);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        return;  /* fresh install: no plant table yet */
+        return false;  /* no legacy blob: never an M8-era device, or already migrated */
     }
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "plants blob length query failed: %s; starting with an empty plant table",
-                 esp_err_to_name(err));
-        return;
+        ESP_LOGW(TAG, "plants: legacy NVS blob length query failed: %s", esp_err_to_name(err));
+        return false;
     }
     if (len != sizeof(plants_blob_t)) {
-        ESP_LOGW(TAG, "plants blob has unrecognised length %d (expected %d); starting with an "
-                      "empty plant table", (int)len, (int)sizeof(plants_blob_t));
-        return;
+        ESP_LOGW(TAG, "plants: legacy NVS blob has unrecognised length %d (expected %d)",
+                 (int)len, (int)sizeof(plants_blob_t));
+        return false;
     }
 
     plants_blob_t blob;
     size_t rlen = sizeof(blob);
     if (nvs_get_blob(h, KEY_PLANTS, &blob, &rlen) != ESP_OK || rlen != sizeof(blob)) {
-        ESP_LOGW(TAG, "plants blob read failed at its expected length; starting with an empty "
-                      "plant table");
-        return;
+        ESP_LOGW(TAG, "plants: legacy NVS blob read failed at its expected length");
+        return false;
     }
     if (blob.format != PLANTS_BLOB_FORMAT) {
-        ESP_LOGE(TAG, "plants blob has unknown format byte %u (expected %u) at the expected "
-                      "length -- DISCARDING it rather than trusting an unrecognised layout; "
-                      "every plant is lost until re-created",
+        ESP_LOGE(TAG, "plants: legacy NVS blob has unknown format byte %u (expected %u) -- "
+                      "DISCARDING it rather than trusting an unrecognised layout",
                  blob.format, (unsigned)PLANTS_BLOB_FORMAT);
-        return;
+        return false;
     }
 
-    plants_table_t t;
-    t.next_id = blob.next_id;
-    for (int i = 0; i < PLANTS_MAX; i++) {
-        t.p[i].in_use = blob.p[i].in_use != 0;
-        t.p[i].id = blob.p[i].id;
-        t.p[i].mac_valid = blob.p[i].mac_valid != 0;
-        memcpy(t.p[i].mac, blob.p[i].mac, 6);
-        memcpy(t.p[i].name, blob.p[i].name, sizeof(t.p[i].name));
-        t.p[i].name[PLANT_NAME_LEN] = '\0';  /* defensive: guard against a corrupt non-terminated blob */
-    }
-    *out = t;
+    unpack_blob(&blob, out);
+    return true;
 }
 
 /* ---------------- One-boot migration (M8 Task 4) ----------------
@@ -478,8 +615,9 @@ static void migrate_execute_action(const migrate_action_t *a)
 }
 
 /* Runs from plants_init(), between the blob load and the summary log
- * below. s_table already holds whatever load_blob() found (normally
- * empty; plants_migrate_plan() skips any mac already in it either way).
+ * below. s_table already holds whatever load_file()/plants_adopt_legacy_nvs()
+ * found (normally empty; plants_migrate_plan() skips any mac already in it
+ * either way).
  *
  * Ordering is deliberately persist-BEFORE-execute, not the more obvious
  * "do the renames, then save what happened" -- plants_migrate_plan()
@@ -577,27 +715,88 @@ static void lv_cache_drop(uint8_t id)
     xSemaphoreGive(s_lv_mutex);
 }
 
+/* One-boot self-migration (this fix, not M8 Task 4's sensor-keyed migration
+ * below): adopts an existing M8-era NVS "plants" blob into plants.bin, for a
+ * live rig that already has a plant table sitting in NVS from before this
+ * fix landed. Only ever does anything when plants.bin does not exist yet
+ * (load_file() already returned false) -- once plants.bin exists, this is
+ * skipped every subsequent boot without even opening NVS. Write-then-erase
+ * ordering, deliberately: the file must be durably on disk before the NVS
+ * key that's the only other copy of this data gets erased, or a crash
+ * between the two would drop the table entirely with no copy left anywhere.
+ * If the file write fails, the NVS key is left in place so this retries
+ * from scratch next boot -- see plants_run_migration()'s own persist-before-
+ * execute comment above for the same reasoning applied to a different pair
+ * of side effects. */
+static void plants_adopt_legacy_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
+        return;  /* fresh "planthub" namespace: nothing to adopt */
+    }
+    plants_table_t legacy;
+    plants_table_init(&legacy);
+    bool have_legacy = load_legacy_nvs_blob(h, &legacy);
+    nvs_close(h);
+    if (!have_legacy) return;
+
+    s_table = legacy;
+    esp_err_t werr = persist_table();
+    if (werr != ESP_OK) {
+        ESP_LOGE(TAG, "plants: adopted a legacy NVS plant table but failed to write %s/%s (%s); "
+                      "keeping the legacy NVS key so this retries next boot",
+                 s_storage_base, PLANTS_FILE_NAME, esp_err_to_name(werr));
+        return;
+    }
+
+    nvs_handle_t wh;
+    esp_err_t eerr = nvs_open(NS, NVS_READWRITE, &wh);
+    if (eerr == ESP_OK) {
+        eerr = nvs_erase_key(wh, KEY_PLANTS);
+        if (eerr == ESP_OK) eerr = nvs_commit(wh);
+        nvs_close(wh);
+    }
+    if (eerr != ESP_OK) {
+        ESP_LOGW(TAG, "plants: adopted a legacy NVS plant table into %s/%s but failed to erase "
+                      "the now-redundant NVS key (%s); it will be ignored (plants.bin already "
+                      "exists) but not cleaned up until this succeeds",
+                 s_storage_base, PLANTS_FILE_NAME, esp_err_to_name(eerr));
+        return;
+    }
+    ESP_LOGI(TAG, "plants: migrated the plant table from NVS to %s/%s (19-stale-copies fix); "
+                  "legacy NVS key erased", s_storage_base, PLANTS_FILE_NAME);
+}
+
 esp_err_t plants_init(const char *storage_base)
 {
     s_mutex = xSemaphoreCreateMutex();
-    s_nvs_mutex = xSemaphoreCreateMutex();
+    s_persist_mutex = xSemaphoreCreateMutex();
     s_lv_mutex = xSemaphoreCreateMutex();
-    if (!s_mutex || !s_nvs_mutex || !s_lv_mutex) return ESP_ERR_NO_MEM;
+    if (!s_mutex || !s_persist_mutex || !s_lv_mutex) return ESP_ERR_NO_MEM;
 
     s_storage_base = storage_base;
     memset(s_full_logged, 0, sizeof(s_full_logged));
     memset(s_last_values, 0, sizeof(s_last_values));
     plants_table_init(&s_table);
 
-    nvs_handle_t h;
-    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
-        load_blob(h, &s_table);
-        nvs_close(h);
+    if (s_storage_base) {
+        if (!load_file(&s_table)) {
+            /* plants.bin doesn't exist (or is unreadable/corrupt): try the
+             * one-boot legacy-NVS adoption before accepting the empty
+             * defaults load_file() already left in s_table. A live M8-era
+             * rig's table gets recovered here; a genuinely fresh install
+             * finds no legacy key either and stays empty. */
+            plants_adopt_legacy_nvs();
+        }
+    } else {
+        /* No filesystem -- see plants.h: plants are hub-only and the hub
+         * always has storage in practice, so this only happens if littlefs
+         * itself failed to mount. RAM-only table for the rest of this boot;
+         * persist_table() below (and on every mutation) is a silent no-op
+         * from here on, this is the one and only WARN for that. */
+        ESP_LOGW(TAG, "plants: no storage_base (littlefs unavailable) -- plant table is "
+                      "RAM-only and will not survive a reboot");
     }
-    /* nvs_open() failure here means a fresh "planthub" namespace (nothing
-     * has ever been written to it) -- s_table already holds
-     * plants_table_init()'s empty defaults, same as swarm_store_init()'s
-     * "fresh NVS = defaults" fallback. */
 
     plants_run_migration();
 
@@ -640,7 +839,7 @@ uint8_t plants_resolve_or_create(const uint8_t mac[6])
 
     esp_err_t err = persist_table();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "plants_resolve_or_create: NVS write failed (%s); RAM cache already "
+        ESP_LOGE(TAG, "plants_resolve_or_create: plants.bin write failed (%s); RAM cache already "
                       "reflects the new plant and will not revert until the next successful "
                       "write or a reboot", esp_err_to_name(err));
     }
@@ -713,7 +912,7 @@ esp_err_t plants_rename(uint8_t id, const char *name)
 
     esp_err_t err = persist_table();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "plants_rename(%u): NVS write failed (%s); RAM cache already reflects "
+        ESP_LOGE(TAG, "plants_rename(%u): plants.bin write failed (%s); RAM cache already reflects "
                       "the new name and will not revert until the next successful write or a "
                       "reboot", id, esp_err_to_name(err));
     }
@@ -741,7 +940,7 @@ esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null)
 
     esp_err_t err = persist_table();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "plants_assign(%u): NVS write failed (%s); RAM cache already reflects "
+        ESP_LOGE(TAG, "plants_assign(%u): plants.bin write failed (%s); RAM cache already reflects "
                       "the new assignment and will not revert until the next successful write "
                       "or a reboot", id, esp_err_to_name(err));
     }
@@ -774,7 +973,7 @@ uint8_t plants_create(void)
 
     esp_err_t err = persist_table();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "plants_create: NVS write failed (%s); RAM cache already reflects the "
+        ESP_LOGE(TAG, "plants_create: plants.bin write failed (%s); RAM cache already reflects the "
                       "new plant and will not revert until the next successful write or a "
                       "reboot", esp_err_to_name(err));
     }
@@ -818,7 +1017,7 @@ esp_err_t plants_delete(uint8_t id)
 
     esp_err_t err = persist_table();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "plants_delete(%u): NVS write failed (%s); RAM cache already reflects "
+        ESP_LOGE(TAG, "plants_delete(%u): plants.bin write failed (%s); RAM cache already reflects "
                       "the deletion and will not revert until the next successful write or a "
                       "reboot", id, esp_err_to_name(err));
     }

@@ -5,12 +5,19 @@
 #include "plants_table.h"
 #include "registry.h"
 
-/* NVS-backed plant registry (M8 Task 2): a single blob keyed "plants" in
- * namespace "planthub" (shared with swarm_store.c -- see swarm_store.c's
- * locking-invariant comment for the two-phase RAM-mutex/NVS-mutex persist
- * discipline this mirrors byte for byte, just against a different key and
- * blob). RAM cache + mutex layered on top of plants_table.h's pure logic;
- * every mutating call below persists to flash before returning.
+/* LittleFS-backed plant registry: a single blob at <storage_base>/plants.bin
+ * (M8 hardware bring-up fix -- this used to be an NVS blob keyed "plants" in
+ * namespace "planthub", the same namespace claim/wifi/swarm state lives in;
+ * every mutation rewrote the whole blob, and NVS's copy-on-write semantics
+ * turned that into 19 stale copies in a 24KB partition within one session,
+ * forcing constant GC in the SAME partition swarm's own rarely-written state
+ * lives in -- see plants.c's top-of-file comment for the full story). RAM
+ * cache + mutex layered on top of plants_table.h's pure logic; every
+ * mutating call below persists to <storage_base>/plants.bin before
+ * returning, via a tmp-file-then-rename() write (rename is atomic on
+ * LittleFS). NVS is touched only once, by a one-boot migration in
+ * plants_init() that adopts an existing pre-fix NVS blob if plants.bin
+ * doesn't exist yet -- steady state never writes NVS.
  *
  * The on-disk blob is an explicit packed mirror struct (format byte 1 +
  * next_id + 16 x {id, in_use:u8, mac[6], mac_valid:u8, name[33]}), never a
@@ -19,21 +26,25 @@
  * or an unrecognised format byte is loudly logged and treated as "start
  * empty" -- this never fails boot. */
 
-/* Init: loads the NVS blob (missing -> empty table), then runs the one-boot
- * migration (Task 4; a stub no-op until then). Call from main.c after
- * data_core_init() and the littlefs mount, HUB ROLE ONLY (nodes keep no
- * plants). storage_base is "/storage", or NULL when storage/littlefs is
- * unavailable -- plants_delete()'s ring-file cleanup then has nothing to
- * remove and is skipped rather than failing. Never fails boot on its own
- * account (any NVS read problem is log-and-continue, defaults to an empty
- * table); the only error this can genuinely return is mutex allocation
- * (ESP_ERR_NO_MEM), which main.c must also log-and-continue past, same as
- * every other storage-adjacent init call there -- ESP_ERROR_CHECK is not
- * appropriate here. */
+/* Init: loads <storage_base>/plants.bin (missing/bad -> empty table, logged;
+ * if also absent, a one-boot check adopts a pre-fix NVS blob if one exists),
+ * then runs the sensor-keyed one-boot migration (Task 4). Call from main.c
+ * after data_core_init() and the littlefs mount, HUB ROLE ONLY (nodes keep
+ * no plants). storage_base is "/storage", or NULL when storage/littlefs is
+ * unavailable -- persistence then becomes a RAM-only no-op (single WARN
+ * here) and plants_delete()'s ring-file cleanup has nothing to remove and is
+ * skipped rather than failing; in practice the hub always has storage, so
+ * this is a mount-failure fallback, not a normal path. Never fails boot on
+ * its own account (any read problem is log-and-continue, defaults to an
+ * empty table); the only error this can genuinely return is mutex
+ * allocation (ESP_ERR_NO_MEM), which main.c must also log-and-continue past,
+ * same as every other storage-adjacent init call there -- ESP_ERROR_CHECK is
+ * not appropriate here. */
 esp_err_t plants_init(const char *storage_base /* "/storage", or NULL when storage unavailable */);
 
-/* mac -> plant id, auto-creating (and persisting) on first sight.
- * TASK CONTEXT ONLY (may write NVS). 0 = table full (logged once/mac/boot). */
+/* mac -> plant id, auto-creating (and persisting to plants.bin) on first
+ * sight. TASK CONTEXT ONLY (may do file I/O). 0 = table full (logged
+ * once/mac/boot). */
 uint8_t plants_resolve_or_create(const uint8_t mac[6]);
 
 /* Read-only snapshot for the API/MQTT/UI. Safe to call before plants_init()
