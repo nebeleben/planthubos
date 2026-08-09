@@ -7,8 +7,6 @@ import { NetworkTab } from './tabs/network.jsx'
 import { NodesTab } from './tabs/nodes.jsx'
 import { RoleTab } from './tabs/role.jsx'
 import { getStoredTheme, setStoredTheme, systemPrefersDark } from './lib/theme.js'
-import logoLight from './logo-light.png'
-import logoDark from './logo-dark.png'
 
 // M8 Task 8: plants are now the primary surface, so the old "Dashboard"/
 // "Devices" labels are renamed to "Plants"/"Probes" -- a sensor is just a
@@ -62,11 +60,11 @@ export function App() {
   const [role, setRole] = useState('main')
 
   // Day/night state, purely presentational (drives the toggle icon and the
-  // header logo swap -- the actual palette is CSS, keyed off the same
+  // theme state -- the actual palette is CSS, keyed off the same
   // data-theme attribute this mirrors). No stored preference means "follow
   // the OS", same rule index.html's inline anti-FOUC script and style.css's
   // prefers-color-scheme block both use; this only tracks it in JS so the
-  // logo/icon can react without a page reload.
+  // toggle icon can react without a page reload.
   const [theme, setTheme] = useState(() => getStoredTheme() || (systemPrefersDark() ? 'dark' : 'light'))
 
   useEffect(() => {
@@ -132,7 +130,6 @@ export function App() {
     <div class="app">
       <header>
         <div class="brand">
-          <img class="brand-logo" src={theme === 'dark' ? logoDark : logoLight} alt="" width="28" height="28" />
           <h1>PlantHub</h1>
         </div>
         <nav>

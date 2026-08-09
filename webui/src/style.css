@@ -143,12 +143,6 @@ a { color: var(--accent-strong); }
   margin-right: 0.5rem;
 }
 
-.brand-logo {
-  display: block;
-  width: 28px;
-  height: 28px;
-  object-fit: contain;
-}
 
 .app h1 {
   margin: 0;
