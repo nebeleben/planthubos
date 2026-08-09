@@ -6,6 +6,7 @@ import { HistoryTab } from './tabs/history.jsx'
 import { NetworkTab } from './tabs/network.jsx'
 import { NodesTab } from './tabs/nodes.jsx'
 import { RoleTab } from './tabs/role.jsx'
+import { getStoredTheme, setStoredTheme, systemPrefersDark } from './lib/theme.js'
 
 // M8 Task 8: plants are now the primary surface, so the old "Dashboard"/
 // "Devices" labels are renamed to "Plants"/"Probes" -- a sensor is just a
@@ -19,6 +20,27 @@ function Placeholder({ name }) {
   return <p class="placeholder">{name} — coming in a later milestone.</p>
 }
 
+// Minimal inline sun/moon glyphs for the header theme toggle -- avoids
+// pulling in an icon font/library for two shapes, and renders identically
+// across platforms (unlike emoji, whose glyph varies by OS).
+function SunIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="4.5" />
+      <path d="M12 2v2.5M12 19.5V22M4.2 4.2l1.8 1.8M18 18l1.8 1.8M2 12h2.5M19.5 12H22M4.2 19.8l1.8-1.8M18 6l1.8-1.8" />
+    </svg>
+  )
+}
+
+function MoonIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">
+      <path d="M20.6 15.1A8.7 8.7 0 1 1 8.9 3.4a7 7 0 0 0 11.7 11.7Z" />
+    </svg>
+  )
+}
+
 export function App() {
   const [tab, setTab] = useState('Plants')
   // Optimistically 'main' so an existing hub (the overwhelmingly common
@@ -26,6 +48,28 @@ export function App() {
   // -- only a device that has never chosen a role (fresh out of the box)
   // ever flips this to 'unset' once /api/v1/status answers.
   const [role, setRole] = useState('main')
+
+  // Day/night state, purely presentational (drives the toggle icon -- the
+  // actual palette is CSS, keyed off the same data-theme attribute this
+  // mirrors). No stored preference means "follow the OS", same rule
+  // index.html's inline anti-FOUC script and style.css's
+  // prefers-color-scheme block both use; this only tracks it in JS so the
+  // icon can react without a page reload.
+  const [theme, setTheme] = useState(() => getStoredTheme() || (systemPrefersDark() ? 'dark' : 'light'))
+
+  useEffect(() => {
+    if (getStoredTheme()) return   // explicit override in effect: OS changes don't apply
+    const mq = window.matchMedia('(prefers-color-scheme: dark)')
+    const onChange = (e) => setTheme(e.matches ? 'dark' : 'light')
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
+  function toggleTheme() {
+    const next = theme === 'dark' ? 'light' : 'dark'
+    setStoredTheme(next)
+    setTheme(next)
+  }
 
   function refreshRole() {
     fetch('/api/v1/status')
@@ -75,11 +119,15 @@ export function App() {
         <h1>PlantHub</h1>
         <nav>
           {TABS.map((t) => (
-            <button key={t} class={t === tab ? 'active' : ''} onClick={() => setTab(t)}>
+            <button key={t} class={'tab-btn' + (t === tab ? ' active' : '')} onClick={() => setTab(t)}>
               {t}
             </button>
           ))}
         </nav>
+        <button type="button" class="theme-toggle" onClick={toggleTheme}
+                aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}>
+          {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
+        </button>
       </header>
       <main>
         {tab === 'Plants' ? <DashboardTab /> :

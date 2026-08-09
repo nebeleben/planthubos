@@ -82,7 +82,7 @@ export function RoleTab({ onMainChosen }) {
         <div class="role-card">
           <h2>Main hub</h2>
           <p>Connects to your WiFi, stores history and shows this dashboard. Choose this for your first device.</p>
-          <button onClick={chooseMain} disabled={busy !== ''}>
+          <button class="btn-primary" onClick={chooseMain} disabled={busy !== ''}>
             {busy === 'main' ? 'Setting up…' : 'Choose main hub'}
           </button>
         </div>
@@ -93,7 +93,7 @@ export function RoleTab({ onMainChosen }) {
             Two steps: first open pairing on your main hub (Nodes &rarr; Add node),
             <em> then</em> press Continue here.
           </p>
-          <button onClick={chooseNode} disabled={busy !== ''}>
+          <button class="btn-primary" onClick={chooseNode} disabled={busy !== ''}>
             {busy === 'node' ? 'Starting…' : 'Continue as node'}
           </button>
         </div>

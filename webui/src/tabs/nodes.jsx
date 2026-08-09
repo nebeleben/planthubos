@@ -206,7 +206,7 @@ function OtaControl({ mac, fwVersion }) {
   return (
     <span class="ota-control">
       {!active && (
-        <button onClick={start} disabled={acting}>
+        <button class="btn-primary" onClick={start} disabled={acting}>
           {acting ? '…' : 'Update'}
         </button>
       )}
@@ -219,7 +219,7 @@ function OtaControl({ mac, fwVersion }) {
           <span class="hint">{pct}%</span>
         </>
       )}
-      {active && <button onClick={doAbort} disabled={acting}>{acting ? '…' : 'Abort'}</button>}
+      {active && <button class="btn-destructive" onClick={doAbort} disabled={acting}>{acting ? '…' : 'Abort'}</button>}
       {msg && <span class="error">{msg}</span>}
     </span>
   )
@@ -314,7 +314,7 @@ function Row({ n, fwVersion, onSaved, onForgotten, onPowerModeSaved }) {
         <form onSubmit={save} class="namef">
           <input value={name} maxlength={24} placeholder={n.mac}
                  onInput={(e) => { setName(e.currentTarget.value); setState('idle') }} />
-          <button type="submit" disabled={state === 'saving'}>
+          <button type="submit" class="btn-primary" disabled={state === 'saving'}>
             {state === 'saving' ? '…' : state === 'saved' ? '✓' : 'Save'}
           </button>
           {state === 'error' && <span class="error">failed</span>}
@@ -335,7 +335,7 @@ function Row({ n, fwVersion, onSaved, onForgotten, onPowerModeSaved }) {
         <OtaControl mac={n.mac} fwVersion={fwVersion} />
       </td>
       <td>
-        <button onClick={forget} disabled={forgetting}>{forgetting ? '…' : 'Forget'}</button>
+        <button class="btn-destructive" onClick={forget} disabled={forgetting}>{forgetting ? '…' : 'Forget'}</button>
       </td>
     </tr>
   )
@@ -456,7 +456,7 @@ export function NodesTab() {
   if (!nodes) return <p class="placeholder">Loading…</p>
 
   return (
-    <div>
+    <div class="panel">
       <h2>Nodes</h2>
       {nodes.length === 0 ? (
         <p class="placeholder">No nodes paired yet — nodes extend BLE range by relaying readings to this hub over ESP-NOW.</p>
@@ -478,7 +478,7 @@ export function NodesTab() {
         <p class="hint">Pairing open — put the node into pairing mode now ({pairSecondsLeft}s left).</p>
       ) : (
         <p>
-          <button onClick={doAddNode} disabled={busy === 'pair'}>
+          <button class="btn-primary" onClick={doAddNode} disabled={busy === 'pair'}>
             {busy === 'pair' ? 'Opening…' : 'Add node'}
           </button>
         </p>

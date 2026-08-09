@@ -128,7 +128,7 @@ function PlantRow({ p, onRenamed, onDeleted }) {
         <form onSubmit={save} class="namef">
           <input value={name} maxlength={32} placeholder={`Plant ${p.id}`}
                  onInput={(e) => { setName(e.currentTarget.value); setState('idle') }} />
-          <button type="submit" disabled={state === 'saving'}>
+          <button type="submit" class="btn-primary" disabled={state === 'saving'}>
             {state === 'saving' ? '…' : state === 'saved' ? '✓' : 'Save'}
           </button>
           {state === 'error' && <span class="error">failed</span>}
@@ -137,7 +137,7 @@ function PlantRow({ p, onRenamed, onDeleted }) {
       </td>
       <td class="mono">{p.id}</td>
       <td>
-        <button onClick={del} disabled={deleting}>{deleting ? '…' : 'Delete'}</button>
+        <button class="btn-destructive" onClick={del} disabled={deleting}>{deleting ? '…' : 'Delete'}</button>
       </td>
     </tr>
   )
@@ -217,28 +217,32 @@ export function DevicesTab() {
 
   return (
     <div>
-      <h2>Probes</h2>
-      {sensors.length === 0 ? (
-        <p class="placeholder">No sensors discovered yet. MiFlora devices are discovered automatically — bring one in range.</p>
-      ) : (
-        <table class="devices">
-          <thead><tr><th>MAC</th><th>Battery</th><th>RSSI</th><th>Via</th><th>Last seen</th><th>Assigned to</th></tr></thead>
-          <tbody>{sensors.map((s) => <SensorRow key={s.mac} s={s} plants={plants} onAssigned={onAssigned} />)}</tbody>
-        </table>
-      )}
+      <div class="panel">
+        <h2>Probes</h2>
+        {sensors.length === 0 ? (
+          <p class="placeholder">No sensors discovered yet. MiFlora devices are discovered automatically — bring one in range.</p>
+        ) : (
+          <table class="devices">
+            <thead><tr><th>MAC</th><th>Battery</th><th>RSSI</th><th>Via</th><th>Last seen</th><th>Assigned to</th></tr></thead>
+            <tbody>{sensors.map((s) => <SensorRow key={s.mac} s={s} plants={plants} onAssigned={onAssigned} />)}</tbody>
+          </table>
+        )}
+      </div>
 
-      <h2>Plants</h2>
-      {plants.length === 0 ? (
-        <p class="placeholder">No plants yet.</p>
-      ) : (
-        <table class="devices">
-          <thead><tr><th>Name</th><th>ID</th><th></th></tr></thead>
-          <tbody>{plants.map((p) => <PlantRow key={p.id} p={p} onRenamed={onRenamed} onDeleted={onDeleted} />)}</tbody>
-        </table>
-      )}
-      <p>
-        <button onClick={doCreate} disabled={creating}>{creating ? 'Creating…' : 'New plant'}</button>
-      </p>
+      <div class="panel">
+        <h2>Plants</h2>
+        {plants.length === 0 ? (
+          <p class="placeholder">No plants yet.</p>
+        ) : (
+          <table class="devices">
+            <thead><tr><th>Name</th><th>ID</th><th></th></tr></thead>
+            <tbody>{plants.map((p) => <PlantRow key={p.id} p={p} onRenamed={onRenamed} onDeleted={onDeleted} />)}</tbody>
+          </table>
+        )}
+        <p>
+          <button class="btn-primary" onClick={doCreate} disabled={creating}>{creating ? 'Creating…' : 'New plant'}</button>
+        </p>
+      </div>
     </div>
   )
 }
