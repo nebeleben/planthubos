@@ -7,6 +7,8 @@ import { NetworkTab } from './tabs/network.jsx'
 import { NodesTab } from './tabs/nodes.jsx'
 import { RoleTab } from './tabs/role.jsx'
 import { getStoredTheme, setStoredTheme, systemPrefersDark } from './lib/theme.js'
+import logoLight from './logo-light.png'
+import logoDark from './logo-dark.png'
 
 // M8 Task 8: plants are now the primary surface, so the old "Dashboard"/
 // "Devices" labels are renamed to "Plants"/"Probes" -- a sensor is just a
@@ -41,6 +43,16 @@ function MoonIcon() {
   )
 }
 
+// Rendered at the bottom of every screen, including the pre-role RoleTab
+// screen -- see both `return`s in App() below.
+function Footer() {
+  return (
+    <footer class="site-footer">
+      <a href="https://plaiiin-planhub.com" target="_blank" rel="noreferrer">@plaiiin-planhub.com</a>
+    </footer>
+  )
+}
+
 export function App() {
   const [tab, setTab] = useState('Plants')
   // Optimistically 'main' so an existing hub (the overwhelmingly common
@@ -49,12 +61,12 @@ export function App() {
   // ever flips this to 'unset' once /api/v1/status answers.
   const [role, setRole] = useState('main')
 
-  // Day/night state, purely presentational (drives the toggle icon -- the
-  // actual palette is CSS, keyed off the same data-theme attribute this
-  // mirrors). No stored preference means "follow the OS", same rule
-  // index.html's inline anti-FOUC script and style.css's
+  // Day/night state, purely presentational (drives the toggle icon and the
+  // header logo swap -- the actual palette is CSS, keyed off the same
+  // data-theme attribute this mirrors). No stored preference means "follow
+  // the OS", same rule index.html's inline anti-FOUC script and style.css's
   // prefers-color-scheme block both use; this only tracks it in JS so the
-  // icon can react without a page reload.
+  // logo/icon can react without a page reload.
   const [theme, setTheme] = useState(() => getStoredTheme() || (systemPrefersDark() ? 'dark' : 'light'))
 
   useEffect(() => {
@@ -99,12 +111,15 @@ export function App() {
 
   if (role === 'unset') {
     return (
-      <RoleTab
-        onMainChosen={() => {
-          setTab('Network')
-          refreshRole()
-        }}
-      />
+      <>
+        <RoleTab
+          onMainChosen={() => {
+            setTab('Network')
+            refreshRole()
+          }}
+        />
+        <Footer />
+      </>
     )
   }
 
@@ -116,7 +131,10 @@ export function App() {
   return (
     <div class="app">
       <header>
-        <h1>PlantHub</h1>
+        <div class="brand">
+          <img class="brand-logo" src={theme === 'dark' ? logoDark : logoLight} alt="" width="28" height="28" />
+          <h1>PlantHub</h1>
+        </div>
         <nav>
           {TABS.map((t) => (
             <button key={t} class={'tab-btn' + (t === tab ? ' active' : '')} onClick={() => setTab(t)}>
@@ -138,6 +156,7 @@ export function App() {
          tab === 'Network' ? <NetworkTab /> :
          <Placeholder name={tab} />}
       </main>
+      <Footer />
     </div>
   )
 }
