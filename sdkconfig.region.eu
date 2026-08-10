@@ -1,0 +1,9 @@
+# Region overlay: Europe / Switzerland. Combined with sdkconfig.defaults via
+# -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.region.eu" (see
+# .github/workflows/release.yml) -- later files in that list win, so this
+# is only here to make the "eu" release leg's regulatory domain explicit
+# and independent of whatever sdkconfig.defaults' own default happens to be,
+# rather than relying on it silently matching. Channels 1-13; matches
+# sdkconfig.defaults' own "CH" (the maintainer's home region, see its
+# comment) on purpose -- this is the same value, not a different one.
+CONFIG_PLANTHUB_WIFI_COUNTRY="CH"
