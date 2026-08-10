@@ -98,6 +98,32 @@ static const char *role_str(swarm_role_t r)
     }
 }
 
+/* GET /api/v1/health -- minimal liveness/readiness probe for monitoring
+ * (e.g. Uptime Kuma). Unauthenticated like every GET here. Deliberately
+ * cheap: no snapshots, no locks, no cJSON -- a monitor polling every few
+ * seconds must not compete with real work. 200 = healthy; 503 = alive but
+ * degraded, currently meaning "storage unmounted" (history/plants dead,
+ * M1 recovery still works) or "heap critically low" (~16KB; the observed
+ * healthy floor under full load is ~40KB, see PlanV1 8j). time_synced is
+ * NOT a health signal -- offline operation is a designed mode. */
+#define HEALTH_HEAP_CRITICAL 16384
+static esp_err_t health_get(httpd_req_t *req)
+{
+    bool storage_ok = esp_littlefs_mounted("storage");
+    uint32_t heap = esp_get_free_heap_size();
+    bool healthy = storage_ok && heap >= HEALTH_HEAP_CRITICAL;
+
+    char body[96];
+    snprintf(body, sizeof(body),
+             "{\"status\":\"%s\",\"storage\":%s,\"heap_free\":%u}",
+             healthy ? "ok" : "degraded", storage_ok ? "true" : "false",
+             (unsigned)heap);
+    if (!healthy) httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, body);
+    return ESP_OK;
+}
+
 static esp_err_t status_get(httpd_req_t *req)
 {
     char name[16], ip[16];
@@ -1404,6 +1430,8 @@ static esp_err_t config_post(httpd_req_t *req)
 
 void api_v1_register(httpd_handle_t server)
 {
+    httpd_uri_t health = { .uri = "/api/v1/health", .method = HTTP_GET, .handler = health_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &health));
     httpd_uri_t status = { .uri = "/api/v1/status", .method = HTTP_GET, .handler = status_get };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status));
     httpd_uri_t scan = { .uri = "/api/v1/wifi/scan", .method = HTTP_GET, .handler = wifi_scan_get };
