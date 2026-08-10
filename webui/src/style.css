@@ -425,6 +425,96 @@ progress {
 .role-card p { margin: 0 0 0.8rem; color: var(--text-muted); }
 .role-card .btn-primary { width: 100%; font-size: 0.95rem; }
 
+/* Node cards (Nodes tab): collapsible panel-on-panel cards, one per paired
+   node, replacing what used to be rows of table.devices. Reuses --input-bg
+   for a background a shade off --panel-bg -- distinct enough to read as its
+   own surface without needing a dedicated variable. Collapsed by default;
+   the body stays in the DOM at all times (display toggles on .open) rather
+   than being conditionally rendered, so a node's OTA poll can keep running
+   while collapsed -- see nodes.jsx's NodeCard/OtaControl for why that matters. */
+.node-cards { display: flex; flex-direction: column; gap: 0.6rem; }
+
+.node-card {
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.node-card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  width: 100%;
+  min-height: auto;
+  padding: 10px 14px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.node-card-header:hover:not(:disabled) { border-color: transparent; }
+
+.node-card-chevron {
+  display: inline-block;
+  flex-shrink: 0;
+  color: var(--text-muted);
+  transition: transform 0.15s ease;
+}
+
+.node-card.open .node-card-chevron { transform: rotate(90deg); }
+
+.node-card-title {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  flex: 1;
+  min-width: 0;
+}
+
+.node-card-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-card-mac { flex-shrink: 0; }
+
+.node-card-age {
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: 0.85rem;
+}
+
+.node-card-body {
+  display: none;
+  padding: 0 14px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.node-card.open .node-card-body {
+  display: block;
+  padding-top: 12px;
+}
+
+.node-card-row {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+  margin: 0.7rem 0;
+}
+
+.node-card-footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.8rem;
+}
+
 /* ---------- 7. Tables ---------------------------------------------------- */
 
 table.devices {
