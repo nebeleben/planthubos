@@ -39,7 +39,7 @@ export function NetworkTab() {
 
   if (state === 'sent') {
     return (
-      <div>
+      <div class="panel">
         <h2>Joining "{ssid}"...</h2>
         <p>
           The hub is switching to your WiFi. Reconnect your device to that network,
@@ -52,7 +52,7 @@ export function NetworkTab() {
   }
 
   return (
-    <div>
+    <div class="panel">
       <h2>WiFi Setup</h2>
       <button onClick={scan} disabled={state === 'scanning'}>
         {state === 'scanning' ? 'Scanning…' : 'Rescan'}
@@ -75,7 +75,7 @@ export function NetworkTab() {
           Password
           <input type="password" value={password} onInput={(e) => setPassword(e.currentTarget.value)} maxlength={64} />
         </label>
-        <button type="submit" disabled={state === 'joining' || !ssid}>
+        <button type="submit" class="btn-primary" disabled={state === 'joining' || !ssid}>
           {state === 'joining' ? 'Sending…' : 'Join'}
         </button>
       </form>

@@ -201,61 +201,70 @@ export function ConfigTab() {
 
   return (
     <div class="config">
-      <h2>Hub</h2>
-      <table class="kv">
-        <tbody>
-          <tr><td>Firmware</td><td>{st.version}</td></tr>
-          <tr><td>Uptime</td><td>{fmtUptime(st.uptime_s)}</td></tr>
-          <tr><td>Clock</td><td>{st.time_synced ? 'synced' : 'not synced'}</td></tr>
-          <tr><td>Storage</td><td>{fmtBytes(st.fs_used)} / {fmtBytes(st.fs_total)}</td></tr>
-          <tr><td>Free heap</td><td>{fmtBytes(st.heap_free)}</td></tr>
-          <tr><td>Claim state</td><td>{st.claimed ? 'claimed' : 'unclaimed'}</td></tr>
-        </tbody>
-      </table>
+      <div class="panel">
+        <h2>Hub</h2>
+        <table class="kv">
+          <tbody>
+            <tr><td>Firmware</td><td>{st.version}</td></tr>
+            <tr><td>Uptime</td><td>{fmtUptime(st.uptime_s)}</td></tr>
+            <tr><td>Clock</td><td>{st.time_synced ? 'synced' : 'not synced'}</td></tr>
+            <tr><td>Storage</td><td>{fmtBytes(st.fs_used)} / {fmtBytes(st.fs_total)}</td></tr>
+            <tr><td>Free heap</td><td>{fmtBytes(st.heap_free)}</td></tr>
+            <tr><td>Claim state</td><td>{st.claimed ? 'claimed' : 'unclaimed'}</td></tr>
+          </tbody>
+        </table>
+      </div>
 
-      <h2>Claim</h2>
-      {secret && (
-        <p class="secretbox">
-          Hub claimed. Your key (shown once, also saved in this browser):
-          <code>{secret}</code>
-        </p>
-      )}
-      {!st.claimed && !secret && (
+      <div class="panel">
+        <h2>Claim</h2>
+        {secret && (
+          <p class="secretbox">
+            Hub claimed. Your key (shown once, also saved in this browser):
+            <code>{secret}</code>
+          </p>
+        )}
+        {!st.claimed && !secret && (
+          <p>
+            <button class="btn-primary" onClick={doClaim} disabled={busy === 'claim'}>
+              {busy === 'claim' ? 'Claiming…' : 'Claim this hub'}
+            </button>
+            <span class="hint"> Locks renaming, WiFi changes and updates behind a key.</span>
+          </p>
+        )}
+        {st.claimed && (
+          <div>
+            <label class="keyrow">
+              Hub key
+              <input type="password" value={keyInput}
+                     onInput={(e) => { setKeyInput(e.currentTarget.value); setKey(e.currentTarget.value) }}
+                     placeholder="paste the 64-char key" />
+            </label>
+            <button class="btn-destructive" onClick={doUnclaim} disabled={busy === 'unclaim'}>
+              {busy === 'unclaim' ? 'Unclaiming…' : 'Unclaim hub'}
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div class="panel">
+        <h2>Firmware update</h2>
         <p>
-          <button onClick={doClaim} disabled={busy === 'claim'}>
-            {busy === 'claim' ? 'Claiming…' : 'Claim this hub'}
-          </button>
-          <span class="hint"> Locks renaming, WiFi changes and updates behind a key.</span>
-        </p>
-      )}
-      {st.claimed && (
-        <div>
-          <label class="keyrow">
-            Hub key
-            <input type="password" value={keyInput}
-                   onInput={(e) => { setKeyInput(e.currentTarget.value); setKey(e.currentTarget.value) }}
-                   placeholder="paste the 64-char key" />
+          <label class="filebtn btn-primary">
+            {busy === 'ota' ? 'Uploading…' : 'Choose firmware…'}
+            <input type="file" accept=".bin" onChange={doOta} disabled={busy === 'ota'} />
           </label>
-          <button onClick={doUnclaim} disabled={busy === 'unclaim'}>
-            {busy === 'unclaim' ? 'Unclaiming…' : 'Unclaim hub'}
-          </button>
-        </div>
-      )}
-
-      <h2>Firmware update</h2>
-      <p>
-        <input type="file" accept=".bin" onChange={doOta} disabled={busy === 'ota'} />
-      </p>
-      {otaPct != null && busy === 'ota' && (
-        <p>
-          <progress max="100" value={otaPct} />
-          <button onClick={cancelOta}>Cancel</button>
         </p>
-      )}
-      {otaMsg && <p class="hint">{otaMsg}</p>}
+        {otaPct != null && busy === 'ota' && (
+          <p>
+            <progress max="100" value={otaPct} />
+            <button class="btn-destructive" onClick={cancelOta}>Cancel</button>
+          </p>
+        )}
+        {otaMsg && <p class="hint">{otaMsg}</p>}
+      </div>
 
       {st.role !== 'node' && (
-        <div>
+        <div class="panel">
           <h2>Integrations</h2>
           {cfgLoadError && (
             <p class="error">
@@ -320,7 +329,7 @@ export function ConfigTab() {
             </fieldset>
 
             <p>
-              <button type="submit" disabled={busy === 'config' || !cfgLoaded}>
+              <button type="submit" class="btn-primary" disabled={busy === 'config' || !cfgLoaded}>
                 {busy === 'config' ? 'Saving…' : 'Save integrations'}
               </button>
             </p>
@@ -329,15 +338,8 @@ export function ConfigTab() {
         </div>
       )}
 
-      {st.role !== 'node' && (
-        <div>
-          <h2>Nodes</h2>
-          <p class="hint">Rename, forget, or pair a node on the <strong>Nodes</strong> tab.</p>
-        </div>
-      )}
-
       {st.role === 'node' && (
-        <div>
+        <div class="panel">
           <h2>Node</h2>
           {st.pair_failed && (
             <p class="error">
@@ -346,7 +348,7 @@ export function ConfigTab() {
           )}
           <p>
             {st.pair_failed && (
-              <button onClick={doRetryPairing} disabled={busy === 'retry'}>
+              <button class="btn-primary" onClick={doRetryPairing} disabled={busy === 'retry'}>
                 {busy === 'retry' ? 'Retrying…' : 'Retry pairing'}
               </button>
             )}

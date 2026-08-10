@@ -87,12 +87,22 @@ function pendingHint(n) {
 // Update on a second node while another is mid-transfer just gets a 409
 // from the hub, surfaced inline below rather than tracked as separate
 // cross-row state.
-function OtaControl({ mac, fwVersion }) {
+function OtaControl({ mac, fwVersion, onActiveChange }) {
   const [prog, setProg] = useState(null)   // last GET .../ota response, or null before the first poll
   const [msg, setMsg] = useState('')
   const [acting, setActing] = useState(false)  // starting/aborting request in flight
   const pollRef = useRef(null)
   const controllerRef = useRef(null)
+
+  // Surfaces this node's active/inactive OTA status to NodesTab, which uses it
+  // (via onOtaActive -> otaActiveMap -> isOpen) to force the card open while a
+  // push is in flight -- collapsing mid-transfer would hide the progress bar.
+  // Fires whenever `active` actually flips, including back to false on
+  // completion/abort/mount finding nothing in flight, so a card doesn't stay
+  // force-open after its OTA ends.
+  useEffect(() => {
+    onActiveChange?.(mac, !!prog?.active)
+  }, [prog?.active])
   // Set by doAbort() right before it fires the request, so the poll loop can
   // tell "the operator clicked Abort" apart from any other OTA_ST_FAILED
   // (the err byte alone can't: node_ota.h's node_ota_progress_t.err is either
@@ -206,7 +216,7 @@ function OtaControl({ mac, fwVersion }) {
   return (
     <span class="ota-control">
       {!active && (
-        <button onClick={start} disabled={acting}>
+        <button class="btn-primary" onClick={start} disabled={acting}>
           {acting ? '…' : 'Update'}
         </button>
       )}
@@ -219,7 +229,7 @@ function OtaControl({ mac, fwVersion }) {
           <span class="hint">{pct}%</span>
         </>
       )}
-      {active && <button onClick={doAbort} disabled={acting}>{acting ? '…' : 'Abort'}</button>}
+      {active && <button class="btn-destructive" onClick={doAbort} disabled={acting}>{acting ? '…' : 'Abort'}</button>}
       {msg && <span class="error">{msg}</span>}
     </span>
   )
@@ -228,7 +238,7 @@ function OtaControl({ mac, fwVersion }) {
 // Per-node power-mode control: a three-option select that POSTs
 // {"power_mode": ...} ALONE on change (per Task 6's contract -- resending name
 // isn't needed and isn't sent). Controlled straight off `n.power_mode` rather
-// than buffered local state (contrast Row's `name` field, which has an
+// than buffered local state (contrast NodeCard's `name` field, which has an
 // explicit Save button): there's no separate save step here, the select's
 // onChange IS the save, so the parent's node list is the only source of truth.
 function PowerModeControl({ n, onSaved }) {
@@ -264,7 +274,12 @@ function PowerModeControl({ n, onSaved }) {
   )
 }
 
-function Row({ n, fwVersion, onSaved, onForgotten, onPowerModeSaved }) {
+// Collapsible per-node card. `open`/`onToggle` are lifted to NodesTab (keyed by
+// mac) rather than kept as local state here, so a node whose OTA goes active
+// can be forced open from the parent without this component needing to know
+// why -- see NodesTab's `isOpen`, which ORs the operator's own toggle state
+// with the OTA poll's `active` flag (reported back up via onOtaActive below).
+function NodeCard({ n, fwVersion, open, onToggle, onSaved, onForgotten, onPowerModeSaved, onOtaActive }) {
   const [name, setName] = useState(n.name || '')
   const [state, setState] = useState('idle') // idle | saving | saved | error | unauth
   const [forgetting, setForgetting] = useState(false)
@@ -308,36 +323,50 @@ function Row({ n, fwVersion, onSaved, onForgotten, onPowerModeSaved }) {
     setForgetting(false)
   }
 
+  // `open` here is already the OR of the lifted per-mac toggle state and this
+  // node's own OTA-active flag (see NodesTab's `isOpen`) -- this component
+  // doesn't need to know which one is responsible, only whether to show the
+  // body. The body itself stays mounted at all times rather than being
+  // conditionally rendered on `open` (only its visibility is toggled, via the
+  // `.node-card.open` CSS below): OtaControl's poll loop must keep running
+  // while collapsed so a push that goes active can report that back up
+  // through onActiveChange and force the card open in the first place.
   return (
-    <tr>
-      <td>
+    <div class={`node-card${open ? ' open' : ''}`}>
+      <button type="button" class="node-card-header" onClick={onToggle} aria-expanded={open}>
+        <span class="node-card-chevron" aria-hidden="true">▸</span>
+        <span class="node-card-title">
+          <span class="node-card-name">{n.name || n.mac}</span>
+          {n.name && <span class="node-card-mac mono">{n.mac}</span>}
+        </span>
+        <span class="node-card-age hint">{n.last_seen_s != null ? fmtAgo(n.last_seen_s) : 'never'}</span>
+      </button>
+      <div class="node-card-body">
         <form onSubmit={save} class="namef">
           <input value={name} maxlength={24} placeholder={n.mac}
                  onInput={(e) => { setName(e.currentTarget.value); setState('idle') }} />
-          <button type="submit" disabled={state === 'saving'}>
+          <button type="submit" class="btn-primary" disabled={state === 'saving'}>
             {state === 'saving' ? '…' : state === 'saved' ? '✓' : 'Save'}
           </button>
           {state === 'error' && <span class="error">failed</span>}
           {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
         </form>
-      </td>
-      <td class="mono">{n.mac}</td>
-      <td>
-        {n.last_seen_s != null ? fmtAgo(n.last_seen_s) : 'never'}
-        <span class="hint"> · {n.reported_mode_valid ? (REPORTED_MODE_LABELS[n.reported_mode] || n.reported_mode) : '—'}</span>
-      </td>
-      <td>{n.frames_rx}</td>
-      <td>{n.rssi != null ? `${n.rssi} dBm` : '–'}</td>
-      <td>
-        <PowerModeControl n={n} onSaved={onPowerModeSaved} />
-      </td>
-      <td>
-        <OtaControl mac={n.mac} fwVersion={fwVersion} />
-      </td>
-      <td>
-        <button onClick={forget} disabled={forgetting}>{forgetting ? '…' : 'Forget'}</button>
-      </td>
-    </tr>
+        <div class="node-card-row">
+          <PowerModeControl n={n} onSaved={onPowerModeSaved} />
+          <span class="hint">reported: {n.reported_mode_valid ? (REPORTED_MODE_LABELS[n.reported_mode] || n.reported_mode) : '—'}</span>
+        </div>
+        <div class="node-card-row">
+          <span class="hint">{n.rssi != null ? `${n.rssi} dBm` : '–'}</span>
+          <span class="hint">{n.frames_rx} frames</span>
+        </div>
+        <div class="node-card-row">
+          <OtaControl mac={n.mac} fwVersion={fwVersion} onActiveChange={onOtaActive} />
+        </div>
+        <div class="node-card-footer">
+          <button class="btn-destructive" onClick={forget} disabled={forgetting}>{forgetting ? '…' : 'Forget'}</button>
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -351,6 +380,28 @@ export function NodesTab() {
   const [pairSecondsLeft, setPairSecondsLeft] = useState(0)
   const pairTickRef = useRef(null)
   const nodesPollRef = useRef(null)
+
+  // Per-mac collapsed/expanded state for the node cards below, plus each
+  // node's own OTA-active flag (reported by its OtaControl via
+  // onOtaActive). Neither persists across a reload -- both default to
+  // "false"/absent, i.e. collapsed and idle, for any mac not yet a key. A
+  // card is actually shown open when EITHER is true (see `isOpen`), so an
+  // active push forces its card open regardless of what the operator last
+  // clicked, without this state needing to track why.
+  const [openMap, setOpenMap] = useState({})
+  const [otaActiveMap, setOtaActiveMap] = useState({})
+
+  function toggleNode(mac) {
+    setOpenMap((prev) => ({ ...prev, [mac]: !prev[mac] }))
+  }
+
+  function onOtaActive(mac, active) {
+    setOtaActiveMap((prev) => (prev[mac] === active ? prev : { ...prev, [mac]: active }))
+  }
+
+  function isOpen(mac) {
+    return !!openMap[mac] || !!otaActiveMap[mac]
+  }
 
   // Called both awaited (initial load, via Promise.all below, which still
   // needs to see a real failure to set the error state) and fire-and-forget
@@ -456,29 +507,25 @@ export function NodesTab() {
   if (!nodes) return <p class="placeholder">Loading…</p>
 
   return (
-    <div>
+    <div class="panel">
       <h2>Nodes</h2>
       {nodes.length === 0 ? (
         <p class="placeholder">No nodes paired yet — nodes extend BLE range by relaying readings to this hub over ESP-NOW.</p>
       ) : (
-        <table class="devices">
-          <thead>
-            <tr><th>Name</th><th>MAC</th><th>Last seen</th><th>Frames</th><th>RSSI</th><th>Power mode</th><th>Firmware</th><th></th></tr>
-          </thead>
-          <tbody>
-            {nodes.map((n) => (
-              <Row key={n.mac} n={n} fwVersion={fwVersion} onSaved={onSaved} onForgotten={onForgotten}
-                   onPowerModeSaved={onPowerModeSaved} />
-            ))}
-          </tbody>
-        </table>
+        <div class="node-cards">
+          {nodes.map((n) => (
+            <NodeCard key={n.mac} n={n} fwVersion={fwVersion} open={isOpen(n.mac)}
+                      onToggle={() => toggleNode(n.mac)} onSaved={onSaved} onForgotten={onForgotten}
+                      onPowerModeSaved={onPowerModeSaved} onOtaActive={onOtaActive} />
+          ))}
+        </div>
       )}
       {total != null && <p class="hint">Frames received across all nodes: {total}</p>}
       {pairSecondsLeft > 0 ? (
         <p class="hint">Pairing open — put the node into pairing mode now ({pairSecondsLeft}s left).</p>
       ) : (
         <p>
-          <button onClick={doAddNode} disabled={busy === 'pair'}>
+          <button class="btn-primary" onClick={doAddNode} disabled={busy === 'pair'}>
             {busy === 'pair' ? 'Opening…' : 'Add node'}
           </button>
         </p>
