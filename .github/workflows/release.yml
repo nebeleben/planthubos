@@ -1,0 +1,116 @@
+name: Release firmware
+
+# Tag-triggered firmware release on the PUBLIC mirror. The tag arrives here
+# via the private repo's mirror workflow (which pushes exactly the triggering
+# v*.*.* tag). Builds the web UI once, then the firmware for both supported
+# chips inside the official ESP-IDF container, and publishes a GitHub
+# Release with the binaries.
+#
+# Runs on GitHub-hosted runners: Actions is free for public repos, and a
+# self-hosted runner must never be attached to a public repo (fork PRs would
+# run arbitrary code on it).
+#
+# Auth: the standard GITHUB_TOKEN — release write on this repo only.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+
+  webui:
+    name: Build web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: npm install + build
+        run: |
+          cd webui
+          npm ci || npm install
+          npm run build
+      - name: Upload dist-gz
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-dist-gz
+          path: webui/dist-gz/
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.chip }}
+    needs: webui
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.3.2
+    strategy:
+      fail-fast: false
+      matrix:
+        chip: [esp32, esp32c3]
+    steps:
+      - name: Checkout firmware at tag
+        uses: actions/checkout@v4
+
+      - name: Mark workspace safe (container UID mismatch)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Download web UI bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: webui-dist-gz
+          path: webui/dist-gz/
+
+      - name: Build
+        run: |
+          . "$IDF_PATH/export.sh"
+          # sdkconfig is not tracked (generated from sdkconfig.defaults);
+          # per-chip build dirs keep the two matrix legs independent.
+          idf.py -B "build_${{ matrix.chip }}" \
+                 -D SDKCONFIG="build_${{ matrix.chip }}/sdkconfig" \
+                 -D IDF_TARGET=${{ matrix.chip }} build
+
+      - name: Collect artifacts
+        run: |
+          B="build_${{ matrix.chip }}"
+          OUT="out"; mkdir -p "$OUT"
+          cp "$B/planthub.bin"                          "$OUT/planthub-${{ matrix.chip }}.bin"
+          cp "$B/bootloader/bootloader.bin"             "$OUT/bootloader-${{ matrix.chip }}.bin"
+          cp "$B/partition_table/partition-table.bin"   "$OUT/partition-table-${{ matrix.chip }}.bin"
+          cp "$B/ota_data_initial.bin"                  "$OUT/ota_data_initial-${{ matrix.chip }}.bin"
+          ls -la "$OUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.chip }}
+          path: out/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-*
+          merge-multiple: true
+          path: assets/
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" assets/* \
+            --repo "${{ github.repository }}" \
+            --title "PlantHub ${{ github.ref_name }}" \
+            --generate-notes
