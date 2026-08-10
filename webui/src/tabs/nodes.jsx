@@ -461,7 +461,7 @@ export function NodesTab() {
       {nodes.length === 0 ? (
         <p class="placeholder">No nodes paired yet — nodes extend BLE range by relaying readings to this hub over ESP-NOW.</p>
       ) : (
-        <table class="devices">
+        <div class="table-scroll"><table class="devices">
           <thead>
             <tr><th>Name</th><th>MAC</th><th>Last seen</th><th>Frames</th><th>RSSI</th><th>Power mode</th><th>Firmware</th><th></th></tr>
           </thead>
@@ -471,7 +471,7 @@ export function NodesTab() {
                    onPowerModeSaved={onPowerModeSaved} />
             ))}
           </tbody>
-        </table>
+        </table></div>
       )}
       {total != null && <p class="hint">Frames received across all nodes: {total}</p>}
       {pairSecondsLeft > 0 ? (

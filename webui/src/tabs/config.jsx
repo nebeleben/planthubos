@@ -249,7 +249,10 @@ export function ConfigTab() {
       <div class="panel">
         <h2>Firmware update</h2>
         <p>
-          <input type="file" accept=".bin" onChange={doOta} disabled={busy === 'ota'} />
+          <label class="filebtn btn-primary">
+            {busy === 'ota' ? 'Uploading…' : 'Choose firmware…'}
+            <input type="file" accept=".bin" onChange={doOta} disabled={busy === 'ota'} />
+          </label>
         </p>
         {otaPct != null && busy === 'ota' && (
           <p>
@@ -332,13 +335,6 @@ export function ConfigTab() {
             </p>
           </form>
           {cfgMsg && <p class="hint">{cfgMsg}</p>}
-        </div>
-      )}
-
-      {st.role !== 'node' && (
-        <div class="panel">
-          <h2>Nodes</h2>
-          <p class="hint">Rename, forget, or pair a node on the <strong>Nodes</strong> tab.</p>
         </div>
       )}
 

@@ -342,7 +342,7 @@ label {
   font-size: 0.9rem;
 }
 
-label input,
+label input:not([type='checkbox']),
 label select {
   display: block;
   margin-top: 0.25rem;
@@ -483,3 +483,35 @@ table.kv td:first-child { color: var(--text-muted); }
 .hist-controls { display: flex; gap: 0.6rem; margin-bottom: 1.1rem; flex-wrap: wrap; align-items: center; }
 
 .chart { max-width: 100%; overflow-x: auto; }
+
+/* -- 2026-08-10 adjustments ----------------------------------------- */
+/* wide tables scroll inside their panel instead of spilling over it */
+.table-scroll { overflow-x: auto; }
+.table-scroll table.devices { min-width: 100%; }
+
+/* checkbox sits inline with its label text ("Enabled") */
+label input[type='checkbox'] {
+  display: inline-block;
+  width: auto;
+  margin: 0 8px 0 0;
+  vertical-align: middle;
+  accent-color: var(--accent);
+}
+
+/* breathing room between a button and trailing hint text (Claim) */
+button + .hint, .btn-primary + .hint { margin-left: 14px; }
+
+/* firmware chooser: native file input hidden behind a styled button.
+   .btn-primary only supplies colors (the sizing lives on the `button`
+   element selector), so the label re-states the button box here. */
+.filebtn {
+  display: inline-block;
+  min-height: 36px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  cursor: pointer;
+  line-height: 20px;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.filebtn input[type='file'] { display: none; }
