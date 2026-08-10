@@ -1,6 +1,6 @@
-set(DIST "${CMAKE_CURRENT_LIST_DIR}/../../../planhubos/webui/dist-gz")
+set(DIST "${CMAKE_CURRENT_LIST_DIR}/../../../planthubos/webui/dist-gz")
 if(NOT EXISTS "${DIST}/index.html.gz")
-    message(FATAL_ERROR "Web assets missing. Run: cd planhubos/webui && npm install && npm run build")
+    message(FATAL_ERROR "Web assets missing. Run: cd planthubos/webui && npm install && npm run build")
 endif()
 
 idf_component_register(
