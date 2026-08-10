@@ -62,7 +62,7 @@ jobs:
         # is independently changeable later from the hub's Config page; this
         # matrix leg only decides the BUILD-TIME default a fresh flash boots
         # with.
-        region: [eu, us]
+        region: [eu, us, jp]
     steps:
       - name: Checkout firmware at tag
         uses: actions/checkout@v4
@@ -135,7 +135,53 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cat > notes.md <<'NOTES'
+          ## Which file do I need?
+
+          | You are in | App image |
+          |---|---|
+          | Europe / UK / most of the world (channels 1-13) | `planthub-<chip>-eu.bin` |
+          | United States / Canada (channels 1-11) | `planthub-<chip>-us.bin` |
+          | Japan (channels 1-14) | `planthub-<chip>-jp.bin` |
+
+          `<chip>` is `esp32c3` or `esp32`, matching your board. The region can
+          also be changed later on the hub's Config page. Using a build for a
+          region you are not in is a regulatory violation.
+
+          The `bootloader-*`, `partition-table-*` and `ota_data_initial-*`
+          files are the same for every region and only needed for a first
+          install over USB.
+
+          ## First install (USB)
+
+          ESP32-C3:
+          ```
+          esptool --chip esp32c3 write_flash \
+            0x0 bootloader-esp32c3.bin \
+            0x8000 partition-table-esp32c3.bin \
+            0xf000 ota_data_initial-esp32c3.bin \
+            0x20000 planthub-esp32c3-eu.bin
+          ```
+
+          Classic ESP32 (note the different bootloader offset):
+          ```
+          esptool --chip esp32 write_flash \
+            0x1000 bootloader-esp32.bin \
+            0x8000 partition-table-esp32.bin \
+            0xf000 ota_data_initial-esp32.bin \
+            0x20000 planthub-esp32-eu.bin
+          ```
+
+          Then join the `PlantHub-XXXX` WiFi the device broadcasts and follow
+          the setup page.
+
+          ## Updating an existing hub
+
+          No cables needed: open the hub's web page, Config tab, "Choose
+          firmware..." and upload just the `planthub-<chip>-<region>.bin`.
+          Paired nodes are then updated over the air from the Nodes tab.
+          NOTES
           gh release create "${{ github.ref_name }}" assets/* \
             --repo "${{ github.repository }}" \
             --title "PlantHubOS ${{ github.ref_name }}" \
-            --generate-notes
+            --notes-file notes.md

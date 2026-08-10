@@ -1,0 +1,4 @@
+# Region overlay: Japan (channels 1-14; ch14 is 802.11b-legacy).
+# Combined with sdkconfig.defaults via SDKCONFIG_DEFAULTS in release.yml;
+# later files win, so this overrides the maintainer default.
+CONFIG_PLANTHUB_WIFI_COUNTRY="JP"
