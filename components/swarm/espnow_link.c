@@ -190,13 +190,33 @@ esp_err_t espnow_link_init(espnow_rx_cb_t cb)
      *     log in swarm.c's swarm_start_main(), added specifically so that
      *     eventual, asynchronous adoption is visible on the console instead
      *     of only ever reflecting whatever was true at this early boot-time
-     *     call (association typically has not happened yet here). */
+     *     call (association typically has not happened yet here).
+     *
+     * (M9) User region takes precedence over ALL of the above, on EITHER
+     * role. swarm_store_region() is the operator's own explicit choice, set
+     * via POST /api/v1/config's "region" field and validated there against
+     * the four codes the webui offers -- an explicit choice beats router
+     * hearsay, so it wins even on the hub, and it forces MANUAL policy
+     * (ieee80211d_auto = false) unconditionally, INCLUDING on the hub: the
+     * whole point of setting it is "trust this code, not whatever the
+     * router's beacons claim", so letting 802.11d auto-adopt over it right
+     * after would silently discard the operator's own setting the moment
+     * the hub associates. When unset, behaviour is unchanged from before
+     * this feature existed: CONFIG_PLANTHUB_WIFI_COUNTRY, hub 802.11d auto
+     * (node manual) as above. (A node's separately-learned sw_hubcc sits
+     * BELOW the default here and ABOVE nothing -- it is only ever consulted
+     * when no user region is set, by swarm.c's swarm_start_node() re-apply
+     * right after this call returns; see that comment for why the region
+     * check has to be repeated there too.) */
     swarm_role_t role = swarm_store_role();
-    bool ieee80211d_auto = (role != SWARM_ROLE_NODE);
-    esp_err_t cc_err = esp_wifi_set_country_code(CONFIG_PLANTHUB_WIFI_COUNTRY, ieee80211d_auto);
+    char user_region[3];
+    bool has_user_region = swarm_store_region(user_region);
+    const char *cc = has_user_region ? user_region : CONFIG_PLANTHUB_WIFI_COUNTRY;
+    bool ieee80211d_auto = has_user_region ? false : (role != SWARM_ROLE_NODE);
+    esp_err_t cc_err = esp_wifi_set_country_code(cc, ieee80211d_auto);
     if (cc_err != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_set_country_code(%s, %s) failed: %s -- channels 12-13 may be unavailable",
-                 CONFIG_PLANTHUB_WIFI_COUNTRY, ieee80211d_auto ? "auto" : "manual", esp_err_to_name(cc_err));
+                 cc, ieee80211d_auto ? "auto" : "manual", esp_err_to_name(cc_err));
     } else {
         /* esp_wifi_set_country_code() can move the radio's current channel
          * as a side effect -- log it here so that's visible, and so a
@@ -210,12 +230,12 @@ esp_err_t espnow_link_init(espnow_rx_cb_t cb)
         esp_wifi_get_channel(&cur_ch, &second);
         wifi_country_t country;
         if (esp_wifi_get_country(&country) == ESP_OK) {
-            ESP_LOGI(TAG, "wifi country set to %s (%s policy), usable channels %u-%u, current channel %u",
-                     CONFIG_PLANTHUB_WIFI_COUNTRY, ieee80211d_auto ? "auto/802.11d" : "manual",
+            ESP_LOGI(TAG, "wifi country set to %s (%s%s policy), usable channels %u-%u, current channel %u",
+                     cc, has_user_region ? "user region, " : "", ieee80211d_auto ? "auto/802.11d" : "manual",
                      country.schan, country.schan + country.nchan - 1, cur_ch);
         } else {
-            ESP_LOGI(TAG, "wifi country set to %s (%s policy), current channel %u",
-                     CONFIG_PLANTHUB_WIFI_COUNTRY, ieee80211d_auto ? "auto/802.11d" : "manual", cur_ch);
+            ESP_LOGI(TAG, "wifi country set to %s (%s%s policy), current channel %u",
+                     cc, has_user_region ? "user region, " : "", ieee80211d_auto ? "auto/802.11d" : "manual", cur_ch);
         }
     }
 

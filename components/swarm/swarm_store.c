@@ -11,6 +11,7 @@ static const char *TAG = "swarm_store";
 #define KEY_ROLE  "role"
 #define KEY_HUB   "sw_hub"
 #define KEY_HUBCC "sw_hubcc"
+#define KEY_REGION "sw_region"
 #define KEY_NODES "sw_nodes"
 #define KEY_PFAIL "sw_pfail"
 #define KEY_OTADONE "sw_otadn"
@@ -161,6 +162,8 @@ static bool s_hub_set;
 static hub_blob_t s_hub;
 static bool s_hub_cc_set;
 static char s_hub_cc[3];
+static bool s_region_set;
+static char s_region[3];
 static nodes_blob_t s_nodes;
 static bool s_pair_failed;
 static bool s_ota_done_set;
@@ -242,6 +245,20 @@ static esp_err_t persist_hub_cc(void)
     xSemaphoreGive(s_mutex);
 
     esp_err_t err = set ? write_blob(KEY_HUBCC, cc, sizeof(cc)) : erase_key(KEY_HUBCC);
+    xSemaphoreGive(s_nvs_mutex);
+    return err;
+}
+
+static esp_err_t persist_region(void)
+{
+    xSemaphoreTake(s_nvs_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool set = s_region_set;
+    char cc[3];
+    memcpy(cc, s_region, sizeof(cc));
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = set ? write_blob(KEY_REGION, cc, sizeof(cc)) : erase_key(KEY_REGION);
     xSemaphoreGive(s_nvs_mutex);
     return err;
 }
@@ -536,6 +553,8 @@ esp_err_t swarm_store_init(void)
     memset(&s_hub, 0, sizeof(s_hub));
     s_hub_cc_set = false;
     memset(s_hub_cc, 0, sizeof(s_hub_cc));
+    s_region_set = false;
+    memset(s_region, 0, sizeof(s_region));
     memset(&s_nodes, 0, sizeof(s_nodes));
     s_nodes.format = SWARM_STORE_FORMAT;
     s_pair_failed = false;
@@ -570,6 +589,15 @@ esp_err_t swarm_store_init(void)
     size_t cc_len = sizeof(s_hub_cc);
     s_hub_cc_set = nvs_get_blob(h, KEY_HUBCC, s_hub_cc, &cc_len) == ESP_OK && cc_len == sizeof(s_hub_cc);
     if (!s_hub_cc_set) memset(s_hub_cc, 0, sizeof(s_hub_cc));
+
+    /* User-selected region (M9 WiFi-region), own key -- see swarm_store.h.
+     * Absent (fresh install, or never explicitly set) just means "no
+     * operator override"; s_region_set stays false and espnow_link.c's
+     * country setup falls through to sw_hubcc/CONFIG_PLANTHUB_WIFI_COUNTRY,
+     * unchanged from before this feature existed. */
+    size_t region_len = sizeof(s_region);
+    s_region_set = nvs_get_blob(h, KEY_REGION, s_region, &region_len) == ESP_OK && region_len == sizeof(s_region);
+    if (!s_region_set) memset(s_region, 0, sizeof(s_region));
 
     load_nodes_blob(h, &s_nodes);
 
@@ -610,10 +638,11 @@ esp_err_t swarm_store_init(void)
      * channel is visible at a glance at every boot, not just inferred from
      * a separate pairing-time log line -- makes a hub/node channel
      * mismatch obvious in the console. */
-    ESP_LOGI(TAG, "role=%d hub_paired=%d hub_channel=%u hub_country=%s nodes=%d pair_failed=%d "
+    ESP_LOGI(TAG, "role=%d hub_paired=%d hub_channel=%u hub_country=%s region=%s nodes=%d pair_failed=%d "
                   "completed_ota_session=%d power_mode=%u failed_wakes=%" PRIu32
                   " wake_counter=%" PRIu32,
              s_role, s_hub_set, s_hub.channel, s_hub_cc_set ? s_hub_cc : "(default)",
+             s_region_set ? s_region : "(unset)",
              s_nodes.count, s_pair_failed, s_ota_done_set, s_power_mode, s_failed_wakes,
              s_wake_counter);
     return ESP_OK;
@@ -718,6 +747,81 @@ esp_err_t swarm_store_set_hub_country(const char cc[3])
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "swarm_store_set_hub_country: NVS write failed (%s); RAM cache already "
                       "reflects the new country and will not revert until the next successful "
+                      "write or a reboot", esp_err_to_name(err));
+    }
+    return err;
+}
+
+/* The four codes swarm_store_set_region() accepts -- see swarm_store.h for
+ * why exactly these four (matches the webui's "WiFi region" select). Kept
+ * as a small static table rather than a chain of strcmp()s so the accepted
+ * set has exactly one place to read/change. */
+static const char *const REGION_CODES[] = { "CH", "US", "JP", "01" };
+#define REGION_CODES_COUNT (sizeof(REGION_CODES) / sizeof(REGION_CODES[0]))
+
+bool swarm_store_region(char out[3])
+{
+    if (!out) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool ok = s_region_set;
+    if (ok) memcpy(out, s_region, sizeof(s_region));
+    xSemaphoreGive(s_mutex);
+    return ok;
+}
+
+esp_err_t swarm_store_set_region(const char *cc)
+{
+    if (!cc) return ESP_ERR_INVALID_ARG;
+
+    /* Unlike swarm_store_set_hub_country() above -- whose only caller
+     * (pairing.c) always hands it an already-validated, exactly-2-char
+     * buffer copied out of its own ESP-NOW frame parsing -- this setter's
+     * real caller is api_v1.c's config_post(), handing over a
+     * NUL-terminated string straight out of untrusted HTTP JSON. A strict
+     * length check is required here, not optional: without it, e.g.
+     * "CHina" would read cc[0]='C', cc[1]='H', match "CH" in the table
+     * below, and silently accept four extra bytes no caller ever asked
+     * about. strlen() is safe here precisely because cJSON always hands
+     * back a proper C string. */
+    size_t len = strlen(cc);
+    if (len > 2) return ESP_ERR_INVALID_ARG;
+
+    /* Empty string clears back to unset -- same "" convention as
+     * swarm_store_set_node_name()'s len==0 clear, just via a dedicated
+     * erase rather than a zero-length blob (mirrors hub_cc's own
+     * set/clear split above). */
+    if (len == 0) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_region_set = false;
+        memset(s_region, 0, sizeof(s_region));
+        xSemaphoreGive(s_mutex);
+
+        esp_err_t err = persist_region();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "swarm_store_set_region: NVS erase failed (%s); RAM cache already "
+                          "cleared and will not revert until the next successful write or a "
+                          "reboot", esp_err_to_name(err));
+        }
+        return err;
+    }
+
+    bool valid = false;
+    for (size_t i = 0; i < REGION_CODES_COUNT; i++) {
+        if (cc[0] == REGION_CODES[i][0] && cc[1] == REGION_CODES[i][1]) { valid = true; break; }
+    }
+    if (!valid) return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_region[0] = cc[0];
+    s_region[1] = cc[1];
+    s_region[2] = '\0';
+    s_region_set = true;
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = persist_region();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_region: NVS write failed (%s); RAM cache already "
+                      "reflects the new region and will not revert until the next successful "
                       "write or a reboot", esp_err_to_name(err));
     }
     return err;
@@ -1039,7 +1143,7 @@ esp_err_t swarm_store_set_pair_failed(bool failed)
 
 esp_err_t swarm_store_reset_all(void)
 {
-    /* Best-effort across all eight: keep going and report the first failure
+    /* Best-effort across all nine: keep going and report the first failure
      * rather than bailing out partway and leaving some cleared and some
      * not -- a factory reset should end up as close to fully-clean as
      * possible even if one NVS write hiccups. */
@@ -1051,6 +1155,8 @@ esp_err_t swarm_store_reset_all(void)
     esp_err_t e6 = swarm_store_set_power_mode(SWARM_PM_ALWAYS_ON);
     esp_err_t e7 = swarm_store_set_failed_wakes(0);
     esp_err_t e8 = swarm_store_set_wake_counter(0);
+    /* "" clears back to unset -- see swarm_store_set_region()'s own comment. */
+    esp_err_t e9 = swarm_store_set_region("");
     if (err == ESP_OK) err = e2;
     if (err == ESP_OK) err = e3;
     if (err == ESP_OK) err = e4;
@@ -1058,6 +1164,7 @@ esp_err_t swarm_store_reset_all(void)
     if (err == ESP_OK) err = e6;
     if (err == ESP_OK) err = e7;
     if (err == ESP_OK) err = e8;
+    if (err == ESP_OK) err = e9;
     return err;
 }
 
