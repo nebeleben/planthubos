@@ -47,6 +47,9 @@ static void batt_cycle_task(void *arg)
 void app_main(void)
 {
     ESP_ERROR_CHECK(app_config_init());
+    /* Before anything slow: the rapid power-cycle counter must increment
+     * within the first moments of a boot (see power_reset.c). */
+    power_cycle_reset_start();
     ESP_ERROR_CHECK(integr_config_init());
     ESP_ERROR_CHECK(claim_init());
     factory_reset_button_start();
