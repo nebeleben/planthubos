@@ -1197,6 +1197,32 @@ static esp_err_t role_post(httpd_req_t *req)
         return ESP_OK;
     }
 
+    /* (Reviewer HIGH, M9) A role change must also drop any operator-set
+     * region. Without this, a device that had a region set from its
+     * PREVIOUS role -- e.g. a hub with "US" set, converted to a node --
+     * keeps that region at TOP precedence in espnow_link.c's country
+     * setup, permanently outranking the country it should instead LEARN
+     * from its new hub's PAIR_ACK once it pairs (PlanV1 3.3's
+     * inheritance). If the new hub happens to sit on a channel the stale
+     * region forbids (e.g. a leftover "US" region blocking channels
+     * 12-13), the node's very first pairing sweep silently never reaches
+     * it -- no error anywhere except the pair-failed portal, with nothing
+     * in it pointing at region as the cause. Clearing here means every
+     * role change starts from a clean slate and correctly inherits from
+     * whatever hub it actually pairs with next. Best-effort: a failure to
+     * clear is logged, not surfaced as a 500 -- the role change itself
+     * already succeeded and must not be rolled back over this. */
+    char cleared_region[3];
+    bool had_region = swarm_store_region(cleared_region);
+    esp_err_t region_clear_err = swarm_store_set_region("");
+    if (region_clear_err != ESP_OK) {
+        ESP_LOGW(TAG, "role_post: failed to clear operator region on role change: %s",
+                 esp_err_to_name(region_clear_err));
+    } else if (had_region) {
+        ESP_LOGI(TAG, "role_post: cleared stale operator region %s on role change (%d -> %d)",
+                 cleared_region, old_role, new_role);
+    }
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true,\"restart_required\":true}");
 
@@ -1216,13 +1242,27 @@ static esp_err_t role_post(httpd_req_t *req)
 /* GET /api/v1/config -- unauthenticated, like every GET in this file.
  * Secrets (mqtt.pass, influx.token) are never echoed -- only *_set booleans,
  * so the webui can show "a secret is already saved" without ever pulling it
- * back down to the browser. */
+ * back down to the browser.
+ *
+ * "region" (M9) is top-level, not nested under mqtt/influx -- it's a
+ * swarm_store-backed device setting (espnow_link.c's country precedence),
+ * not an integr_config_t field, so it's read separately here. null means
+ * "unset" (build default / learned hub country applies, see
+ * swarm_store.h); one of the four codes the webui offers otherwise. */
 static esp_err_t config_get(httpd_req_t *req)
 {
     integr_config_t cfg;
     integr_config_get(&cfg);
 
     cJSON *root = cJSON_CreateObject();
+
+    char region[3];
+    if (swarm_store_region(region)) {
+        cJSON_AddStringToObject(root, "region", region);
+    } else {
+        cJSON_AddNullToObject(root, "region");
+    }
+
     cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
     cJSON_AddBoolToObject(mqtt, "enabled", cfg.mqtt.enabled);
     cJSON_AddStringToObject(mqtt, "uri", cfg.mqtt.uri);
@@ -1287,6 +1327,43 @@ static esp_err_t config_post(httpd_req_t *req)
 
     cJSON *json = cJSON_Parse(body);
     if (!json) return config_send_invalid(req);
+
+    /* "region" (M9): top-level, like GET's response -- validated and
+     * applied BEFORE mqtt/influx below, so an invalid region 400s cleanly
+     * without touching them. null or "" clears back to unset; one of the
+     * four codes swarm_store_set_region() accepts sets it (that's also
+     * where the actual validation lives -- see its comment for why a
+     * strict length check matters for HTTP-sourced input specifically);
+     * anything else -> ESP_ERR_INVALID_ARG -> 400. Absent key leaves it
+     * untouched (same merge semantics as the mqtt/influx sections below).
+     * Lives in its own swarm_store NVS key, independent of integr_config_t
+     * below it, so this write's success/failure is not coupled to
+     * mqtt/influx's -- consistent with how every other swarm_store field
+     * (role, hub, hub_cc, ...) is already its own independently-committed
+     * key. */
+    const cJSON *region_j = cJSON_GetObjectItem(json, "region");
+    if (region_j) {
+        const char *region_cc = cJSON_IsString(region_j) ? region_j->valuestring
+                               : cJSON_IsNull(region_j)   ? ""
+                               : NULL;  /* neither string nor null: always invalid */
+        esp_err_t region_err = region_cc ? swarm_store_set_region(region_cc) : ESP_ERR_INVALID_ARG;
+        if (region_err == ESP_ERR_INVALID_ARG) {
+            cJSON_Delete(json);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"error\":\"bad region\"}");
+            return ESP_OK;
+        }
+        if (region_err != ESP_OK) {
+            /* NVS write failure, not a bad request -- logged, not surfaced
+             * as an error response, matching how the rest of this file
+             * treats swarm_store write failures (e.g. role_post()'s
+             * swarm_store_set_role() is the only one that 500s; every
+             * other setter here just logs and lets the RAM cache stand
+             * for the rest of this boot). */
+            ESP_LOGW(TAG, "config_post: swarm_store_set_region failed: %s", esp_err_to_name(region_err));
+        }
+    }
 
     integr_config_t cfg;
     integr_config_get(&cfg);

@@ -1751,26 +1751,43 @@ esp_err_t swarm_start_node(void)
     if (err != ESP_OK) return err;
 
     /* Country inheritance (PlanV1 3.3): espnow_link_init() just set the
-     * regulatory domain to the compile-time CONFIG_PLANTHUB_WIFI_COUNTRY
-     * default. If this node has previously learned a different country
-     * from the hub's PAIR_ACK (protocol v2+), re-apply THAT here instead --
-     * every boot, not just the one right after pairing -- so a resync's
-     * channel sweep (pairing_node_resync_channel(), below this in the
-     * boot sequence via forward_task()) can actually reach channels 12-13
-     * if the hub's domain allows them, rather than silently reverting to
-     * the compile-time default on every restart. Absent (this node paired
-     * under v1, or was factory-reset) just means "nothing to reapply" --
-     * the compile-time default espnow_link_init() already set stands, same
-     * as a pre-v2 node. Same MANUAL policy reasoning as pairing.c: this
-     * device never associates, so ieee80211d_enabled stays false always. */
-    char hub_cc[3];
-    if (swarm_store_hub_country(hub_cc)) {
-        esp_err_t cc_err = esp_wifi_set_country_code(hub_cc, false);
-        if (cc_err != ESP_OK) {
-            ESP_LOGW(TAG, "failed to reapply learned hub country %s: %s",
-                     hub_cc, esp_err_to_name(cc_err));
-        } else {
-            ESP_LOGI(TAG, "reapplied learned hub country %s", hub_cc);
+     * regulatory domain to CONFIG_PLANTHUB_WIFI_COUNTRY (or, M9, an
+     * operator-set region -- see below) as its default. If this node has
+     * previously learned a different country from the hub's PAIR_ACK
+     * (protocol v2+), re-apply THAT here instead -- every boot, not just
+     * the one right after pairing -- so a resync's channel sweep
+     * (pairing_node_resync_channel(), below this in the boot sequence via
+     * forward_task()) can actually reach channels 12-13 if the hub's
+     * domain allows them, rather than silently reverting to the compile-
+     * time default on every restart. Absent (this node paired under v1, or
+     * was factory-reset) just means "nothing to reapply" -- the default
+     * espnow_link_init() already set stands, same as a pre-v2 node. Same
+     * MANUAL policy reasoning as pairing.c: this device never associates,
+     * so ieee80211d_enabled stays false always.
+     *
+     * (M9) Precedence check repeated here, not just in espnow_link.c: an
+     * operator-set region on THIS node already won there and is what's
+     * currently applied. Re-applying the learned hub_cc unconditionally
+     * would silently overwrite that explicit choice with router hearsay on
+     * every single boot -- the one precedence violation that wouldn't be
+     * visible in espnow_link.c's own log line, since this call happens
+     * strictly after it returns. Skip the reapply entirely when a user
+     * region is set; swarm_store_region() is a cheap RAM-cache read, so
+     * this costs nothing on the common (no user region) path. */
+    char probe_region[3];
+    if (swarm_store_region(probe_region)) {
+        ESP_LOGI(TAG, "user region %s set -- not overriding it with the learned hub country",
+                 probe_region);
+    } else {
+        char hub_cc[3];
+        if (swarm_store_hub_country(hub_cc)) {
+            esp_err_t cc_err = esp_wifi_set_country_code(hub_cc, false);
+            if (cc_err != ESP_OK) {
+                ESP_LOGW(TAG, "failed to reapply learned hub country %s: %s",
+                         hub_cc, esp_err_to_name(cc_err));
+            } else {
+                ESP_LOGI(TAG, "reapplied learned hub country %s", hub_cc);
+            }
         }
     }
 

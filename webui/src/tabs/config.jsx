@@ -30,6 +30,8 @@ export function ConfigTab() {
   const [mqtt, setMqtt] = useState({ enabled: false, uri: '', user: '', pass: '' })
   const [influx, setInflux] = useState({ enabled: false, url: '', org: '', bucket: '', token: '' })
   const [cfgMsg, setCfgMsg] = useState('')
+  const [region, setRegion] = useState('')           // '' = build default (GET's null)
+  const [regionMsg, setRegionMsg] = useState('')
 
   function refresh() {
     fetch('/api/v1/status')
@@ -47,6 +49,7 @@ export function ConfigTab() {
         setCfg(c)
         setMqtt({ enabled: c.mqtt.enabled, uri: c.mqtt.uri, user: c.mqtt.user, pass: '' })
         setInflux({ enabled: c.influx.enabled, url: c.influx.url, org: c.influx.org, bucket: c.influx.bucket, token: '' })
+        setRegion(c.region ?? '')   // null (build default) -> the select's "" option
         setCfgLoaded(true)
       })
       // Leave cfgLoaded false on failure: the form would otherwise render
@@ -196,6 +199,30 @@ export function ConfigTab() {
     setBusy('')
   }
 
+  async function doSaveRegion() {
+    setBusy('region'); setRegionMsg('')
+    try {
+      const res = await fetch('/api/v1/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ region: region || null }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        setRegionMsg(data.restart_required
+          ? 'Saved — applies after the hub reboots. Nodes adopt it when they (re)pair.'
+          : 'Saved.')
+      } else if (res.status === 401) {
+        setRegionMsg('Unauthorized — set the hub key above.')
+      } else {
+        let msg = 'Save failed.'
+        try { const d = await res.json(); if (d.error) msg = d.error } catch { /* non-JSON body */ }
+        setRegionMsg(msg)
+      }
+    } catch { setRegionMsg('hub not reachable') }
+    setBusy('')
+  }
+
   if (error) return <p class="error">Hub not reachable.</p>
   if (!st) return <p class="placeholder">Loading…</p>
 
@@ -213,6 +240,32 @@ export function ConfigTab() {
             <tr><td>Claim state</td><td>{st.claimed ? 'claimed' : 'unclaimed'}</td></tr>
           </tbody>
         </table>
+      </div>
+
+      <div class="panel">
+        <h2>WiFi region</h2>
+        <p>
+          <label>
+            Region
+            <select value={region} onChange={(e) => setRegion(e.currentTarget.value)}>
+              <option value="">Build default</option>
+              <option value="CH">Europe (channels 1–13)</option>
+              <option value="US">United States (1–11)</option>
+              <option value="JP">Japan (1–14)</option>
+              <option value="01">World-safe (1–11)</option>
+            </select>
+          </label>
+          {' '}
+          <button class="btn-primary" onClick={doSaveRegion} disabled={busy === 'region'}>
+            {busy === 'region' ? 'Saving…' : 'Save region'}
+          </button>
+        </p>
+        <p class="hint">
+          Applies after reboot. Nodes adopt the hub's region when they pair — changing role
+          clears this setting, since a new role should learn its region fresh rather than
+          keep one set for the old role. If pairing fails on channels 12–13, check the region.
+        </p>
+        {regionMsg && <p class="hint">{regionMsg}</p>}
       </div>
 
       <div class="panel">

@@ -1,0 +1,10 @@
+# Region overlay: United States. Combined with sdkconfig.defaults via
+# -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.region.us" (see
+# .github/workflows/release.yml) -- later files in that list win, so this
+# overrides sdkconfig.defaults' own CONFIG_PLANTHUB_WIFI_COUNTRY="CH".
+# Channels 1-11 (US does not permit 12-13, unlike CH/EU) -- see swarm's
+# Kconfig (PLANTHUB_WIFI_COUNTRY) and PlanV1 8e for why this must be a
+# real, deliberately-set regulatory domain rather than the IDF's own "01"
+# world-safe default: shipping the wrong code outside its region is a
+# regulatory violation.
+CONFIG_PLANTHUB_WIFI_COUNTRY="US"

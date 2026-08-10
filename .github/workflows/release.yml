@@ -47,7 +47,7 @@ jobs:
           if-no-files-found: error
 
   build:
-    name: Build ${{ matrix.chip }}
+    name: Build ${{ matrix.chip }} (${{ matrix.region }})
     needs: webui
     runs-on: ubuntu-latest
     container:
@@ -56,6 +56,13 @@ jobs:
       fail-fast: false
       matrix:
         chip: [esp32, esp32c3]
+        # Per-region release builds (M9): each region overlay sets its own
+        # CONFIG_PLANTHUB_WIFI_COUNTRY (sdkconfig.region.<region>) -- see
+        # PlanV1 8e for why this can't just be one world-safe build. Region
+        # is independently changeable later from the hub's Config page; this
+        # matrix leg only decides the BUILD-TIME default a fresh flash boots
+        # with.
+        region: [eu, us]
     steps:
       - name: Checkout firmware at tag
         uses: actions/checkout@v4
@@ -73,25 +80,43 @@ jobs:
         run: |
           . "$IDF_PATH/export.sh"
           # sdkconfig is not tracked (generated from sdkconfig.defaults);
-          # per-chip build dirs keep the two matrix legs independent.
-          idf.py -B "build_${{ matrix.chip }}" \
-                 -D SDKCONFIG="build_${{ matrix.chip }}/sdkconfig" \
+          # per-chip-per-region build dirs keep all four matrix legs
+          # independent. SDKCONFIG_DEFAULTS takes a semicolon-separated list
+          # -- sdkconfig.defaults first, the region overlay second so it
+          # wins on the one key they share (CONFIG_PLANTHUB_WIFI_COUNTRY);
+          # IDF still auto-appends each listed file's own
+          # "<file>.<target>" variant (e.g. sdkconfig.defaults.esp32) on top
+          # of that, unchanged from the pre-region build.
+          idf.py -B "build_${{ matrix.chip }}_${{ matrix.region }}" \
+                 -D SDKCONFIG="build_${{ matrix.chip }}_${{ matrix.region }}/sdkconfig" \
+                 -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.region.${{ matrix.region }}" \
                  -D IDF_TARGET=${{ matrix.chip }} build
 
       - name: Collect artifacts
         run: |
-          B="build_${{ matrix.chip }}"
+          B="build_${{ matrix.chip }}_${{ matrix.region }}"
           OUT="out"; mkdir -p "$OUT"
-          cp "$B/planthub.bin"                          "$OUT/planthub-${{ matrix.chip }}.bin"
-          cp "$B/bootloader/bootloader.bin"             "$OUT/bootloader-${{ matrix.chip }}.bin"
-          cp "$B/partition_table/partition-table.bin"   "$OUT/partition-table-${{ matrix.chip }}.bin"
-          cp "$B/ota_data_initial.bin"                  "$OUT/ota_data_initial-${{ matrix.chip }}.bin"
+          cp "$B/planthub.bin" "$OUT/planthub-${{ matrix.chip }}-${{ matrix.region }}.bin"
+          # bootloader/partition-table/ota_data are region-independent (the
+          # region overlay only touches CONFIG_PLANTHUB_WIFI_COUNTRY, which
+          # affects app.bin's embedded Kconfig value, not these three) --
+          # their filenames deliberately carry no region suffix. Emitting
+          # them from every region leg would make two same-chip legs upload
+          # identically-named files (e.g. bootloader-esp32.bin from both the
+          # eu and us legs); the release job's merge-multiple download
+          # writes all artifacts into one flat directory, so that would
+          # collide. Emit them from exactly one region per chip (eu) instead.
+          if [ "${{ matrix.region }}" = "eu" ]; then
+            cp "$B/bootloader/bootloader.bin"           "$OUT/bootloader-${{ matrix.chip }}.bin"
+            cp "$B/partition_table/partition-table.bin" "$OUT/partition-table-${{ matrix.chip }}.bin"
+            cp "$B/ota_data_initial.bin"                "$OUT/ota_data_initial-${{ matrix.chip }}.bin"
+          fi
           ls -la "$OUT"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ matrix.chip }}
+          name: firmware-${{ matrix.chip }}-${{ matrix.region }}
           path: out/
           if-no-files-found: error
 

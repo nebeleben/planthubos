@@ -84,6 +84,47 @@ esp_err_t swarm_store_clear_hub(void);
 bool swarm_store_hub_country(char out[3]);
 esp_err_t swarm_store_set_hub_country(const char cc[3]);
 
+/* Operator-selected WiFi region (M9), independent of the hub_country pair
+ * above and of CONFIG_PLANTHUB_WIFI_COUNTRY. Set on THIS device (hub or
+ * node) via POST /api/v1/config's "region" field; espnow_link.c's country
+ * setup gives it top precedence over everything else -- an explicit
+ * operator choice beats router hearsay (the hub's 802.11d auto-adoption)
+ * and beats a node's learned sw_hubcc, and unlike both of those it forces
+ * MANUAL policy (no 802.11d) even on the hub. See espnow_link.c for the
+ * full precedence chain and why.
+ *
+ * Only the four codes the webui's "WiFi region" select offers are ever
+ * accepted: "CH" (Europe, channels 1-13), "US" (1-11), "JP" (1-14), "01"
+ * (IDF's world-safe default, 1-11) -- swarm_store_set_region() rejects
+ * anything else with ESP_ERR_INVALID_ARG, and this validation is
+ * deliberately NOT the general-purpose "any two bytes" flexibility
+ * swarm_store_set_hub_country() allows (that one only ever receives an
+ * already-validated code echoed back from another PlantHub device's own
+ * esp_wifi_get_country(), never arbitrary user input over HTTP).
+ *
+ * Stored under its own NVS key, same "false = nothing set, caller falls
+ * back to the next thing in the precedence chain" shape as
+ * swarm_store_hub_country() above. swarm_store_set_region("") clears back
+ * to unset (also done by swarm_store_reset_all(), AND by api_v1.c's
+ * role_post() on every successful role change -- a region set from a
+ * device's PREVIOUS role must not survive into its next one: at TOP
+ * precedence, a stale region would permanently outrank the country a
+ * newly-converted node is supposed to LEARN from its new hub's PAIR_ACK,
+ * silently defeating pairing if the new hub's channel falls outside the
+ * stale region's allowed range. Node regions are meant to come from
+ * whatever hub the device actually pairs with next, not from a role it no
+ * longer has). Applies at next boot only, like the rest of
+ * /api/v1/config -- there is no live re-init of the radio's country here.
+ *
+ * swarm_store_set_region() takes a plain NUL-terminated C string (unlike
+ * swarm_store_hub_country()'s fixed char[3] pair above) because its real
+ * caller hands over a cJSON string of whatever length untrusted HTTP JSON
+ * contained -- the function itself checks that length (strlen(cc) <= 2)
+ * as part of validation, rather than trusting a fixed-size buffer the
+ * caller already sized correctly. */
+bool swarm_store_region(char out[3]);
+esp_err_t swarm_store_set_region(const char *cc);
+
 /* Node side (M7): this device's OWN power mode + battery bookkeeping.
  * Deliberately separate NVS keys from KEY_HUB/KEY_NODES -- this is state
  * about the device itself, not about its pairing to a hub, so it survives
@@ -146,10 +187,11 @@ esp_err_t swarm_store_set_pair_failed(bool failed);
 
 /* Factory reset: returns this device to a fresh, role-unset state --
  * clears role, the stored hub peer, the node table, the pair-failed flag,
- * and (M7) this device's own power mode + battery bookkeeping (mode,
- * failed_wakes, wake_counter -- all back to their ALWAYS_ON/0/0 defaults).
- * Used by claim.c's physical reset button so a node (which may run no web
- * server at all once paired) is always recoverable without reflashing. */
+ * (M7) this device's own power mode + battery bookkeeping (mode,
+ * failed_wakes, wake_counter -- all back to their ALWAYS_ON/0/0 defaults),
+ * and (M9) the operator-selected WiFi region (back to unset). Used by
+ * claim.c's physical reset button so a node (which may run no web server
+ * at all once paired) is always recoverable without reflashing. */
 esp_err_t swarm_store_reset_all(void);
 
 /* Node side: identifies the most recently node_ota_recv.c-completed OTA
