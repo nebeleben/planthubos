@@ -112,5 +112,5 @@ jobs:
         run: |
           gh release create "${{ github.ref_name }}" assets/* \
             --repo "${{ github.repository }}" \
-            --title "PlantHub ${{ github.ref_name }}" \
+            --title "PlantHubOS ${{ github.ref_name }}" \
             --generate-notes

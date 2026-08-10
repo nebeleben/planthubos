@@ -1,8 +1,8 @@
-# PlantHub
+# PlantHubOS
 
 **Your plants, on your network — no cloud, no account, no app store.**
 
-PlantHub is an open ESP32 hub for Xiaomi MiFlora plant sensors. Plug it in,
+PlantHubOS is the open firmware: an ESP32 hub for Xiaomi MiFlora plant sensors. Plug it in,
 join its setup WiFi once, and it quietly watches your plants for you:
 
 - 🌱 **Plants first** — you track *plants*, not gadgets. Swap a broken
