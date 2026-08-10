@@ -105,9 +105,16 @@ esp_err_t swarm_store_set_hub_country(const char cc[3]);
  * Stored under its own NVS key, same "false = nothing set, caller falls
  * back to the next thing in the precedence chain" shape as
  * swarm_store_hub_country() above. swarm_store_set_region("") clears back
- * to unset (also done by swarm_store_reset_all()). Applies at next boot
- * only, like the rest of /api/v1/config -- there is no live re-init of the
- * radio's country here.
+ * to unset (also done by swarm_store_reset_all(), AND by api_v1.c's
+ * role_post() on every successful role change -- a region set from a
+ * device's PREVIOUS role must not survive into its next one: at TOP
+ * precedence, a stale region would permanently outrank the country a
+ * newly-converted node is supposed to LEARN from its new hub's PAIR_ACK,
+ * silently defeating pairing if the new hub's channel falls outside the
+ * stale region's allowed range. Node regions are meant to come from
+ * whatever hub the device actually pairs with next, not from a role it no
+ * longer has). Applies at next boot only, like the rest of
+ * /api/v1/config -- there is no live re-init of the radio's country here.
  *
  * swarm_store_set_region() takes a plain NUL-terminated C string (unlike
  * swarm_store_hub_country()'s fixed char[3] pair above) because its real

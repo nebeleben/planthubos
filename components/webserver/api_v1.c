@@ -1197,6 +1197,32 @@ static esp_err_t role_post(httpd_req_t *req)
         return ESP_OK;
     }
 
+    /* (Reviewer HIGH, M9) A role change must also drop any operator-set
+     * region. Without this, a device that had a region set from its
+     * PREVIOUS role -- e.g. a hub with "US" set, converted to a node --
+     * keeps that region at TOP precedence in espnow_link.c's country
+     * setup, permanently outranking the country it should instead LEARN
+     * from its new hub's PAIR_ACK once it pairs (PlanV1 3.3's
+     * inheritance). If the new hub happens to sit on a channel the stale
+     * region forbids (e.g. a leftover "US" region blocking channels
+     * 12-13), the node's very first pairing sweep silently never reaches
+     * it -- no error anywhere except the pair-failed portal, with nothing
+     * in it pointing at region as the cause. Clearing here means every
+     * role change starts from a clean slate and correctly inherits from
+     * whatever hub it actually pairs with next. Best-effort: a failure to
+     * clear is logged, not surfaced as a 500 -- the role change itself
+     * already succeeded and must not be rolled back over this. */
+    char cleared_region[3];
+    bool had_region = swarm_store_region(cleared_region);
+    esp_err_t region_clear_err = swarm_store_set_region("");
+    if (region_clear_err != ESP_OK) {
+        ESP_LOGW(TAG, "role_post: failed to clear operator region on role change: %s",
+                 esp_err_to_name(region_clear_err));
+    } else if (had_region) {
+        ESP_LOGI(TAG, "role_post: cleared stale operator region %s on role change (%d -> %d)",
+                 cleared_region, old_role, new_role);
+    }
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true,\"restart_required\":true}");
 

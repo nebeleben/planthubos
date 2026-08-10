@@ -260,7 +260,11 @@ export function ConfigTab() {
             {busy === 'region' ? 'Saving…' : 'Save region'}
           </button>
         </p>
-        <p class="hint">Applies after reboot. Nodes adopt the hub's region when they pair.</p>
+        <p class="hint">
+          Applies after reboot. Nodes adopt the hub's region when they pair — changing role
+          clears this setting, since a new role should learn its region fresh rather than
+          keep one set for the old role. If pairing fails on channels 12–13, check the region.
+        </p>
         {regionMsg && <p class="hint">{regionMsg}</p>}
       </div>
 
