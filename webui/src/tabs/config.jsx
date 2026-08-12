@@ -384,6 +384,13 @@ export function ConfigTab() {
             <button class="btn-destructive" onClick={cancelOta}>Cancel</button>
           </p>
         )}
+        <p class="infobox">
+          Firmware comes in regional builds (<code>eu</code>/<code>us</code>/<code>jp</code>)
+          that differ in allowed WiFi channels. Updating with the wrong region's image can
+          strand the hub if your router uses channels the image forbids (12–13 on{' '}
+          <code>us</code>) — pick the build for your region. A WiFi region set above
+          overrides the image's default.
+        </p>
         {otaMsg && <p class="hint">{otaMsg}</p>}
       </div>
 
@@ -496,27 +503,33 @@ export function ConfigTab() {
         </div>
       )}
 
-      {st.claimed && (
-        <div class="panel">
-          <h2>Factory reset</h2>
-          <p>
-            <button class="btn-destructive" onClick={() => doFactoryReset(false)} disabled={busy === 'freset'}>
-              {busy === 'freset' ? 'Resetting…' : 'Factory reset'}
-            </button>
-            {' '}
-            <button class="btn-destructive" onClick={() => doFactoryReset(true)} disabled={busy === 'freset'}>
-              {busy === 'freset' ? 'Resetting…' : 'Factory reset + erase data'}
-            </button>
-          </p>
-          <p class="infobox">
-            Both clear the claim, WiFi and node pairings, then reboot into the setup
-            WiFi — reconnect to it to set the hub up again. <strong>Factory reset</strong>{' '}
-            keeps your plants, their history and the integration settings.{' '}
-            <strong>+ erase data</strong> wipes everything back to a fresh install.
-          </p>
-          {fresetMsg && <p class="hint">{fresetMsg}</p>}
-        </div>
-      )}
+      <div class="panel">
+        <h2>Factory reset</h2>
+        {!st.claimed && (
+          <p class="hint">Available on claimed hubs only — claim the hub above to enable.</p>
+        )}
+        <p>
+          <button class="btn-destructive" onClick={() => doFactoryReset(false)}
+                  disabled={busy === 'freset' || !st.claimed}>
+            {busy === 'freset' ? 'Resetting…' : 'Factory reset'}
+          </button>
+          <span class="hint">
+            {' '}Clears claim, WiFi and node pairings, then reboots into the setup WiFi —
+            plants, their history and the integration settings all survive.
+          </span>
+        </p>
+        <p>
+          <button class="btn-destructive" onClick={() => doFactoryReset(true)}
+                  disabled={busy === 'freset' || !st.claimed}>
+            {busy === 'freset' ? 'Resetting…' : 'Hard factory reset'}
+          </button>
+          <span class="hint">
+            {' '}Erases <strong>everything</strong> — plants, history and all settings —
+            back to a fresh install, then reboots into the setup WiFi.
+          </span>
+        </p>
+        {fresetMsg && <p class="hint">{fresetMsg}</p>}
+      </div>
     </div>
   )
 }
