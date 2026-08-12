@@ -72,9 +72,18 @@ page. Updates after that happen over the air from the hub's own web page.
 - **The setup network (`PlantHub-XXXX`) doesn't appear** after first
   flash: power-cycle once; if it still doesn't, re-run the full first
   install (all four files) rather than just the app image.
-- **Locked out or in a weird state?** Hold the BOOT button for 10 seconds:
-  factory reset — WiFi, claim and pairings are cleared (your plants and
-  their history survive), and the setup network comes back.
+- **Locked out or in a weird state?** Three ways back, mildest first:
+  - **Can't reach the WiFi settings, but can reach the plug?** Unplug and
+    replug power **5 times in a row** (each within ~10 seconds of boot):
+    the WiFi settings are cleared and the setup network comes back.
+    Everything else — plants, history, pairings — survives. Only real
+    power cycles count, so normal reboots and updates can never trigger it.
+  - **Hold the BOOT button for 10 seconds**: factory reset — WiFi, claim
+    and pairings are cleared, your plants and their history survive, and
+    the setup network comes back.
+  - **From the hub's own page** (claimed hubs only): the Config tab has
+    both a factory reset that keeps your plant data and a *factory reset +
+    erase data* that wipes the hub back to a fresh install.
 
 ## About this repository
 
