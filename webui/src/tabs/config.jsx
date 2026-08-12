@@ -34,6 +34,7 @@ export function ConfigTab() {
   const [regionMsg, setRegionMsg] = useState('')
   const [hubName, setHubName] = useState('')
   const [nameMsg, setNameMsg] = useState('')
+  const [fresetMsg, setFresetMsg] = useState('')
 
   // Every successful config save reboots the hub (the settings only apply
   // at boot). One shared countdown: tell the user, then pull the page back
@@ -245,6 +246,32 @@ export function ConfigTab() {
         setNameMsg(msg)
       }
     } catch { setNameMsg('hub not reachable') }
+    setBusy('')
+  }
+
+  async function doFactoryReset(wipe) {
+    const q = wipe
+      ? 'Factory reset AND ERASE ALL DATA? Plants, history and every setting are wiped — the hub returns to a fresh install and starts its setup WiFi.'
+      : 'Factory reset? Claim, WiFi and node pairings are cleared (plants and history survive) — the hub starts its setup WiFi.'
+    if (!confirm(q)) return
+    setBusy('freset'); setFresetMsg('')
+    try {
+      const res = await fetch('/api/v1/factory_reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ wipe_data: wipe }),
+      })
+      if (res.ok) {
+        setFresetMsg('Resetting — the hub is leaving this network. Connect to its setup WiFi to start over.')
+        return    // deliberately stay "busy": the hub is gone, the buttons must not re-arm
+      } else if (res.status === 401) {
+        setFresetMsg('Unauthorized — set the hub key above.')
+      } else {
+        let msg = 'Reset failed.'
+        try { const d = await res.json(); if (d.error) msg = d.error } catch { /* non-JSON body */ }
+        setFresetMsg(msg)
+      }
+    } catch { setFresetMsg('hub not reachable') }
     setBusy('')
   }
 
@@ -466,6 +493,28 @@ export function ConfigTab() {
               {busy === 'switch' ? 'Switching…' : 'Switch back to main hub'}
             </button>
           </p>
+        </div>
+      )}
+
+      {st.claimed && (
+        <div class="panel">
+          <h2>Factory reset</h2>
+          <p>
+            <button class="btn-destructive" onClick={() => doFactoryReset(false)} disabled={busy === 'freset'}>
+              {busy === 'freset' ? 'Resetting…' : 'Factory reset'}
+            </button>
+            {' '}
+            <button class="btn-destructive" onClick={() => doFactoryReset(true)} disabled={busy === 'freset'}>
+              {busy === 'freset' ? 'Resetting…' : 'Factory reset + erase data'}
+            </button>
+          </p>
+          <p class="infobox">
+            Both clear the claim, WiFi and node pairings, then reboot into the setup
+            WiFi — reconnect to it to set the hub up again. <strong>Factory reset</strong>{' '}
+            keeps your plants, their history and the integration settings.{' '}
+            <strong>+ erase data</strong> wipes everything back to a fresh install.
+          </p>
+          {fresetMsg && <p class="hint">{fresetMsg}</p>}
         </div>
       )}
     </div>

@@ -17,6 +17,7 @@
 #include "cJSON.h"
 #include "esp_littlefs.h"
 #include "esp_ota_ops.h"
+#include "nvs_flash.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -1455,10 +1456,69 @@ static esp_err_t config_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* POST /api/v1/factory_reset {"wipe_data":bool} -- network-triggered
+ * factory reset, claimed hubs only. Two deliberate gates: a 403 when the
+ * hub is unclaimed (an unclaimed hub's mutations are otherwise open, but
+ * "anyone on the LAN can wipe the device" is not an acceptable default --
+ * the BOOT hold and rapid power-cycling remain the unclaimed recovery
+ * paths), then the usual 401 bearer check against the claim key.
+ *
+ * wipe_data=false matches the BOOT-hold reset exactly: claim, WiFi and
+ * swarm role/pairings cleared; plants, history, integrations config and
+ * names survive. wipe_data=true is the full return-to-fresh-flash: format
+ * the LittleFS data partition and erase the whole NVS partition (claim,
+ * wifi, swarm, integrations, region, all names -- boot re-inits an erased
+ * NVS from scratch). The erase happens inline before the response; the
+ * 1.5s restart window after it is accepted -- hub-side NVS/FS writers are
+ * event-driven and rare, same pragmatism as the BOOT-hold path. */
+static esp_err_t factory_reset_post(httpd_req_t *req)
+{
+    if (!claim_is_claimed()) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"factory reset over the network requires a claimed hub\"}");
+        return ESP_OK;
+    }
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    bool wipe = false;
+    char body[128];
+    if (req->content_len > 0 && req->content_len < sizeof(body)) {
+        int r = httpd_req_recv(req, body, req->content_len);
+        if (r > 0) {
+            body[r] = '\0';
+            cJSON *json = cJSON_Parse(body);
+            if (json) {
+                wipe = cJSON_IsTrue(cJSON_GetObjectItem(json, "wipe_data"));
+                cJSON_Delete(json);
+            }
+        }
+    }
+
+    ESP_LOGW(TAG, "factory reset via api (wipe_data=%d)", (int)wipe);
+    claim_reset();
+    if (wipe) {
+        esp_err_t fs_err = esp_littlefs_format("storage");
+        if (fs_err != ESP_OK) ESP_LOGE(TAG, "littlefs format failed: %s", esp_err_to_name(fs_err));
+        esp_err_t nvs_err = nvs_flash_erase();
+        if (nvs_err != ESP_OK) ESP_LOGE(TAG, "nvs erase failed: %s", esp_err_to_name(nvs_err));
+    } else {
+        app_config_clear_wifi();
+        swarm_store_reset_all();
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"rebooting\":true}");
+    schedule_restart("freset-restart");
+    return ESP_OK;
+}
+
 void api_v1_register(httpd_handle_t server)
 {
     httpd_uri_t health = { .uri = "/api/v1/health", .method = HTTP_GET, .handler = health_get };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &health));
+    httpd_uri_t freset = { .uri = "/api/v1/factory_reset", .method = HTTP_POST, .handler = factory_reset_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &freset));
     httpd_uri_t status = { .uri = "/api/v1/status", .method = HTTP_GET, .handler = status_get };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status));
     httpd_uri_t scan = { .uri = "/api/v1/wifi/scan", .method = HTTP_GET, .handler = wifi_scan_get };
