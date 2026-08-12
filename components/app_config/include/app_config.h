@@ -23,3 +23,9 @@ esp_err_t app_config_clear_sensor_name(const uint8_t mac[6]);   /* erase; == set
  * land before any slow init so a user yanking power every ~2 seconds
  * still advances the counter. */
 void power_cycle_reset_start(void);
+
+/* True when THIS boot crossed the power-cycle threshold. For main.c only:
+ * a node's reset needs swarm state cleared too, which app_config cannot
+ * reach -- main.c checks this after swarm_store_init() and finishes the
+ * job there (role-aware: hubs stay wifi-only). */
+bool power_cycle_reset_triggered(void);

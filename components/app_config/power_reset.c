@@ -24,6 +24,15 @@
 
 static const char *TAG = "power_reset";
 
+/* Set when this boot IS the triggering one. A hub is done at that point
+ * (clearing WiFi is the whole reset), but a NODE has no WiFi credentials
+ * at all -- its identity is role + pairing in the swarm store, which this
+ * component must not depend on. main.c reads this flag after
+ * swarm_store_init() and finishes the node half there. */
+static bool s_triggered;
+
+bool power_cycle_reset_triggered(void) { return s_triggered; }
+
 #define POWER_RESET_CYCLES     5
 #define POWER_RESET_WINDOW_MS  10000
 #define NS  "planthub"
@@ -71,9 +80,10 @@ void power_cycle_reset_start(void)
     uint8_t n = counter_load() + 1;
     if (n >= POWER_RESET_CYCLES) {
         counter_store(0);
+        s_triggered = true;
         esp_err_t err = app_config_clear_wifi();
         ESP_LOGW(TAG, "%d rapid power cycles: WiFi credentials cleared (%s) -- "
-                      "claim, pairings and plant data untouched; onboarding portal next",
+                      "claim and plant data untouched; onboarding portal next",
                  n, esp_err_to_name(err));
         return;
     }

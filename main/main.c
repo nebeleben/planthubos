@@ -102,6 +102,16 @@ void app_main(void)
      * unchanged -- this is the byte-for-byte-with-today requirement for
      * ROLE_UNSET and ROLE_MAIN. */
     ESP_ERROR_CHECK(swarm_store_init());
+    /* Second half of the rapid power-cycle reset (power_reset.c): a node
+     * has no WiFi credentials, so the wifi clear alone is invisible there
+     * -- its "back to onboarding" is clearing role + pairing, which needs
+     * swarm_store and therefore happens here, not in app_config. Must run
+     * before the role branch below reads the role. Hubs keep the
+     * documented wifi-only semantics (pairings survive). */
+    if (power_cycle_reset_triggered() && swarm_store_role() == SWARM_ROLE_NODE) {
+        ESP_LOGW(TAG, "power-cycle reset on a node: clearing role and pairing");
+        swarm_store_reset_all();
+    }
     swarm_role_t role = swarm_store_role();
     bool node_paired = (role == SWARM_ROLE_NODE) && swarm_store_hub(NULL, NULL, NULL);
     /* Unpaired node, no pairing failure on record yet: actively search for

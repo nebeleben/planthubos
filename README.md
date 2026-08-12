@@ -78,6 +78,8 @@ page. Updates after that happen over the air from the hub's own web page.
     the WiFi settings are cleared and the setup network comes back.
     Everything else — plants, history, pairings — survives. Only real
     power cycles count, so normal reboots and updates can never trigger it.
+    (On a *node*, the same gesture clears its role and pairing instead —
+    that's a node's way back to the setup network.)
   - **Hold the BOOT button for 10 seconds**: factory reset — WiFi, claim
     and pairings are cleared, your plants and their history survive, and
     the setup network comes back.
