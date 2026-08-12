@@ -349,6 +349,12 @@ export function ConfigTab() {
                        placeholder={cfg?.mqtt?.pass_set ? 'saved' : ''}
                        onInput={(e) => setMqtt((m) => ({ ...m, pass: e.currentTarget.value }))} />
               </label>
+              <p class="infobox">
+                Each plant publishes JSON to{' '}
+                <code>planthub/{st.name}/plant/&lt;id&gt;/state</code>, availability to{' '}
+                <code>planthub/{st.name}/status</code>. Home Assistant finds them automatically
+                via MQTT discovery.
+              </p>
             </fieldset>
 
             <fieldset>
@@ -379,6 +385,12 @@ export function ConfigTab() {
                        placeholder={cfg?.influx?.token_set ? 'saved' : ''}
                        onInput={(e) => setInflux((i) => ({ ...i, token: e.currentTarget.value }))} />
               </label>
+              <p class="infobox">
+                Points land in this bucket as measurement <code>plant</code>, tagged{' '}
+                <code>plant=&lt;id&gt;</code>, with fields <code>temp</code>,{' '}
+                <code>moisture</code>, <code>lux</code>, <code>conductivity</code>,{' '}
+                <code>battery</code> and <code>name</code>.
+              </p>
             </fieldset>
 
             <p>

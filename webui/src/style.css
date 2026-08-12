@@ -409,6 +409,25 @@ progress {
   font-size: 0.85rem;
 }
 
+.infobox {
+  margin: 0.6rem 0 0.4rem;
+  padding: 0.55rem 0.75rem;
+  border-left: 3px solid var(--accent-soft);
+  border-radius: 0 6px 6px 0;
+  background: var(--bg-alt);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.infobox code {
+  padding: 0.05rem 0.3rem;
+  border-radius: 4px;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  font-size: 0.8rem;
+  word-break: break-all;
+}
+
 .role-screen { max-width: 640px; margin: 2.5rem auto; padding: 0 1rem; }
 .role-screen h1 { font-size: 1.35rem; margin: 0 0 1.1rem; }
 .role-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
