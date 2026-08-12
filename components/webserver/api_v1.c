@@ -1282,6 +1282,10 @@ static esp_err_t config_get(httpd_req_t *req)
 
     cJSON *root = cJSON_CreateObject();
 
+    char hubname[16];
+    app_config_hub_name(hubname);
+    cJSON_AddStringToObject(root, "name", hubname);
+
     char region[3];
     if (swarm_store_region(region)) {
         cJSON_AddStringToObject(root, "region", region);
@@ -1321,7 +1325,11 @@ static esp_err_t config_send_invalid(httpd_req_t *req)
  * influx.token only replace the stored secret when present AND non-empty --
  * there is no clear-secret path in v1 (disable the integration instead).
  * Config changes apply on next boot only (integrations_start() runs once at
- * boot); no live restart of esp-mqtt/influx tasks is attempted here. */
+ * boot, the AP SSID and the swarm's regulatory domain are likewise fixed at
+ * their init) -- so instead of attempting any live restart of esp-mqtt /
+ * influx / wifi, a successful save schedules a clean reboot, same
+ * schedule_restart() pattern as role_post. The response says so
+ * ("rebooting":true) and the webui reloads itself after the hub is back. */
 static esp_err_t config_post(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
@@ -1353,6 +1361,24 @@ static esp_err_t config_post(httpd_req_t *req)
 
     cJSON *json = cJSON_Parse(body);
     if (!json) return config_send_invalid(req);
+
+    /* "name": optional top-level hub rename. Validation (charset, length)
+     * lives in app_config_set_hub_name(); the name feeds the setup-AP SSID
+     * and the MQTT topic prefix, both fixed at init -- the reboot below is
+     * what applies it. Absent key leaves the name untouched; "" clears
+     * back to the MAC-derived default. */
+    const cJSON *name_j = cJSON_GetObjectItem(json, "name");
+    if (name_j) {
+        esp_err_t name_err = cJSON_IsString(name_j)
+            ? app_config_set_hub_name(name_j->valuestring) : ESP_ERR_INVALID_ARG;
+        if (name_err != ESP_OK) {
+            cJSON_Delete(json);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"error\":\"bad name: letters, digits, - and _ only, max 15\"}");
+            return ESP_OK;
+        }
+    }
 
     /* "region" (M9): top-level, like GET's response -- validated and
      * applied BEFORE mqtt/influx below, so an invalid region 400s cleanly
@@ -1424,7 +1450,8 @@ static esp_err_t config_post(httpd_req_t *req)
     if (integr_config_set(&cfg) != ESP_OK) return config_send_invalid(req);
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"ok\":true,\"restart_required\":true}");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"rebooting\":true}");
+    schedule_restart("cfg-restart");
     return ESP_OK;
 }
 

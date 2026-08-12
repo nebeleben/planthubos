@@ -32,6 +32,16 @@ export function ConfigTab() {
   const [cfgMsg, setCfgMsg] = useState('')
   const [region, setRegion] = useState('')           // '' = build default (GET's null)
   const [regionMsg, setRegionMsg] = useState('')
+  const [hubName, setHubName] = useState('')
+  const [nameMsg, setNameMsg] = useState('')
+
+  // Every successful config save reboots the hub (the settings only apply
+  // at boot). One shared countdown: tell the user, then pull the page back
+  // up once the hub should be reachable again.
+  function rebootCountdown(setMsg, extra) {
+    setMsg(`Saved — hub is rebooting to apply.${extra ? ` ${extra}` : ''} This page reloads in ~15 s.`)
+    setTimeout(() => location.reload(), 15000)
+  }
 
   function refresh() {
     fetch('/api/v1/status')
@@ -50,6 +60,7 @@ export function ConfigTab() {
         setMqtt({ enabled: c.mqtt.enabled, uri: c.mqtt.uri, user: c.mqtt.user, pass: '' })
         setInflux({ enabled: c.influx.enabled, url: c.influx.url, org: c.influx.org, bucket: c.influx.bucket, token: '' })
         setRegion(c.region ?? '')   // null (build default) -> the select's "" option
+        setHubName(c.name ?? '')
         setCfgLoaded(true)
       })
       // Leave cfgLoaded false on failure: the form would otherwise render
@@ -180,13 +191,9 @@ export function ConfigTab() {
         body: JSON.stringify(body),
       })
       if (res.ok) {
-        const data = await res.json()
-        setCfgMsg(data.restart_required
-          ? 'Saved — takes effect after the hub reboots. Reboot is manual: power-cycle or re-flash it.'
-          : 'Saved.')
         setMqtt((m) => ({ ...m, pass: '' }))
         setInflux((i) => ({ ...i, token: '' }))
-        refreshConfig()
+        rebootCountdown(setCfgMsg)
       } else if (res.status === 401) {
         setCfgMsg('Unauthorized — set the hub key above.')
       } else {
@@ -208,18 +215,36 @@ export function ConfigTab() {
         body: JSON.stringify({ region: region || null }),
       })
       if (res.ok) {
-        const data = await res.json()
-        setRegionMsg(data.restart_required
-          ? 'Saved — applies after the hub reboots. Nodes adopt it when they (re)pair.'
-          : 'Saved.')
+        rebootCountdown(setRegionMsg)
       } else if (res.status === 401) {
-        setRegionMsg('Unauthorized — set the hub key above.')
+        setRegionMsg('Unauthorized — set the hub key below.')
       } else {
         let msg = 'Save failed.'
         try { const d = await res.json(); if (d.error) msg = d.error } catch { /* non-JSON body */ }
         setRegionMsg(msg)
       }
     } catch { setRegionMsg('hub not reachable') }
+    setBusy('')
+  }
+
+  async function doSaveName() {
+    setBusy('name'); setNameMsg('')
+    try {
+      const res = await fetch('/api/v1/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ name: hubName }),
+      })
+      if (res.ok) {
+        rebootCountdown(setNameMsg)
+      } else if (res.status === 401) {
+        setNameMsg('Unauthorized — set the hub key below.')
+      } else {
+        let msg = 'Save failed.'
+        try { const d = await res.json(); if (d.error) msg = d.error } catch { /* non-JSON body */ }
+        setNameMsg(msg)
+      }
+    } catch { setNameMsg('hub not reachable') }
     setBusy('')
   }
 
@@ -240,6 +265,24 @@ export function ConfigTab() {
             <tr><td>Claim state</td><td>{st.claimed ? 'claimed' : 'unclaimed'}</td></tr>
           </tbody>
         </table>
+        <p>
+          <label>
+            Name
+            <input value={hubName} maxLength={15} placeholder={st.name}
+                   onInput={(e) => setHubName(e.currentTarget.value)} />
+          </label>
+          {' '}
+          <button class="btn-primary" onClick={doSaveName}
+                  disabled={busy === 'name' || !cfgLoaded || hubName === (cfg?.name ?? '')}>
+            {busy === 'name' ? 'Saving…' : 'Rename'}
+          </button>
+        </p>
+        <p class="infobox">
+          Letters, digits, <code>-</code> and <code>_</code> only (max 15). The name is also
+          the setup WiFi name and the MQTT topic prefix — renaming reboots the hub, and
+          Home Assistant will rediscover the plants under the new topics.
+        </p>
+        {nameMsg && <p class="hint">{nameMsg}</p>}
       </div>
 
       <div class="panel">
@@ -260,10 +303,11 @@ export function ConfigTab() {
             {busy === 'region' ? 'Saving…' : 'Save region'}
           </button>
         </p>
-        <p class="hint">
-          Applies after reboot. Nodes adopt the hub's region when they pair — changing role
-          clears this setting, since a new role should learn its region fresh rather than
-          keep one set for the old role. If pairing fails on channels 12–13, check the region.
+        <p class="infobox">
+          Saving reboots the hub and applies the region to it. Already-paired nodes do{' '}
+          <strong>not</strong> pick up the change automatically — a node inherits the region
+          once, when it pairs. To move existing nodes to the new region, forget and re-pair
+          them. If pairing fails on channels 12–13, check the region.
         </p>
         {regionMsg && <p class="hint">{regionMsg}</p>}
       </div>

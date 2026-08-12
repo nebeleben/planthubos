@@ -5,6 +5,7 @@
 #include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -83,11 +84,53 @@ esp_err_t app_config_clear_wifi(void)
     return err;
 }
 
+/* Effective hub name: the operator-set one from NVS if present, else the
+ * MAC-derived default. Cached after the first read -- callers include
+ * status_get() on every webui poll, and the boot-sequence users
+ * (wifi_manager AP SSID, mqtt topics) all run before any HTTP handler, so
+ * the first fill happens single-threaded. A rename via
+ * app_config_set_hub_name() updates the cache, but its callers reboot to
+ * apply anyway (SSID and MQTT topics are fixed at their init). */
+static char s_hub_name[16];
+
 void app_config_hub_name(char out[16])
 {
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    snprintf(out, 16, "PlantHub-%02X%02X", mac[4], mac[5]);
+    if (s_hub_name[0] == '\0') {
+        nvs_handle_t h;
+        if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+            size_t len = sizeof(s_hub_name);
+            nvs_get_str(h, "hub_name", s_hub_name, &len);
+            nvs_close(h);
+        }
+        if (s_hub_name[0] == '\0') {
+            uint8_t mac[6];
+            esp_read_mac(mac, ESP_MAC_WIFI_STA);
+            snprintf(s_hub_name, sizeof(s_hub_name), "PlantHub-%02X%02X", mac[4], mac[5]);
+        }
+    }
+    strlcpy(out, s_hub_name, 16);
+}
+
+/* Restricted to [A-Za-z0-9_-]: the name becomes the setup-AP SSID and the
+ * MQTT topic segment, so no spaces and none of MQTT's '/', '+', '#'.
+ * Empty string clears back to the MAC-derived default. */
+esp_err_t app_config_set_hub_name(const char *name)
+{
+    if (!name || strlen(name) > 15) return ESP_ERR_INVALID_ARG;
+    for (const char *p = name; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_') return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = name[0] ? nvs_set_str(h, "hub_name", name) : nvs_erase_key(h, "hub_name");
+    if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) err = nvs_commit(h);
+    nvs_close(h);
+    if (err == ESP_OK) {
+        s_hub_name[0] = '\0';           /* re-derive on next read */
+        if (name[0]) strlcpy(s_hub_name, name, sizeof(s_hub_name));
+    }
+    return err;
 }
 
 static void name_key(char out[16], const uint8_t mac[6])
