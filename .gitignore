@@ -22,4 +22,5 @@ tests/host/test_batt_cycle
 tests/host/test_plants_table
 tests/host/test_plants_migrate
 tests/host/test_psvm
+tests/host/test_rules_fsm
 .DS_Store
