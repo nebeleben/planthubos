@@ -1,8 +1,13 @@
 # ESP32-C5 layout (V2): bigger app slots, smaller storage.
-# The C5 image carries the Zigbee stack and dual-band WiFi blobs -- 1600K
-# slots left only 2% headroom at v1.0.0. 0x20000 + 2*0x1C0000 + 0x60000
-# ends exactly at the 4MB boundary. esp32/esp32c3 keep partitions.csv
-# (V1 layout) so deployed V1 devices can web-OTA into V2 images.
+# The C5 image will carry the Zigbee stack and already carries dual-band
+# WiFi blobs -- 1600K slots left only 2% headroom at v1.0.0. 0x20000 +
+# 2*0x1C0000 + 0x60000 ends exactly at the 4MB boundary. esp32/esp32c3
+# keep partitions.csv (V1 layout) so deployed V1 devices can web-OTA into
+# V2 images.
+# NOT Zigbee-ready yet: the stack needs dedicated zb_storage/zb_fct data
+# partitions this table does not have, so M6 must re-layout (not append --
+# the table already ends at 4MB). Ground truth: the coex spike findings,
+# docs/superpowers/specs/2026-08-15-c5-coex-findings.md.
 # Name,    Type, SubType,  Offset,   Size
 nvs,       data, nvs,      0x9000,   24K
 otadata,   data, ota,      0xf000,   8K
