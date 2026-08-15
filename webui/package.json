@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && node scripts/gzip-dist.mjs"
+    "build": "vite build && node scripts/gzip-dist.mjs",
+    "test": "node --test src/lib/psc/tests/*.test.mjs"
   },
   "dependencies": {
     "preact": "^10.22.0",
