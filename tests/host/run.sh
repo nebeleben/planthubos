@@ -73,3 +73,7 @@ $CC -Wall -Wextra -Werror -I../../components/psvm/include \
 $CC -Wall -Wextra -Werror -I../../components/rules/include \
     test_rules_fsm.c ../../components/rules/rules_fsm.c -o test_rules_fsm
 ./test_rules_fsm
+
+$CC -Wall -Wextra -Werror -I../../components/event_log/include \
+    test_event_ring.c ../../components/event_log/event_ring.c -o test_event_ring
+./test_event_ring
