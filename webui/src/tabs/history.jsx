@@ -108,7 +108,13 @@ export function HistoryTab() {
       {state === 'unsynced' && <p class="placeholder">Hub clock not synced yet — history becomes available once the hub learns the time (open this page once while online).</p>}
       {state === 'loading' && <p class="placeholder">Loading…</p>}
       {state === 'ready' && plants.length === 0 && <p class="placeholder">No plants yet.</p>}
-      {state === 'ready' && points && points.length === 0 && <p class="placeholder">No data in this range yet.</p>}
+      {state === 'ready' && points && points.length === 0 && (
+        <p class="placeholder">
+          No data in this range yet. The hub records a history snapshot every 15 minutes
+          (the first one ~2 minutes after power-on) — live values are on the Dashboard,
+          and show up here from the next snapshot onward.
+        </p>
+      )}
       {state === 'ready' && points && points.length > 0 && <Chart points={points} />}
     </div>
   )

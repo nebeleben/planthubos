@@ -156,5 +156,19 @@ esp_err_t sampler_start(const char *base_path)
     esp_timer_handle_t timer;
     esp_err_t err = esp_timer_create(&t, &timer);
     if (err != ESP_OK) return err;
+    /* One extra early sample ~2 minutes after boot: readings reach the
+     * live registry within seconds, but the periodic timer's first tick is
+     * a full interval out -- on a fresh (or just-rebooted) hub that left
+     * History empty for 15 minutes while the Dashboard already showed
+     * data, which reads as "history is broken". Two minutes is enough for
+     * the BLE scan (and a relaying node's first forward) to have heard
+     * the probes; anything unheard by then is skipped by sample_once()'s
+     * usual guards and simply waits for the periodic tick. Best-effort:
+     * losing the early sample costs nothing but the old wait. */
+    const esp_timer_create_args_t t1 = { .callback = timer_cb, .name = "sampler1st" };
+    esp_timer_handle_t first;
+    if (esp_timer_create(&t1, &first) == ESP_OK) {
+        esp_timer_start_once(first, 120ULL * 1000000ULL);
+    }
     return esp_timer_start_periodic(timer, (uint64_t)CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN * 60 * 1000000ULL);
 }
