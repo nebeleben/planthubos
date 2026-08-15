@@ -66,18 +66,23 @@ typedef struct {
     char        reason[48];     /* first not-ready reason, meaningful iff !all_ready */
 } resolve_state_t;
 
-/* Loads r's bytecode, validates it, and resolves every ref into s_resolved.
- * refs_out/nrefs/refs_cap (all optional -- pass NULL/NULL/0 to skip): fills
- * one rules_test_ref_t per ref up to refs_cap, *nrefs left at the actual
- * count -- rules_test()'s ref list (spec §6). Caller must hold s_eval_mutex. */
-static void resolve_all(rule_t *r, resolve_state_t *st,
+/* Loads rule_id's bytecode, validates it, and resolves every ref into
+ * s_resolved. Takes an id, not a rule_t* -- the id is all it ever needed
+ * (the on-disk .psbc is looked up by id), and callers now only ever have a
+ * SNAPSHOT rule_t (copied by value, see evaluate_all()) rather than a live
+ * pointer into g_rules[], so there is no slot to dereference here safely
+ * anyway. refs_out/nrefs/refs_cap (all optional -- pass NULL/NULL/0 to
+ * skip): fills one rules_test_ref_t per ref up to refs_cap, *nrefs left at
+ * the actual count -- rules_test()'s ref list (spec §6). Caller must hold
+ * s_eval_mutex. */
+static void resolve_all(uint32_t rule_id, resolve_state_t *st,
                         rules_test_ref_t *refs_out, size_t *nrefs, size_t refs_cap)
 {
     memset(st, 0, sizeof(*st));
     if (nrefs) *nrefs = 0;
 
     size_t len = 0;
-    if (!rules_store_read_psbc(r->id, s_psbc, sizeof(s_psbc), &len)) {
+    if (!rules_store_read_psbc(rule_id, s_psbc, sizeof(s_psbc), &len)) {
         st->validate_err = PSVM_ERR_TRUNCATED;
         strlcpy(st->reason, "bytecode unreadable", sizeof(st->reason));
         return;
@@ -155,51 +160,70 @@ static bool capture_sink(void *ctx, uint8_t builtin, const char *msg)
     return true;
 }
 
-/* One real evaluation of rule r (brief step 3's exact path): resolve ->
- * not-ready short-circuits (status update only) -> psvm_run(run_actions =
- * false) for cond -> rules_fsm_should_fire -> if firing, a SECOND
- * psvm_run(run_actions = true) with the real sink. psvm_run is stateless
- * per call (always starts at pc 0), so re-running the condition code a
- * second time to reach the action code is the documented way to do this
- * (spec §3), not wasted work worth avoiding. Caller must hold s_eval_mutex. */
-static void evaluate_real(rule_t *r, uint32_t now_uptime_s)
-{
-    resolve_state_t st;
-    resolve_all(r, &st, NULL, NULL, 0);
+/* Result of one real evaluation, computed entirely against a SNAPSHOT
+ * rule_t (a by-value copy taken under g_rules_mutex before this runs -- see
+ * evaluate_all()) rather than a live g_rules[] slot. out->fsm starts as the
+ * snapshot's own fsm and is only advanced by rules_fsm_should_fire() when
+ * evaluation reaches that point (i.e. exactly the cases where the pre-fix
+ * code used to mutate r->fsm directly) -- evaluate_all()'s write-back phase
+ * decides whether/where this outcome actually lands in g_rules[]. */
+typedef struct {
+    bool               ready;
+    char               not_ready_reason[48];
+    psvm_err_t         last_err;
+    bool               fired;
+    rules_fsm_state_t  fsm;
+} eval_outcome_t;
 
-    xSemaphoreTake(g_rules_mutex, portMAX_DELAY);
-    r->last_eval_ts = now_uptime_s;
+/* One real evaluation of snapshot rule `snap` (brief step 3's exact path):
+ * resolve -> not-ready short-circuits (status update only) ->
+ * psvm_run(run_actions = false) for cond -> rules_fsm_should_fire -> if
+ * firing, a SECOND psvm_run(run_actions = true) with the real sink. psvm_run
+ * is stateless per call (always starts at pc 0), so re-running the
+ * condition code a second time to reach the action code is the documented
+ * way to do this (spec §3), not wasted work worth avoiding.
+ *
+ * Deliberately touches g_rules_mutex nowhere -- `snap` is a private copy
+ * (review fix, critical: the pre-fix version held a live rule_t* across
+ * this whole unlocked resolve+psvm_run stretch, so a concurrent
+ * rules_delete()+rules_upsert() reusing that slot for a different rule
+ * mid-evaluation could read a torn slot and misattribute a fire). Any
+ * log/notify action DOES already happen for real inside this call (via
+ * real_sink -> event_log_append(), keyed by snap->id, which stays valid and
+ * correctly-attributed regardless of what happens to the slot afterward) --
+ * only the g_rules[] status write-back is deferred to the caller, which can
+ * still discard it if the id no longer resolves to a live slot. Caller must
+ * hold s_eval_mutex. */
+static void evaluate_real(const rule_t *snap, uint32_t now_uptime_s, eval_outcome_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->fsm = snap->fsm;
+
+    resolve_state_t st;
+    resolve_all(snap->id, &st, NULL, NULL, 0);
+
     if (!st.loaded_ok || !st.all_ready) {
-        r->ready = false;
-        strlcpy(r->not_ready_reason, st.reason, sizeof(r->not_ready_reason));
-        r->last_err = st.loaded_ok ? PSVM_OK : st.validate_err;
-        xSemaphoreGive(g_rules_mutex);
+        out->ready = false;
+        strlcpy(out->not_ready_reason, st.reason, sizeof(out->not_ready_reason));
+        out->last_err = st.loaded_ok ? PSVM_OK : st.validate_err;
         return;
     }
-    xSemaphoreGive(g_rules_mutex);
 
     psvm_result_t cres = psvm_run(&st.prog, s_resolved, NULL, NULL, false);
-
-    xSemaphoreTake(g_rules_mutex, portMAX_DELAY);
     if (cres.err != PSVM_OK) {
-        r->ready = false;
-        r->last_err = cres.err;
-        strlcpy(r->not_ready_reason, "evaluation error", sizeof(r->not_ready_reason));
-        xSemaphoreGive(g_rules_mutex);
+        out->ready = false;
+        out->last_err = cres.err;
+        strlcpy(out->not_ready_reason, "evaluation error", sizeof(out->not_ready_reason));
         return;
     }
-    r->ready = true;
-    r->last_err = PSVM_OK;
-    r->not_ready_reason[0] = '\0';
-    bool fire = rules_fsm_should_fire(&r->fsm, (rules_mode_t)r->mode, r->cooldown_s, now_uptime_s, cres.cond);
-    uint32_t rule_id = r->id;
-    char name[RULES_NAME_MAX + 1];
-    strlcpy(name, r->name, sizeof(name));
-    xSemaphoreGive(g_rules_mutex);
+    out->ready = true;
+    out->last_err = PSVM_OK;
 
+    bool fire = rules_fsm_should_fire(&out->fsm, (rules_mode_t)snap->mode, snap->cooldown_s,
+                                      now_uptime_s, cres.cond);
     if (!fire) return;
 
-    real_sink_ctx_t ctx = { .rule_id = rule_id };
+    real_sink_ctx_t ctx = { .rule_id = snap->id };
     psvm_result_t ares = psvm_run(&st.prog, s_resolved, real_sink, &ctx, true);
     if (ares.err != PSVM_OK) {
         /* The fire already happened (fsm state above already advanced) --
@@ -208,15 +232,9 @@ static void evaluate_real(rule_t *r, uint32_t now_uptime_s)
          * that; it just means some/all of this fire's log/notify calls
          * never ran. Logged, not fatal to the engine. */
         ESP_LOGW(TAG, "rule %u (\"%s\"): action code error %d after firing",
-                 (unsigned)rule_id, name, (int)ares.err);
+                 (unsigned)snap->id, snap->name, (int)ares.err);
     }
-
-    xSemaphoreTake(g_rules_mutex, portMAX_DELAY);
-    r->last_fire_ts = now_uptime_s;
-    r->fire_count++;
-    xSemaphoreGive(g_rules_mutex);
-
-    ESP_LOGI(TAG, "rule %u (\"%s\") fired", (unsigned)rule_id, name);
+    out->fired = true;
 }
 
 /* only_due=false: value-update wake -- every enabled rule gets re-evaluated
@@ -225,20 +243,77 @@ static void evaluate_real(rule_t *r, uint32_t now_uptime_s)
  * only rules whose own esp_timer actually ticked. Either way, a rule's due
  * flag is cleared once its evaluation is queued here, so a periodic rule
  * touched by a value-update sweep doesn't ALSO get a redundant periodic pass
- * moments later. */
+ * moments later.
+ *
+ * Three phases per slot, none of which holds g_rules_mutex across the
+ * resolve+psvm_run work (review fix, critical -- see evaluate_real()'s doc
+ * comment): (1) snapshot the candidate slot by value under g_rules_mutex,
+ * clearing `due` in the same hold; (2) evaluate the snapshot, unlocked,
+ * under s_eval_mutex; (3) re-take g_rules_mutex and re-find the slot BY ID
+ * (never by index i -- a concurrent rules_delete()/rules_upsert() may have
+ * reused slot i for a different rule while (2) ran unlocked). A missing id
+ * at write-back time discards the status write-back entirely (the rule was
+ * deleted, or replaced by an upsert that reused the same slot under a NEW
+ * id -- ids are never reused, so an id mismatch always means "not the same
+ * rule anymore"); an already-fired action from (2) is logged but accepted,
+ * since event_log_append() already ran for real and cannot be un-fired. */
 static void evaluate_all(bool only_due)
 {
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
     for (int i = 0; i < RULES_MAX; i++) {
-        rule_t *r = &g_rules[i];
-        if (!r->in_use || !r->enabled) continue;
-        bool due = r->due;
-        if (only_due && !due) continue;
-        if (due) r->due = false;
+        xSemaphoreTake(g_rules_mutex, portMAX_DELAY);
+        rule_t *slot = &g_rules[i];
+        bool candidate = slot->in_use && slot->enabled && (!only_due || slot->due);
+        rule_t snap;
+        if (candidate) {
+            snap = *slot;
+            slot->due = false;
+        }
+        xSemaphoreGive(g_rules_mutex);
+        if (!candidate) continue;
 
         xSemaphoreTake(s_eval_mutex, portMAX_DELAY);
-        evaluate_real(r, now_uptime_s);
+        eval_outcome_t out;
+        evaluate_real(&snap, now_uptime_s, &out);
         xSemaphoreGive(s_eval_mutex);
+
+        xSemaphoreTake(g_rules_mutex, portMAX_DELAY);
+        int idx = -1;
+        for (int j = 0; j < RULES_MAX; j++) {
+            if (g_rules[j].in_use && g_rules[j].id == snap.id) { idx = j; break; }
+        }
+        if (idx < 0) {
+            xSemaphoreGive(g_rules_mutex);
+            if (out.fired) {
+                ESP_LOGW(TAG, "rule %u (\"%s\") fired but was deleted/replaced mid-evaluation; "
+                              "discarding its status write-back", (unsigned)snap.id, snap.name);
+            }
+            continue;
+        }
+        rule_t *live = &g_rules[idx];
+        live->last_eval_ts = now_uptime_s;
+        live->ready = out.ready;
+        strlcpy(live->not_ready_reason, out.not_ready_reason, sizeof(live->not_ready_reason));
+        live->last_err = out.last_err;
+        if (out.ready) {
+            /* Only advance fsm/fire bookkeeping on the ready path -- same
+             * as the pre-fix code, which never touched r->fsm at all on a
+             * not-ready evaluation. This also protects against clobbering
+             * a fresh rules_fsm_reset() from a same-id rules_upsert()/
+             * rules_set_enabled() that raced this evaluation: on the
+             * not-ready path, out.fsm is left equal to snap.fsm (whatever
+             * it was at snapshot time) and is simply never written back. */
+            live->fsm = out.fsm;
+            if (out.fired) {
+                live->last_fire_ts = now_uptime_s;
+                live->fire_count++;
+            }
+        }
+        xSemaphoreGive(g_rules_mutex);
+
+        if (out.fired) {
+            ESP_LOGI(TAG, "rule %u (\"%s\") fired", (unsigned)snap.id, snap.name);
+        }
     }
 }
 
@@ -362,7 +437,7 @@ int rules_test(uint32_t id, bool *ready, bool *cond, bool *would_fire,
 
     xSemaphoreTake(s_eval_mutex, portMAX_DELAY);
     resolve_state_t st;
-    resolve_all(&snapshot, &st, refs, nrefs, refs_cap);
+    resolve_all(snapshot.id, &st, refs, nrefs, refs_cap);
     if (!st.loaded_ok || !st.all_ready) {
         xSemaphoreGive(s_eval_mutex);
         return ESP_OK;   /* *ready stays false; refs[] already shows why */

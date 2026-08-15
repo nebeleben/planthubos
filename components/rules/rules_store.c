@@ -478,7 +478,19 @@ bool rules_set_enabled(uint32_t id, bool enabled)
         if (g_rules[i].in_use && g_rules[i].id == id) { idx = i; break; }
     }
     bool changed = (idx >= 0) && (g_rules[idx].enabled != enabled);
-    if (idx >= 0) g_rules[idx].enabled = enabled;
+    if (idx >= 0) {
+        g_rules[idx].enabled = enabled;
+        if (changed && enabled) {
+            /* Re-enabling re-arms from scratch (review fix): a rule
+             * disabled while armed=false (already fired, condition still
+             * true) must not skip straight back to firing the instant it's
+             * re-enabled with no transition -- evaluate_all() never touches
+             * a disabled rule's fsm, so without this its armed/
+             * ever_evaluated state would just be whatever it was the
+             * moment it got disabled. */
+            rules_fsm_reset(&g_rules[idx].fsm);
+        }
+    }
     rule_t snapshot;
     if (changed) snapshot = g_rules[idx];
     xSemaphoreGive(g_rules_mutex);
