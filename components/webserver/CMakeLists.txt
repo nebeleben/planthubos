@@ -7,5 +7,6 @@ idf_component_register(
     SRCS "webserver.c" "api_v1.c" "dns_hijack.c" "sensors_json.c" "sse.c" "ota_post.c"
     INCLUDE_DIRS "include"
     REQUIRES esp_http_server esp_timer json wifi_manager app_config esp_wifi esp_event data_core lwip storage timekeeper claiming joltwallet__littlefs app_update swarm integrations plants
+    PRIV_REQUIRES rules event_log mbedtls
     EMBED_FILES "${DIST}/index.html.gz" "${DIST}/app.js.gz" "${DIST}/app.css.gz"
 )

@@ -19,10 +19,62 @@
 #include "plants.h"
 #include "event_log.h"
 #include "rules.h"
+#include "sse.h"
+#include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 static const char *TAG = "planthub";
+
+/* mqtt_pub.c (components/integrations) has no header of its own -- its file
+ * header explains why it, alone, owns every esp_mqtt_client_publish() call,
+ * and mqtt_pub_event() (Task 6) is its one additional entry point beyond
+ * integrations_start(). Declared extern here rather than growing
+ * integrations.h for this single call site (on_event_logged() below, its
+ * only caller). */
+extern void mqtt_pub_event(const char *json);
+
+/* event_log hook (spec §5/§6): event_log_append() invokes this on every
+ * append. Builds the {"ts":...,"rule":"...","level":"log"|"notify",
+ * "msg":"..."} payload ONCE via cJSON (which escapes rule/msg for us) and
+ * hands the same buffer to both the SSE event feed and the MQTT event
+ * topic -- that's why event_log_set_hooks() below passes this as the SOLE
+ * hook (its mqtt_hook argument is NULL): building the JSON independently
+ * in two separate hook callbacks would be wasted, duplicate work for every
+ * single event. Rule name comes from rules_list() keyed by the event's
+ * rule_id; a rule deleted after logging (or, defensively, rule_id 0) falls
+ * back to "rule <id>" rather than dropping the push. */
+static void on_event_logged(const event_t *e)
+{
+    rule_info_t infos[RULES_MAX];
+    size_t n = rules_list(infos, RULES_MAX);
+    char name[RULES_NAME_MAX + 1];
+    bool found = false;
+    for (size_t i = 0; i < n; i++) {
+        if (infos[i].id == e->rule_id) {
+            strlcpy(name, infos[i].name, sizeof(name));
+            found = true;
+            break;
+        }
+    }
+    if (!found) snprintf(name, sizeof(name), "rule %u", (unsigned)e->rule_id);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "ts", (double)e->ts);
+    cJSON_AddStringToObject(root, "rule", name);
+    cJSON_AddStringToObject(root, "level", e->level == 1 ? "notify" : "log");
+    cJSON_AddStringToObject(root, "msg", e->msg);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return;
+
+    sse_push_event(json);
+    mqtt_pub_event(json);
+    free(json);
+}
 
 /* M7 Task 5: wrapper task for swarm_node_battery_cycle() (spec §4). That
  * function either deep-sleeps (esp_deep_sleep() never returns) or returns
@@ -221,6 +273,13 @@ void app_main(void)
              * is only that both run after plants_init()/data_core_init(),
              * which they do. */
             event_log_init();
+            /* Before rules_init() starts the engine task, so no event fired
+             * in the window right after boot can slip through with the SSE/
+             * MQTT hooks still unset (see on_event_logged()'s own comment
+             * above -- a NULL hook is harmless either way, event_log.c
+             * checks before calling, but there's no reason to leave the gap
+             * open at all). */
+            event_log_set_hooks(on_event_logged, NULL);
             rules_init();
         }
         /* role == NODE only reaches here when swarm_store_pair_failed() is

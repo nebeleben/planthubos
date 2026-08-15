@@ -79,14 +79,26 @@ static const char *const METRICS[] = { "temp", "moisture", "lux", "conductivity"
  * mqtt_event_handler()'s MQTT_EVENT_CONNECTED case, esp-mqtt's task) --
  * both without either producer blocking or doing publish/NVS work itself.
  * mac is meaningful only for MQTT_PUB_MSG_STATE_UPDATE. */
+/* MQTT_PUB_MSG_EVENT (Task 6, spec §5/§6): carries a rules/event_log
+ * event's already-built JSON payload from mqtt_pub_event() (the event_log
+ * hook's MQTT leg, wired in main.c) to mqtt_pub_task() for publish to
+ * planthub/<hub>/event -- same single-publisher discipline as the two
+ * message types above; only mqtt_pub_task() ever calls
+ * esp_mqtt_client_publish(). */
 typedef enum {
     MQTT_PUB_MSG_STATE_UPDATE,
     MQTT_PUB_MSG_RESYNC_DISCOVERY,
+    MQTT_PUB_MSG_EVENT,
 } mqtt_pub_msg_type_t;
 
 typedef struct {
     mqtt_pub_msg_type_t type;
     uint8_t              mac[6];
+    /* MQTT_PUB_MSG_EVENT only: heap copy made by mqtt_pub_event() (the
+     * caller's own json buffer is not retained past that call); freed by
+     * mqtt_pub_task() after publish, or immediately by mqtt_pub_event()
+     * itself if the queue send fails. */
+    char                 *event_json;
 } mqtt_pub_msg_t;
 
 static esp_mqtt_client_handle_t s_client;
@@ -230,6 +242,20 @@ static void mqtt_pub_task(void *arg)
 
         if (msg.type == MQTT_PUB_MSG_RESYNC_DISCOVERY) {
             publish_all_discovery();
+            continue;
+        }
+
+        if (msg.type == MQTT_PUB_MSG_EVENT) {
+            if (s_client) {
+                char topic[TOPIC_BUF_SIZE];
+                int n = snprintf(topic, sizeof(topic), "planthub/%s/event", s_hub);
+                if (n > 0 && (size_t)n < sizeof(topic)) {
+                    esp_mqtt_client_publish(s_client, topic, msg.event_json, 0, 0, 0);
+                } else {
+                    ESP_LOGW(TAG, "event topic did not fit for hub \"%s\"", s_hub);
+                }
+            }
+            free(msg.event_json);
             continue;
         }
 
@@ -413,4 +439,29 @@ esp_err_t integrations_start(void)
     }
 
     return influx_start(&cfg);
+}
+
+/* Enqueues a pre-built event JSON payload (main.c's event_log hook, spec
+ * §5/§6) for publish to planthub/<hub>/event, QoS 0, non-retained --
+ * declared directly in whichever caller needs it (main.c) rather than in a
+ * header of its own, same as this file's own header comment explains for
+ * why it, not some other file, owns every esp_mqtt_client_publish() call.
+ * No-op when MQTT is disabled/not started (s_client/s_queue still NULL,
+ * mirrors publish_discovery()/publish_state()'s own `if (!s_client)
+ * return`) -- the caller doesn't need to check integr_config itself.
+ * Best-effort: an event dropped here (disabled MQTT, or a momentarily full
+ * queue) has already landed in the durable event_log ring and gone out over
+ * SSE: MQTT is an integration leg, not the source of truth. */
+void mqtt_pub_event(const char *json)
+{
+    if (!s_client || !s_queue || !json) return;
+
+    char *copy = strdup(json);
+    if (!copy) return;
+
+    mqtt_pub_msg_t msg = { .type = MQTT_PUB_MSG_EVENT, .event_json = copy };
+    if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "mqtt_pub queue full; dropping event publish");
+        free(copy);
+    }
 }

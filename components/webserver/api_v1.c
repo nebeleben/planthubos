@@ -14,7 +14,9 @@
 #include "pairing.h"
 #include "integr_config.h"
 #include "espnow_link.h"
+#include "rules.h"
 #include "cJSON.h"
+#include "mbedtls/base64.h"
 #include "esp_littlefs.h"
 #include "esp_ota_ops.h"
 #include "nvs_flash.h"
@@ -1558,6 +1560,456 @@ static esp_err_t factory_reset_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---- Rules + events HTTP API (Task 6, spec §6) --------------------------
+ *
+ * Note: GET /api/v1/events itself is NOT registered here -- it's the SAME
+ * URI as the SSE stream sse.c already owns, and ESP-IDF's httpd rejects an
+ * exact-URI duplicate registration for the same method
+ * (ESP_ERR_HTTPD_HANDLER_EXISTS). sse.c's events_get() branches on the
+ * "after" query key instead; see its own comment. Every other route below
+ * follows this file's existing auth/body-size/404 idioms verbatim (mirror
+ * of the plants_ and node_ handlers above).
+ */
+
+/* Shared, static: too big for the 8KB httpd task stack, and (like
+ * s_api_reg_snap/s_api_plant_snap above) safe to share because
+ * esp_http_server only ever runs one registered handler at a time on this
+ * one task. */
+static rule_info_t         s_rules_list_buf[RULES_MAX];
+static char                s_rules_source_buf[RULES_SRC_MAX + 1];
+static rules_test_ref_t    s_rules_test_refs[PSVM_MAX_REFS];
+static rules_test_action_t s_rules_test_acts[16];   /* generous cap for a dry-run capture; extra actions beyond this are silently not captured (rules_engine.c's capture_sink), never a crash */
+
+/* POST/PUT body: name?(<=48)+source(<=4096, JSON-escaped -- worst realistic
+ * case around 1.5x for compiler-produced source, not the 2x pathological
+ * worst case) + bytecode_b64 (<=~2732 chars for RULES_PSBC_MAX=2048 bytes)
+ * + a few numeric/bool fields. 8192 is generous headroom over that. */
+#define RULES_BODY_MAX 8192
+static char    s_rules_body[RULES_BODY_MAX];
+static uint8_t s_rules_psbc[RULES_PSBC_MAX];
+/* base64 length of RULES_PSBC_MAX (2048) bytes: 4*ceil(2048/3), checked
+ * BEFORE decoding (brief: "validate sizes BEFORE base64 decode") so a
+ * wildly oversized bytecode_b64 is rejected without ever calling into
+ * mbedtls; the decode call below is still bounds-checked against
+ * sizeof(s_rules_psbc) regardless, as a second line of defense. */
+#define RULES_B64_MAX 2732
+
+/* Parses a decimal rule id (u32, rules.h -- ids are 1-based monotonic,
+ * never reused) from the start of s, stopping at '/', '?' or the string's
+ * end -- same contract as parse_plant_id() above (see its comment for why
+ * '?' must stop the scan too: req->uri keeps the query string in this
+ * IDF). Accumulates in a 64-bit temporary so a too-long digit run is
+ * detected as "doesn't fit in u32" rather than silently wrapping (unsigned
+ * long is only 32 bits on this target, same width as uint32_t, so
+ * comparing against a 32-bit bound while accumulating IN a 32-bit type
+ * could never trigger). 0 is the "didn't parse" sentinel, same convention
+ * as parse_plant_id(). */
+static uint32_t parse_rule_id(const char *s, const char **tail_out)
+{
+    if (*s < '1' || *s > '9') return 0;
+    uint64_t v = 0;
+    const char *p = s;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (uint64_t)(*p - '0');
+        if (v > 0xFFFFFFFFULL) return 0;
+        p++;
+    }
+    if (*p != '\0' && *p != '/' && *p != '?') return 0;
+    if (tail_out) *tail_out = p;
+    return (uint32_t)v;
+}
+
+/* POST body's "name" default (spec §6: "Name defaults from source"): pulls
+ * the quoted name out of source's `rule "<name>"` header line (spec §1).
+ * Copies up to outlen-1 bytes; false (out untouched) if the pattern isn't
+ * found or would be empty -- rules_upsert_from_body()'s caller then falls
+ * back to a placeholder, and rules_upsert()'s own name validation is what's
+ * actually authoritative regardless. */
+static bool name_from_source(const char *source, char *out, size_t outlen)
+{
+    const char *p = strstr(source, "rule \"");
+    if (!p || outlen == 0) return false;
+    p += 6;
+    size_t i = 0;
+    while (p[i] != '"' && p[i] != '\0' && i < outlen - 1) i++;
+    if (p[i] != '"' || i == 0) return false;
+    memcpy(out, p, i);
+    out[i] = '\0';
+    return true;
+}
+
+/* Short human text for a psvm_err_t (mirrors rules_store.c's own private
+ * psvm_err_str() -- that one isn't exported via rules.h, and psvm_err_t's
+ * value set is a fixed, spec'd contract (psvm.h), so duplicating this small
+ * switch here is safe rather than fragile). Only used for last_error below
+ * when a rule IS ready to resolve but its most recent run itself errored
+ * (division by zero, step budget, ...) -- distinct from not_ready_reason,
+ * which covers unresolved refs. */
+static const char *psvm_err_short(psvm_err_t e)
+{
+    switch (e) {
+    case PSVM_OK:            return "";
+    case PSVM_ERR_HEADER:    return "bad bytecode header";
+    case PSVM_ERR_LIMITS:    return "bytecode exceeds a hub limit";
+    case PSVM_ERR_TRUNCATED: return "bytecode truncated";
+    case PSVM_ERR_BADOP:     return "bad opcode";
+    case PSVM_ERR_STACK:     return "stack error";
+    case PSVM_ERR_STEPS:     return "step budget exceeded";
+    case PSVM_ERR_DIV0:      return "division by zero";
+    case PSVM_ERR_JUMP:      return "bad jump target";
+    case PSVM_ERR_TYPE:      return "type error";
+    case PSVM_ERR_REF:       return "bad reference";
+    default:                 return "vm error";
+    }
+}
+
+/* Shared by rules_list_get()/rules_get_one() -- the meta+status fields
+ * common to both spec §6 shapes (GET /rules/<id> adds "source" on top of
+ * this). last_eval_ts/last_fire_ts in rule_info_t are MONOTONIC uptime
+ * seconds, never epoch (Task 5 review finding -- see rules.h's own
+ * comment): exposed here as ages (seconds since eval/fire) rather than raw
+ * timestamps, so the API can never be mistaken for emitting epoch time;
+ * null when the rule has never evaluated/fired (ts==0). */
+static cJSON *rule_status_json(const rule_info_t *r, uint32_t now_uptime_s)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddNumberToObject(o, "id", r->id);
+    cJSON_AddStringToObject(o, "name", r->name);
+    cJSON_AddBoolToObject(o, "enabled", r->enabled);
+    cJSON_AddNumberToObject(o, "mode", r->mode);
+    cJSON_AddNumberToObject(o, "cooldown_s", r->cooldown_s);
+    cJSON_AddNumberToObject(o, "every_s", r->every_s);
+    cJSON_AddBoolToObject(o, "ready", r->ready);
+    /* ready implies last_err == PSVM_OK (rules_engine.c never sets one
+     * without the other) -- so when not ready, prefer the specific VM error
+     * text over the generic "evaluation error" not_ready_reason whenever
+     * one is available; otherwise fall back to not_ready_reason (e.g. "no
+     * plant X"), which is always populated when !ready. */
+    const char *last_error = "";
+    if (!r->ready) last_error = (r->last_err != PSVM_OK) ? psvm_err_short(r->last_err) : r->not_ready_reason;
+    cJSON_AddStringToObject(o, "last_error", last_error);
+    if (r->last_eval_ts != 0) cJSON_AddNumberToObject(o, "last_eval_age_s", now_uptime_s - r->last_eval_ts);
+    else cJSON_AddNullToObject(o, "last_eval_age_s");
+    if (r->last_fire_ts != 0) cJSON_AddNumberToObject(o, "last_fire_age_s", now_uptime_s - r->last_fire_ts);
+    else cJSON_AddNullToObject(o, "last_fire_age_s");
+    cJSON_AddNumberToObject(o, "fire_count", r->fire_count);
+    return o;
+}
+
+/* GET /api/v1/rules -- unauthenticated, like every GET in this file. */
+static esp_err_t rules_list_get(httpd_req_t *req)
+{
+    size_t n = rules_list(s_rules_list_buf, RULES_MAX);
+    uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "rules");
+    for (size_t i = 0; i < n; i++) cJSON_AddItemToArray(arr, rule_status_json(&s_rules_list_buf[i], now_uptime_s));
+    return send_json(req, root);
+}
+
+/* GET /api/v1/rules/{id} -- meta + source + status (spec §6). Unauthenticated. */
+static esp_err_t rules_get_one(httpd_req_t *req)
+{
+    const char *tail = req->uri + strlen("/api/v1/rules/");
+    const char *suffix = NULL;
+    uint32_t id = parse_rule_id(tail, &suffix);
+    if (id == 0 || (suffix[0] != '\0' && suffix[0] != '?')) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+        return ESP_OK;
+    }
+
+    size_t n = rules_list(s_rules_list_buf, RULES_MAX);
+    const rule_info_t *found = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (s_rules_list_buf[i].id == id) { found = &s_rules_list_buf[i]; break; }
+    }
+    if (!found) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown rule");
+        return ESP_OK;
+    }
+
+    if (!rules_get_source(id, s_rules_source_buf, sizeof(s_rules_source_buf))) s_rules_source_buf[0] = '\0';
+
+    uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    cJSON *root = rule_status_json(found, now_uptime_s);
+    cJSON_AddStringToObject(root, "source", s_rules_source_buf);
+    return send_json(req, root);
+}
+
+/* True iff id currently names a rule -- used by rules_update_put() to 404
+ * before ever calling rules_upsert() (which folds "unknown id" into the
+ * same ESP_ERR_INVALID_ARG as every other validation failure, not
+ * distinguishable from its errbuf text alone). No race with a concurrent
+ * delete: esp_http_server runs one handler at a time on this task. */
+static bool rule_id_exists(uint32_t id)
+{
+    size_t n = rules_list(s_rules_list_buf, RULES_MAX);
+    for (size_t i = 0; i < n; i++) if (s_rules_list_buf[i].id == id) return true;
+    return false;
+}
+
+/* Sends a 400 with a properly JSON-escaped {"error":"<errbuf>"} body --
+ * NOT a hand-rolled snprintf: rules_upsert()'s own errbuf text can contain
+ * a literal '"' (its name-validation message is `...must not contain '"'`),
+ * which would break hand-rolled JSON syntax outright. */
+static void send_rules_error(httpd_req_t *req, const char *errbuf)
+{
+    httpd_resp_set_status(req, "400 Bad Request");
+    cJSON *eroot = cJSON_CreateObject();
+    cJSON_AddStringToObject(eroot, "error", errbuf);
+    char *ebody = cJSON_PrintUnformatted(eroot);
+    cJSON_Delete(eroot);
+    httpd_resp_set_type(req, "application/json");
+    if (ebody) {
+        httpd_resp_sendstr(req, ebody);
+        free(ebody);
+    } else {
+        httpd_resp_sendstr(req, "{\"error\":\"invalid rule\"}");
+    }
+}
+
+/* Shared by rules_create_post() (POST /api/v1/rules, id_inout starts at 0)
+ * and rules_update_put() (PUT /api/v1/rules/{id}, id_inout already set to
+ * the URL's id): reads+validates the {name?, source, bytecode_b64, enabled,
+ * mode, cooldown_s, every_s} body (spec §6) and calls rules_upsert().
+ * Sends the 400/413 response itself and returns false on any failure --
+ * caller has nothing left to do. Returns true (id_inout holding the
+ * created/updated id, no response sent yet) on success, so the two callers
+ * can each add their own success body ({"ok":true,"id":N} vs {"ok":true}). */
+static bool rules_upsert_from_body(httpd_req_t *req, uint32_t *id_inout)
+{
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return false;
+    }
+    if (req->content_len > sizeof(s_rules_body) - 1) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
+        return false;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, s_rules_body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return false;
+        }
+        received += (size_t)r;
+    }
+    s_rules_body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(s_rules_body);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return false;
+    }
+
+    const cJSON *name_j     = cJSON_GetObjectItem(json, "name");
+    const cJSON *source_j   = cJSON_GetObjectItem(json, "source");
+    const cJSON *b64_j      = cJSON_GetObjectItem(json, "bytecode_b64");
+    const cJSON *enabled_j  = cJSON_GetObjectItem(json, "enabled");
+    const cJSON *mode_j     = cJSON_GetObjectItem(json, "mode");
+    const cJSON *cooldown_j = cJSON_GetObjectItem(json, "cooldown_s");
+    const cJSON *every_j    = cJSON_GetObjectItem(json, "every_s");
+
+    if (!cJSON_IsString(source_j) || !cJSON_IsString(b64_j)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing source/bytecode_b64");
+        return false;
+    }
+
+    size_t b64len = strlen(b64_j->valuestring);
+    if (b64len == 0 || b64len > RULES_B64_MAX) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bytecode_b64 too large");
+        return false;
+    }
+    size_t psbc_len = 0;
+    int mbrc = mbedtls_base64_decode(s_rules_psbc, sizeof(s_rules_psbc), &psbc_len,
+                                      (const unsigned char *)b64_j->valuestring, b64len);
+    if (mbrc != 0) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid base64");
+        return false;
+    }
+
+    char name_buf[RULES_NAME_MAX + 1];
+    const char *name;
+    if (cJSON_IsString(name_j) && name_j->valuestring[0] != '\0') {
+        name = name_j->valuestring;
+    } else if (name_from_source(source_j->valuestring, name_buf, sizeof(name_buf))) {
+        name = name_buf;
+    } else {
+        name = "rule";   /* rules_upsert() still enforces the real name grammar below */
+    }
+
+    bool enabled = cJSON_IsTrue(enabled_j);
+    uint8_t mode = cJSON_IsNumber(mode_j) ? (uint8_t)mode_j->valuedouble : 0;
+    uint32_t cooldown_s = cJSON_IsNumber(cooldown_j) ? (uint32_t)cooldown_j->valuedouble : 0;
+    uint32_t every_s = cJSON_IsNumber(every_j) ? (uint32_t)every_j->valuedouble : 0;
+
+    char errbuf[80];
+    int err = rules_upsert(id_inout, name, source_j->valuestring, s_rules_psbc, psbc_len,
+                           enabled, mode, cooldown_s, every_s, errbuf, sizeof(errbuf));
+    cJSON_Delete(json);
+    if (err != ESP_OK) {
+        send_rules_error(req, errbuf);
+        return false;
+    }
+    return true;
+}
+
+/* POST /api/v1/rules -- create (auth). */
+static esp_err_t rules_create_post(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+    uint32_t id = 0;
+    if (!rules_upsert_from_body(req, &id)) return ESP_OK;
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddNumberToObject(root, "id", id);
+    return send_json(req, root);
+}
+
+/* PUT /api/v1/rules/{id} -- update (auth). Same body as POST. */
+static esp_err_t rules_update_put(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+    const char *tail = req->uri + strlen("/api/v1/rules/");
+    const char *suffix = NULL;
+    uint32_t id = parse_rule_id(tail, &suffix);
+    if (id == 0 || (suffix[0] != '\0' && suffix[0] != '?')) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad id");
+        return ESP_OK;
+    }
+    if (!rule_id_exists(id)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown rule");
+        return ESP_OK;
+    }
+    if (!rules_upsert_from_body(req, &id)) return ESP_OK;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* DELETE /api/v1/rules/{id} -- auth. */
+static esp_err_t rules_delete_delete(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+    const char *tail = req->uri + strlen("/api/v1/rules/");
+    const char *suffix = NULL;
+    uint32_t id = parse_rule_id(tail, &suffix);
+    if (id == 0 || (suffix[0] != '\0' && suffix[0] != '?')) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad id");
+        return ESP_OK;
+    }
+    if (!rules_delete(id)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown rule");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* POST /api/v1/rules/{id}/enable {"enabled":bool} -- auth (checked by
+ * rules_post_dispatch() before this is ever reached). */
+static esp_err_t rules_enable_post(httpd_req_t *req, uint32_t id)
+{
+    char body[64];
+    if (req->content_len == 0 || req->content_len > sizeof(body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(body);
+    const cJSON *en = json ? cJSON_GetObjectItem(json, "enabled") : NULL;
+    bool valid = cJSON_IsBool(en);
+    bool want = valid && cJSON_IsTrue(en);
+    cJSON_Delete(json);
+    if (!valid) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid enabled");
+        return ESP_OK;
+    }
+    if (!rules_set_enabled(id, want)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown rule");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* POST /api/v1/rules/{id}/test -- immediate dry-run evaluation (spec §6).
+ * Auth (checked by rules_post_dispatch() before this is ever reached). */
+static esp_err_t rules_test_post(httpd_req_t *req, uint32_t id)
+{
+    bool ready, cond, would_fire;
+    size_t nrefs = PSVM_MAX_REFS;
+    size_t nacts = sizeof(s_rules_test_acts) / sizeof(s_rules_test_acts[0]);
+    int err = rules_test(id, &ready, &cond, &would_fire,
+                         s_rules_test_refs, &nrefs, s_rules_test_acts, &nacts);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown rule");
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "test failed");
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ready", ready);
+    cJSON_AddBoolToObject(root, "cond", cond);
+    cJSON_AddBoolToObject(root, "would_fire", would_fire);
+    cJSON *refs_arr = cJSON_AddArrayToObject(root, "refs");
+    for (size_t i = 0; i < nrefs; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "ref", s_rules_test_refs[i].ref_desc);
+        cJSON_AddNumberToObject(o, "value", s_rules_test_refs[i].value);
+        cJSON_AddNumberToObject(o, "age_s", s_rules_test_refs[i].age_s);
+        cJSON_AddBoolToObject(o, "ready", s_rules_test_refs[i].ready);
+        cJSON_AddItemToArray(refs_arr, o);
+    }
+    cJSON *acts_arr = cJSON_AddArrayToObject(root, "actions");
+    for (size_t i = 0; i < nacts; i++) cJSON_AddItemToArray(acts_arr, cJSON_CreateString(s_rules_test_acts[i].msg));
+    return send_json(req, root);
+}
+
+/* POST /api/v1/rules/{id}[/enable|/test] -- all under the SAME registered
+ * wildcard route, same ESP-IDF one-wildcard-per-prefix reason
+ * node_post_dispatch()/plants_post_dispatch() above document in full. Auth
+ * checked once here, not in either sub-handler. */
+static esp_err_t rules_post_dispatch(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/rules/");
+    const char *suffix = NULL;
+    uint32_t id = parse_rule_id(tail, &suffix);
+    if (id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad id");
+        return ESP_OK;
+    }
+    if (strncmp(suffix, "/enable", 7) == 0 && (suffix[7] == '\0' || suffix[7] == '?'))
+        return rules_enable_post(req, id);
+    if (strncmp(suffix, "/test", 5) == 0 && (suffix[5] == '\0' || suffix[5] == '?'))
+        return rules_test_post(req, id);
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+    return ESP_OK;
+}
+
 void api_v1_register(httpd_handle_t server)
 {
     httpd_uri_t health = { .uri = "/api/v1/health", .method = HTTP_GET, .handler = health_get };
@@ -1630,4 +2082,23 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &config_g));
     httpd_uri_t config_p = { .uri = "/api/v1/config", .method = HTTP_POST, .handler = config_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &config_p));
+
+    /* Rules (Task 6, spec §6). "GET /api/v1/events?after=" is deliberately
+     * NOT registered here -- see the block comment above rules_list_get()
+     * for why: it shares sse.c's existing exact "/api/v1/events" GET route
+     * instead of a second, colliding registration. */
+    httpd_uri_t rules_g = { .uri = "/api/v1/rules", .method = HTTP_GET, .handler = rules_list_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rules_g));
+    httpd_uri_t rules_c = { .uri = "/api/v1/rules", .method = HTTP_POST, .handler = rules_create_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rules_c));
+    httpd_uri_t rules_get1 = { .uri = "/api/v1/rules/*", .method = HTTP_GET, .handler = rules_get_one };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rules_get1));
+    httpd_uri_t rules_put = { .uri = "/api/v1/rules/*", .method = HTTP_PUT, .handler = rules_update_put };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rules_put));
+    httpd_uri_t rules_del = { .uri = "/api/v1/rules/*", .method = HTTP_DELETE, .handler = rules_delete_delete };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rules_del));
+    /* Handles "/{id}/enable" and "/{id}/test" -- both under this one route,
+     * per rules_post_dispatch()'s comment. */
+    httpd_uri_t rules_post = { .uri = "/api/v1/rules/*", .method = HTTP_POST, .handler = rules_post_dispatch };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rules_post));
 }
