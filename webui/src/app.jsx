@@ -45,7 +45,7 @@ function MoonIcon() {
 function Footer() {
   return (
     <footer class="site-footer">
-      <a href="https://plaiiin-planhub.com" target="_blank" rel="noreferrer">@plaiiin-planhub.com</a>
+      <a href="https://PlantHubOS.com" target="_blank" rel="noreferrer">@PlantHubOS.com</a>
     </footer>
   )
 }
