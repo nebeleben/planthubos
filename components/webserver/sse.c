@@ -156,12 +156,42 @@ static esp_err_t events_get(httpd_req_t *req)
 {
     /* JSON poll branch (see events_json_get()'s comment above) -- checked
      * first, before any SSE client-slot bookkeeping below, since a poll
-     * request never wants one. */
+     * request never wants one.
+     *
+     * Reviewer fix: must distinguish "genuinely no after key"
+     * (ESP_ERR_NOT_FOUND at either step below -- falls through to the SSE
+     * stream, unchanged) from any OTHER non-OK result
+     * (ESP_ERR_HTTPD_RESULT_TRUNC for a query string over 63 bytes or an
+     * "after" value over 15 bytes, ESP_ERR_INVALID_ARG, ...), which must
+     * 400 rather than silently fall through -- an unauthenticated
+     * GET .../events?after=<16+ digits> would otherwise be misrouted into
+     * claiming one of the only SSE_MAX_CLIENTS==2 slots, and two such
+     * requests can starve the live feed for every real client
+     * indefinitely. A present-but-non-numeric "after" value is likewise
+     * rejected (strict endptr check) rather than silently treated as 0. */
     char query[64], val[16];
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-        httpd_query_key_value(query, "after", val, sizeof(val)) == ESP_OK) {
-        return events_json_get(req, (uint32_t)strtoul(val, NULL, 10));
+    esp_err_t qerr = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (qerr == ESP_OK) {
+        esp_err_t kerr = httpd_query_key_value(query, "after", val, sizeof(val));
+        if (kerr == ESP_OK) {
+            char *endptr = NULL;
+            unsigned long after = strtoul(val, &endptr, 10);
+            if (endptr == val || *endptr != '\0') {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad events query");
+                return ESP_OK;
+            }
+            return events_json_get(req, (uint32_t)after);
+        }
+        if (kerr != ESP_ERR_NOT_FOUND) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad events query");
+            return ESP_OK;
+        }
+        /* kerr == ESP_ERR_NOT_FOUND: query string present, just no "after" key -- fall through to SSE. */
+    } else if (qerr != ESP_ERR_NOT_FOUND) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad events query");
+        return ESP_OK;
     }
+    /* qerr == ESP_ERR_NOT_FOUND (no query string at all): fall through to SSE. */
 
     int slot = -1;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
