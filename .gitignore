@@ -21,4 +21,5 @@ tests/host/test_battery_sched
 tests/host/test_batt_cycle
 tests/host/test_plants_table
 tests/host/test_plants_migrate
+tests/host/test_psvm
 .DS_Store

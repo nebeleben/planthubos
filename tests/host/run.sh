@@ -65,3 +65,7 @@ $CC -Wall -Wextra -Werror -I../../components/plants/include \
 $CC -Wall -Wextra -Werror -I../../components/plants/include \
     test_plants_migrate.c ../../components/plants/plants_migrate.c ../../components/plants/plants_table.c -o test_plants_migrate
 ./test_plants_migrate
+
+$CC -Wall -Wextra -Werror -I../../components/psvm/include \
+    test_psvm.c ../../components/psvm/psvm.c -o test_psvm
+./test_psvm
