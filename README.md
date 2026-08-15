@@ -87,11 +87,6 @@ page. Updates after that happen over the air from the hub's own web page.
     both a *Factory reset* that keeps your plant data and a *Hard factory
     reset* that wipes the hub back to a fresh install.
 
-## About this repository
+## License
 
-This is the read-only source mirror of PlantHub's firmware, published from a
-private development mono-repo. Issues are welcome here; the code itself is
-force-pushed by the mirror pipeline, so direct pull requests cannot be
-merged in place.
-
-Home Assistant and HomeBridge integrations live in their own repositories.
+PlantHubOS is licensed under the [Apache License 2.0](LICENSE).
