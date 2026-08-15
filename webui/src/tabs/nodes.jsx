@@ -302,12 +302,10 @@ function NodeCard({ n, fwVersion, open, onToggle, onSaved, onForgotten, onPowerM
 
   async function forget() {
     if (!confirm(
-      `Forget node ${n.name || n.mac}? The hub will notify it over the air so it re-enters pairing ` +
-      `mode on its own -- but that notification is best-effort (it needs the node to be powered on ` +
-      `and listening right now). If it was off, or otherwise never receives it, it will keep ` +
-      `believing it is paired -- the hub silently drops its readings after radio-acking them, so it ` +
-      `sees "successful" sends and never resyncs by itself. In that case, recover it by physically ` +
-      `holding its BOOT button for 10 seconds to force it back into pairing mode.`
+      `Forget node ${n.name || n.mac}? The hub notifies it over the air so it re-enters pairing ` +
+      `mode on its own — but that's best-effort (the node must be powered on and listening right ` +
+      `now). If it never gets the message, force it back into pairing mode yourself: unplug/replug ` +
+      `power 5 times quickly, or hold its BOOT button for 10 seconds.`
     )) return
     setForgetting(true)
     try {
