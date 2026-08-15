@@ -5,6 +5,15 @@
  * given seq is (seq-1) % EVENT_SLOTS -- seq 0 is reserved to mean "empty
  * slot" (see event_t.seq), so seqs start at 1 and wrap trivially. */
 
+void event_ring_sanitize(event_t *slots)
+{
+    for (uint32_t i = 0; i < EVENT_SLOTS; i++) {
+        if (slots[i].msg[EVENT_MSG_MAX] != '\0' || slots[i].level > 1) {
+            memset(&slots[i], 0, sizeof(slots[i]));
+        }
+    }
+}
+
 void event_ring_init(event_ring_t *r, event_t *slots)
 {
     r->slots = slots;

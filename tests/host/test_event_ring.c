@@ -78,6 +78,56 @@ int main(void)
     assert(out[0].seq == 8);
     assert(out[1].seq == 9);
 
+    /* event_ring_sanitize: a torn write can leave a slot with garbage --
+     * including a bogus seq that event_ring_init would otherwise trust
+     * and use to desync the whole ring's numbering. A slot failing
+     * validity (level > 1, or no NUL at msg[EVENT_MSG_MAX]) must be
+     * zeroed; valid slots must survive untouched. */
+    event_t torn[EVENT_SLOTS];
+    memset(torn, 0, sizeof(torn));
+
+    /* valid slot, seq=1 */
+    torn[0].seq = 1;
+    torn[0].ts = 1700000000u;
+    torn[0].rule_id = 11;
+    torn[0].level = 0;
+    snprintf(torn[0].msg, sizeof(torn[0].msg), "valid1");
+
+    /* torn write: bogus huge seq + invalid level (>1) -- must be zeroed */
+    torn[1].seq = 0xFFFFFFFFu;
+    torn[1].ts = 1700000001u;
+    torn[1].rule_id = 12;
+    torn[1].level = 7;
+    snprintf(torn[1].msg, sizeof(torn[1].msg), "garbage-level");
+
+    /* torn write: no NUL at msg[EVENT_MSG_MAX] -- must be zeroed */
+    torn[2].seq = 3;
+    torn[2].ts = 1700000002u;
+    torn[2].rule_id = 13;
+    torn[2].level = 0;
+    memset(torn[2].msg, 'y', sizeof(torn[2].msg));   /* fills msg[EVENT_MSG_MAX] too, no NUL anywhere */
+
+    /* valid slot, seq=4 (also the highest surviving seq) */
+    torn[3].seq = 4;
+    torn[3].ts = 1700000003u;
+    torn[3].rule_id = 14;
+    torn[3].level = 1;
+    snprintf(torn[3].msg, sizeof(torn[3].msg), "valid4");
+
+    event_ring_sanitize(torn);
+    assert(torn[0].seq == 1);
+    assert(strcmp(torn[0].msg, "valid1") == 0);
+    assert(torn[1].seq == 0);   /* zeroed: invalid level */
+    assert(torn[1].level == 0);
+    assert(torn[2].seq == 0);   /* zeroed: missing NUL terminator */
+    assert(torn[3].seq == 4);
+    assert(strcmp(torn[3].msg, "valid4") == 0);
+
+    /* the bogus huge seq must not leak into next_seq once sanitized */
+    event_ring_t r4;
+    event_ring_init(&r4, torn);
+    assert(r4.next_seq == 5);
+
     printf("test_event_ring: OK\n");
     return 0;
 }

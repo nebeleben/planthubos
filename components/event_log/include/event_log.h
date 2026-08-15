@@ -16,6 +16,13 @@ typedef struct {
 
 /* Pure ring over a caller-provided slot array (host-testable). */
 typedef struct { event_t *slots; uint32_t next_seq; } event_ring_t;
+/* Zeroes any slot that fails validity (msg[EVENT_MSG_MAX] != '\0', or
+ * level > 1) -- a torn write (unclean power loss mid-record) can leave a
+ * slot with a bogus seq, which event_ring_init would otherwise trust and
+ * use to desync the whole ring's numbering. Call before event_ring_init
+ * on any array loaded from persistent storage. event_ring_append always
+ * produces valid slots, so this never touches a slot it wrote itself. */
+void     event_ring_sanitize(event_t *slots);
 void     event_ring_init(event_ring_t *r, event_t *slots);         /* scans for max seq */
 uint32_t event_ring_append(event_ring_t *r, uint32_t ts, uint32_t rule_id,
                            uint8_t level, const char *msg);         /* returns seq */
