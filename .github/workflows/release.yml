@@ -51,22 +51,14 @@ jobs:
     needs: webui
     runs-on: ubuntu-latest
     container:
-      # Per-chip IDF version (from the matrix include): esp32/esp32c3 stay
-      # on v5.3.2 -- the version every shipped device was built and
-      # hardware-validated with -- while esp32c5 needs v5.5+, where the C5
-      # is a fully supported target (it is preview-only in 5.3/5.4).
-      image: espressif/idf:${{ matrix.idf }}
+      # v2 builds every chip with one IDF: v5.5+ is required by the esp32c5
+      # (preview-only before that) and the Zigbee stack, and esp32/esp32c3
+      # moved up with it in V2/M0.
+      image: espressif/idf:v5.5.5
     strategy:
       fail-fast: false
       matrix:
         chip: [esp32, esp32c3, esp32c5]
-        include:
-          - chip: esp32
-            idf: v5.3.2
-          - chip: esp32c3
-            idf: v5.3.2
-          - chip: esp32c5
-            idf: v5.5.5
         # Per-region release builds (M9): each region overlay sets its own
         # CONFIG_PLANTHUB_WIFI_COUNTRY (sdkconfig.region.<region>) -- see
         # PlanV1 8e for why this can't just be one world-safe build. Region
@@ -101,7 +93,13 @@ jobs:
           idf.py -B "build_${{ matrix.chip }}_${{ matrix.region }}" \
                  -D SDKCONFIG="build_${{ matrix.chip }}_${{ matrix.region }}/sdkconfig" \
                  -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.region.${{ matrix.region }}" \
-                 -D IDF_TARGET=${{ matrix.chip }} build
+                 -D IDF_TARGET=${{ matrix.chip }} build 2>&1 | tee build.log
+          # Size report: the partition-size check line ("planthub.bin binary
+          # size ... free") lands in the job summary so per-chip headroom is
+          # one click away on every release -- the C3 1600K ceiling is a
+          # tracked V2 risk (roadmap spec section 9).
+          echo '### ${{ matrix.chip }} (${{ matrix.region }})' >> "$GITHUB_STEP_SUMMARY"
+          grep -o 'planthub.bin binary size.*' build.log >> "$GITHUB_STEP_SUMMARY" || echo 'size line not found' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect artifacts
         run: |
