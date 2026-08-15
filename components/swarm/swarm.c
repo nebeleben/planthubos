@@ -18,6 +18,7 @@
 #include "registry.h"
 #include "mibeacon.h"
 #include "app_config.h"
+#include "rules.h"
 
 #include "cJSON.h"
 #include "esp_event.h"
@@ -192,6 +193,16 @@ static void ingest_reading(const uint8_t src[6], const swarm_reading_t *r, int r
      * which is the hub's signal to the node, not the node's signal to the
      * sensor). */
     data_core_submit_from(&m, src, r->rssi, r->age_s);
+    /* Wake the rules engine (spec §4 "Triggers") for the swarm-ingest leg,
+     * same as ble_collector.c's gap_event() does for the hub's own direct
+     * BLE reception -- see that call site's comment for why a plain
+     * event-group bit set is safe to add here despite ingest_reading()
+     * running on the ESP-NOW receive callback (WiFi driver task), the exact
+     * context this file's own comment above already established
+     * data_core_submit_from() itself is safe to call from directly (short,
+     * bounded, never blocks). rules_notify_value_update() is safe before
+     * rules_init() has run (rules.h). */
+    rules_notify_value_update();
     record_stat(src, rssi);
 }
 

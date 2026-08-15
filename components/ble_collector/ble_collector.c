@@ -4,6 +4,7 @@
 #include "battery_sched.h"
 #include "ble_collector_internal.h"
 #include "swarm_store.h"
+#include "rules.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -82,6 +83,20 @@ static int gap_event(struct ble_gap_event *event, void *arg)
              * wrapper already uses for callers with no RSSI at all. */
             int8_t rssi = (event->disc.rssi == 127) ? 0 : event->disc.rssi;
             data_core_submit_from(&m, NULL, rssi, 0);
+            /* Wake the rules engine (spec section 4 "Triggers"): a plain
+             * event-group bit set, safe from this callback despite it
+             * running on the NimBLE host task rather than a dedicated task
+             * -- same "short, bounded, never blocks" standard
+             * data_core_submit_from() itself is held to just above.
+             * data_core_submit_from() is void (no merged/duplicate/full
+             * signal to gate on), so this fires for every accepted MiFlora
+             * frame, not just ones that changed a value; the engine's own
+             * 2s debounce (rules_engine.c) absorbs that, and re-resolving
+             * to the same reading on a duplicate value is harmless, not a
+             * spurious fire (rules_fsm.h's edge/level semantics key off the
+             * condition result, not off "did a value change"). Safe before
+             * rules_init() has run (rules.h). */
+            rules_notify_value_update();
 
             /* Direct reception (this file only ever handles the hub's own
              * radio, never a node relay): record it as a battery-poll

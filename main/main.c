@@ -17,6 +17,8 @@
 #include "swarm_store.h"
 #include "integrations.h"
 #include "plants.h"
+#include "event_log.h"
+#include "rules.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -199,6 +201,27 @@ void app_main(void)
 
             esp_err_t ierr = integrations_start();
             if (ierr != ESP_OK) ESP_LOGE(TAG, "integrations start failed (%s); continuing without them", esp_err_to_name(ierr));
+
+            /* M1 rules engine (spec §4): hub-only, same as plants_init()
+             * just above -- a rule's plant() refs need the plant table,
+             * which nodes never load. event_log_init() must run before
+             * rules_init() starts the engine task: rules_engine.c's real
+             * firing path calls event_log_append() on every fire, and that
+             * function dereferences event_log's static ring, which stays
+             * NULL/zeroed (and would crash on first use) until
+             * event_log_init() has loaded it -- see event_log.c. Neither
+             * call can fail boot (see their own headers); both are
+             * log-and-continue like every other storage-adjacent init here.
+             * Note: this lands after webserver_start()/wifi_manager_start()
+             * above, not before as an earlier draft of this ordering
+             * assumed -- those two must stay ahead of swarm_start_main() for
+             * the AP_START/portal-DNS reasons documented at their own call
+             * sites, and no rules HTTP route exists yet for this task's
+             * ordering to protect (Task 6 wires the API). What matters here
+             * is only that both run after plants_init()/data_core_init(),
+             * which they do. */
+            event_log_init();
+            rules_init();
         }
         /* role == NODE only reaches here when swarm_store_pair_failed() is
          * true: the portal is shown so the user can see what happened and
