@@ -2,6 +2,10 @@
 
 **Your plants, on your network — no cloud, no account, no app store.**
 
+> **Heads-up:** `main` is the V2 development line and may be broken or
+> incompatible at any commit. The latest stable firmware is always the
+> newest [v1.x release](https://github.com/nebeleben/planthubos/releases).
+
 PlantHubOS is the open firmware: an ESP32 hub for Xiaomi MiFlora plant sensors. Plug it in,
 join its setup WiFi once, and it quietly watches your plants for you:
 

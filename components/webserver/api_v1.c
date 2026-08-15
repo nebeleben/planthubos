@@ -28,7 +28,7 @@
 #include <stdlib.h>
 
 static const char *TAG = "api_v1";
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "2.0.0-dev"
 
 /* Shared by sensors_get() and plants_get() below (final M8 review, L5):
  * each used to hold its own private `static registry_t` + `static
