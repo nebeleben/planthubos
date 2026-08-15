@@ -27,8 +27,8 @@
 #define RULES_BUILTINS_IMPL 0x3u
 
 /* One in-RAM rule entry. Deliberately does NOT hold the source text or
- * bytecode blob -- at RULES_MAX (32) rules x (RULES_SRC_MAX 4096 +
- * RULES_PSBC_MAX 2048) that would be ~196KB of static RAM, more than this
+ * bytecode blob -- at RULES_MAX (16) rules x (RULES_SRC_MAX 4096 +
+ * RULES_PSBC_MAX 2048) that would be ~98KB of static RAM, more than this
  * class of chip can spare. Source/bytecode live only on LittleFS (raw
  * fopen()/fread() in rules_store.c, plus rules_store_read_psbc() below) and
  * are read into a scratch buffer on the paths that need them

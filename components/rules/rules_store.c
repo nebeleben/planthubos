@@ -376,7 +376,7 @@ int rules_upsert(uint32_t *id_inout, const char *name, const char *source,
         }
         if (idx < 0) {
             xSemaphoreGive(g_rules_mutex);
-            seterr(errbuf, errlen, "rule table full (32 rules max)");
+            seterr(errbuf, errlen, "rule table full (16 rules max)");
             return ESP_ERR_NO_MEM;
         }
         id = g_rules_next_id++;
