@@ -1456,6 +1456,51 @@ static esp_err_t config_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* POST /api/v1/sensors/{MAC12} {"name":"..."} -- probe display name, NVS-
+ * backed via app_config_set_sensor_name() (<=32 chars, "" clears). Any
+ * well-formed mac is accepted, registry-known or not: names key off the
+ * mac alone, and pre-naming a probe that hasn't been heard yet is
+ * harmless (the same reasoning that lets plants pre-assign one). Purely
+ * cosmetic -- plant identity/history never key off this. */
+static esp_err_t sensors_rename_post(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/sensors/");
+    uint8_t mac[6];
+    if (!parse_mac12(tail, mac) || (tail[12] != '\0' && tail[12] != '?')) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown sensors route");
+        return ESP_OK;
+    }
+
+    char body[128];
+    if (req->content_len == 0 || req->content_len > sizeof(body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_OK;
+    }
+    int r = httpd_req_recv(req, body, req->content_len);
+    if (r <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+        return ESP_OK;
+    }
+    body[r] = '\0';
+
+    cJSON *json = cJSON_Parse(body);
+    const cJSON *name = json ? cJSON_GetObjectItem(json, "name") : NULL;
+    esp_err_t err = cJSON_IsString(name)
+        ? app_config_set_sensor_name(mac, name->valuestring) : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(json);
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"bad name (max 32 chars)\"}");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 /* POST /api/v1/factory_reset {"wipe_data":bool} -- network-triggered
  * factory reset, claimed hubs only. Two deliberate gates: a 403 when the
  * hub is unclaimed (an unclaimed hub's mutations are otherwise open, but
@@ -1529,6 +1574,8 @@ void api_v1_register(httpd_handle_t server)
      * per-sensor history or rename routes anymore (removed, see
      * plants_history_get()'s comment for why the history route in
      * particular isn't just re-registered under this prefix). */
+    httpd_uri_t sensors_rn = { .uri = "/api/v1/sensors/*", .method = HTTP_POST, .handler = sensors_rename_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensors_rn));
     httpd_uri_t sensors = { .uri = "/api/v1/sensors", .method = HTTP_GET, .handler = sensors_get };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensors));
 

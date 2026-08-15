@@ -95,6 +95,9 @@ cJSON *sensor_json(const sensor_entry_t *e)
 cJSON *probe_json(const sensor_entry_t *e, uint8_t plant_id, uint32_t now_uptime_s)
 {
     cJSON *o = probe_core_json(e);
+    char name[33];
+    if (app_config_get_sensor_name(e->mac, name)) cJSON_AddStringToObject(o, "name", name);
+    else cJSON_AddNullToObject(o, "name");
     cJSON_AddNumberToObject(o, "last_seen_s", age_s(now_uptime_s, e->last_seen_s));
     if (plant_id != 0) cJSON_AddNumberToObject(o, "plant_id", plant_id);
     else cJSON_AddNullToObject(o, "plant_id");

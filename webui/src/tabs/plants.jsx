@@ -31,7 +31,7 @@ function ProbeSelect({ p, sensors, onAssigned }) {
     const s = sensors.find((x) => x.mac === mac)
     if (!s) return `${mac} · not heard yet`
     const owner = s.plant_id != null && s.plant_id !== p.id ? ` · on ${s.owner_label}` : ''
-    return `${mac} · ${fmtAge(s.last_seen_s)}${owner}`
+    return `${s.name || s.mac} · ${fmtAge(s.last_seen_s)}${owner}`
   }
 
   async function onChange(e) {
