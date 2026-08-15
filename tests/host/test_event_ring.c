@@ -44,19 +44,20 @@ int main(void)
     for (int i = 0; i < EVENT_MSG_MAX; i++) assert(out[0].msg[i] == 'x');
     assert(out[0].msg[EVENT_MSG_MAX] == '\0');
 
-    /* 257 appends overwrite oldest (read after=0 yields 256, oldest seq==2) */
+    /* EVENT_SLOTS+1 appends overwrite oldest (read after=0 yields
+     * EVENT_SLOTS entries, oldest seq==2) */
     memset(g_slots, 0, sizeof(g_slots));
     event_ring_t r2;
     event_ring_init(&r2, g_slots);
-    for (int i = 0; i < 257; i++) {
+    for (int i = 0; i < EVENT_SLOTS + 1; i++) {
         char msg[16];
         snprintf(msg, sizeof(msg), "e%d", i);
         event_ring_append(&r2, 1700000000u + (uint32_t)i, (uint32_t)i, 0, msg);
     }
     n = event_ring_read(&r2, 0, out, EVENT_SLOTS);
-    assert(n == 256);
+    assert(n == EVENT_SLOTS);
     assert(out[0].seq == 2);
-    assert(out[255].seq == 257);
+    assert(out[EVENT_SLOTS - 1].seq == EVENT_SLOTS + 1);
 
     /* event_ring_init on a prefilled array (simulated reboot: slots with
      * seqs 5..9) continues at next_seq 10 and read(after=7) returns 8,9 */

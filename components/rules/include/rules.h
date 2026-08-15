@@ -4,7 +4,10 @@
 #include <stddef.h>
 #include "psvm.h"
 
-#define RULES_MAX        32
+/* 16, not the spec's 32: the rule table is static RAM (~200B/slot) and the
+ * C3 ran out of heap for BLE/sampler during M1 hardware validation -- see
+ * the matching note in event_log.h. 16 concurrent rules is plenty for M1. */
+#define RULES_MAX        16
 #define RULES_SRC_MAX    4096
 #define RULES_PSBC_MAX   2048
 #define RULES_NAME_MAX   48

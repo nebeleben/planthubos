@@ -3,7 +3,14 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define EVENT_SLOTS   256
+/* 64, not the spec's original 256: the ring is mirrored in static RAM
+ * (EVENT_SLOTS * sizeof(event_t) ~ 8.5KB at 64). At 256 (~34KB) the C3
+ * no longer had enough contiguous heap for the BLE controller -- BLE_INIT
+ * "hci inits failed" on real hardware, silently killing sensor collection.
+ * 32 events is still ample feed history for the UI (second reduction from
+ * 64: the sampler then failed ESP_ERR_NO_MEM on the same board -- every
+ * static KB matters on the C3 once WiFi+BLE are both up). */
+#define EVENT_SLOTS   32
 #define EVENT_MSG_MAX 118
 
 typedef struct {
