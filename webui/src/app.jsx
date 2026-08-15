@@ -7,13 +7,22 @@ import { NetworkTab } from './tabs/network.jsx'
 import { NodesTab } from './tabs/nodes.jsx'
 import { PlantsTab } from './tabs/plants.jsx'
 import { RoleTab } from './tabs/role.jsx'
+import { RulesTab } from './tabs/rules.jsx'
 import { getStoredTheme, setStoredTheme, systemPrefersDark } from './lib/theme.js'
 
 // Post-M8 split: Dashboard is the live plant cards (DashboardTab),
 // Plants is plant management -- create/rename/delete plus per-plant probe
 // assignment (plants.jsx), and Probes is just the probe pool
-// (devices.jsx, which keeps its own sensor-side assign control).
-const ALL_TABS = ['Dashboard', 'Plants', 'Probes', 'History', 'Nodes', 'Config', 'Network']
+// (devices.jsx, which keeps its own sensor-side assign control). Rules
+// (M1 VM) sits after History, ahead of Nodes -- both mirror the same
+// "operate the fleet" grouping the tab order already implies.
+const ALL_TABS = ['Dashboard', 'Plants', 'Probes', 'History', 'Rules', 'Nodes', 'Config', 'Network']
+
+// localStorage key the Rules tab's own event feed (rules.jsx) writes on
+// every fetch while mounted -- reading it here is how the tab bar knows
+// whether unseen rule events exist without duplicating an SSE connection
+// just for a badge (the hub's SSE endpoint caps at 2 clients total).
+const EVENTS_SEEN_KEY = 'planthub_events_seen'
 
 function Placeholder({ name }) {
   return <p class="placeholder">{name} — coming in a later milestone.</p>
@@ -65,6 +74,31 @@ export function App() {
   // prefers-color-scheme block both use; this only tracks it in JS so the
   // toggle icon can react without a page reload.
   const [theme, setTheme] = useState(() => getStoredTheme() || (systemPrefersDark() ? 'dark' : 'light'))
+
+  // Rules tab-badge (Task 7 brief): a cheap poll against the "after=<seen>"
+  // JSON branch of GET /api/v1/events (never the SSE stream -- see the
+  // EVENTS_SEEN_KEY comment above) tells us whether last_seq has moved past
+  // whatever the Rules tab itself last recorded as seen. Runs regardless of
+  // which tab is active so the dot can appear while the operator is
+  // elsewhere; cleared immediately (optimistically) the moment they click
+  // into Rules, since mounting that tab is what actually advances the
+  // "seen" bookmark for real.
+  const [rulesUnseen, setRulesUnseen] = useState(false)
+
+  useEffect(() => {
+    if (role === 'node' || role === 'unset') return   // no Rules tab there at all -- see TABS below
+    const controller = new AbortController()
+    function poll() {
+      const seen = Number(localStorage.getItem(EVENTS_SEEN_KEY) || '0')
+      fetch(`/api/v1/events?after=${seen}`, { signal: controller.signal })
+        .then((r) => r.json())
+        .then((d) => setRulesUnseen((d.last_seq || 0) > seen))
+        .catch(() => {})
+    }
+    poll()
+    const id = setInterval(poll, 15000)
+    return () => { clearInterval(id); controller.abort() }
+  }, [role])
 
   useEffect(() => {
     if (getStoredTheme()) return   // explicit override in effect: OS changes don't apply
@@ -122,8 +156,10 @@ export function App() {
 
   // Nodes only means anything on a hub (unset/main); a node device runs no
   // node-management surface of its own, so hide the tab there rather than
-  // rendering an empty/confusing list.
-  const TABS = role === 'node' ? ALL_TABS.filter((t) => t !== 'Nodes') : ALL_TABS
+  // rendering an empty/confusing list. Rules follows the same rule -- the
+  // rules engine (components/rules) only ever runs on the hub that owns the
+  // plant/device registry, never on a paired node.
+  const TABS = role === 'node' ? ALL_TABS.filter((t) => t !== 'Nodes' && t !== 'Rules') : ALL_TABS
 
   return (
     <div class="app">
@@ -133,8 +169,10 @@ export function App() {
         </div>
         <nav>
           {TABS.map((t) => (
-            <button key={t} class={'tab-btn' + (t === tab ? ' active' : '')} onClick={() => setTab(t)}>
+            <button key={t} class={'tab-btn' + (t === tab ? ' active' : '')}
+                    onClick={() => { setTab(t); if (t === 'Rules') setRulesUnseen(false) }}>
               {t}
+              {t === 'Rules' && rulesUnseen && <span class="tab-dot" aria-hidden="true" />}
             </button>
           ))}
         </nav>
@@ -148,6 +186,7 @@ export function App() {
          tab === 'Plants' ? <PlantsTab /> :
          tab === 'Probes' ? <DevicesTab /> :
          tab === 'History' ? <HistoryTab /> :
+         tab === 'Rules' ? <RulesTab /> :
          tab === 'Nodes' ? <NodesTab /> :
          tab === 'Config' ? <ConfigTab /> :
          tab === 'Network' ? <NetworkTab /> :

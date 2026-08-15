@@ -255,12 +255,25 @@ button:focus-visible {
 
 /* Tab bar: pill style, accent fill on the active tab. */
 .tab-btn {
+  position: relative;   /* anchors .tab-dot (Rules tab's unseen-events badge) */
   min-height: 32px;
   padding: 6px 14px;
   border-radius: 999px;
   border: 1px solid transparent;
   background: transparent;
   color: var(--text-muted);
+}
+
+/* Unseen-rule-events indicator (app.jsx's rulesUnseen) -- a plain dot, not
+   a count: the events feed itself is the place to see how many/what. */
+.tab-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-strong);
 }
 
 .tab-btn:hover:not(:disabled) {
@@ -334,6 +347,28 @@ input[type='file'] {
   font: inherit;
   color: var(--text);
 }
+
+/* Rules tab's source editor -- same field chrome as inputs/selects above,
+   sized for code rather than a single line. */
+textarea {
+  font: inherit;
+  width: 100%;
+  max-width: 100%;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--input-bg);
+  color: var(--text);
+  resize: vertical;
+}
+
+textarea:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.rule-source { font-size: 0.85rem; margin-bottom: 0.6rem; }
 
 label {
   display: block;
@@ -531,6 +566,7 @@ progress {
 .node-card-footer {
   display: flex;
   justify-content: flex-end;
+  gap: 0.5rem;
   margin-top: 0.8rem;
 }
 
@@ -624,3 +660,21 @@ button + .hint, .btn-primary + .hint { margin-left: 14px; }
   transition: background-color 0.15s ease, border-color 0.15s ease;
 }
 .filebtn input[type='file'] { display: none; }
+
+/* Rules tab event feed: level badge (log/notify -- spec §5's event_t.level). */
+.level-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  color: var(--text-muted);
+}
+.level-badge.level-notify {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+}
