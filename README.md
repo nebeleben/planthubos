@@ -84,8 +84,8 @@ page. Updates after that happen over the air from the hub's own web page.
     and pairings are cleared, your plants and their history survive, and
     the setup network comes back.
   - **From the hub's own page** (claimed hubs only): the Config tab has
-    both a factory reset that keeps your plant data and a *factory reset +
-    erase data* that wipes the hub back to a fresh install.
+    both a *Factory reset* that keeps your plant data and a *Hard factory
+    reset* that wipes the hub back to a fresh install.
 
 ## About this repository
 
