@@ -21,7 +21,7 @@ join its setup WiFi once, and it quietly watches your plants for you:
 
 Grab the latest firmware from the
 [Releases](https://github.com/nebeleben/planthubos/releases) page and flash
-it to an ESP32 or ESP32-C3 board.
+it to an ESP32, ESP32-C3 or ESP32-C5 board.
 
 ### Which download?
 
@@ -47,9 +47,10 @@ esptool --chip esp32c3 write_flash \
 ```
 
 (Swap `planthub-esp32c3-eu.bin` for the `-us`/`-jp` variant, or the
-`esp32` filenames, as needed — `bootloader`/`partition-table`/`ota_data_initial`
-don't vary by region, only by chip. Classic ESP32 flashes its bootloader at
-`0x1000`, not `0x0` — the release notes carry both full commands.)
+`esp32`/`esp32c5` filenames, as needed — `bootloader`/`partition-table`/`ota_data_initial`
+don't vary by region, only by chip. The bootloader offset does vary:
+`0x0` on ESP32-C3, `0x2000` on ESP32-C5, `0x1000` on classic ESP32 — the
+release notes carry the full command for every chip.)
 
 Then connect to the `PlantHub-XXXX` WiFi it broadcasts and follow the setup
 page. Updates after that happen over the air from the hub's own web page.

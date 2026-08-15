@@ -11,6 +11,7 @@
 
 #include "esp_now.h"
 #include "esp_wifi.h"
+#include "esp_idf_version.h"
 #include "esp_mac.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -66,9 +67,17 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
     s_rx_cb(info->src_addr, data, len, rssi);
 }
 
+/* IDF 5.4 changed the send-callback's first parameter from the peer MAC to
+ * a wifi_tx_info_t*. This callback never used it either way. */
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+static void on_send(const wifi_tx_info_t *tx_info, esp_now_send_status_t status)
+{
+    (void)tx_info;
+#else
 static void on_send(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
     (void)mac_addr;
+#endif
     s_last_status = status;
     s_send_complete_seq++;   /* claim the next ticket, in strict completion order */
     xSemaphoreGive(s_send_done);
