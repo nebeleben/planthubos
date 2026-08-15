@@ -133,7 +133,7 @@ export function ConfigTab() {
   }
 
   async function doUnclaim() {
-    if (!confirm('Unclaim this hub? Mutating endpoints become open again.')) return
+    if (!confirm('Unclaim this hub? Releases your ownership — the hub stays reachable, and anyone on your network can claim it.')) return
     setBusy('unclaim')
     try {
       const res = await fetch('/api/v1/unclaim', { method: 'POST', headers: authHeaders() })
