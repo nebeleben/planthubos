@@ -4,10 +4,34 @@
  * evaluate-one-rule path used both by the real firing loop and by
  * rules_test()'s dry run.
  *
- * Engine task stack is 8192, not a smaller default: psvm_run()'s own stack
- * frame is close to 3KB (value_t stack[32] + a 512-byte string build
- * buffer), stacked on top of this file's own scratch locals -- see
- * task-5-brief review notes. */
+ * Engine task stack is 8192. The original justification for that number was
+ * wrong in its arithmetic and right in its conclusion, so both halves are
+ * recorded here (M2 Task 4 hardware hotfix, round 4, which audited every
+ * oversized allocation on the hub boot path after a boot heap trace showed
+ * the device running on 2.6 KB of free heap):
+ *
+ *   - WRONG: "psvm_run()'s own stack frame is close to 3KB". Measured on the
+ *     actual C3 build (`riscv32-esp-elf-objdump -d psvm.c.obj`, prologue
+ *     `addi sp,sp,-N`), psvm_run()'s frame is 1632 B -- the compiler overlaps
+ *     the block-scoped `tmp[PSVM_STACK]`/`msgbuf[PSVM_STRBUF]` locals with
+ *     the function-scope `stack[32]`/`strbuf[512]` rather than stacking them.
+ *
+ *   - RIGHT: 8192 is still the correct size, for a reason the old comment
+ *     never named. The deep path is not psvm_run() itself but what runs
+ *     UNDERNEATH it: engine_task (16) -> evaluate_all (416) -> evaluate_real
+ *     (368) -> psvm_run (1632) -> real_sink -> event_log_append (192) ->
+ *     fopen/fwrite into LittleFS (VFS + lfs_dir_commit/lfs_dir_traverse
+ *     chain, ~1.5-2 KB) -> then the SSE and MQTT hooks, which
+ *     event_log_append calls before returning. All of that is live at once,
+ *     because real_sink is invoked from inside psvm_run. Worst case measures
+ *     out near 5 KB, so 8192 is roughly a 1.6x margin, not the 3x the old
+ *     comment implied -- and cutting it to 6144 to reclaim 2 KB of heap would
+ *     leave about 1 KB, which is not a margin worth having on a device whose
+ *     failure mode is a stack-overflow panic.
+ *
+ * engine_task() logs its real high-water mark after the first evaluation
+ * pass (see there) so a future round can size this from a boot log instead
+ * of from a call-chain estimate. */
 #include "rules_internal.h"
 #include "event_log.h"
 #include "esp_log.h"
@@ -362,6 +386,18 @@ void rules_engine_sync_timer(rule_t *r)
 static void engine_task(void *arg)
 {
     (void)arg;
+    /* See this file's header comment: ENGINE_TASK_STACK is the single
+     * largest dynamic task allocation on the hub boot path, and until now
+     * its size rested on an estimate (a wrong one, at that). This logs the
+     * measured headroom after the first evaluation pass, and again whenever
+     * a later pass sets a new low -- a fire path that reaches LittleFS and
+     * the SSE/MQTT hooks is deeper than a no-op pass, so the first pass
+     * alone is NOT representative here (unlike the sampler's). Cheap
+     * (uxTaskGetStackHighWaterMark is a stack scan, once per pass) and
+     * permanent: it is what lets a future round reclaim heap from this
+     * stack with evidence, and it turns a would-be stack-overflow panic
+     * into a visible warning first. */
+    static UBaseType_t lowest_free = (UBaseType_t)-1;
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(s_events, VALUE_UPDATE_BIT | PERIODIC_BIT,
                                                pdTRUE, pdFALSE, portMAX_DELAY);
@@ -376,6 +412,12 @@ static void engine_task(void *arg)
             evaluate_all(false);
         } else if (bits & PERIODIC_BIT) {
             evaluate_all(true);
+        }
+        UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL);
+        if (free_bytes < lowest_free) {
+            lowest_free = free_bytes;
+            ESP_LOGI(TAG, "engine task stack high-water mark: %u B unused of %u B",
+                     (unsigned)free_bytes, (unsigned)ENGINE_TASK_STACK);
         }
     }
 }

@@ -47,7 +47,23 @@ static bool s_agg_used[PLANTS_MAX];
  * enabled project-wide (sdkconfig). Stack size kept at the existing 4096
  * bytes, unchanged -- no `uxTaskGetStackHighWaterMark()` measurement is
  * available without hardware access this round, so this deliberately does
- * NOT guess a smaller size; only WHERE the bytes come from changed. */
+ * NOT guess a smaller size; only WHERE the bytes come from changed.
+ *
+ * Round 4 KEPT this, having reconsidered it. Round 3's boot heap trace
+ * showed the real defect was elsewhere -- sampler_start() was simply being
+ * called at the one moment in the boot sequence when only 2624 B of heap
+ * remained (main.c now starts it ~79 KB earlier, right after plants_init())
+ * -- so the fragmentation reasoning above was not, on its own, the whole
+ * story. Reverting to xTaskCreate() would give these 4096+336 bytes back to
+ * the heap, but that is a wash in total DRAM (.bss and the heap pool come
+ * out of the same 320 KB), and it would re-couple a headline feature's
+ * availability to the allocator's state at one instant during a boot
+ * sequence that has repeatedly proven tight on this board. A guaranteed
+ * start is worth more here than 4.4 KB of pooled-vs-reserved bookkeeping.
+ * What round 4 DID add is the measurement round 2 could not make: see
+ * sampler_task()'s stack high-water-mark log -- if the boot log shows this
+ * 4096 is largely unused, shrinking it is then a safe, evidence-backed
+ * saving in a way that guessing never was. */
 static StaticSemaphore_t s_wake_buf;
 static StackType_t s_sampler_stack[4096];
 static StaticTask_t s_sampler_tcb;
@@ -218,9 +234,28 @@ static void sample_once(void)
 
 static void sampler_task(void *arg)
 {
+    /* Round 4: the 4096-byte stack above has never been validated against a
+     * real run -- round 2 sized it by "keep whatever xTaskCreate() was
+     * asking for", explicitly refusing to guess a smaller number without
+     * hardware. This is that measurement, made permanent and free: after the
+     * first sample (the deepest pass this task ever makes -- registry
+     * snapshot, per-plant binding walk, storage_col_for()/storage_append()
+     * ring-file I/O, hourly aggregation), log the unused headroom once. A
+     * boot log line like `stack high-water mark: N B unused` is what a future
+     * round needs to shrink s_sampler_stack with evidence instead of nerve;
+     * it also catches the opposite case (a near-zero margin) before it
+     * becomes a stack-overflow panic. Logged once, not per sample: this task
+     * runs forever and the first pass is representative. */
+    bool watermark_logged = false;
     while (1) {
         xSemaphoreTake(s_wake, portMAX_DELAY);
         sample_once();
+        if (!watermark_logged) {
+            watermark_logged = true;
+            ESP_LOGI(TAG, "sampler task stack high-water mark after first sample: %u B unused "
+                          "of %u B", (unsigned)(uxTaskGetStackHighWaterMark(NULL)),
+                     (unsigned)sizeof(s_sampler_stack));
+        }
     }
 }
 

@@ -108,8 +108,20 @@ static void batt_cycle_task(void *arg)
  * esp_get_free_heap_size() alone can look healthy while fragmentation
  * blocks it (see sampler.c's log_heap_diag(), added for the same reason
  * one boot-log level down). Called at every major init milestone along the
- * boot path that actually reaches sampler_start() below (hub role,
- * storage_ok) -- see each call site's own placement. */
+ * hub boot path (role != NODE, storage_ok) -- see each call site's own
+ * placement.
+ *
+ * Round 4 refined the milestone set after round 3's trace showed ONE step
+ * ("after swarm/BLE bring-up") swallowing 78.8 KB of the device's 145 KB
+ * boot heap and leaving 2624 B free for the rest of its life. That step
+ * actually covered swarm_start_main(), integrations_start() (opt-in MQTT
+ * client + a 6 KB Influx task), rules_init() (an 8 KB task stack) AND
+ * ble_collector_start(), which is why it could not be acted on. Those are
+ * four separate milestones now, ble_collector.c logs two more inside its
+ * own bring-up, and plants.c logs three inside plants_init() (whose 7956 B
+ * is likewise unexplained by source reading). The goal is that ONE boot log
+ * attributes every kilobyte of that 145 KB, so no future round has to guess
+ * again. Keep them. */
 static void log_heap(const char *milestone)
 {
     ESP_LOGI(TAG, "heap @ %s: free=%u B largest_free_block(8BIT|INTERNAL)=%u B",
@@ -277,6 +289,10 @@ void app_main(void)
              * swarm_start_main() as the only addition. */
             esp_err_t serr = swarm_start_main();
             if (serr != ESP_OK) ESP_LOGE(TAG, "swarm (main) start failed (%s)", esp_err_to_name(serr));
+            /* Own milestone (round 4): swarm_start_main() brings up ESP-NOW
+             * plus two 3 KB-stack responder tasks, and round 3's trace could
+             * not tell those apart from BLE's much larger footprint. */
+            log_heap("after swarm_start_main");
 
             /* M8 Task 2: hub-only plant registry, NVS-backed -- see
              * plants.h. Hub role only (nodes keep no plants), so this lives
@@ -301,8 +317,56 @@ void app_main(void)
             }
             log_heap("after plants_init");
 
+            /* M2 Task 4 hardware hotfix, round 4: sampler_start() USED to
+             * live at the very end of app_main(), after the swarm/BLE
+             * bring-up. The round-3 boot-time heap trace showed why that was
+             * fatal on a C3: the swarm/BLE/integrations stretch below
+             * consumes ~79 KB and leaves ~2.6 KB free for the rest of the
+             * device's life, so the sampler's ~4.4 KB of task + timers could
+             * never be satisfied there -- no amount of .bss tuning fixes a
+             * shortage that lands AFTER the shortage is created. Here, right
+             * after plants_init(), the same trace measured ~81 KB free.
+             *
+             * Safe to run this early -- verified call-by-call, not assumed:
+             * sampler_task() blocks on its semaphore immediately and its
+             * first sample is a 120 s one-shot away, and everything
+             * sample_once() touches is already up at this point --
+             * data_core_snapshot() (data_core_init, above), plants_ids()/
+             * plants_bindings()/plants_cap_value()/plants_resolve_or_create()
+             * (plants_init, immediately above), timekeeper_boot_id()
+             * (timekeeper_init, above), storage_col_for()/storage_append()
+             * (no init at all -- storage.c's cache is a zero-initialised
+             * file-scope static), capability_encode()/hourly_agg_* (pure).
+             * NOTHING in the sampler depends on swarm, ESP-NOW, BLE or the
+             * rules engine: it reads the registry and writes ring files.
+             *
+             * Placement inside the `role != SWARM_ROLE_NODE` block is
+             * equivalent to the old call site's own `role != SWARM_ROLE_NODE`
+             * guard: the two node branches above never fell through to it
+             * either. The one behaviour delta is that a NODE-role device in
+             * the portal fallback with a failed mount no longer logs
+             * "skipping sampler_start: storage unavailable" -- it never
+             * would have started a sampler anyway (nodes keep no history),
+             * so the line was noise there. */
+            if (storage_ok && data_fmt_safe()) {
+                log_heap("before sampler_start");
+                esp_err_t sampler_err = sampler_start("/storage");
+                if (sampler_err != ESP_OK) ESP_LOGE(TAG, "sampler_start failed (%s); running without history sampling", esp_err_to_name(sampler_err));
+                log_heap("after sampler_start");
+            } else if (!storage_ok) {
+                ESP_LOGW(TAG, "skipping sampler_start: storage unavailable");
+            } else {
+                ESP_LOGE(TAG, "data_fmt: on-disk format is newer than this firmware supports; skipping sampler_start");
+            }
+
             esp_err_t ierr = integrations_start();
             if (ierr != ESP_OK) ESP_LOGE(TAG, "integrations start failed (%s); continuing without them", esp_err_to_name(ierr));
+            /* Split out of the old single "after swarm/BLE bring-up"
+             * milestone (round 3): MQTT (esp-mqtt client + its own task) and
+             * Influx (a 6 KB task) are both opt-in but, when enabled, are
+             * several KB each -- lumping them in with swarm/BLE hid which
+             * of the three actually owns the ~79 KB step. */
+            log_heap("after integrations_start");
 
             /* M1 rules engine (spec §4): hub-only, same as plants_init()
              * just above -- a rule's plant() refs need the plant table,
@@ -331,6 +395,11 @@ void app_main(void)
              * open at all). */
             event_log_set_hooks(on_event_logged, NULL);
             rules_init();
+            /* rules_init() creates an 8 KB-stack task (rules_engine.c) --
+             * the single largest dynamic task allocation on the hub boot
+             * path, so it gets its own milestone rather than hiding inside
+             * the swarm/BLE step. */
+            log_heap("after rules_init");
         }
         /* role == NODE only reaches here when swarm_store_pair_failed() is
          * true: the portal is shown so the user can see what happened and
@@ -340,7 +409,11 @@ void app_main(void)
 
     esp_err_t ble_err = ble_collector_start();
     if (ble_err != ESP_OK) ESP_LOGE(TAG, "BLE collector failed to start (%s); running without BLE", esp_err_to_name(ble_err));
-    log_heap("after swarm/BLE bring-up");
+    /* Renamed from "after swarm/BLE bring-up" (round 3): swarm, integrations
+     * and rules now have their own milestones above, so this one measures
+     * ble_collector_start() -- controller + NimBLE host pools + host task --
+     * and nothing else. ble_collector.c logs two finer milestones inside it. */
+    log_heap("after ble_collector_start");
 
     /* M7 Task 5 (spec §4): a battery-mode paired node runs its wake cycle
      * (scan -> checkin -> sleep) instead of just sitting always-on -- see
@@ -376,17 +449,9 @@ void app_main(void)
         }
     }
 
-    /* Sampler appends to /storage every CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN
-     * minutes; starting it against a failed mount would just fail forever,
-     * so skip it outright rather than let it retry into the void. Also
-     * hub-only: a node keeps no local history to sample. */
-    if (storage_ok && role != SWARM_ROLE_NODE && data_fmt_safe()) {
-        log_heap("before sampler_start");
-        esp_err_t sampler_err = sampler_start("/storage");
-        if (sampler_err != ESP_OK) ESP_LOGE(TAG, "sampler_start failed (%s); running without history sampling", esp_err_to_name(sampler_err));
-    } else if (!storage_ok) {
-        ESP_LOGW(TAG, "skipping sampler_start: storage unavailable");
-    } else if (storage_ok && role != SWARM_ROLE_NODE) {
-        ESP_LOGE(TAG, "data_fmt: on-disk format is newer than this firmware supports; skipping sampler_start");
-    }
+    /* The sampler (history sampling, hub-only) is started much earlier now --
+     * inside the `role != SWARM_ROLE_NODE` block above, right after
+     * plants_init(). See its call site there for the hardware evidence.
+     * Nothing else belongs at the tail of app_main(). */
+    log_heap("end of app_main");
 }

@@ -10,6 +10,57 @@ CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
 CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+# ---------------------------------------------------------------------------
+# BLE memory profile (M2 Task 4 hardware hotfix, round 4)
+#
+# Everything below was at its stock IDF default, which is sized for a
+# general-purpose BLE device (multiple connections, adv + scan + periodic
+# sync, throughput-oriented ATT). This product is neither: it is a passive
+# OBSERVER of MiFlora advertisements (ble_collector.c: ble_gap_disc with
+# passive=1, filter_duplicates=0, BLE_HS_FOREVER) that additionally opens at
+# most ONE outbound connection at a time, to read a single ~16-byte
+# characteristic once a day (battery_poll.c, MAX_CONNECTIONS=1 above). It
+# never advertises (ROLE_PERIPHERAL/ROLE_BROADCASTER=n above) and runs no
+# GATT server.
+#
+# The round-3 boot heap trace measured the swarm/BLE bring-up consuming
+# ~78.8 KB and leaving 2624 B free for the rest of the device's life -- which
+# is also why WiFi could not allocate receive buffers ("wifi:alloc eb len=752
+# type=4 fail"). These are reductions in OVER-PROVISIONING, not in
+# capability: scan interval/window, passive scanning, duplicate-free reporting
+# and the daily battery poll all behave exactly as before.
+#
+# Do NOT reduce anything on the advertisement-RECEIVE path to save more
+# memory: BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM (100), the discardable HCI
+# event pool (BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT) and MSYS_1 are
+# deliberately left at their defaults for that reason.
+
+# Controller activity instances, 828 bytes each (see the C3 controller's own
+# Kconfig help). Default 6. This device needs exactly two at any instant --
+# one scan, one connection -- so 3 keeps a full spare instance.
+CONFIG_BT_CTRL_BLE_MAX_ACT=3
+
+# Controller-side duplicate-advertisement filter list. ble_collector.c always
+# passes filter_duplicates=0 (it WANTS every repeat frame; data_core dedups
+# in RAM instead), and it is the only ble_gap_disc() caller in the tree, so
+# this list is allocated and then never consulted. 10 is the Kconfig minimum;
+# the feature stays compiled in so a future caller can still ask for it.
+CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=10
+
+# Host-side HCI ACL receive pool: count x (BT_NIMBLE_TRANSPORT_ACL_SIZE 255 +
+# ~40 B mbuf overhead) ~= 300 B per buffer. Default 24 buffers (~7.2 KB) is
+# sized for sustained multi-connection data transfer; one connection reading
+# one short characteristic needs a small handful, and 8 still absorbs a burst.
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=8
+
+# MSYS_2 is the large-mbuf pool (320 B blocks) used for ATT/L2CAP payloads on
+# an established connection -- not for advertisement reception. Default 24
+# blocks = 7680 B for a device that has at most one connection carrying one
+# small read at a time. MSYS_1 (12 x 256 B) is deliberately left alone.
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=8
+# ---------------------------------------------------------------------------
+
 # timekeeper's on_epoch_learned handler does a LittleFS (VFS) write on the
 # default event-loop task; IDF recommends >=4KB stack for VFS file I/O,
 # above the 2304B default.

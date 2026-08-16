@@ -7,6 +7,8 @@
 #include "rules.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nimble/nimble_port.h"
@@ -137,13 +139,35 @@ static void host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
+/* Same permanent boot-time heap trace main.c keeps (see its log_heap()),
+ * one level further down. main.c's "after ble_collector_start" milestone
+ * measures this whole function as one ~70 KB step; these two split it into
+ * the parts that are actually tunable separately: nimble_port_init() brings
+ * up the BLE CONTROLLER (BT_CTRL_BLE_MAX_ACT instances, scan duplicate
+ * cache, adv-report flow-control buffers) plus the NimBLE HOST pools
+ * (msys 1/2, transport ACL/event pools -- all CONFIG_BT_NIMBLE_* sized),
+ * while nimble_port_freertos_init() adds only the host task's own stack
+ * (CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE). Round 4 cut the connection-side
+ * pools and the controller instance count on the grounds that this product
+ * is a passive OBSERVER with at most ONE outbound connection at a time
+ * (battery_poll.c); these two lines are how the next boot log proves how
+ * much that actually bought, and where the remainder still sits. */
+static void log_heap(const char *milestone)
+{
+    ESP_LOGI(TAG, "heap @ %s: free=%u B largest_free_block(8BIT|INTERNAL)=%u B",
+             milestone, (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+}
+
 esp_err_t ble_collector_start(void)
 {
+    log_heap("before nimble_port_init");
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nimble_port_init: %s", esp_err_to_name(err));
         return err;
     }
+    log_heap("after nimble_port_init (controller + host pools)");
 
     /* Created before nimble_port_freertos_init() below starts the host
      * task -- gap_event (which locks this) must never be able to run
@@ -157,6 +181,7 @@ esp_err_t ble_collector_start(void)
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
     nimble_port_freertos_init(host_task);
+    log_heap("after nimble_port_freertos_init (host task stack)");
 
     /* Node role: battery polling connects out and would fight ESP-NOW
      * timing on the node's single radio. Scanning/relaying (above) still

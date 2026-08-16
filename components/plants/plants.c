@@ -7,6 +7,8 @@
 #include "app_config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
@@ -951,8 +953,27 @@ static void plants_adopt_legacy_nvs(void)
  * measured numbers). None of this reopens the bug this section describes:
  * every buffer that was `static` before still is, just fewer of them --
  * nothing moved back onto a task stack. */
+/* M2 Task 4 hardware hotfix, round 4. main.c's boot heap trace measured
+ * plants_init() costing 7956 B of heap that is never returned -- an amount
+ * that nothing in this function's source obviously accounts for (three
+ * mutexes are ~264 B; every plants_table_t/plants_blob_t buffer here is
+ * file-scope .bss, not heap; and esp_littlefs frees each
+ * vfs_littlefs_file_t on fclose()). Rather than guess, this splits the one
+ * measurement into three, so a single boot log says whether the cost is in
+ * the mutexes, the plants.bin load (stdio/VFS/LittleFS first-open
+ * allocations, which newlib and esp_littlefs both retain in per-process
+ * pools), or plants_run_migration()'s directory scan. Permanent, same
+ * rationale as main.c's log_heap(). */
+static void plants_log_heap(const char *milestone)
+{
+    ESP_LOGI(TAG, "heap @ plants_init %s: free=%u B largest_free_block(8BIT|INTERNAL)=%u B",
+             milestone, (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+}
+
 esp_err_t plants_init(const char *storage_base)
 {
+    plants_log_heap("entry");
     s_mutex = xSemaphoreCreateMutex();
     s_persist_mutex = xSemaphoreCreateMutex();
     s_lv_mutex = xSemaphoreCreateMutex();
@@ -982,7 +1003,10 @@ esp_err_t plants_init(const char *storage_base)
                       "RAM-only and will not survive a reboot");
     }
 
+    plants_log_heap("after table load");
+
     plants_run_migration();
+    plants_log_heap("after migration scan");
 
     int count = 0;
     for (int i = 0; i < PLANTS_MAX; i++) {
