@@ -49,27 +49,32 @@ bthome_err_t bthome_decode(const uint8_t *data, size_t len, const uint8_t key[16
 
 /* ---------------- bindkey.c (NVS-backed key store) ----------------
  * NVS namespace "planthub" (the same shared namespace app_config.c,
- * claim.c and swarm_store.c already use -- distinct fixed-string keys
- * there, see NVS-key-length note below, so no collision), one 16-byte blob
- * per device.
+ * claim.c and swarm_store.c already use -- distinct key names there, see
+ * below, so no collision with THEM), one blob per device, keyed by dev_id
+ * -- the device-id STRING (device_id_format()'s output, e.g.
+ * "ble:AABBCCDDEEFF").
  *
- * dev_id is the device-id STRING (device_id_format()'s output, e.g.
- * "ble:AABBCCDDEEFF") -- but that string does not become the literal NVS
- * key. ESP-IDF's NVS_KEY_NAME_MAX_SIZE is 16 bytes INCLUDING the null
- * terminator (nvs.h), i.e. a 15-char ceiling, and "ble:AABBCCDDEEFF" is
- * already 16 characters -- one over the limit -- before a longer
- * espnow:/zb: id is even considered (espnow: id = 19 chars, zb: id = 19
- * chars). A literal `nvs_open`/`nvs_set_blob(..., dev_id, ...)` would
- * therefore fail (or silently truncate, depending on IDF version) for
- * every BLE device this feature targets. bindkey.c instead hashes dev_id
- * (FNV-1a 32-bit, formatted as 8 lowercase hex chars) into the actual NVS
- * key -- well inside the 15-char limit for any device kind, and, with at
- * most REGISTRY_MAX_DEVICES (16) devices ever paired to one hub, a 32-bit
- * hash collision between two of them is astronomically unlikely
- * (birthday-bound ~16*15/2 / 2^32 ~= 3e-8). The blob VALUE stored is still
- * exactly the 16 raw key bytes -- the spec's "16 bytes per device-id
- * string" contract for what Task 7's POST /api/v1/devices/<id>/key route
- * writes, unpadded by any collision-detection tag. */
+ * That string does not become the literal NVS key: ESP-IDF's
+ * NVS_KEY_NAME_MAX_SIZE is 16 bytes INCLUDING the null terminator (nvs.h),
+ * i.e. a 15-char ceiling, and "ble:AABBCCDDEEFF" is already 16 characters
+ * -- one over the limit -- before a longer espnow:/zb: id is even
+ * considered. A literal `nvs_open`/`nvs_set_blob(..., dev_id, ...)` would
+ * therefore fail for every BLE device this feature targets.
+ *
+ * bindkey_core.h/.c (host-testable, no NVS dependency) instead hash dev_id
+ * (FNV-1a 64-bit, using the full 15-hex-char NVS key-name budget, not a
+ * truncated 32-bit/8-char version) into the actual NVS key name, AND tag
+ * the stored blob itself with dev_id (bindkey_blob_t: 16 key bytes + the
+ * device-id string, see bindkey_core.h) so a collision between two
+ * DIFFERENT device ids that happen to hash to the same 15-char name is
+ * DETECTABLE and SAFE, not merely unlikely: bindkey_get()/bindkey_has()
+ * verify the stored tag against the id actually being asked about and
+ * treat a mismatch identically to "no key exists" (logged, never handing
+ * back the wrong device's key material), and bindkey_set()'s clear path
+ * (key == NULL) only ever erases a slot it has verified belongs to the
+ * calling dev_id. See bindkey_core.h's own doc comments for the exact
+ * contract of each pure helper, and test_bindkey_core.c
+ * (tests/host/run.sh) for the collision-safety proof. */
 bool bindkey_get(const char *dev_id, uint8_t out[16]);
 bool bindkey_set(const char *dev_id, const uint8_t key[16]);   /* key NULL clears */
 bool bindkey_has(const char *dev_id);

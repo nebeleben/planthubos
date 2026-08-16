@@ -31,4 +31,5 @@ tests/host/test_data_fmt
 tests/host/test_adv_queue
 tests/host/test_wrapper_index
 tests/host/test_bthome
+tests/host/test_bindkey_core
 .DS_Store

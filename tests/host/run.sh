@@ -149,3 +149,10 @@ $CC -Wall -Wextra -Werror -I../../components/bthome/include -I../../components/c
     test_bthome.c ../../components/bthome/bthome.c ../../components/capability/capability.c \
     $BTHOME_CCM_FLAGS -o test_bthome -lm
 ./test_bthome
+
+# The pure (no-NVS) half of bindkey.c's logic -- the dev_id -> NVS-key hash
+# and the collision-safety verify check -- split into bindkey_core.c
+# specifically so it can be exercised here without ESP-IDF's nvs_flash.
+$CC -Wall -Wextra -Werror -I../../components/bthome/include \
+    test_bindkey_core.c ../../components/bthome/bindkey_core.c -o test_bindkey_core
+./test_bindkey_core
