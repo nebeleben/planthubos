@@ -1,6 +1,7 @@
 #include "plants.h"
 #include "plants_migrate.h"
 #include "storage.h"
+#include "storage_compat.h"   /* M2-SHIM */
 #include "timekeeper.h"
 #include "app_config.h"
 #include "esp_log.h"
@@ -1166,16 +1167,16 @@ static bool lv_resolve(void *rctx, uint16_t boot_id, uint32_t rel_s, uint32_t *e
 }
 
 typedef struct {
-    bool          found;
-    uint32_t      epoch;
-    storage_rec_t rec;
+    bool             found;
+    uint32_t         epoch;
+    storage_rec_v1_t rec;   /* M2-SHIM */
 } lv_scan_ctx_t;
 
 /* storage_query() emits rows in ring order, strictly oldest-to-newest (see
  * storage.c and test_storage.c's wraparound-order assertions) -- so simply
  * overwriting on every call, with no comparison, leaves the newest row in
  * *ctx once the scan completes. */
-static void lv_row(void *vctx, uint32_t epoch, const storage_rec_t *rec)
+static void lv_row(void *vctx, uint32_t epoch, const storage_rec_v1_t *rec)   /* M2-SHIM */
 {
     lv_scan_ctx_t *c = vctx;
     c->found = true;
@@ -1218,8 +1219,8 @@ bool plants_last_values(uint8_t id, int16_t *temp_dc, uint8_t *moisture,
      * yet: fopen() fails, 0 rows emitted, "not found" below. */
     lv_scan_ctx_t scan = { .found = false };
     if (s_storage_base) {
-        storage_query(s_storage_base, id, STORAGE_TIER_RAW, 0, 0xFFFFFFFFu,
-                      lv_resolve, NULL, lv_row, &scan);
+        storage_query_v1(s_storage_base, id, STORAGE_TIER_RAW, 0, 0xFFFFFFFFu,   /* M2-SHIM */
+                         lv_resolve, NULL, lv_row, &scan);
     }
 
     /* Cache ONLY a genuine hit obtained under a synced clock (M8 Task 6

@@ -1,6 +1,7 @@
 #include "sampler.h"
 #include "data_core.h"
 #include "storage.h"
+#include "storage_compat.h"   /* M2-SHIM */
 #include "hourly_agg.h"
 #include "timekeeper.h"
 #include "plants.h"
@@ -41,9 +42,11 @@ static hourly_agg_t *agg_for(uint8_t plant_id)
     return &s_agg[free_i];
 }
 
-static storage_rec_t rec_from_entry(const sensor_entry_t *e, uint32_t rel_s)
+/* M2-SHIM: builds the V1-shaped record; storage_encode_v1() (storage_compat.h)
+ * maps it onto the real V2 storage_rec_t below. */
+static storage_rec_v1_t rec_from_entry(const sensor_entry_t *e, uint32_t rel_s)
 {
-    storage_rec_t r;
+    storage_rec_v1_t r;
     memset(&r, 0xFF, sizeof(r));
     r.temp_dc = STORAGE_TEMP_NONE;
     r.boot_id = timekeeper_boot_id();
@@ -103,7 +106,9 @@ static void sample_once(void)
         /* skip sensors that produced nothing since the last sample (dead battery / gone) */
         if (now - e->last_seen_s > interval_s) continue;
 
-        storage_rec_t rec = rec_from_entry(e, now);
+        storage_rec_v1_t v1 = rec_from_entry(e, now);
+        storage_rec_t rec;
+        storage_encode_v1(s_base, p->id, &v1, &rec);   /* M2-SHIM */
         if (storage_append(s_base, p->id, STORAGE_TIER_RAW, &rec) != 0) {
             ESP_LOGW(TAG, "raw append failed for plant %u", p->id);
             continue;

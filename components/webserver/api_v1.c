@@ -4,6 +4,7 @@
 #include "data_core.h"
 #include "sensors_json.h"
 #include "storage.h"
+#include "storage_compat.h"   /* M2-SHIM */
 #include "timekeeper.h"
 #include "plants.h"
 #include "claim.h"
@@ -333,7 +334,7 @@ typedef struct {
  * don't abort the underlying storage_query scan early, but that scan is
  * bounded (<=STORAGE_RAW_CAP == 2880 records) so letting it run to
  * completion costs at most a bounded, harmless amount of wasted work. */
-static void hist_row(void *vctx, uint32_t epoch, const storage_rec_t *rec)
+static void hist_row(void *vctx, uint32_t epoch, const storage_rec_v1_t *rec)   /* M2-SHIM */
 {
     hist_ctx_t *c = vctx;
     if (c->failed) return;
@@ -494,7 +495,7 @@ static esp_err_t plants_history_get(httpd_req_t *req)
 
     if (synced) {
         hist_ctx_t ctx = { .req = req, .first = true, .failed = false };
-        storage_query("/storage", id, tier, from, to, resolve_shim, NULL, hist_row, &ctx);
+        storage_query_v1("/storage", id, tier, from, to, resolve_shim, NULL, hist_row, &ctx);   /* M2-SHIM */
         /* A chunk send already failed (client/socket gone) -- don't send the
          * trailing chunks over a dead connection, and return non-OK so
          * esp_http_server closes the session instead of believing it's

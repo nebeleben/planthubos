@@ -12,6 +12,7 @@ tests/host/test_registry
 tests/host/test_boottab
 tests/host/test_storage
 tests/host/test_hourly_agg
+tests/host/test_history_cols
 tests/host/test_authtok
 tests/host/test_swarm_frame
 tests/host/test_swarm_buf

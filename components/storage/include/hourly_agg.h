@@ -5,11 +5,9 @@
 typedef struct {
     bool     open;
     uint16_t boot_id;
-    uint32_t bucket;        /* rel_s / 3600 */
-    uint32_t n_temp, n_moist, n_batt, n_lux, n_cond;
-    int32_t  sum_temp;
-    uint32_t sum_moist, sum_batt, sum_cond;
-    uint64_t sum_lux;
+    uint32_t bucket;                  /* rel_s / 3600 */
+    uint32_t n[HISTORY_COLS];
+    int64_t  sum[HISTORY_COLS];
 } hourly_agg_t;
 
 void hourly_agg_init(hourly_agg_t *a);

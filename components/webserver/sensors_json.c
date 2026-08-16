@@ -3,6 +3,7 @@
 #include "swarm_store.h"
 #include "plants.h"
 #include "storage.h"
+#include "storage_compat.h"   /* M2-SHIM: STORAGE_*_NONE sentinels */
 #include <stdio.h>
 
 /* ---------------- shared field helpers ---------------- */

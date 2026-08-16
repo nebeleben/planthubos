@@ -23,13 +23,17 @@ $CC -Wall -Wextra -Werror -I../../components/timekeeper/include \
     test_boottab.c ../../components/timekeeper/boottab.c -o test_boottab
 ./test_boottab
 
-$CC -Wall -Wextra -Werror -I../../components/storage/include \
+$CC -Wall -Wextra -Werror -I../../components/storage/include -I../../components/capability/include \
     test_storage.c ../../components/storage/storage.c -o test_storage
 ./test_storage
 
-$CC -Wall -Wextra -Werror -I../../components/storage/include \
+$CC -Wall -Wextra -Werror -I../../components/storage/include -I../../components/capability/include \
     test_hourly_agg.c ../../components/storage/hourly_agg.c -o test_hourly_agg
 ./test_hourly_agg
+
+$CC -Wall -Wextra -Werror -I../../components/storage/include -I../../components/capability/include \
+    test_history_cols.c ../../components/storage/storage.c -o test_history_cols
+./test_history_cols
 
 $CC -Wall -Wextra -Werror -I../../components/claiming/include \
     test_authtok.c ../../components/claiming/authtok.c -o test_authtok
