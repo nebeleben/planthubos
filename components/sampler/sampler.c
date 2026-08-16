@@ -8,6 +8,8 @@
 #include "plants_table.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -27,6 +29,28 @@ static SemaphoreHandle_t s_wake;
 static hourly_agg_t s_agg[PLANTS_MAX];
 static uint8_t s_agg_plant_id[PLANTS_MAX];
 static bool s_agg_used[PLANTS_MAX];
+
+/* M2 Task 4 hardware hotfix, round 2: `s_wake` and the sampler task's own
+ * stack/TCB moved to STATIC allocation (StaticSemaphore_t/StackType_t[]/
+ * StaticTask_t below), not because .bss is short -- round 1 already bought
+ * back ~2769B there -- but because round 1's fix did NOT resolve the C3
+ * boot failure (see sampler_bringup()'s doc comment for the hardware
+ * evidence and the fragmentation reasoning). xTaskCreate()/
+ * xSemaphoreCreateBinary() both pull from the SAME heap region WiFi/BLE
+ * init has just been fragmenting; a task needs one contiguous ~4KB+ block,
+ * which is exactly the shape most likely to be starved by fragmentation
+ * even when total free bytes look healthy (heap_caps_get_largest_free_block()
+ * is the metric that matters, not esp_get_free_heap_size() alone). Static
+ * allocation draws this memory from .bss at LINK time instead -- a fixed,
+ * always-available address, zero dependency on the runtime heap allocator's
+ * fragmentation state. CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION is already
+ * enabled project-wide (sdkconfig). Stack size kept at the existing 4096
+ * bytes, unchanged -- no `uxTaskGetStackHighWaterMark()` measurement is
+ * available without hardware access this round, so this deliberately does
+ * NOT guess a smaller size; only WHERE the bytes come from changed. */
+static StaticSemaphore_t s_wake_buf;
+static StackType_t s_sampler_stack[4096];
+static StaticTask_t s_sampler_tcb;
 
 static hourly_agg_t *agg_for(uint8_t plant_id)
 {
@@ -205,22 +229,78 @@ static void timer_cb(void *arg)
     xSemaphoreGive(s_wake);   /* wake the worker; never do file I/O here */
 }
 
+/* M2 Task 4 hardware hotfix, round 2 -- diagnostics. Round 1 (static-.bss
+ * cuts + a single 15s retry) did NOT fix the C3 boot failure: reflashed
+ * hardware (commit 91aca6b) still showed `xTaskCreate`-shaped bring-up
+ * failing, AND the 15s retry failing again with the identical error --
+ * despite round 1 genuinely growing the initial DRAM heap region (48048 ->
+ * 50064 bytes, MORE than M1 had, per `heap_init`'s boot log). That
+ * "more total heap, still fails, retry doesn't help" combination is the
+ * signature of FRAGMENTATION, not exhaustion: `xTaskCreate()` needs one
+ * CONTIGUOUS block for the task's stack+TCB, and WiFi/BLE's own init-time
+ * allocations (both start before sampler_start(), see main.c's boot order)
+ * are well known to leave the heap chopped into many small live/free
+ * blocks -- a moment where total-free can look fine while the single
+ * largest free block is far smaller. A retry 15s later doesn't help
+ * because WiFi/BLE aren't still ALLOCATING at that point, they're just
+ * *sitting* on the blocks they already grabbed -- there's nothing to
+ * "settle".
+ *
+ * We don't have hardware access this round (the coordinator reflashes and
+ * reports back), so this function logs the exact numbers that distinguish
+ * fragmentation from exhaustion -- esp_get_free_heap_size() (total),
+ * esp_get_minimum_free_heap_size() (the worst it's ever been, so a boot-log
+ * grep doesn't need to catch the failure instant), and
+ * heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL)
+ * (the number that actually gates whether a 4KB+ allocation can succeed) --
+ * at every point in sampler_bringup() that can plausibly return
+ * ESP_ERR_NO_MEM, tagged with WHICH call failed. Permanent, not a
+ * throwaway print: this is the only way to tell "task creation still can't
+ * get a big enough block" apart from "one of the two esp_timer_create()
+ * calls' much smaller allocation is failing instead" on a future boot,
+ * without re-guessing. */
+static void log_heap_diag(const char *what, esp_err_t err)
+{
+    ESP_LOGE(TAG, "sampler: %s failed (%s) -- heap: free=%u B, min_free_ever=%u B, "
+                  "largest_free_block(8BIT|INTERNAL)=%u B",
+             what, esp_err_to_name(err),
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)esp_get_minimum_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+}
+
 /* Creates the sampler task and its two timers. Split out of sampler_start()
- * (M2 Task 4 hardware hotfix) so it can be retried: `s_wake` is created once
- * by sampler_start() itself and is safe to reuse across attempts (a failed
- * xTaskCreate() never consumes it, and no earlier task exists to have
- * consumed it either). Returns whatever the first step that fails returns;
- * ESP_ERR_NO_MEM from xTaskCreate() specifically is what sampler_start()
- * treats as worth retrying. */
+ * so it can be retried (see sampler_start()'s own doc comment for why one
+ * retry is still kept despite the fixes below).
+ *
+ * The task itself is now created with xTaskCreateStatic() (s_sampler_stack/
+ * s_sampler_tcb, file top) instead of xTaskCreate() -- see those statics'
+ * doc comment for the fragmentation reasoning this responds to. With a
+ * valid static buffer pair (always true here), xTaskCreateStatic() cannot
+ * fail from heap pressure at all; the log_heap_diag() call on that path is
+ * defense-in-depth for a future change to this function, not an expected
+ * outcome. That leaves the two esp_timer_create() calls below as the only
+ * plausible remaining source of an ESP_ERR_NO_MEM from this function --
+ * each is a single small (roughly 100-150 byte) allocation, far less
+ * likely to be blocked by fragmentation than the 4KB+ contiguous block the
+ * task used to need, but not impossible, and now individually diagnosed
+ * rather than lumped into one generic "bring-up failed". */
 static esp_err_t sampler_bringup(void)
 {
-    if (xTaskCreate(sampler_task, "sampler", 4096, NULL, 3, NULL) != pdPASS)
+    TaskHandle_t task = xTaskCreateStatic(sampler_task, "sampler", sizeof(s_sampler_stack), NULL, 3,
+                                          s_sampler_stack, &s_sampler_tcb);
+    if (!task) {
+        log_heap_diag("xTaskCreateStatic(sampler)", ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
+    }
 
     const esp_timer_create_args_t t = { .callback = timer_cb, .name = "sampler" };
     esp_timer_handle_t timer;
     esp_err_t err = esp_timer_create(&t, &timer);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        log_heap_diag("esp_timer_create(sampler, periodic)", err);
+        return err;
+    }
     /* One extra early sample ~2 minutes after boot: readings reach the
      * live registry within seconds, but the periodic timer's first tick is
      * a full interval out -- on a fresh (or just-rebooted) hub that left
@@ -229,23 +309,34 @@ static esp_err_t sampler_bringup(void)
      * the BLE scan (and a relaying node's first forward) to have heard
      * the probes; anything unheard by then is skipped by sample_once()'s
      * usual guards and simply waits for the periodic tick. Best-effort:
-     * losing the early sample costs nothing but the old wait. */
+     * losing the early sample costs nothing but the old wait -- but still
+     * diagnosed on failure (not just silently skipped) since a second
+     * small allocation failing right after the first one succeeded would
+     * itself be a useful data point. */
     const esp_timer_create_args_t t1 = { .callback = timer_cb, .name = "sampler1st" };
     esp_timer_handle_t first;
-    if (esp_timer_create(&t1, &first) == ESP_OK) {
+    esp_err_t ferr = esp_timer_create(&t1, &first);
+    if (ferr == ESP_OK) {
         esp_timer_start_once(first, 120ULL * 1000000ULL);
+    } else {
+        log_heap_diag("esp_timer_create(sampler1st, one-shot, non-fatal)", ferr);
     }
     return esp_timer_start_periodic(timer, (uint64_t)CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN * 60 * 1000000ULL);
 }
 
-/* One-shot retry callback (M2 Task 4 hardware hotfix), fired ~15s after a
- * bring-up that failed with ESP_ERR_NO_MEM -- see sampler_start(). By then
- * WiFi/BLE's own init-time allocations have settled, so the same 4096-byte
- * task stack that failed at boot is much more likely to succeed. Logs the
- * outcome either way; a second failure leaves history sampling disabled for
- * the rest of this boot (no further retries -- a heap this consistently
- * short is a standing condition, not a transient boot-time spike, and is
- * better surfaced once than retried forever). */
+/* One-shot retry callback, fired ~15s after a bring-up that failed with
+ * ESP_ERR_NO_MEM -- see sampler_start(). Kept from round 1 as a safety net
+ * for the two esp_timer_create() calls that remain heap-dependent (the task
+ * itself no longer is, see sampler_bringup()'s doc comment) -- a genuine,
+ * if less likely, transient heap-exhaustion moment for a ~150-byte
+ * allocation is still worth one retry. NOT a fix for fragmentation-driven
+ * task-creation failures on its own (round 1's evidence already showed a
+ * 15s wait alone doesn't heal fragmentation -- WiFi/BLE aren't still
+ * allocating at that point, so there's nothing to "settle"); the static
+ * task allocation above is what actually addresses that. Logs the outcome
+ * either way; a second failure leaves history sampling disabled for the
+ * rest of this boot (no further retries -- see log_heap_diag()'s numbers
+ * on that second failure to tell a standing shortage apart from bad luck). */
 static void sampler_retry_cb(void *arg)
 {
     esp_err_t err = sampler_bringup();
@@ -260,30 +351,37 @@ static void sampler_retry_cb(void *arg)
 esp_err_t sampler_start(const char *base_path)
 {
     s_base = base_path;
-    s_wake = xSemaphoreCreateBinary();
-    if (!s_wake) return ESP_ERR_NO_MEM;
+    /* Static, not xSemaphoreCreateBinary() -- see s_wake_buf's doc comment
+     * at the top of this file. Only fails on a bad buffer pointer (never,
+     * here), so this is defense-in-depth, same as sampler_bringup()'s task
+     * check. */
+    s_wake = xSemaphoreCreateBinaryStatic(&s_wake_buf);
+    if (!s_wake) {
+        log_heap_diag("xSemaphoreCreateBinaryStatic(s_wake)", ESP_ERR_NO_MEM);
+        return ESP_ERR_NO_MEM;
+    }
 
     esp_err_t err = sampler_bringup();
     if (err != ESP_ERR_NO_MEM) {
         return err;   /* success, or a non-transient failure not worth retrying */
     }
 
-    /* Boot is the worst possible moment for a 4KB task-stack allocation --
-     * WiFi and BLE have both just finished their own init-time allocations
-     * -- so a single ESP_ERR_NO_MEM here is very likely transient rather
-     * than a real "this device is out of RAM" condition (M2 Task 4 hardware
-     * hotfix: this is exactly what was observed on a C3 with M2's registry/
-     * plant-table static growth). Caller (main.c) still logs this failure
-     * itself, same as always; this schedules the actual recovery. */
-    ESP_LOGW(TAG, "sampler: bring-up failed (%s), most likely transient right after WiFi/BLE init "
-                  "-- retrying once in 15s instead of disabling history sampling for the rest of "
-                  "this boot", esp_err_to_name(err));
+    /* See sampler_retry_cb()'s doc comment: this is a safety net for the
+     * two esp_timer_create() calls, not the primary fix for the C3
+     * fragmentation failure round 1's evidence pointed to (that's the
+     * static task allocation above). Caller (main.c) still logs this
+     * failure itself, same as always; this schedules the actual recovery
+     * attempt. */
+    ESP_LOGW(TAG, "sampler: bring-up failed (%s) -- retrying once in 15s (see log_heap_diag() "
+                  "output above for which call failed and the heap numbers at that moment)",
+             esp_err_to_name(err));
     const esp_timer_create_args_t rt = { .callback = sampler_retry_cb, .name = "samplerRetry" };
     esp_timer_handle_t retry_timer;
     esp_err_t rerr = esp_timer_create(&rt, &retry_timer);
     if (rerr != ESP_OK) {
-        ESP_LOGE(TAG, "sampler: could not schedule the retry either (%s); history sampling stays "
-                      "disabled for the rest of this boot", esp_err_to_name(rerr));
+        log_heap_diag("esp_timer_create(samplerRetry)", rerr);
+        ESP_LOGE(TAG, "sampler: could not schedule the retry either; history sampling stays "
+                      "disabled for the rest of this boot");
         return err;   /* original ESP_ERR_NO_MEM */
     }
     esp_timer_start_once(retry_timer, 15ULL * 1000000ULL);
