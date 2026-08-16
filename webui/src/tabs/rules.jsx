@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 import { compile, disassemble } from '../lib/psc/index.js'
+import { getAiSettings, hasAiKey } from '../lib/ai/settings.js'
+import { aiComplete, AiError } from '../lib/ai/provider.js'
+import { RULE_TEMPLATE } from '../lib/ai/prompts/rule.js'
+import { extractSource, provenance } from '../lib/ai/extract.js'
 
 // Ages come back from GET /api/v1/rules as SECONDS AGO already (api_v1.c's
 // rule_status_json), same shape as devices.jsx/nodes.jsx's own fmtAge --
@@ -323,6 +327,37 @@ export function RulesTab() {
   const [saveState, setSaveState] = useState('idle')  // idle | saving | saved | error | unauth
   const [saveMsg, setSaveMsg] = useState('')
 
+  // M4 Task 8: the second generation flow -- a sentence in, rule source
+  // out. Unlike wrappers.jsx's Generate (gated on a captured device from a
+  // cross-tab hop), the precondition here is free text the operator types
+  // right in this panel, so there's no prefill plumbing: aiRequest is local
+  // state, read fresh on every Generate click.
+  const [aiRequest, setAiRequest] = useState('')
+  const [aiBusy, setAiBusy] = useState(false)
+  const [aiError, setAiError] = useState(null)          // {message, detail} | null
+  const [aiRawResponse, setAiRawResponse] = useState(null)  // set only when extractSource() found no code block
+  const abortRef = useRef(null)   // current in-flight aiComplete()'s AbortController, for the Cancel button
+
+  // Clears every piece of AI-generation state -- shared by startNewRule and
+  // onEdit, both of which start a session an old generation/request no
+  // longer applies to. Aborts a still-in-flight aiComplete() first: a
+  // response that lands after the editor has moved on to a different rule
+  // must never write into it.
+  function resetAiState() {
+    if (abortRef.current) abortRef.current.abort()
+    // Nulled (not just aborted) so a since-superseded onGenerate's own
+    // catch handler -- which checks `abortRef.current === <its own
+    // controller>` before touching state -- recognises this session as
+    // stale and stays silent, instead of painting a "cancelled" message
+    // into whatever New-rule/Edit session replaced it. Mirrors
+    // wrappers.jsx's resetAiState exactly.
+    abortRef.current = null
+    setAiRequest('')
+    setAiBusy(false)
+    setAiError(null)
+    setAiRawResponse(null)
+  }
+
   function refreshRules(signal) {
     return fetch('/api/v1/rules', { signal })
       .then((r) => r.json())
@@ -424,6 +459,7 @@ export function RulesTab() {
       setCompileResult(null)
       setSaveState('idle')
       setSaveMsg('')
+      resetAiState()
     } catch {
       setActionError(id, 'hub not reachable')
     }
@@ -436,19 +472,91 @@ export function RulesTab() {
     setCompileResult(null)
     setSaveState('idle')
     setSaveMsg('')
+    resetAiState()
   }
 
   function onSourceChange(v) {
     setSource(v)
     // Any edit invalidates the last Compile -- Save stays gated on a clean
-    // compile of the CURRENT text, never a stale one.
+    // compile of the CURRENT text, never a stale one. Same reasoning
+    // extends to a stale Generate error/raw-response: neither describes the
+    // text now in the editor.
     setCompileResult(null)
     setSaveState('idle')
     setSaveMsg('')
+    setAiError(null)
+    setAiRawResponse(null)
+  }
+
+  function runCompile(src) {
+    setCompileResult(compile(src))
   }
 
   function onCompile() {
-    setCompileResult(compile(source))
+    runCompile(source)
+  }
+
+  // Step 2: fetches the plant list fresh (never cached -- names/bindings can
+  // have changed since this tab last loaded) and builds the prompt from the
+  // RAW array GET /api/v1/plants returns, per the task's own "One thing to
+  // get right" -- redact.js does the actual redaction inside
+  // RULE_TEMPLATE.build, this function never touches plant fields itself.
+  // Calls the provider with an AbortController so the Cancel button below
+  // can interrupt a tens-of-seconds request, and on success runs the
+  // identical path a human pasting code in would: extractSource -> prepend
+  // provenance -> into the editor -> compile. No code path here reaches
+  // POST /api/v1/rules -- onSave (untouched) is still the only one.
+  async function onGenerate() {
+    const request = aiRequest.trim()
+    if (!request || abortRef.current) return
+    setAiError(null)
+    setAiRawResponse(null)
+    setAiBusy(true)
+    const controller = new AbortController()
+    abortRef.current = controller
+    const settings = getAiSettings()
+    let text
+    try {
+      const plantsRes = await fetch('/api/v1/plants', { signal: controller.signal })
+      const plantsData = await plantsRes.json()
+      const { system, user } = RULE_TEMPLATE.build({ plants: plantsData.plants || [], request })
+      text = await aiComplete({ system, user, signal: controller.signal, settings })
+    } catch (err) {
+      // Superseded by a New rule/Edit mid-flight (resetAiState nulls
+      // abortRef.current, see its own doc comment) -- that session already
+      // painted over this one, so stay silent rather than clobber it with a
+      // stale "cancelled" message.
+      if (abortRef.current === controller) {
+        if (err instanceof AiError) {
+          setAiError({ message: err.message, detail: err.detail })
+        } else if (err.name !== 'AbortError') {
+          // The plants fetch/parse can fail for reasons aiComplete never
+          // hits (hub unreachable, bad JSON) -- same catch-all wording
+          // every other fetch in this file uses.
+          setAiError({ message: 'hub not reachable', detail: '' })
+        }
+        setAiBusy(false)
+        abortRef.current = null
+      }
+      return
+    }
+    if (abortRef.current !== controller) return   // same supersede check, success side
+    const extracted = extractSource(text)
+    if (extracted == null) {
+      setAiRawResponse(text)
+    } else {
+      const generated = `${provenance('rule', RULE_TEMPLATE.version, settings.model)}\n${extracted}`
+      setSource(generated)
+      setSaveState('idle')
+      setSaveMsg('')
+      runCompile(generated)
+    }
+    setAiBusy(false)
+    abortRef.current = null
+  }
+
+  function onCancelGenerate() {
+    if (abortRef.current) abortRef.current.abort()
   }
 
   async function onSave() {
@@ -512,6 +620,43 @@ export function RulesTab() {
 
       <div class="panel">
         <h2>{editingId != null ? `Edit rule #${editingId}` : 'New rule'}</h2>
+        <p>
+          <label>
+            Describe a rule{' '}
+            <input value={aiRequest} placeholder="e.g. notify me when the Fern's soil drops below 20%"
+                   onInput={(e) => setAiRequest(e.currentTarget.value)} />
+          </label>
+          {' '}
+          {/* hasAiKey() gate and title mirror wrappers.jsx's own "Generate
+              with AI" button so a user hits the same explanation wherever
+              they meet the feature disabled. The extra !aiRequest.trim()
+              gate has no title of its own -- RULE_TEMPLATE.build({request})
+              needs text to build a prompt from at all, but that's a
+              this-file-only precondition, not a whole-feature one. */}
+          {aiBusy ? (
+            <button type="button" onClick={onCancelGenerate}>Cancel</button>
+          ) : (
+            <button type="button" onClick={onGenerate} disabled={!hasAiKey() || !aiRequest.trim()}
+                    title={hasAiKey() ? undefined : 'Set an API key in Config to use AI generation'}>
+              Generate with AI
+            </button>
+          )}
+          {aiBusy && <span class="hint"> Generating… this can take up to a minute.</span>}
+        </p>
+        {aiError && (
+          <div class="infobox">
+            <p class="error">{aiError.message}</p>
+            {aiError.detail && (
+              <details><summary>Details</summary><pre class="mono">{aiError.detail}</pre></details>
+            )}
+          </div>
+        )}
+        {aiRawResponse != null && (
+          <div class="infobox">
+            <p class="error">The model did not return a code block.</p>
+            <details><summary>Raw response</summary><pre class="mono">{aiRawResponse}</pre></details>
+          </div>
+        )}
         <textarea class="rule-source mono" rows={12} value={source} spellcheck={false}
                   onInput={(e) => onSourceChange(e.currentTarget.value)} />
         <p>
