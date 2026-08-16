@@ -10,12 +10,15 @@
 #define PSVM_STACK        32
 #define PSVM_MAX_STEPS    10000
 #define PSVM_STRBUF       512
-/* Largest raw BLE advertisement payload a wrapper (dialect=2) ever decodes.
- * Matches ble_collector's ADV_PAYLOAD_MAX (31 -- a full legacy adv/scan-rsp
- * AD-structure area); psvm.c does not include that header (stays a
- * dependency-free, host-testable component) so the number is restated here
- * and is part of this file's contract instead. */
-#define PSVM_PAYLOAD_MAX  31
+/* Raised from 31 to 64 for M5a. 31 was the largest legacy advertisement
+ * payload, which is still the only thing an advert-only wrapper decodes.
+ * A connect wrapper decodes a CONCATENATION of its GATT reads instead:
+ * PSVM_PLAN_MAX_READS (4) fixed slots of 16 bytes each. Fixed slots are
+ * what let named buffers be compile-time offsets, which is why M5a needs
+ * no new opcodes and no VM surgery -- the cost is these 33 extra bytes in
+ * the interpreter's working buffer. */
+#define PSVM_PAYLOAD_MAX  64
+#define PSVM_PLAN_SLOT    16
 /* Emitted (capability, value) pairs are buffered (never flushed to the
  * caller's sink) until a wrapper program reaches HALT successfully; a
  * failed REQUIRE (spec section 3) discards the buffer instead, so "require

@@ -924,6 +924,26 @@ int main(void) {
         assert(r2.err == PSVM_ERR_REF);
     }
 
+    /* A wrapper reading at offset 48 is in bounds once the buffer is 64 B --
+     * that offset is slot 3 of the concatenated GATT read buffer (16 B slots).
+     * Before M5a it was out of range and the run failed with a bounds error. */
+    {
+        assert(PSVM_PAYLOAD_MAX == 64);
+        uint8_t payload[64] = {0};
+        payload[48] = 0x12; payload[49] = 0x34;
+        /* u16_le at 48 -> 0x3412 */
+        psvm_wrapper_io_t wio = {0};
+        wio.payload.data = payload; wio.payload.len = 64;
+
+        uint8_t b2[64]; psvm_prog_t p2;
+        size_t l2 = build_w_load(b2, 0x61 /* LOAD_U16LE */, 48);
+        assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
+        emit_cap_t ecap = {0};
+        wio.emit = emit_capture; wio.emit_ctx = &ecap;
+        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        assert(r2.err == PSVM_OK && ecap.count == 1 && ecap.items[0].value == 0x3412);
+    }
+
     /* REQUIRE: false discards the whole run's buffered emits (including one
      * emitted BEFORE the require); true lets both through. EMIT reaching
      * the sink with the right capability id is covered by both halves. */
