@@ -1,7 +1,7 @@
 #include "sampler.h"
 #include "data_core.h"
 #include "storage.h"
-#include "storage_compat.h"   /* M2-SHIM */
+#include "capability.h"
 #include "hourly_agg.h"
 #include "timekeeper.h"
 #include "plants.h"
@@ -42,29 +42,14 @@ static hourly_agg_t *agg_for(uint8_t plant_id)
     return &s_agg[free_i];
 }
 
-/* M2-SHIM: builds the V1-shaped record; storage_encode_v1() (storage_compat.h)
- * maps it onto the real V2 storage_rec_t below. */
-static storage_rec_v1_t rec_from_entry(const sensor_entry_t *e, uint32_t rel_s)
-{
-    storage_rec_v1_t r;
-    memset(&r, 0xFF, sizeof(r));
-    r.temp_dc = STORAGE_TEMP_NONE;
-    r.boot_id = timekeeper_boot_id();
-    r.rel_s = rel_s;
-    if (e->latest.has_temp)         r.temp_dc = e->latest.temp_dc;
-    if (e->latest.has_moisture)     r.moisture_pct = e->latest.moisture_pct;
-    if (e->latest.has_battery)      r.battery_pct = e->latest.battery_pct;
-    if (e->latest.has_lux)          r.lux = e->latest.lux;
-    if (e->latest.has_conductivity) r.conductivity_us = e->latest.conductivity_us;
-    return r;
-}
-
 static void sample_once(void)
 {
     /* only touched on the sampler task */
-    static legacy_registry_t reg_snap;   /* M2-SHIM */
+    static registry_t reg_snap;             /* V2: drives the binding-mapped sampling loop below */
+    static legacy_registry_t reg_snap_legacy;   /* M2-SHIM: only for the auto-create sweep at the end */
     static plants_table_t plant_snap;
-    data_core_snapshot_legacy(&reg_snap);   /* M2-SHIM */
+    data_core_snapshot(&reg_snap);
+    data_core_snapshot_legacy(&reg_snap_legacy);   /* M2-SHIM */
     plants_snapshot(&plant_snap);
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000);
     uint32_t interval_s = CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN * 60;
@@ -88,27 +73,64 @@ static void sample_once(void)
     }
 
     /* Plants are the unit of sampling (M8 Task 5): walk the plant table, not
-     * the sensor registry. A plant with no assigned probe (mac_valid ==
-     * false) is skipped outright -- it has nothing to sample, per spec. */
+     * the sensor registry. M2 Task 4: what a plant samples is now its
+     * capability bindings, not a single assigned probe mac -- a plant with
+     * no bindings has nothing to sample and writes nothing, per the M2
+     * device-model spec. `bindings` is `static` like reg_snap/plant_snap
+     * above: only ever touched on the sampler task, reused fresh every
+     * iteration. */
+    static plant_binding_t bindings[CAPABILITY_COUNT];
     for (int i = 0; i < PLANTS_MAX; i++) {
         const plant_entry_t *p = &plant_snap.p[i];
-        if (!p->in_use || !p->mac_valid) continue;
+        if (!p->in_use) continue;
 
-        int ri = legacy_registry_find(&reg_snap, p->mac);   /* M2-SHIM */
-        if (ri < 0) {
-            /* Assigned to a probe this boot hasn't heard from yet -- there's
-             * no registry entry to sample. Not a warning: this is routine
-             * right after a reboot or a fresh assignment. */
-            ESP_LOGD(TAG, "plant %u: probe not heard yet this boot, skipping", p->id);
-            continue;
-        }
-        const sensor_entry_t *e = &reg_snap.sensors[ri];
-        /* skip sensors that produced nothing since the last sample (dead battery / gone) */
-        if (now - e->last_seen_s > interval_s) continue;
+        size_t n = plants_bindings(p->id, bindings, CAPABILITY_COUNT);
+        if (n == 0) continue;   /* no bindings: writes nothing */
 
-        storage_rec_v1_t v1 = rec_from_entry(e, now);
         storage_rec_t rec;
-        storage_encode_v1(s_base, p->id, &v1, &rec);   /* M2-SHIM */
+        rec.boot_id = timekeeper_boot_id();
+        rec.rel_s = now;
+        for (int c = 0; c < HISTORY_COLS; c++) rec.col[c] = CAP_VALUE_NONE;
+
+        bool any_value = false;
+        for (size_t b = 0; b < n; b++) {
+            uint8_t cap_id = bindings[b].cap_id;
+            float value;
+            uint32_t age_s;
+            if (!plants_cap_value(p->id, cap_id, &reg_snap, &value, &age_s)) {
+                /* Unbound-in-practice (device not in this snapshot) or no
+                 * value in its slot yet -- e.g. a probe just bound but not
+                 * heard from this boot. Not a warning: routine right after
+                 * a fresh binding or a reboot. */
+                continue;
+            }
+            /* skip a capability that produced nothing since the last sample
+             * (dead battery / gone) -- per-capability now, not per-device,
+             * since a plant's bindings can span multiple physical devices. */
+            if (age_s > interval_s) continue;
+
+            /* Ensure the column on BOTH tiers (see storage_compat.h's old
+             * shim doing the same): hourly_agg_add() below builds the
+             * hourly record straight from `rec`'s column layout, so the two
+             * tiers must already agree on what each column means before
+             * that happens. */
+            int col = storage_col_for(s_base, p->id, STORAGE_TIER_RAW, cap_id);
+            (void)storage_col_for(s_base, p->id, STORAGE_TIER_HOURLY, cap_id);
+            if (col < 0) {
+                ESP_LOGW(TAG, "plant %u: history column map full, dropping cap %u", p->id, cap_id);
+                continue;
+            }
+
+            int16_t raw = capability_encode(cap_id, value);
+            if (raw == CAP_VALUE_NONE) {
+                ESP_LOGW(TAG, "plant %u: cap %u value out of range, dropping", p->id, cap_id);
+                continue;
+            }
+            rec.col[col] = raw;
+            any_value = true;
+        }
+        if (!any_value) continue;   /* every binding stale/unbound this tick: nothing to record */
+
         if (storage_append(s_base, p->id, STORAGE_TIER_RAW, &rec) != 0) {
             ESP_LOGW(TAG, "raw append failed for plant %u", p->id);
             continue;
@@ -133,8 +155,10 @@ static void sample_once(void)
      * interval_s for its first plant to appear -- see that function's doc
      * comment in plants.h for the liveness gate and the DoS-rule boundary
      * (registry-snapshot macs only, never a request-supplied one) both
-     * callers share. */
-    plants_adopt_from_registry(&reg_snap, now, interval_s);
+     * callers share. Still mac-based (M2-SHIM) -- auto-CREATING a plant for
+     * a newly-seen probe is unrelated to what capabilities it later gets
+     * bound to, and is not rewired by this task (RULING-1). */
+    plants_adopt_from_registry(&reg_snap_legacy, now, interval_s);   /* M2-SHIM */
 }
 
 static void sampler_task(void *arg)

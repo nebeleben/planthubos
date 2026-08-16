@@ -1,10 +1,12 @@
 #include "plants.h"
 #include "plants_migrate.h"
+#include "capability.h"
 #include "storage.h"
 #include "storage_compat.h"   /* M2-SHIM */
 #include "timekeeper.h"
 #include "app_config.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
@@ -52,8 +54,18 @@ static const char *TAG = "plants";
  * node table. Deliberately NOT plants_table_t dumped raw: that struct's
  * `bool` fields and any compiler-inserted padding are not a stable on-disk
  * shape, so this mirror struct pins every field to an explicit width/order
- * instead. */
-#define PLANTS_BLOB_FORMAT 1
+ * instead.
+ *
+ * Format 2 (M2 Task 4): adds each plant's capability bindings (cap_bound[]/
+ * cap_dev[], plants_table.h). No migration branch for format 1 -- per the
+ * M2 device-model plan, this is a clean-start format change: a format-1
+ * blob is already the wrong LENGTH (674B vs this format's 1954B, see
+ * plant_entry_blob_t below) and gets discarded by load_file()'s existing
+ * "unrecognised size" branch before the format byte is even checked, so
+ * bumping this number is defense in depth, not the primary guard. An
+ * upgrading hub starts with an empty plant table (logged) rather than a
+ * silently-reinterpreted one -- see task-4-report.md. */
+#define PLANTS_BLOB_FORMAT 2
 
 typedef struct __attribute__((packed)) {
     uint8_t id;
@@ -61,6 +73,8 @@ typedef struct __attribute__((packed)) {
     uint8_t mac[6];
     uint8_t mac_valid;   /* bool, packed as u8 */
     char    name[PLANT_NAME_LEN + 1];
+    uint8_t     cap_bound[CAPABILITY_COUNT];   /* bool, packed as u8, indexed by cap_id */
+    device_id_t cap_dev[CAPABILITY_COUNT];     /* device_id_t is all-uint8_t: safe to embed directly */
 } plant_entry_blob_t;
 
 typedef struct __attribute__((packed)) {
@@ -190,6 +204,10 @@ static void pack_blob(const plants_table_t *in, plants_blob_t *out)
         memcpy(out->p[i].mac, in->p[i].mac, 6);
         out->p[i].mac_valid = in->p[i].mac_valid ? 1 : 0;
         memcpy(out->p[i].name, in->p[i].name, sizeof(out->p[i].name));
+        for (int c = 0; c < CAPABILITY_COUNT; c++) {
+            out->p[i].cap_bound[c] = in->p[i].cap_bound[c] ? 1 : 0;
+            out->p[i].cap_dev[c] = in->p[i].cap_dev[c];
+        }
     }
 }
 
@@ -215,6 +233,10 @@ static void unpack_blob(const plants_blob_t *blob, plants_table_t *out)
         memcpy(out->p[i].mac, blob->p[i].mac, 6);
         memcpy(out->p[i].name, blob->p[i].name, sizeof(out->p[i].name));
         out->p[i].name[PLANT_NAME_LEN] = '\0';  /* defensive: guard against a corrupt non-terminated blob */
+        for (int c = 0; c < CAPABILITY_COUNT; c++) {
+            out->p[i].cap_bound[c] = blob->p[i].cap_bound[c] != 0;
+            out->p[i].cap_dev[c] = blob->p[i].cap_dev[c];
+        }
     }
 }
 
@@ -1034,7 +1056,7 @@ esp_err_t plants_rename(uint8_t id, const char *name)
     return err;
 }
 
-esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null)
+esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null)   /* M2-SHIM: see plants.h */
 {
     /* Same uninitialised-registry guard as plants_rename() above. */
     if (!s_mutex) return ESP_ERR_NOT_FOUND;
@@ -1156,6 +1178,96 @@ esp_err_t plants_delete(uint8_t id)
     return err;
 }
 
+/* ---------------- Capability bindings (M2 Task 4) ----------------
+ *
+ * Same two-phase discipline as plants_rename()/plants_assign()/etc. above:
+ * mutate s_table under s_mutex (a bounded, allocation-free
+ * plants_table_bind_cap() call), release s_mutex, THEN persist_table() --
+ * which re-reads the current s_table under its own brief s_mutex hold, so
+ * this never holds s_mutex across the file write. */
+
+bool plants_bind_cap(uint8_t plant_id, uint8_t cap_id, const device_id_t *dev)
+{
+    /* Same uninitialised-registry guard as plants_rename() above. */
+    if (!s_mutex) return false;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool ok = plants_table_bind_cap(&s_table, plant_id, cap_id, dev);
+    xSemaphoreGive(s_mutex);
+    if (!ok) return false;
+
+    esp_err_t err = persist_table();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "plants_bind_cap(%u, cap %u): plants.bin write failed (%s); RAM cache already "
+                      "reflects the new binding and will not revert until the next successful "
+                      "write or a reboot", plant_id, cap_id, esp_err_to_name(err));
+    }
+    return true;
+}
+
+int plants_bind_device(uint8_t plant_id, const device_id_t *dev, const registry_t *reg)
+{
+    if (!dev || !reg || !s_mutex) return 0;
+
+    int ridx = registry_find(reg, dev);
+    if (ridx < 0) return 0;   /* dev not in this snapshot: nothing to bind */
+    const device_entry_t *de = &reg->devices[ridx];
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int count = 0;
+    for (uint8_t cap = 0; cap < CAPABILITY_COUNT; cap++) {
+        if (de->caps[cap].valid && plants_table_bind_cap(&s_table, plant_id, cap, dev)) {
+            count++;
+        }
+    }
+    xSemaphoreGive(s_mutex);
+    if (count == 0) return 0;   /* unknown plant_id, or dev reports nothing yet */
+
+    esp_err_t err = persist_table();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "plants_bind_device(%u): plants.bin write failed (%s); RAM cache already "
+                      "reflects %d new binding(s) and will not revert until the next successful "
+                      "write or a reboot", plant_id, esp_err_to_name(err), count);
+    }
+    return count;
+}
+
+size_t plants_bindings(uint8_t plant_id, plant_binding_t *out, size_t max)
+{
+    if (!out || !s_mutex) return 0;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    size_t n = plants_table_bindings(&s_table, plant_id, out, max);
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+bool plants_cap_value(uint8_t plant_id, uint8_t cap_id, const registry_t *reg,
+                      float *value_out, uint32_t *age_s_out)
+{
+    if (!reg || cap_id >= CAPABILITY_COUNT || !s_mutex) return false;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int idx = plants_table_find_id(&s_table, plant_id);
+    bool bound = idx >= 0 && s_table.p[idx].cap_bound[cap_id];
+    device_id_t dev = bound ? s_table.p[idx].cap_dev[cap_id] : (device_id_t){ 0 };
+    xSemaphoreGive(s_mutex);
+    if (!bound) return false;
+
+    int ridx = registry_find(reg, &dev);
+    if (ridx < 0) return false;   /* bound device isn't in this snapshot */
+
+    const cap_slot_t *slot = &reg->devices[ridx].caps[cap_id];
+    if (!slot->valid) return false;   /* no value in this slot yet */
+
+    if (value_out) *value_out = capability_decode(cap_id, slot->raw);
+    if (age_s_out) {
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000);
+        *age_s_out = (now >= slot->updated_s) ? now - slot->updated_s : 0;
+    }
+    return true;
+}
+
 /* Same boot-table resolve api_v1.c's history_get wires storage_query's
  * resolve_fn to (its resolve_shim there does the identical one-line
  * forward) -- boot_id/rel_s -> wall-clock epoch is timekeeper's job, not
@@ -1184,7 +1296,7 @@ static void lv_row(void *vctx, uint32_t epoch, const storage_rec_v1_t *rec)   /*
     c->rec = *rec;
 }
 
-bool plants_last_values(uint8_t id, int16_t *temp_dc, uint8_t *moisture,
+bool plants_last_values(uint8_t id, int16_t *temp_dc, uint8_t *moisture,   /* M2-SHIM: see plants.h */
                         uint32_t *lux, uint16_t *conductivity, uint8_t *battery,
                         uint32_t *epoch_out)
 {

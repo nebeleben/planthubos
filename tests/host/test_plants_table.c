@@ -7,13 +7,19 @@ static const uint8_t MAC_A[6] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
 static const uint8_t MAC_B[6] = { 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F };
 static const uint8_t MAC_C[6] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
 
+static device_id_t dev_ble(const uint8_t mac[6])
+{
+    return device_id_from_mac(DEV_KIND_BLE, mac);
+}
+
 int main(void)
 {
     plants_table_t t;
     plants_table_init(&t);
     assert(t.next_id == 1);
 
-    /* resolve(macA) creates plant 1 */
+    /* ---- create/rename/delete: unchanged from V1 ---- */
+
     uint8_t id_a = plants_table_resolve(&t, MAC_A);
     assert(id_a == 1);
     assert(t.next_id == 2);
@@ -28,44 +34,14 @@ int main(void)
     assert(id_a2 == 1);
     assert(t.next_id == 2);
 
-    /* resolve(macB) -> 2 */
-    uint8_t id_b = plants_table_resolve(&t, MAC_B);
-    assert(id_b == 2);
-    assert(t.next_id == 3);
-
-    /* create(NULL) -> 3, empty plant */
+    /* create(NULL) -> empty plant */
     uint8_t id_empty = plants_table_create(&t, NULL);
-    assert(id_empty == 3);
-    assert(t.next_id == 4);
-    idx = plants_table_find_id(&t, 3);
+    assert(id_empty == 2);
+    assert(t.next_id == 3);
+    idx = plants_table_find_id(&t, 2);
     assert(idx >= 0);
     assert(t.p[idx].mac_valid == false);
     assert(strcmp(t.p[idx].name, "") == 0);
-
-    /* assign(3, macB) moves macB off plant 2 onto plant 3 */
-    assert(plants_table_assign(&t, 3, MAC_B) == true);
-    assert(t.next_id == 4); /* assign never allocates an id */
-    int idx2 = plants_table_find_id(&t, 2);
-    assert(idx2 >= 0);
-    assert(t.p[idx2].mac_valid == false);
-    int idx3 = plants_table_find_id(&t, 3);
-    assert(idx3 >= 0);
-    assert(t.p[idx3].mac_valid == true);
-    assert(memcmp(t.p[idx3].mac, MAC_B, 6) == 0);
-    int idx_mac_b = plants_table_find_mac(&t, MAC_B);
-    assert(idx_mac_b == idx3);
-
-    /* assign(1, NULL) unassigns */
-    assert(plants_table_assign(&t, 1, NULL) == true);
-    int idx1 = plants_table_find_id(&t, 1);
-    assert(idx1 >= 0);
-    assert(t.p[idx1].mac_valid == false);
-    assert(plants_table_find_mac(&t, MAC_A) == -1);
-
-    /* assign/rename/delete on unknown id fail */
-    assert(plants_table_assign(&t, 99, MAC_A) == false);
-    assert(plants_table_rename(&t, 99, "x") == false);
-    assert(plants_table_delete(&t, 99) == false);
 
     /* rename bounds: 33-char name rejected, 32 accepted */
     char name32[PLANT_NAME_LEN + 1];
@@ -78,27 +54,29 @@ int main(void)
     name33[PLANT_NAME_LEN + 1] = '\0';
     assert(strlen(name33) == 33);
 
-    assert(plants_table_rename(&t, 3, name33) == false);
-    assert(plants_table_rename(&t, 3, name32) == true);
-    idx3 = plants_table_find_id(&t, 3);
-    assert(strcmp(t.p[idx3].name, name32) == 0);
+    assert(plants_table_rename(&t, 2, name33) == false);
+    assert(plants_table_rename(&t, 2, name32) == true);
+    idx = plants_table_find_id(&t, 2);
+    assert(strcmp(t.p[idx].name, name32) == 0);
 
-    /* delete(2) retires: find_id(2) == -1, id 2 never reused */
-    assert(plants_table_delete(&t, 2) == true);
-    assert(plants_table_find_id(&t, 2) == -1);
-    assert(t.next_id == 4); /* delete never touches next_id */
+    /* rename/delete on unknown id fail */
+    assert(plants_table_rename(&t, 99, "x") == false);
+    assert(plants_table_delete(&t, 99) == false);
 
     uint8_t id_c = plants_table_resolve(&t, MAC_C);
-    assert(id_c == 4);
-    assert(t.next_id == 5);
+    assert(id_c == 3);
+    assert(t.next_id == 4);
 
-    /* next_id persistence: always last id + 1 */
-    assert(t.next_id == (uint8_t)(id_c + 1));
+    /* delete(2) retires: find_id(2) == -1, id 2 never reused */
+    assert(plants_table_delete(&t, id_empty) == true);
+    assert(plants_table_find_id(&t, id_empty) == -1);
+    assert(t.next_id == 4);   /* delete never touches next_id */
 
-    /* currently in_use: ids 1, 3, 4 (id 2 retired) = 3 entries.
-     * Fill remaining PLANTS_MAX - 3 slots to hit capacity. */
+    /* currently in_use: ids 1, 3 (id 2 retired) = 2 entries. Fill remaining
+     * PLANTS_MAX - 2 slots to hit capacity -- create/delete's fill/full/
+     * fresh-id-after-delete behavior, unchanged from V1. */
     uint8_t last_id = id_c;
-    for (int i = 0; i < PLANTS_MAX - 3; i++) {
+    for (int i = 0; i < PLANTS_MAX - 2; i++) {
         uint8_t new_id = plants_table_create(&t, NULL);
         assert(new_id != 0);
         assert(new_id == (uint8_t)(last_id + 1));
@@ -110,14 +88,93 @@ int main(void)
     assert(plants_table_create(&t, NULL) == 0);
     assert(t.next_id == (uint8_t)(last_id + 1));
 
-    /* delete one -> create succeeds with a FRESH id (never id 4 again) */
-    assert(plants_table_delete(&t, 4) == true);
-    assert(plants_table_find_id(&t, 4) == -1);
+    /* delete one -> create succeeds with a FRESH id (never reused) */
+    uint8_t reused_slot_id = (uint8_t)(id_c + 1);
+    assert(plants_table_delete(&t, reused_slot_id) == true);
+    assert(plants_table_find_id(&t, reused_slot_id) == -1);
     uint8_t fresh_id = plants_table_create(&t, NULL);
     assert(fresh_id != 0);
-    assert(fresh_id != 4);
+    assert(fresh_id != reused_slot_id);
     assert(fresh_id == (uint8_t)(last_id + 1));
     assert(t.next_id == (uint8_t)(fresh_id + 1));
+    /* free that slot back up again for the bindings section below */
+    assert(plants_table_delete(&t, fresh_id) == true);
+
+    /* ---- capability bindings (M2) ---- */
+
+    device_id_t dev_a = dev_ble(MAC_A);
+    device_id_t dev_b = dev_ble(MAC_B);
+
+    /* bind one capability then read it back */
+    assert(plants_table_bind_cap(&t, id_a, CAP_SOIL_MOISTURE, &dev_a) == true);
+    plant_binding_t out[CAPABILITY_COUNT];
+    size_t n = plants_table_bindings(&t, id_a, out, CAPABILITY_COUNT);
+    assert(n == 1);
+    assert(out[0].cap_id == CAP_SOIL_MOISTURE);
+    assert(device_id_equal(&out[0].dev, &dev_a));
+
+    /* binding a second capability to a DIFFERENT device keeps both */
+    assert(plants_table_bind_cap(&t, id_a, CAP_AIR_TEMPERATURE, &dev_b) == true);
+    n = plants_table_bindings(&t, id_a, out, CAPABILITY_COUNT);
+    assert(n == 2);
+    bool saw_moisture = false, saw_temp = false;
+    for (size_t i = 0; i < n; i++) {
+        if (out[i].cap_id == CAP_SOIL_MOISTURE) {
+            saw_moisture = true;
+            assert(device_id_equal(&out[i].dev, &dev_a));
+        } else if (out[i].cap_id == CAP_AIR_TEMPERATURE) {
+            saw_temp = true;
+            assert(device_id_equal(&out[i].dev, &dev_b));
+        }
+    }
+    assert(saw_moisture && saw_temp);
+
+    /* plants_table_bind_cap(..., NULL) clears just that one binding */
+    assert(plants_table_bind_cap(&t, id_a, CAP_SOIL_MOISTURE, NULL) == true);
+    n = plants_table_bindings(&t, id_a, out, CAPABILITY_COUNT);
+    assert(n == 1);
+    assert(out[0].cap_id == CAP_AIR_TEMPERATURE);
+    assert(device_id_equal(&out[0].dev, &dev_b));
+
+    /* two plants may bind the same device (V2 lifts V1's one-probe-per-plant
+     * restriction -- see plants_table_bind_cap()'s doc comment) */
+    assert(plants_table_bind_cap(&t, id_c, CAP_AIR_TEMPERATURE, &dev_b) == true);
+    n = plants_table_bindings(&t, id_c, out, CAPABILITY_COUNT);
+    assert(n == 1);
+    assert(out[0].cap_id == CAP_AIR_TEMPERATURE);
+    assert(device_id_equal(&out[0].dev, &dev_b));
+    /* plant id_a's own binding to dev_b is untouched by id_c also binding it */
+    n = plants_table_bindings(&t, id_a, out, CAPABILITY_COUNT);
+    assert(n == 1);
+    assert(out[0].cap_id == CAP_AIR_TEMPERATURE);
+
+    /* binding an unknown capability id is rejected */
+    assert(plants_table_bind_cap(&t, id_a, CAPABILITY_COUNT, &dev_a) == false);
+    assert(plants_table_bind_cap(&t, id_a, 200, &dev_a) == false);
+    n = plants_table_bindings(&t, id_a, out, CAPABILITY_COUNT);
+    assert(n == 1);   /* unchanged by the rejected calls */
+
+    /* binding on an unknown plant id is rejected */
+    assert(plants_table_bind_cap(&t, 99, CAP_SOIL_MOISTURE, &dev_a) == false);
+    assert(plants_table_bindings(&t, 99, out, CAPABILITY_COUNT) == 0);
+
+    /* deleting a plant drops its bindings */
+    assert(plants_table_delete(&t, id_a) == true);
+    assert(plants_table_find_id(&t, id_a) == -1);
+    /* id never reused, so plants_table_bindings() on the retired id reports
+     * "unknown plant" (0), not stale bindings */
+    assert(plants_table_bindings(&t, id_a, out, CAPABILITY_COUNT) == 0);
+    /* id_c's binding survives id_a's deletion */
+    n = plants_table_bindings(&t, id_c, out, CAPABILITY_COUNT);
+    assert(n == 1);
+    assert(out[0].cap_id == CAP_AIR_TEMPERATURE);
+
+    /* a freshly created plant starts with no bindings (memset in
+     * plants_table_create() covers the new fields too, same slot id_a just
+     * vacated) */
+    uint8_t id_d = plants_table_create(&t, NULL);
+    assert(id_d != 0 && id_d != id_a);
+    assert(plants_table_bindings(&t, id_d, out, CAPABILITY_COUNT) == 0);
 
     printf("test_plants_table: OK\n");
     return 0;

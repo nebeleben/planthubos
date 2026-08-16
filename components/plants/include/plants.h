@@ -1,8 +1,10 @@
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 #include "plants_table.h"
+#include "registry.h"          /* registry_t: plants_bind_device()/plants_cap_value() */
 #include "registry_compat.h"   /* M2-SHIM: legacy_registry_t, see that header */
 
 /* LittleFS-backed plant registry: a single blob at <storage_base>/plants.bin
@@ -19,12 +21,14 @@
  * plants_init() that adopts an existing pre-fix NVS blob if plants.bin
  * doesn't exist yet -- steady state never writes NVS.
  *
- * The on-disk blob is an explicit packed mirror struct (format byte 1 +
- * next_id + 16 x {id, in_use:u8, mac[6], mac_valid:u8, name[33]}), never a
- * raw dump of plants_table_t -- the host struct's bool fields and padding
- * are not a stable on-disk shape across compilers/targets. A wrong length
- * or an unrecognised format byte is loudly logged and treated as "start
- * empty" -- this never fails boot. */
+ * The on-disk blob is an explicit packed mirror struct (format byte 2 +
+ * next_id + 16 x {id, in_use:u8, mac[6], mac_valid:u8, name[33], cap_bound[8],
+ * cap_dev[8]}), never a raw dump of plants_table_t -- the host struct's bool
+ * fields and padding are not a stable on-disk shape across compilers/targets.
+ * A wrong length or an unrecognised format byte is loudly logged and treated
+ * as "start empty" -- this never fails boot. See plants.c's PLANTS_BLOB_FORMAT
+ * comment for the format-1 -> format-2 (M2 Task 4) bump: no migration code,
+ * a clean-start format change (task-4-report.md). */
 
 /* Init: loads <storage_base>/plants.bin (missing/bad -> empty table, logged;
  * if also absent, a one-boot check adopts a pre-fix NVS blob if one exists),
@@ -59,9 +63,51 @@ void plants_snapshot(plants_table_t *out);
  * doesn't exist (ESP_ERR_NOT_FOUND, or 0 for plants_create()'s "full"
  * contract), never touching an uninitialised mutex. */
 esp_err_t plants_rename(uint8_t id, const char *name);
-esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null);
 uint8_t   plants_create(void);                       /* 0 = full (or uninitialised) */
 esp_err_t plants_delete(uint8_t id);                 /* also deletes P<id> ring files */
+
+/* M2-SHIM: V1's single-probe-per-plant assignment (mac_valid/mac,
+ * plants_table_assign()'s "assigning a mac already assigned elsewhere MOVES
+ * it" semantics). The M2 model (below) replaces "assign a probe" with "bind
+ * the capabilities that probe reports" -- api_v1.c's probe-assignment route
+ * is the only remaining caller, and it is not rewired by this task (RULING-1,
+ * task-4-report.md). DELETE once that route moves to plants_bind_device(). */
+esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null);   /* M2-SHIM */
+
+/* plant_binding_t is declared in plants_table.h (included above). */
+
+/* Bind one capability on `plant_id` to `dev` (dev == NULL clears just that
+ * one). Persists to plants.bin like every other mutation in this header.
+ * Returns false for an unknown plant id or an unrecognised cap_id, or
+ * before plants_init() has run (same "uninitialised registry" contract as
+ * every other mutator here). */
+bool plants_bind_cap(uint8_t plant_id, uint8_t cap_id, const device_id_t *dev);
+
+/* Bind every capability `dev` currently reports in `reg` (a registry
+ * snapshot the caller already took -- e.g. data_core_snapshot()) -- the V2
+ * shape of the old V1 "assign this probe to this plant" one-click flow, now
+ * "bind everything it currently has" instead of a single mac. Binds and
+ * persists once after the whole sweep, not once per capability. Returns the
+ * number of capabilities bound: 0 when plant_id is unknown, dev isn't in
+ * `reg`, or the device reports nothing yet (registry devices with every
+ * cap_slot_t.valid == false, e.g. paired but silent this boot). */
+int plants_bind_device(uint8_t plant_id, const device_id_t *dev, const registry_t *reg);
+
+/* Copies plant_id's currently-bound capabilities into out[] (max
+ * CAPABILITY_COUNT). Returns the count actually copied. */
+size_t plants_bindings(uint8_t plant_id, plant_binding_t *out, size_t max);
+
+/* Latest value for one bound capability, straight from `reg` (a snapshot
+ * the caller already took, same as plants_bind_device() above -- this
+ * function does no registry lookup of its own beyond indexing into `reg`).
+ * age_s_out is how long ago (seconds, this call's own wall-clock read) the
+ * registry slot was last updated -- callers use it the way sampler.c's old
+ * "now - e->last_seen_s > interval_s" staleness check did, just per
+ * capability instead of per device. Returns false when plant_id has no
+ * binding for cap_id, the bound device isn't in `reg`, or its slot has no
+ * value yet (cap_slot_t.valid == false). */
+bool plants_cap_value(uint8_t plant_id, uint8_t cap_id, const registry_t *reg,
+                      float *value_out, uint32_t *age_s_out);
 
 /* Auto-create sweep (final M8 review, H1+M3): adopts every LIVE registry mac
  * not already claimed by a plant into a new one (plants_resolve_or_create()),
@@ -101,7 +147,12 @@ esp_err_t plants_delete(uint8_t id);                 /* also deletes P<id> ring 
  * which this inherits. */
 void plants_adopt_from_registry(const legacy_registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s);   /* M2-SHIM */
 
-/* Probe-less last values: the plant's last history record (ring tail),
+/* M2-SHIM: probe-less last values, V1's fixed 5-field shape (storage_compat.h's
+ * storage_rec_v1_t) rather than plants_cap_value()'s per-capability one.
+ * sensors_json.c is the only remaining caller and is not rewired by this
+ * task (RULING-1, task-4-report.md) -- DELETE once it moves to
+ * plants_bindings()/plants_cap_value(). Kept working exactly as before:
+ * the plant's last history record (ring tail),
  * read via storage_query() (storage.h) over the plant's own P<id>_raw.bin
  * ring -- id-keyed since M8 Task 3, so this works for a plant with no
  * assigned sensor, or one whose probe was unplugged/reassigned elsewhere,
@@ -115,6 +166,6 @@ void plants_adopt_from_registry(const legacy_registry_t *reg, uint32_t now_uptim
  * the first scan's result stays correct until the plant itself is deleted.
  * Returns false when the plant has no history (id unknown, no ring file
  * yet, or the ring is empty). Fields use storage.h NONE sentinels. */
-bool plants_last_values(uint8_t id, int16_t *temp_dc, uint8_t *moisture,
+bool plants_last_values(uint8_t id, int16_t *temp_dc, uint8_t *moisture,   /* M2-SHIM */
                         uint32_t *lux, uint16_t *conductivity, uint8_t *battery,
                         uint32_t *epoch_out);

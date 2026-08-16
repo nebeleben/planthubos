@@ -118,7 +118,45 @@ bool plants_table_delete(plants_table_t *t, uint8_t id)
     if (idx < 0) {
         return false;
     }
-    memset(&t->p[idx], 0, sizeof(t->p[idx]));
+    memset(&t->p[idx], 0, sizeof(t->p[idx]));   /* also drops every binding */
     t->p[idx].in_use = false;
     return true;
+}
+
+bool plants_table_bind_cap(plants_table_t *t, uint8_t id, uint8_t cap_id,
+                           const device_id_t *dev)
+{
+    if (cap_id >= CAPABILITY_COUNT) {
+        return false;
+    }
+    int idx = plants_table_find_id(t, id);
+    if (idx < 0) {
+        return false;
+    }
+    if (dev == NULL) {
+        t->p[idx].cap_bound[cap_id] = false;
+        memset(&t->p[idx].cap_dev[cap_id], 0, sizeof(device_id_t));
+        return true;
+    }
+    t->p[idx].cap_bound[cap_id] = true;
+    t->p[idx].cap_dev[cap_id] = *dev;
+    return true;
+}
+
+size_t plants_table_bindings(const plants_table_t *t, uint8_t id,
+                             plant_binding_t *out, size_t max)
+{
+    int idx = plants_table_find_id(t, id);
+    if (idx < 0) {
+        return 0;
+    }
+    size_t n = 0;
+    for (uint8_t cap = 0; cap < CAPABILITY_COUNT && n < max; cap++) {
+        if (t->p[idx].cap_bound[cap]) {
+            out[n].cap_id = cap;
+            out[n].dev = t->p[idx].cap_dev[cap];
+            n++;
+        }
+    }
+    return n;
 }
