@@ -62,6 +62,20 @@ test('two manufacturer structures: the LAST one wins, matching ble_hs_adv_parse_
   assert.equal(sliceWrapperPayload(advert, 1), '2222')
 })
 
+// M4 fix wave finding 2: a LAST-matching structure too short to hold its
+// own 2-byte id must still clobber an earlier, longer match -- NimBLE has
+// no minimum-length check on manufacturer data and overwrites
+// fields.mfg_data/mfg_data_len unconditionally. Verified example from the
+// finding: 05 FF 99 04 11 22 | 02 FF 77 -- firmware ends up with a 1-byte
+// mfg_data (matching no manufacturer wrapper at all), so this must yield
+// empty, never the earlier match's '1122'.
+test('a short trailing same-type structure clobbers an earlier longer match', () => {
+  const first = adStruct('ff', '9904' + '1122')   // company 0x0499, data 1122
+  const second = adStruct('ff', '77')             // only 1 byte total after type -- too short for a company id
+  const advert = first + second
+  assert.equal(sliceWrapperPayload(advert, 1), '')
+})
+
 test('two service-data structures: the LAST one wins', () => {
   const first = adStruct('16', '4afc' + '1111')
   const second = adStruct('16', '0918' + '2222')

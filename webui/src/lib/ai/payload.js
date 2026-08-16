@@ -47,10 +47,13 @@ function bytesToHex(bytes) {
 
 // Walks every AD structure in a raw advertisement and returns the bytes
 // after the LAST occurrence of `adType`'s own 2-byte id, or null if none
-// exists (or every occurrence found was too short to even hold an id). A
-// structure whose length byte overruns the remaining buffer ends the walk
-// right there -- whatever was found before the truncation still stands,
-// nothing past a truncated structure is trusted.
+// exists at all. A LAST occurrence too short to even hold the 2-byte id
+// still wins over an earlier, longer one -- it yields an empty array
+// rather than null, matching NimBLE's unconditional overwrite (see the
+// comment at the assignment below). A structure whose length byte
+// overruns the remaining buffer ends the walk right there -- whatever was
+// found before the truncation still stands, nothing past a truncated
+// structure is trusted.
 function lastAdStructureAfterId(bytes, adType) {
   let i = 0
   let found = null
@@ -59,7 +62,18 @@ function lastAdStructureAfterId(bytes, adType) {
     if (segLen === 0) break
     if (i + 1 + segLen > bytes.length) break
     const segType = bytes[i + 1]
-    if (segType === adType && segLen >= 3) found = bytes.slice(i + 4, i + 1 + segLen)
+    // Assign unconditionally on a type match, even when segLen < 3 (too
+    // short to hold the 2-byte id) -- NimBLE's ble_hs_adv_parse_fields()
+    // has no minimum-length check on manufacturer data, so a short
+    // trailing manufacturer structure still overwrites fields.mfg_data
+    // (to a near-empty slice) and must clobber an earlier match here too,
+    // not leave it standing. The service-data branch never actually hits
+    // the segLen < 3 case in practice: a service-data structure too short
+    // to hold its own 2-byte UUID16 fails NimBLE's parse and gets the
+    // whole advertisement rejected before it reaches /api/v1/unknown --
+    // this function still treats both types the same way rather than
+    // encoding that difference here.
+    if (segType === adType) found = segLen >= 3 ? bytes.slice(i + 4, i + 1 + segLen) : []
     i += 1 + segLen
   }
   return found
