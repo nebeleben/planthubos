@@ -164,3 +164,9 @@ $CC -Wall -Wextra -Werror -I../../components/bthome/include -I../../components/c
 $CC -Wall -Wextra -Werror -I../../components/bthome/include \
     test_bindkey_core.c ../../components/bthome/bindkey_core.c -o test_bindkey_core
 ./test_bindkey_core
+
+# Guards cfg.max_uri_handlers against the number of routes actually
+# registered. Pure text check over the webserver sources -- see the file's own
+# top comment for the boot loop it exists to prevent.
+$CC -Wall -Wextra -Werror test_uri_handler_budget.c -o test_uri_handler_budget
+./test_uri_handler_budget

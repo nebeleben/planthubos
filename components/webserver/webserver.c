@@ -72,15 +72,24 @@ static const static_asset_t ASSETS[] = {
 esp_err_t webserver_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    /* M5b Task 6 (node rename/forget) brought the registered total to 21
-     * (3 static assets + 16 in api_v1_register() + 1 SSE + 1 captive-portal
-     * fallback) against the old cap of 24 -- close enough that the brief
-     * calls for raising it now rather than waiting for the next handler to
-     * trip ESP_ERR_NO_MEM at httpd_register_uri_handler(). Raised with
-     * headroom for further growth, not just to clear today's count. */
-    cfg.max_uri_handlers = 40;  /* 28 registered as of the health endpoint; the
-                                 * M8 review noted overflow aborts boot via
-                                 * ESP_ERROR_CHECK, so keep real headroom. */
+    /* Registered total, recounted at V2 M3 Task 9: 48
+     *   3 static assets (ASSETS above)
+     *  43 in api_v1_register()
+     *   1 SSE (sse_init)
+     *   1 captive-portal fallback
+     * M3 Task 7 added seven wrapper/unknown/bind-key routes, which took the
+     * total from 41 to 48 against the then-cap of 40. That does not fail the
+     * build and no host test can see it: httpd_register_uri_handler() returns
+     * ESP_ERR_HTTPD_HANDLERS_FULL, ESP_ERROR_CHECK aborts, and the board boot
+     * loops at ~520 ms -- which is exactly how it was found, on the bench,
+     * three tasks after the code landed. tests/host/test_uri_handler_budget.c
+     * now counts the registrations against this number so the next one is
+     * caught by `tests/host/run.sh` instead of by a dead board.
+     *
+     * Sized with real headroom rather than to clear today's count: each slot
+     * is one pointer in the server's handler array, so the 8 spare cost 32 B
+     * of heap. */
+    cfg.max_uri_handlers = 56;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 8192; /* wifi_scan_get's records buffer + cJSON work no longer fit in 4K */
     /* Without this, abandoned sockets (phone walks away from the portal, tab
