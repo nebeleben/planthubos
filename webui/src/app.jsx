@@ -8,6 +8,7 @@ import { NodesTab } from './tabs/nodes.jsx'
 import { PlantsTab } from './tabs/plants.jsx'
 import { RoleTab } from './tabs/role.jsx'
 import { RulesTab } from './tabs/rules.jsx'
+import { WrappersTab } from './tabs/wrappers.jsx'
 import { getStoredTheme, setStoredTheme, systemPrefersDark } from './lib/theme.js'
 
 // Post-M8 split: Dashboard is the live plant cards (DashboardTab),
@@ -18,8 +19,10 @@ import { getStoredTheme, setStoredTheme, systemPrefersDark } from './lib/theme.j
 // probes -- binding itself moved onto the Plants tab with the M2
 // capability model, so this tab is read-only plus rename). Rules (M1 VM)
 // sits after History, ahead of Nodes -- both mirror the same "operate the
-// fleet" grouping the tab order already implies.
-const ALL_TABS = ['Dashboard', 'Plants', 'Devices', 'History', 'Rules', 'Nodes', 'Config', 'Network']
+// fleet" grouping the tab order already implies. Wrappers (M3 Task 8)
+// follows Rules for the same reason -- another "write PlantScript, compile,
+// save" surface, immediately after its closest sibling.
+const ALL_TABS = ['Dashboard', 'Plants', 'Devices', 'History', 'Rules', 'Wrappers', 'Nodes', 'Config', 'Network']
 
 // localStorage key the Rules tab's own event feed (rules.jsx) writes on
 // every fetch while mounted -- reading it here is how the tab bar knows
@@ -87,6 +90,14 @@ export function App() {
   // into Rules, since mounting that tab is what actually advances the
   // "seen" bookmark for real.
   const [rulesUnseen, setRulesUnseen] = useState(false)
+
+  // Cross-tab "Add wrapper" hop from the Devices tab's Unknown devices
+  // section into the Wrappers tab's editor, prefilled with the captured
+  // hex payload. Held here (not localStorage, unlike the Rules tab's
+  // unseen-events badge above -- that's a reload-persistence problem, this
+  // is a same-session handoff) since app.jsx already owns which tab is
+  // showing. WrappersTab clears it back to null once consumed.
+  const [wrapperPrefillHex, setWrapperPrefillHex] = useState(null)
 
   useEffect(() => {
     if (role === 'node' || role === 'unset') return   // no Rules tab there at all -- see TABS below
@@ -161,8 +172,10 @@ export function App() {
   // node-management surface of its own, so hide the tab there rather than
   // rendering an empty/confusing list. Rules follows the same rule -- the
   // rules engine (components/rules) only ever runs on the hub that owns the
-  // plant/device registry, never on a paired node.
-  const TABS = role === 'node' ? ALL_TABS.filter((t) => t !== 'Nodes' && t !== 'Rules') : ALL_TABS
+  // plant/device registry, never on a paired node. Wrappers is hub-only for
+  // the identical reason: the wrapper store/decoder/registry all live on
+  // the hub, never on a paired node.
+  const TABS = role === 'node' ? ALL_TABS.filter((t) => t !== 'Nodes' && t !== 'Rules' && t !== 'Wrappers') : ALL_TABS
 
   return (
     <div class="app">
@@ -187,9 +200,14 @@ export function App() {
       <main>
         {tab === 'Dashboard' ? <DashboardTab /> :
          tab === 'Plants' ? <PlantsTab /> :
-         tab === 'Devices' ? <DevicesTab /> :
+         tab === 'Devices' ? (
+           <DevicesTab onAddWrapper={(hex) => { setWrapperPrefillHex(hex); setTab('Wrappers') }} />
+         ) :
          tab === 'History' ? <HistoryTab /> :
          tab === 'Rules' ? <RulesTab /> :
+         tab === 'Wrappers' ? (
+           <WrappersTab prefillHex={wrapperPrefillHex} onPrefillConsumed={() => setWrapperPrefillHex(null)} />
+         ) :
          tab === 'Nodes' ? <NodesTab /> :
          tab === 'Config' ? <ConfigTab /> :
          tab === 'Network' ? <NetworkTab /> :
