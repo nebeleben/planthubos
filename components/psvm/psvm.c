@@ -77,11 +77,11 @@ static void const_entry(const psvm_prog_t *p, uint16_t idx, uint8_t *tag_out,
     }
 }
 
-psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t caps_max,
-                         uint32_t builtins_impl, psvm_prog_t *out) {
+psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
+                         uint8_t caps_max, uint32_t builtins_impl, psvm_prog_t *out) {
     if (len < PSVM_HEADER_LEN) return PSVM_ERR_TRUNCATED;
     if (memcmp(blob, "PSBC", 4) != 0) return PSVM_ERR_HEADER;
-    if (blob[4] != PSVM_FMT_VER || blob[5] != PSVM_DIALECT_RULES) return PSVM_ERR_HEADER;
+    if (blob[4] != PSVM_FMT_VER || blob[5] != dialect) return PSVM_ERR_HEADER;
     uint16_t flags = rd_u16(blob + 6);
     if (flags != 0) return PSVM_ERR_HEADER;
 
@@ -166,7 +166,13 @@ typedef struct {
     bool b;
 } value_t;
 
+/* One buffered EMIT (spec section 3) -- see psvm_run()'s doc comment in
+ * psvm.h for why buffering (rather than calling wio->emit immediately) is
+ * what makes "a failed require emits nothing" work cleanly. */
+typedef struct { uint8_t cap; float value; } emit_item_t;
+
 psvm_result_t psvm_run(const psvm_prog_t *p, const psvm_ref_val_t *resolved,
+                       const psvm_wrapper_io_t *wio,
                        psvm_sink_t sink, void *sink_ctx, bool run_actions) {
     psvm_result_t res = {false, PSVM_OK, 0};
     value_t stack[PSVM_STACK];
@@ -175,6 +181,20 @@ psvm_result_t psvm_run(const psvm_prog_t *p, const psvm_ref_val_t *resolved,
     uint32_t steps = 0;
     uint16_t pc = 0;
     bool cond = false;
+
+    /* Wrapper-dialect state -- harmless/unused for a rules-dialect run
+     * (wio==NULL there, and rules bytecode never contains a payload
+     * accessor, EMIT or AES_CCM opcode). payload_buf is a working COPY (not
+     * a pointer into wio->payload.data) specifically so AES_CCM can decrypt
+     * in place without requiring the caller to hand over mutable storage. */
+    uint8_t payload_buf[PSVM_PAYLOAD_MAX];
+    uint8_t payload_len = 0;
+    if (wio && wio->payload.data && wio->payload.len > 0) {
+        payload_len = (wio->payload.len > PSVM_PAYLOAD_MAX) ? PSVM_PAYLOAD_MAX : wio->payload.len;
+        memcpy(payload_buf, wio->payload.data, payload_len);
+    }
+    emit_item_t emit_buf[PSVM_MAX_EMITS];
+    uint8_t emit_count = 0;
 
     for (;;) {
         if (steps >= PSVM_MAX_STEPS) { res.err = PSVM_ERR_STEPS; goto done; }
@@ -349,9 +369,111 @@ psvm_result_t psvm_run(const psvm_prog_t *p, const psvm_ref_val_t *resolved,
             if (!run_actions || !cond) { res.err = PSVM_OK; goto done; }
             break;
         }
-        case 0xFF: /* HALT */
+        /* ---- wrapper dialect (M3 spec section 3): payload accessors ---- */
+        case 0x60: case 0x61: case 0x62: case 0x63:
+        case 0x64: case 0x65: case 0x66: { /* LOAD_U8/U16LE/U16BE/I16LE/I16BE/U24LE/U32LE u16 offset */
+            if ((size_t)pc + 3 > p->code_len) { res.err = PSVM_ERR_BADOP; goto done; }
+            uint16_t off = rd_u16(p->code + pc + 1);
+            uint8_t size = (op == 0x60) ? 1u
+                         : (op == 0x65) ? 3u
+                         : (op == 0x66) ? 4u
+                         : 2u;
+            if ((uint32_t)off + size > payload_len) { res.err = PSVM_ERR_REF; goto done; }
+            const uint8_t *b = payload_buf + off;
+            float f;
+            switch (op) {
+            case 0x60: f = (float)b[0]; break;
+            case 0x61: f = (float)((uint16_t)b[0] | ((uint16_t)b[1] << 8)); break;
+            case 0x62: f = (float)(((uint16_t)b[0] << 8) | (uint16_t)b[1]); break;
+            case 0x63: f = (float)(int16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8)); break;
+            case 0x64: f = (float)(int16_t)(((uint16_t)b[0] << 8) | (uint16_t)b[1]); break;
+            case 0x65: f = (float)((uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16)); break;
+            default:   f = (float)((uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+                                    ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24)); break;
+            }
+            value_t v = { .tag = V_NUM, .f = f, .s = NULL, .slen = 0, .b = false };
+            if (sp >= PSVM_STACK) { res.err = PSVM_ERR_STACK; goto done; }
+            stack[sp++] = v;
+            pc = (uint16_t)(pc + 3);
+            break;
+        }
+        case 0x67: { /* LOAD_BITS u16 offset, u8 lsb, u8 width */
+            if ((size_t)pc + 5 > p->code_len) { res.err = PSVM_ERR_BADOP; goto done; }
+            uint16_t off = rd_u16(p->code + pc + 1);
+            uint8_t lsb = p->code[pc + 3];
+            uint8_t width = p->code[pc + 4];
+            if (width == 0 || width > 32 || (uint32_t)lsb + width > 32) { res.err = PSVM_ERR_BADOP; goto done; }
+            uint8_t need = (uint8_t)((lsb + width + 7) / 8);
+            if ((uint32_t)off + need > payload_len) { res.err = PSVM_ERR_REF; goto done; }
+            uint32_t word = 0;
+            for (uint8_t i = 0; i < need; i++) word |= ((uint32_t)payload_buf[off + i]) << (8u * i);
+            uint32_t mask = (width == 32) ? 0xFFFFFFFFu : ((1u << width) - 1u);
+            uint32_t val = (word >> lsb) & mask;
+            value_t v = { .tag = V_NUM, .f = (float)val, .s = NULL, .slen = 0, .b = false };
+            if (sp >= PSVM_STACK) { res.err = PSVM_ERR_STACK; goto done; }
+            stack[sp++] = v;
+            pc = (uint16_t)(pc + 5);
+            break;
+        }
+        case 0x68: { /* PAYLOAD_LEN */
+            value_t v = { .tag = V_NUM, .f = (float)payload_len, .s = NULL, .slen = 0, .b = false };
+            if (sp >= PSVM_STACK) { res.err = PSVM_ERR_STACK; goto done; }
+            stack[sp++] = v;
+            pc = (uint16_t)(pc + 1);
+            break;
+        }
+        case 0x69: { /* EMIT u8 capability; pops value, buffers (see HALT) */
+            if ((size_t)pc + 2 > p->code_len) { res.err = PSVM_ERR_BADOP; goto done; }
+            uint8_t cap = p->code[pc + 1];
+            if (sp < 1) { res.err = PSVM_ERR_STACK; goto done; }
+            value_t v = stack[--sp];
+            if (v.tag != V_NUM) { res.err = PSVM_ERR_TYPE; goto done; }
+            if (emit_count >= PSVM_MAX_EMITS) { res.err = PSVM_ERR_LIMITS; goto done; }
+            emit_buf[emit_count].cap = cap;
+            emit_buf[emit_count].value = v.f;
+            emit_count++;
+            pc = (uint16_t)(pc + 2);
+            break;
+        }
+        case 0x6A: { /* REQUIRE: pops bool; false ends the run at PSVM_OK
+                      * WITHOUT reaching HALT, so the emit buffer (whatever
+                      * it holds so far) is simply never flushed. */
+            if (sp < 1) { res.err = PSVM_ERR_STACK; goto done; }
+            value_t c = stack[--sp];
+            if (c.tag != V_BOOL) { res.err = PSVM_ERR_TYPE; goto done; }
+            if (!c.b) { res.err = PSVM_OK; goto done; }
+            pc = (uint16_t)(pc + 1);
+            break;
+        }
+        case 0x6B: { /* AES_CCM: pops len, offset (see psvm_aes_ccm_t's contract) */
+            if (sp < 2) { res.err = PSVM_ERR_STACK; goto done; }
+            value_t vlen = stack[--sp], voff = stack[--sp];
+            if (vlen.tag != V_NUM || voff.tag != V_NUM) { res.err = PSVM_ERR_TYPE; goto done; }
+            if (voff.f < 0 || voff.f > 255 || vlen.f < 1 || vlen.f > 255) { res.err = PSVM_ERR_REF; goto done; }
+            uint16_t off = (uint16_t)voff.f, rlen = (uint16_t)vlen.f;
+            /* The ciphertext+tag region must run exactly to the end of the
+             * current working payload -- every real BLE encryption scheme
+             * this VM targets (BTHome-style and otherwise) puts the tag
+             * last, and requiring this means shrinking payload_len to
+             * off+out_len below needs no byte-shifting. */
+            if ((uint32_t)off + rlen != payload_len) { res.err = PSVM_ERR_REF; goto done; }
+            if (!wio || !wio->aes_ccm) { res.err = PSVM_ERR_REF; goto done; }
+            uint8_t out_len = 0;
+            if (!wio->aes_ccm(wio->aes_ccm_ctx, (uint8_t)off, (uint8_t)rlen,
+                              payload_buf, payload_len, &out_len) || out_len > rlen) {
+                res.err = PSVM_ERR_REF; goto done;
+            }
+            payload_len = (uint8_t)(off + out_len);
+            pc = (uint16_t)(pc + 1);
+            break;
+        }
+        case 0xFF: { /* HALT -- only place a wrapper's buffered emits are flushed */
+            for (uint8_t i = 0; i < emit_count; i++) {
+                if (wio && wio->emit) wio->emit(wio->emit_ctx, emit_buf[i].cap, emit_buf[i].value);
+            }
             res.err = PSVM_OK;
             goto done;
+        }
         default:
             res.err = PSVM_ERR_BADOP;
             goto done;

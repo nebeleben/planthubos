@@ -111,7 +111,8 @@ static void resolve_all(uint32_t rule_id, resolve_state_t *st,
         strlcpy(st->reason, "bytecode unreadable", sizeof(st->reason));
         return;
     }
-    psvm_err_t verr = psvm_validate(s_psbc, len, RULES_CAP_MAX_ID, RULES_BUILTINS_IMPL, &st->prog);
+    psvm_err_t verr = psvm_validate(s_psbc, len, PSVM_DIALECT_RULES,
+                                    RULES_CAP_MAX_ID, RULES_BUILTINS_IMPL, &st->prog);
     if (verr != PSVM_OK) {
         st->validate_err = verr;
         strlcpy(st->reason, "invalid bytecode", sizeof(st->reason));
@@ -233,7 +234,7 @@ static void evaluate_real(const rule_t *snap, uint32_t now_uptime_s, eval_outcom
         return;
     }
 
-    psvm_result_t cres = psvm_run(&st.prog, s_resolved, NULL, NULL, false);
+    psvm_result_t cres = psvm_run(&st.prog, s_resolved, NULL, NULL, NULL, false);
     if (cres.err != PSVM_OK) {
         out->ready = false;
         out->last_err = cres.err;
@@ -248,7 +249,7 @@ static void evaluate_real(const rule_t *snap, uint32_t now_uptime_s, eval_outcom
     if (!fire) return;
 
     real_sink_ctx_t ctx = { .rule_id = snap->id };
-    psvm_result_t ares = psvm_run(&st.prog, s_resolved, real_sink, &ctx, true);
+    psvm_result_t ares = psvm_run(&st.prog, s_resolved, NULL, real_sink, &ctx, true);
     if (ares.err != PSVM_OK) {
         /* The fire already happened (fsm state above already advanced) --
          * an error partway through the action code (e.g. a step-budget
@@ -489,7 +490,8 @@ int rules_test(uint32_t id, bool *ready, bool *cond, bool *would_fire,
      * passes run_actions=true when the condition holds"), always through the
      * capturing sink -- rendered strings only, never event_log/MQTT. */
     capture_sink_ctx_t cctx = { .acts = acts, .nacts = nacts, .cap = acts_cap };
-    psvm_result_t res = psvm_run(&st.prog, s_resolved, (acts && nacts) ? capture_sink : NULL, &cctx, true);
+    psvm_result_t res = psvm_run(&st.prog, s_resolved, NULL,
+                                 (acts && nacts) ? capture_sink : NULL, &cctx, true);
     xSemaphoreGive(s_eval_mutex);
 
     if (res.err != PSVM_OK) return ESP_OK;   /* *ready stays false */

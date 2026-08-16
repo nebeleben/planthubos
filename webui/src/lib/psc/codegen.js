@@ -28,12 +28,33 @@ export const OPCODES = {
   JMP: 0x41,
   BUILD_STR: 0x50,
   CALL_BUILTIN: 0x51,
+  // Wrapper dialect (M3 spec section 3), dialect=2. Appended after M1's
+  // table (0x00-0x51, 0xFF); do not renumber the opcodes above.
+  LOAD_U8: 0x60,
+  LOAD_U16LE: 0x61,
+  LOAD_U16BE: 0x62,
+  LOAD_I16LE: 0x63,
+  LOAD_I16BE: 0x64,
+  LOAD_U24LE: 0x65,
+  LOAD_U32LE: 0x66,
+  LOAD_BITS: 0x67,
+  PAYLOAD_LEN: 0x68,
+  EMIT: 0x69,
+  REQUIRE: 0x6A,
+  AES_CCM: 0x6B,
   HALT: 0xFF,
 }
 
 const CMP_OPCODE = { '<': OPCODES.LT, '<=': OPCODES.LE, '>': OPCODES.GT, '>=': OPCODES.GE, '==': OPCODES.EQ, '!=': OPCODES.NE }
 const ARITH_OPCODE = { '+': OPCODES.ADD, '-': OPCODES.SUB, '*': OPCODES.MUL, '/': OPCODES.DIV }
 const BUILTIN_ID = { log: 0, notify: 1 }
+// name -> LOAD_* opcode, for the fixed-width single-offset accessors
+// (u8..u32_le). 'bits' and 'len' compile via their own emitWrapperExpr cases.
+const ACCESSOR_OPCODE = {
+  u8: OPCODES.LOAD_U8, u16_le: OPCODES.LOAD_U16LE, u16_be: OPCODES.LOAD_U16BE,
+  i16_le: OPCODES.LOAD_I16LE, i16_be: OPCODES.LOAD_I16BE,
+  u24_le: OPCODES.LOAD_U24LE, u32_le: OPCODES.LOAD_U32LE,
+}
 
 class ByteWriter {
   constructor() { this.bytes = [] }
@@ -118,6 +139,17 @@ function emitExpr(node, buf, ctx) {
       emitExpr(node.right, buf, ctx)
       buf.op(ARITH_OPCODE[node.op])
       return
+    case 'shr': {
+      // `>>` shares the or/and/not/cmp/shift/add/mul/unary precedence chain
+      // with the rules dialect (parser.js), but there is no dedicated shift
+      // opcode in M1's table -- x >> n compiles to x / 2^n (DIV), same as
+      // codegen.js's wrapper-dialect 'shr' case below.
+      emitExpr(node.operand, buf, ctx)
+      const idx = ctx.consts.addNum(2 ** node.amount)
+      buf.op(OPCODES.PUSH_CONST); buf.u16(idx)
+      buf.op(OPCODES.DIV)
+      return
+    }
     case 'cmp':
       emitExpr(node.left, buf, ctx)
       emitExpr(node.right, buf, ctx)
@@ -215,4 +247,120 @@ export function emit(ast) {
     bytecode: w.toUint8Array(),
     refs: refs.entries.map((r) => ({ kind: r.kind, name: r.name, capability: r.capability, field: r.field })),
   }
+}
+
+// ---- wrapper dialect (M3 spec section 3) ----
+// Same expression precedence as emitExpr, extended with the payload
+// accessors and pct(); no LOAD_REF ever appears (wrapper bytecode always
+// has ref_count=0) and no string ops either (no log/notify in this
+// dialect), so string-shaped rule AST nodes are simply not reachable here.
+function emitWrapperExpr(node, buf, ctx) {
+  switch (node.type) {
+    case 'num': {
+      const idx = ctx.consts.addNum(node.value)
+      buf.op(OPCODES.PUSH_CONST); buf.u16(idx)
+      return
+    }
+    case 'unary': {
+      const zeroIdx = ctx.consts.addNum(0)
+      buf.op(OPCODES.PUSH_CONST); buf.u16(zeroIdx)
+      emitWrapperExpr(node.operand, buf, ctx)
+      buf.op(OPCODES.SUB)
+      return
+    }
+    case 'shr': {
+      emitWrapperExpr(node.operand, buf, ctx)
+      const idx = ctx.consts.addNum(2 ** node.amount)
+      buf.op(OPCODES.PUSH_CONST); buf.u16(idx)
+      buf.op(OPCODES.DIV)
+      return
+    }
+    case 'binop':
+      emitWrapperExpr(node.left, buf, ctx)
+      emitWrapperExpr(node.right, buf, ctx)
+      buf.op(ARITH_OPCODE[node.op])
+      return
+    case 'cmp':
+      emitWrapperExpr(node.left, buf, ctx)
+      emitWrapperExpr(node.right, buf, ctx)
+      buf.op(CMP_OPCODE[node.op])
+      return
+    case 'and':
+      emitWrapperExpr(node.left, buf, ctx)
+      emitWrapperExpr(node.right, buf, ctx)
+      buf.op(OPCODES.AND)
+      return
+    case 'or':
+      emitWrapperExpr(node.left, buf, ctx)
+      emitWrapperExpr(node.right, buf, ctx)
+      buf.op(OPCODES.OR)
+      return
+    case 'not':
+      emitWrapperExpr(node.operand, buf, ctx)
+      buf.op(OPCODES.NOT)
+      return
+    case 'load':
+      buf.op(ACCESSOR_OPCODE[node.accessor]); buf.u16(node.offset)
+      return
+    case 'bits':
+      buf.op(OPCODES.LOAD_BITS); buf.u16(node.offset); buf.u8(node.lsb); buf.u8(node.width)
+      return
+    case 'plen':
+      buf.op(OPCODES.PAYLOAD_LEN)
+      return
+    case 'pct':
+      // Identity at codegen level -- see parser.js's parsePct() doc comment.
+      emitWrapperExpr(node.operand, buf, ctx)
+      return
+    default:
+      throw new Error(`codegen: unhandled wrapper node type '${node.type}'`)
+  }
+}
+
+// emitWrapper(ast) -> { bytecode, capsUsed } for a parseWrapper() AST.
+// dialect=2, ref_count always 0 (no LOAD_REF in this dialect), builtins
+// header bitmap always 0 (no CALL_BUILTIN either -- EMIT/REQUIRE/AES_CCM
+// are dedicated opcodes, not builtin calls).
+export function emitWrapper(ast) {
+  const consts = new ConstPool()
+  const ctx = { consts }
+  const buf = new CodeBuf()
+  const capsUsed = []
+
+  for (const stmt of ast.statements) {
+    if (stmt.type === 'require') {
+      emitWrapperExpr(stmt.expr, buf, ctx)
+      buf.op(OPCODES.REQUIRE)
+    } else if (stmt.type === 'emit') {
+      emitWrapperExpr(stmt.expr, buf, ctx)
+      const capId = CAPS[stmt.capability].id
+      buf.op(OPCODES.EMIT); buf.u8(capId)
+      if (!capsUsed.includes(capId)) capsUsed.push(capId)
+    } else if (stmt.type === 'decrypt') {
+      emitWrapperExpr(stmt.offsetExpr, buf, ctx)
+      emitWrapperExpr(stmt.lenExpr, buf, ctx)
+      buf.op(OPCODES.AES_CCM)
+    } else {
+      throw new Error(`codegen: unhandled wrapper statement type '${stmt.type}'`)
+    }
+  }
+  buf.op(OPCODES.HALT)
+
+  const w = new ByteWriter()
+  w.raw([0x50, 0x53, 0x42, 0x43]) // "PSBC"
+  w.u8(1) // fmt_ver
+  w.u8(2) // dialect (wrappers)
+  w.u16(0) // flags — psvm.c rejects nonzero
+  w.u32(0) // builtins — unused by this dialect
+  w.u16(consts.entries.length)
+  w.u16(0) // ref_count — always 0
+  w.u16(buf.bytes.length)
+  for (const c of consts.entries) {
+    if (c.tag === 0) { w.u8(0); w.f32(c.value) }
+    else { w.u8(1); w.str(c.value) }
+  }
+  // no refs section
+  w.raw(buf.bytes)
+
+  return { bytecode: w.toUint8Array(), capsUsed }
 }

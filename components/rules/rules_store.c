@@ -355,7 +355,8 @@ int rules_upsert(uint32_t *id_inout, const char *name, const char *source,
      * compatibility gate) -- reject unknown capability ids / builtins here,
      * at upload, not at first evaluation. */
     psvm_prog_t prog;
-    psvm_err_t verr = psvm_validate(psbc, psbc_len, RULES_CAP_MAX_ID, RULES_BUILTINS_IMPL, &prog);
+    psvm_err_t verr = psvm_validate(psbc, psbc_len, PSVM_DIALECT_RULES,
+                                    RULES_CAP_MAX_ID, RULES_BUILTINS_IMPL, &prog);
     if (verr != PSVM_OK) {
         seterr(errbuf, errlen, psvm_err_str(verr));
         return ESP_ERR_INVALID_ARG;

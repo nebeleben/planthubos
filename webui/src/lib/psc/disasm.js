@@ -109,6 +109,34 @@ export function disassemble(bytecode) {
         pc += 2
         break
       }
+      // ---- wrapper dialect (M3 spec section 3) ----
+      case OPCODES.LOAD_U8:
+      case OPCODES.LOAD_U16LE:
+      case OPCODES.LOAD_U16BE:
+      case OPCODES.LOAD_I16LE:
+      case OPCODES.LOAD_I16BE:
+      case OPCODES.LOAD_U24LE:
+      case OPCODES.LOAD_U32LE: {
+        const off = view.getUint16(codeStart + pc + 1, true)
+        lines.push(`${addr}: ${name} ${off}`)
+        pc += 3
+        break
+      }
+      case OPCODES.LOAD_BITS: {
+        const off = view.getUint16(codeStart + pc + 1, true)
+        const lsb = bytes[codeStart + pc + 3]
+        const width = bytes[codeStart + pc + 4]
+        lines.push(`${addr}: LOAD_BITS ${off} ${lsb} ${width}`)
+        pc += 5
+        break
+      }
+      case OPCODES.EMIT: {
+        const cap = bytes[codeStart + pc + 1]
+        const capName = CAPS_BY_ID[cap] ? CAPS_BY_ID[cap].name : `cap${cap}`
+        lines.push(`${addr}: EMIT ${capName}`)
+        pc += 2
+        break
+      }
       case OPCODES.HALT_BOOL:
       case OPCODES.HALT:
       case OPCODES.ADD:
@@ -124,6 +152,9 @@ export function disassemble(bytecode) {
       case OPCODES.AND:
       case OPCODES.OR:
       case OPCODES.NOT:
+      case OPCODES.PAYLOAD_LEN:
+      case OPCODES.REQUIRE:
+      case OPCODES.AES_CCM:
         lines.push(`${addr}: ${name}`)
         pc += 1
         break

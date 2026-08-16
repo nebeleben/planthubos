@@ -17,14 +17,18 @@ export class PSError extends Error {
 
 const KEYWORDS = new Set([
   'rule', 'when', 'then', 'mode', 'cooldown', 'every', 'and', 'or', 'not',
+  // Wrapper dialect (M3 spec section 3).
+  'wrapper', 'match', 'decode', 'require', 'emit',
+  'service', 'manufacturer', 'mac_prefix',
 ])
 
 const UNIT_CHAR = /[A-Za-z%°]/
 const IDENT_START = /[A-Za-z_]/
 const IDENT_PART = /[A-Za-z0-9_]/
 const DIGIT = /[0-9]/
+const HEX_DIGIT = /[0-9A-Fa-f]/
 
-const TWO_CHAR_PUNCT = new Set(['<=', '>=', '==', '!='])
+const TWO_CHAR_PUNCT = new Set(['<=', '>=', '==', '!=', '>>'])
 const ONE_CHAR_PUNCT = new Set(['(', ')', '.', ',', ';', '<', '>', '+', '-', '*', '/'])
 
 function unescape(s) {
@@ -64,7 +68,21 @@ export function tokenize(source) {
     }
   }
 
+  // Wrapper-dialect match keys and byte offsets are naturally hex
+  // (0x0499, 0xFCD2...) -- spec section 3. No unit suffix after a hex
+  // literal (unlike decimal): a hex value is always a bare integer here.
+  function readHexNumber(startLine, startCol) {
+    advance(); advance() // "0x"
+    let s = ''
+    while (peek() !== undefined && HEX_DIGIT.test(peek())) s += advance()
+    if (s === '') throw new PSError('expected hex digits after 0x', startLine, startCol)
+    return { type: 'NUMBER', value: parseInt(s, 16), unit: null, line: startLine, col: startCol }
+  }
+
   function readNumber(startLine, startCol) {
+    if (peek() === '0' && (peek(1) === 'x' || peek(1) === 'X')) {
+      return readHexNumber(startLine, startCol)
+    }
     let s = ''
     while (peek() !== undefined && DIGIT.test(peek())) s += advance()
     if (peek() === '.' && DIGIT.test(peek(1))) {

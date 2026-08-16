@@ -9,10 +9,29 @@ const CMP_OPS = new Set(['<', '<=', '>', '>=', '==', '!='])
 const MODES = new Set(['edge', 'level'])
 const ACTIONS = new Set(['log', 'notify'])
 
+// Wrapper dialect (M3 spec section 3).
+const MATCH_KIND_ID = { service: 0, manufacturer: 1, mac_prefix: 2 }
+const MATCH_KEY_MAX = { service: 0xFFFF, manufacturer: 0xFFFF, mac_prefix: 0xFFFFFF }
+// name -> byte width, for the single-literal-offset accessors (u8..u32_le).
+// `bits` and `len` have their own arg shapes and aren't in this table.
+const ACCESSOR_WIDTH = {
+  u8: 1, u16_le: 2, u16_be: 2, i16_le: 2, i16_be: 2, u24_le: 3, u32_le: 4,
+}
+// Every payload-accessor primary parsePrimary() recognises in the wrapper
+// dialect: the fixed-width loads above plus 'bits' and 'len', which have
+// their own arg shapes (parseAccessorCall() branches on the name).
+const ACCESSOR_NAMES = new Set([...Object.keys(ACCESSOR_WIDTH), 'bits', 'len'])
+
 class Parser {
-  constructor(tokens) {
+  // dialect: 'rules' (default) or 'wrapper' -- selects parseFile()'s entry
+  // point and parsePrimary()'s payload-accessor/pct branch. Everything else
+  // (tokenizer, or/and/not/cmp/shift/add/mul/unary precedence, string
+  // interpolation) is shared, per the brief: "a second dialect in the same
+  // toolchain, not a fork of it".
+  constructor(tokens, dialect = 'rules') {
     this.tokens = tokens
     this.pos = 0
+    this.dialect = dialect
   }
 
   peek(offset = 0) {
@@ -63,6 +82,26 @@ class Parser {
     const t = this.peek()
     if (t.type !== 'STRING') {
       throw new PSError(`expected string, got '${describeToken(t)}'`, t.line, t.col)
+    }
+    return this.advance()
+  }
+
+  // A payload accessor's offset/lsb/width args (wrapper dialect): must be a
+  // compile-time non-negative integer literal, never a general expression
+  // -- that's what makes "catch out-of-range literal offsets at compile
+  // time" possible at all (brief, Step 4).
+  expectIntLiteral() {
+    const t = this.peek()
+    if (t.type !== 'NUMBER' || t.unit || !Number.isInteger(t.value) || t.value < 0) {
+      throw new PSError(`expected a non-negative integer literal, got '${describeToken(t)}'`, t.line, t.col)
+    }
+    return this.advance()
+  }
+
+  expectPayloadIdent() {
+    const t = this.peek()
+    if (t.type !== 'IDENT' || t.value !== 'payload') {
+      throw new PSError(`expected 'payload', got '${describeToken(t)}'`, t.line, t.col)
     }
     return this.advance()
   }
@@ -119,6 +158,162 @@ class Parser {
     return { name, when, actions, mode, cooldown_s, every_s }
   }
 
+  // ---- wrapper dialect (M3 spec section 3) ----
+  // `wrapper "<name>" match <service|manufacturer|mac_prefix> <value>`
+  // followed by a `decode` block of require/emit/aes_ccm_decrypt statements.
+  parseWrapperFile() {
+    this.expectKeyword('wrapper')
+    const nameTok = this.expectString()
+    const name = plainStringValue(nameTok)
+    if (name.length < 1 || name.length > 48) {
+      throw new PSError('wrapper name must be 1-48 characters', nameTok.line, nameTok.col)
+    }
+
+    this.expectKeyword('match')
+    const kindTok = this.peek()
+    const kindName = kindTok.type === 'KEYWORD' ? kindTok.value : null
+    if (!kindName || !(kindName in MATCH_KIND_ID)) {
+      throw new PSError(
+        `unknown match kind '${describeToken(kindTok)}' (expected service, manufacturer or mac_prefix)`,
+        kindTok.line, kindTok.col
+      )
+    }
+    this.advance()
+    const kind = MATCH_KIND_ID[kindName]
+
+    const keyTok = this.peek()
+    if (keyTok.type !== 'NUMBER' || !Number.isInteger(keyTok.value) || keyTok.value < 0) {
+      throw new PSError('expected a non-negative integer match key', keyTok.line, keyTok.col)
+    }
+    this.advance()
+    const maxKey = MATCH_KEY_MAX[kindName]
+    if (keyTok.value > maxKey) {
+      throw new PSError(
+        `match key 0x${keyTok.value.toString(16)} out of range for ${kindName} (max 0x${maxKey.toString(16)})`,
+        keyTok.line, keyTok.col
+      )
+    }
+
+    this.expectKeyword('decode')
+    const statements = []
+    while (this.peek().type !== 'EOF') {
+      statements.push(this.parseDecodeStmt())
+    }
+    if (statements.length === 0) {
+      const t = this.peek()
+      throw new PSError('decode block must contain at least one statement', t.line, t.col)
+    }
+
+    return { name, match: { kind, key: keyTok.value }, statements }
+  }
+
+  parseDecodeStmt() {
+    if (this.isKeyword('require')) {
+      const t = this.advance()
+      const expr = this.parseOr()
+      return { type: 'require', expr, line: t.line, col: t.col }
+    }
+    if (this.isKeyword('emit')) {
+      const t = this.advance()
+      const seg1 = this.expectIdent()
+      this.expectPunct('.')
+      const seg2 = this.expectIdent()
+      const capability = `${seg1.value}.${seg2.value}`
+      if (!CAPS[capability]) {
+        throw new PSError(`unknown capability '${capability}'`, seg1.line, seg1.col)
+      }
+      const expr = this.parseOr()
+      return { type: 'emit', capability, expr, line: t.line, col: t.col }
+    }
+    const t = this.peek()
+    if (t.type === 'IDENT' && t.value === 'aes_ccm_decrypt') {
+      return this.parseDecryptStmt()
+    }
+    throw new PSError(
+      `expected 'require', 'emit' or 'aes_ccm_decrypt', got '${describeToken(t)}'`,
+      t.line, t.col
+    )
+  }
+
+  // aes_ccm_decrypt(payload, <expr>, <expr>) -- offset/len may be any
+  // expression (unlike the fixed-offset accessors), matching AES_CCM's
+  // pop-two-operands-off-the-stack opcode shape (no immediate operand).
+  parseDecryptStmt() {
+    const t = this.advance() // 'aes_ccm_decrypt'
+    this.expectPunct('(')
+    this.expectPayloadIdent()
+    this.expectPunct(',')
+    const offsetExpr = this.parseOr()
+    this.expectPunct(',')
+    const lenExpr = this.parseOr()
+    this.expectPunct(')')
+    return { type: 'decrypt', offsetExpr, lenExpr, line: t.line, col: t.col }
+  }
+
+  // u8(payload, i) / u16_le/u16_be/i16_le/i16_be(payload, i) / u24_le /
+  // u32_le(payload, i) / bits(payload, i, lsb, width) / len(payload).
+  // Bounds-checks the literal offset(s) against the 31-byte payload cap at
+  // COMPILE time (brief: "an offset literal beyond 30 is a compile error"),
+  // in addition to psvm_run()'s own runtime check against the actual advert
+  // length (which may be shorter).
+  parseAccessorCall() {
+    const nameTok = this.advance()
+    const name = nameTok.value
+    this.expectPunct('(')
+    this.expectPayloadIdent()
+    if (name === 'len') {
+      this.expectPunct(')')
+      return { type: 'plen', line: nameTok.line, col: nameTok.col }
+    }
+    this.expectPunct(',')
+    const offTok = this.expectIntLiteral()
+    if (name === 'bits') {
+      this.expectPunct(',')
+      const lsbTok = this.expectIntLiteral()
+      this.expectPunct(',')
+      const widthTok = this.expectIntLiteral()
+      this.expectPunct(')')
+      if (widthTok.value < 1 || widthTok.value > 32 || lsbTok.value + widthTok.value > 32) {
+        throw new PSError(
+          `bits(): lsb+width must be between 1 and 32 bits, got lsb=${lsbTok.value} width=${widthTok.value}`,
+          lsbTok.line, lsbTok.col
+        )
+      }
+      const need = Math.ceil((lsbTok.value + widthTok.value) / 8)
+      if (offTok.value + need > 31) {
+        throw new PSError(
+          `offset ${offTok.value} out of range for bits() (payload is at most 31 bytes)`,
+          offTok.line, offTok.col
+        )
+      }
+      return {
+        type: 'bits', offset: offTok.value, lsb: lsbTok.value, width: widthTok.value,
+        line: nameTok.line, col: nameTok.col,
+      }
+    }
+    this.expectPunct(')')
+    const size = ACCESSOR_WIDTH[name]
+    if (offTok.value + size > 31) {
+      throw new PSError(
+        `offset ${offTok.value} out of range for ${name}() (payload is at most 31 bytes)`,
+        offTok.line, offTok.col
+      )
+    }
+    return { type: 'load', accessor: name, offset: offTok.value, line: nameTok.line, col: nameTok.col }
+  }
+
+  // pct(<expr>) -- identity at the codegen level (spec section 3: "pct(x)
+  // ... reuse[s] M1's numeric ops", i.e. no dedicated opcode; capability
+  // range/clamping is capability_encode()'s job downstream, same as any
+  // other emitted value).
+  parsePct() {
+    const t = this.advance() // 'pct'
+    this.expectPunct('(')
+    const operand = this.parseOr()
+    this.expectPunct(')')
+    return { type: 'pct', operand, line: t.line, col: t.col }
+  }
+
   parseDuration(clauseName, min, max) {
     const t = this.peek()
     if (t.type !== 'NUMBER') {
@@ -160,7 +355,7 @@ class Parser {
     return actions
   }
 
-  // ---- expressions (or -> and -> not -> cmp -> add -> mul -> unary -> primary) ----
+  // ---- expressions (or -> and -> not -> cmp -> shift -> add -> mul -> unary -> primary) ----
 
   parseOr() {
     let left = this.parseAnd()
@@ -192,13 +387,35 @@ class Parser {
   }
 
   parseCmp() {
-    const left = this.parseAdd()
+    const left = this.parseShift()
     const t = this.peek()
     if (t.type === 'PUNCT' && CMP_OPS.has(t.value)) {
       this.advance()
-      const right = this.parseAdd()
+      const right = this.parseShift()
       checkUnitMatch(left, right, t)
       return { type: 'cmp', op: t.value, left, right, line: t.line, col: t.col }
+    }
+    return left
+  }
+
+  // `>>` (dialect-agnostic, but only the wrapper dialect's grammar ever
+  // produces it in practice -- spec §3's Ruuvi example, `u16_be(payload,
+  // 13) >> 5`). Right operand must be a compile-time integer literal in
+  // 0..31; codegen compiles `x >> n` to `x / 2^n` (spec §3: "pct(x) and
+  // plain arithmetic reuse M1's numeric ops" -- there is no dedicated
+  // shift opcode in the M3 opcode table, so this is DIV by a power of two,
+  // not a bit-exact integer shift; see codegen.js's own note on 'shr').
+  parseShift() {
+    let left = this.parseAdd()
+    while (this.isPunct('>>')) {
+      const t = this.advance()
+      const amtTok = this.peek()
+      if (amtTok.type !== 'NUMBER' || amtTok.unit || !Number.isInteger(amtTok.value) ||
+          amtTok.value < 0 || amtTok.value > 31) {
+        throw new PSError('right-shift amount must be an integer literal between 0 and 31', amtTok.line, amtTok.col)
+      }
+      this.advance()
+      left = { type: 'shr', operand: left, amount: amtTok.value, line: t.line, col: t.col }
     }
     return left
   }
@@ -248,7 +465,13 @@ class Parser {
       this.advance()
       return buildStringAst(t)
     }
-    if (t.type === 'IDENT' && (t.value === 'plant' || t.value === 'device')) {
+    if (this.dialect === 'wrapper' && t.type === 'IDENT' && ACCESSOR_NAMES.has(t.value)) {
+      return this.parseAccessorCall()
+    }
+    if (this.dialect === 'wrapper' && t.type === 'IDENT' && t.value === 'pct') {
+      return this.parsePct()
+    }
+    if (this.dialect !== 'wrapper' && t.type === 'IDENT' && (t.value === 'plant' || t.value === 'device')) {
       return this.parseRef()
     }
     throw new PSError(`unexpected token '${describeToken(t)}'`, t.line, t.col)
@@ -338,4 +561,9 @@ function checkUnitMatch(left, right, opTok) {
 export function parse(tokens) {
   const p = new Parser(tokens)
   return p.parseRuleFile()
+}
+
+export function parseWrapper(tokens) {
+  const p = new Parser(tokens, 'wrapper')
+  return p.parseWrapperFile()
 }

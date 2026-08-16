@@ -1,7 +1,7 @@
 // PlantScript compiler public API (spec section 1 grammar, section 2 PSBC v1).
 import { tokenize, PSError } from './lexer.js'
-import { parse } from './parser.js'
-import { emit } from './codegen.js'
+import { parse, parseWrapper } from './parser.js'
+import { emit, emitWrapper } from './codegen.js'
 
 export { disassemble } from './disasm.js'
 export { CAPS } from './caps.js'
@@ -22,6 +22,25 @@ export function compile(source) {
       bytecode,
       refs,
     }
+  } catch (err) {
+    if (err instanceof PSError) {
+      return { ok: false, errors: [{ line: err.line, col: err.col, message: err.message }] }
+    }
+    throw err
+  }
+}
+
+// compileWrapper(source) -> {ok:true, name, match:{kind,key}, bytecode, capsUsed}
+//                         | {ok:false, errors:[{line,col,message}]}
+// The wrapper dialect (M3 spec section 3, dialect=2). match.kind matches
+// wmatch_kind_t in components/wrappers/include/wrapper_index.h
+// (0 service, 1 manufacturer, 2 mac_prefix).
+export function compileWrapper(source) {
+  try {
+    const tokens = tokenize(source)
+    const ast = parseWrapper(tokens)
+    const { bytecode, capsUsed } = emitWrapper(ast)
+    return { ok: true, name: ast.name, match: ast.match, bytecode, capsUsed }
   } catch (err) {
     if (err instanceof PSError) {
       return { ok: false, errors: [{ line: err.line, col: err.col, message: err.message }] }
