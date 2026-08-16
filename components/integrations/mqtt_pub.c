@@ -81,6 +81,50 @@ static const char *TAG = "mqtt_pub";
 #define STATE_JSON_BUF_SIZE 320   /* up to CAPABILITY_COUNT fields keyed by full capability name (M2 Task 7, up from V1's 256) */
 #define DISC_JSON_BUF_SIZE  1024  /* longer capability names + suggested_display_precision (M2 Task 7, up from V1's 640) */
 
+/* esp-mqtt's OWN client task/buffers (esp_mqtt_client_config_t.task/.buffer
+ * below, in start_mqtt()) -- NOT to be confused with MQTT_PUB_TASK_STACK
+ * above, which sizes OUR mqtt_pub_task, a completely separate FreeRTOS
+ * task esp-mqtt knows nothing about. M2 Task 7 hardware round 3
+ * (task-7-report.md): IDF's defaults here (6144 B task stack, 1024 B
+ * buffer shared for both directions since out_size falls back to size,
+ * i.e. ~2048 B for the pair) are sized for a client that might do a TLS
+ * handshake; ours never does (mqtt.uri is validated to always start with
+ * "mqtt://" -- integr_config_set()) and never subscribes (no
+ * MQTT_EVENT_DATA handler in this file), so both are real overshoot on a
+ * C3 this starved for a single large contiguous free block.
+ *
+ *   - MQTT_CLIENT_TASK_STACK: no mbedtls call chain (the single biggest
+ *     stack consumer TLS would add) and our own event callback
+ *     (mqtt_event_handler() below) does only a stack-local 128 B snprintf,
+ *     a switch, and an xQueueSend -- 4096 B is the conventional safe
+ *     minimum Espressif's own non-TLS MQTT examples use; picked with
+ *     margin, not shaved to the documented minimum, given this project's
+ *     history of stack-sizing regressions (see MQTT_PUB_TASK_STACK's own
+ *     comment) -- reported for hardware verification, not asserted as
+ *     proven.
+ *   - MQTT_CLIENT_IN_BUF_SIZE: this client only ever receives CONNACK/
+ *     PUBACK/PINGRESP-class control packets (a few bytes each) -- 256 B
+ *     leaves generous margin over that without keeping IDF's 1024 B
+ *     receive-sized default for traffic that never arrives.
+ *   - MQTT_CLIENT_OUT_BUF_SIZE: the largest PUBLISH this firmware can ever
+ *     emit, measured (not guessed) by driving mqtt_json.c's
+ *     mqtt_json_discovery()/mqtt_json_device_discovery() with worst-case
+ *     inputs (max-length hub name, a 32-char all-`"`-character plant/
+ *     device display name so every byte escapes to \", the longest
+ *     canonical device id string, every capability in turn) plus its
+ *     topic: the worst case is a device-form discovery publish at 81 B
+ *     topic + 597 B payload = 678 B combined; +journal for the MQTT
+ *     PUBLISH variable header (topic length prefix, QoS-1 packet id) and
+ *     fixed header is at most ~10 B more. 1024 B (IDF's own default,
+ *     unchanged -- confirmed correct by measurement, not assumed) leaves
+ *     ~336 B of headroom over that measured worst case, comfortably
+ *     covering any realistic display name (the all-quotes case is a
+ *     pathological adversarial input, not a realistic one) plus MQTT
+ *     framing overhead. */
+#define MQTT_CLIENT_TASK_STACK   4096
+#define MQTT_CLIENT_IN_BUF_SIZE   256
+#define MQTT_CLIENT_OUT_BUF_SIZE 1024
+
 /* s_queue items: a tagged union rather than a bare MAC, so the same queue
  * can carry a per-sensor state update (from data_event_handler(), the
  * default esp_event loop task), a RESYNC_DISCOVERY control message (from
@@ -706,6 +750,18 @@ static esp_err_t start_mqtt(const integr_config_t *cfg)
     mcfg.session.last_will.msg    = "offline";
     mcfg.session.last_will.qos    = 1;
     mcfg.session.last_will.retain = 1;
+    /* Explicit here, not left to CONFIG_MQTT_USE_CUSTOM_CONFIG's Kconfig
+     * defaults (also set, sdkconfig.defaults -- see that file's comment):
+     * esp-mqtt's esp_mqtt_set_config() always prefers a non-zero struct
+     * field over the compiled-in Kconfig default regardless of
+     * MQTT_USE_CUSTOM_CONFIG (see mqtt_client.c), so setting it here is
+     * both the authoritative value AND immune to the generated-sdkconfig-
+     * doesn't-pick-up-defaults-file gotcha that bit the buffer/stack
+     * settings the first time. See MQTT_CLIENT_TASK_STACK/_IN_BUF_SIZE/
+     * _OUT_BUF_SIZE's own comment for the sizing justification. */
+    mcfg.task.stack_size   = MQTT_CLIENT_TASK_STACK;
+    mcfg.buffer.size       = MQTT_CLIENT_IN_BUF_SIZE;
+    mcfg.buffer.out_size   = MQTT_CLIENT_OUT_BUF_SIZE;
 
     /* esp_mqtt_client_init() duplicates every string/topic it needs
      * (esp_mqtt_set_config() -> esp_mqtt_set_if_config()/strdup() for the

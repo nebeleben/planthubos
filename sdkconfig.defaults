@@ -81,3 +81,33 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # PLANTHUB_WIFI_COUNTRY) -- shipping "CH" outside Switzerland is a
 # regulatory violation.
 CONFIG_PLANTHUB_WIFI_COUNTRY="CH"
+
+# ---------------------------------------------------------------------------
+# ESP-MQTT footprint (M2 Task 7 hardware round 3, task-7-report.md): this
+# firmware's mqtt.uri is validated to always start with "mqtt://"
+# (integr_config.c's integr_config_set()) and mqtt_pub.c never subscribes
+# (publish-only, no MQTT_EVENT_DATA handler) -- SSL/Websocket transports and
+# a receive-sized buffer are pure unused capability. esp-mqtt's own
+# esp_mqtt_client_create_transport() branches on the URI's scheme string at
+# runtime and only ever constructs a plain-TCP transport for "mqtt://" (see
+# mqtt_client.c) regardless of these flags -- so disabling them changes
+# nothing about what gets allocated for THIS firmware's connections; the
+# saving here is dead code (SSL/WS transport glue, unreachable for us)
+# leaving the link, not runtime heap. Confirmed before touching anything.
+# CONFIG_MQTT_TRANSPORT_SSL is not set
+# CONFIG_MQTT_TRANSPORT_WEBSOCKET is not set
+# CONFIG_MQTT_TRANSPORT_WEBSOCKET_SECURE is not set
+
+# The actual heap fix: task stack and buffer sizes, previously at IDF's
+# TLS-sized defaults (6144 B task stack, 1024 B shared in/out buffer, so
+# ~2048 B for the pair since out_size falls back to size) though this
+# firmware never does a TLS handshake on this client. mqtt_pub.c's
+# start_mqtt() sets the equivalent esp_mqtt_client_config_t.task/.buffer
+# fields directly (which always win over these Kconfig values, see that
+# file's comment) -- CONFIG_MQTT_USE_CUSTOM_CONFIG is enabled here anyway so
+# menuconfig/sdkconfig reports the true operating numbers instead of stale
+# TLS-sized defaults, and so these stay the correct fallback if that
+# explicit override were ever removed by mistake.
+CONFIG_MQTT_USE_CUSTOM_CONFIG=y
+CONFIG_MQTT_BUFFER_SIZE=1024
+CONFIG_MQTT_TASK_STACK_SIZE=4096
