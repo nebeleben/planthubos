@@ -3,6 +3,8 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_littlefs.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "app_config.h"
 #include "integr_config.h"
 #include "claim.h"
@@ -98,6 +100,23 @@ static void batt_cycle_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* Boot-time heap trace (M2 hardware hotfix round 3): permanent, not debug
+ * litter -- a memory-constrained device's boot sequence is exactly where a
+ * milestone-by-milestone heap trace earns its keep. `largest_free_block` is
+ * the number that actually gates whether a later multi-KB-or-contiguous
+ * allocation (an xTaskCreate, a wifi rx buffer, ...) can succeed --
+ * esp_get_free_heap_size() alone can look healthy while fragmentation
+ * blocks it (see sampler.c's log_heap_diag(), added for the same reason
+ * one boot-log level down). Called at every major init milestone along the
+ * boot path that actually reaches sampler_start() below (hub role,
+ * storage_ok) -- see each call site's own placement. */
+static void log_heap(const char *milestone)
+{
+    ESP_LOGI(TAG, "heap @ %s: free=%u B largest_free_block(8BIT|INTERNAL)=%u B",
+             milestone, (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(app_config_init());
@@ -138,6 +157,7 @@ void app_main(void)
     esp_err_t storage_err = esp_vfs_littlefs_register(&fs_conf);
     bool storage_ok = storage_err == ESP_OK;
     if (!storage_ok) ESP_LOGE(TAG, "littlefs mount failed (%s); running without on-device history", esp_err_to_name(storage_err));
+    log_heap("after littlefs mount");
 
     /* M2 Task 5 (spec Sec.5): one-time V1->V2 data wipe, gated on NVS
      * "data_fmt". Must run before ANYTHING that reads plants.bin or a
@@ -154,6 +174,7 @@ void app_main(void)
      * same log-and-continue treatment as every other littlefs-dependent
      * init in this function. */
     data_fmt_apply(storage_ok ? "/storage" : NULL);
+    log_heap("after data_fmt_apply");
 
     /* timekeeper_init runs regardless of storage_ok: its boot counter lives
      * in NVS (a separate partition, unaffected by a littlefs failure) and
@@ -164,6 +185,7 @@ void app_main(void)
     if (tk_err != ESP_OK) ESP_LOGE(TAG, "timekeeper_init failed (%s); time sync unavailable", esp_err_to_name(tk_err));
 
     ESP_ERROR_CHECK(data_core_init());
+    log_heap("after data_core_init");
 
     /* swarm_store_init() loads role + paired-peer state from NVS into RAM;
      * it must run before the role branch below decides how to boot. A
@@ -245,9 +267,11 @@ void app_main(void)
         }
     } else {
         ESP_ERROR_CHECK(webserver_start());
+        log_heap("after webserver_start");
         /* Before wifi starts, so the guard sees the very first AP_START/GOT_IP. */
         ota_rollback_guard_start();
         ESP_ERROR_CHECK(wifi_manager_start());
+        log_heap("after wifi_manager_start");
         if (role != SWARM_ROLE_NODE) {
             /* ROLE_UNSET or ROLE_MAIN: this is today's hub, with
              * swarm_start_main() as the only addition. */
@@ -275,6 +299,7 @@ void app_main(void)
             } else {
                 ESP_LOGE(TAG, "data_fmt: on-disk format is newer than this firmware supports; skipping plants_init");
             }
+            log_heap("after plants_init");
 
             esp_err_t ierr = integrations_start();
             if (ierr != ESP_OK) ESP_LOGE(TAG, "integrations start failed (%s); continuing without them", esp_err_to_name(ierr));
@@ -315,6 +340,7 @@ void app_main(void)
 
     esp_err_t ble_err = ble_collector_start();
     if (ble_err != ESP_OK) ESP_LOGE(TAG, "BLE collector failed to start (%s); running without BLE", esp_err_to_name(ble_err));
+    log_heap("after swarm/BLE bring-up");
 
     /* M7 Task 5 (spec §4): a battery-mode paired node runs its wake cycle
      * (scan -> checkin -> sleep) instead of just sitting always-on -- see
@@ -355,6 +381,7 @@ void app_main(void)
      * so skip it outright rather than let it retry into the void. Also
      * hub-only: a node keeps no local history to sample. */
     if (storage_ok && role != SWARM_ROLE_NODE && data_fmt_safe()) {
+        log_heap("before sampler_start");
         esp_err_t sampler_err = sampler_start("/storage");
         if (sampler_err != ESP_OK) ESP_LOGE(TAG, "sampler_start failed (%s); running without history sampling", esp_err_to_name(sampler_err));
     } else if (!storage_ok) {
