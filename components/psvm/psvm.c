@@ -286,6 +286,7 @@ psvm_result_t psvm_run(const psvm_prog_t *p, const psvm_ref_val_t *resolved,
             if ((size_t)pc + 3 > p->code_len) { res.err = PSVM_ERR_BADOP; goto done; }
             uint16_t idx = rd_u16(p->code + pc + 1);
             if (idx >= p->ref_count) { res.err = PSVM_ERR_BADOP; goto done; }
+            if (!resolved) { res.err = PSVM_ERR_REF; goto done; }
             psvm_ref_t r = psvm_get_ref(p, idx);
             const psvm_ref_val_t *rv = &resolved[idx];
             if (!rv->ready) { res.err = PSVM_ERR_REF; goto done; }

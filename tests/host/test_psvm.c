@@ -902,6 +902,33 @@ int main(void) {
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p) == PSVM_ERR_LIMITS);
     }
 
+    /* M3 review fix 1: a dialect=2 (wrapper) blob with ref_count>=1 and a
+     * LOAD_REF instruction validates cleanly (psvm_validate() does not
+     * opcode-walk for dialect legality, and validate_emit_caps() treats
+     * 0x02 as a 3-byte instruction and walks past it). Both wrapper-dialect
+     * call sites (wrapper_exec.c, api_v1.c's /test) pass resolved=NULL, so
+     * psvm_run() must turn that into PSVM_ERR_REF instead of dereferencing
+     * NULL. Without the psvm.c fix this segfaults. */
+    {
+        uint8_t code[8]; size_t co = 0;
+        co = emit_op_u16(code, co, 0x02, 0);   /* LOAD_REF 0 */
+        co = emit_op_u8(code, co, 0x69, 0);    /* EMIT 0 */
+        co = emit_op(code, co, 0xFF);          /* HALT */
+
+        uint8_t b2[64];
+        size_t o = emit_header_d(b2, PSVM_DIALECT_WRAPPERS, 0, 1, 1, (uint16_t)co);
+        o = emit_str(b2, o, "x");
+        o = emit_ref(b2, o, 0, 0, 0, 0);
+        memcpy(b2 + o, code, co);
+        size_t l2 = o + co;
+
+        psvm_prog_t p2;
+        assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
+
+        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, true);
+        assert(r2.err == PSVM_ERR_REF);
+    }
+
     printf("test_psvm: all passed\n");
     return 0;
 }
