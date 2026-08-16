@@ -10,6 +10,7 @@
 #include "wrapper_index.h"
 #include "wrapper_arena.h"
 #include "wrapper_exec.h"
+#include "unknown_capture.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
@@ -265,6 +266,14 @@ static void decode_adv_item(const adv_item_t *item)
                           ? s_wrapper_memo[ridx]
                           : wrapper_index_lookup(&s_wrapper_index, svc_uuid, manu_id, item->mac);
     if (wrapper_id >= 0) {
+        /* M3 Task 6 (spec §5): this advert now resolves to a wrapper --
+         * either it always did, or a wrapper install/reindex just made it
+         * start matching. Either way it no longer belongs in the
+         * unknown-device capture; no-op if it was never tracked there (see
+         * unknown_capture_forget()'s own doc comment for why this call site,
+         * not do_wrapper_reindex(), is the natural place). */
+        unknown_capture_forget(item->mac);
+
         /* Payload slice convention mirrors decode_bthome_item()'s own
          * "hand the wrapper the bytes AFTER the matched AD structure's own
          * header, not the raw multi-structure advert" -- service-data past
@@ -313,10 +322,10 @@ static void decode_adv_item(const adv_item_t *item)
 
     /* Native MiFlora path -- unchanged behaviour from before this task,
      * just reusing the single parse above instead of a second one. */
-    if (!fields.svc_data_uuid16 || fields.svc_data_uuid16_len < 2 || svc_uuid != XIAOMI_SVC_UUID) return;
+    if (!fields.svc_data_uuid16 || fields.svc_data_uuid16_len < 2 || svc_uuid != XIAOMI_SVC_UUID) goto no_match;
     mibeacon_t m;
-    if (mibeacon_parse(fields.svc_data_uuid16 + 2, fields.svc_data_uuid16_len - 2, &m) != MIBEACON_OK) return;
-    if (m.product_id != MIBEACON_PRODUCT_MIFLORA) return;
+    if (mibeacon_parse(fields.svc_data_uuid16 + 2, fields.svc_data_uuid16_len - 2, &m) != MIBEACON_OK) goto no_match;
+    if (m.product_id != MIBEACON_PRODUCT_MIFLORA) goto no_match;
 
     /* Direct reception: no relaying node, just heard (age_s = 0). item->rssi
      * already has NimBLE's 127 "RSSI unavailable" sentinel (see ble_gap.h)
@@ -355,6 +364,18 @@ static void decode_adv_item(const adv_item_t *item)
     xSemaphoreTake(s_batt_mutex, portMAX_DELAY);
     batt_sched_seen(s_batt_tab, m.mac, item->addr_type, item->mac, item->uptime_s);
     xSemaphoreGive(s_batt_mutex);
+    return;
+
+no_match:
+    /* M3 Task 6 (spec §5): every "nothing dispatched this" exit on this
+     * path lands here -- BTHome didn't claim it (checked earlier, well
+     * before this point), no wrapper's match key hit, and the native
+     * MiFlora check just above also missed (wrong/missing service data, a
+     * parse failure, or a non-MiFlora product id). item->mac/payload/len/
+     * rssi/uptime_s are the queued item's own fields, unpacked here at the
+     * call site rather than passed as an adv_item_t* (see unknown_capture.h's
+     * top comment on why this module takes primitives instead). */
+    unknown_capture_add(item->mac, item->payload, item->len, item->rssi, item->uptime_s);
 }
 
 /* See ble_collector.h's doc comment on ble_collector_wrapper_reindex_request()
@@ -547,6 +568,10 @@ esp_err_t ble_collector_start(void)
     wrapper_arena_set_loader(wrapper_store_read_psbc);
     wrapper_arena_init();
     memset(s_wrapper_memo, WRAPPER_MEMO_NONE, sizeof(s_wrapper_memo));
+    /* M3 Task 6 (spec §5): reset the unknown-device capture to empty before
+     * adv_decoder_task (below) can run decode_adv_item() and start filling
+     * it. Static 768 B (see unknown_capture.c's top comment). */
+    unknown_capture_init();
     log_heap("before adv_decoder_task");
     if (xTaskCreate(adv_decoder_task, "ble_adv_decoder", ADV_DECODER_TASK_STACK,
                      NULL, ADV_DECODER_TASK_PRIO, NULL) != pdPASS) {
