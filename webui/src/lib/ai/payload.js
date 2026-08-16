@@ -19,12 +19,13 @@
 // carrying two same-type structures, the LAST one is both what
 // wrapper_index_lookup() matched the wrapper on (svc_uuid/manu_id are read
 // off those same overwritten fields) and what the wrapper's `payload`
-// pointer actually decodes. api_v1.c's wrapper_ad_find_u16() -- which
-// resolves first-match -- is NOT the ground truth to mirror here: its own
-// doc comment disclaims itself as advisory-only, used only to pick which
-// stored sample previews a wrapper in the UI, with "the real match" always
-// happening on the decoder task via ble_hs_adv_parse_fields() + this
-// module's own last-wins walk.
+// pointer actually decodes. decode_adv_item() + ble_hs_adv_parse_fields()
+// remain the ground truth for the slicing rule itself. api_v1.c's
+// wrapper_ad_find_slice() (renamed from wrapper_ad_find_u16() in the same
+// fix wave) was changed to walk last-wins too, matching that ground truth,
+// and is no longer advisory-only bookkeeping for a UI preview -- it is now
+// the function that produces the actual dry-run sample GET
+// /api/v1/wrappers/test returns.
 //
 // `matchKind` is always the NUMERIC form (0 service, 1 manufacturer,
 // 2 mac_prefix) straight off a fresh compileWrapper() result -- GET
