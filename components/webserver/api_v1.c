@@ -2869,7 +2869,7 @@ static esp_err_t unknown_get(httpd_req_t *req)
 }
 
 /* POST /api/v1/devices/{id}/key {"key":"<32 hex chars>"|null} -- bind-key
- * set/clear (spec §4, auth). Only sub-route "/api/v1/devices/*" (POST)
+ * set/clear (spec §4, auth). Only the "/api/v1/devices" wildcard route (POST)
  * has -- unlike plants/nodes/rules there is nothing else to dispatch on
  * here, but this still goes through the same wildcard-route-plus-suffix-
  * check shape as those for consistency and because "/api/v1/devices" (GET,
@@ -3095,7 +3095,7 @@ void api_v1_register(httpd_handle_t server)
     /* Bind-key set/clear. "/api/v1/devices" (GET, exact) already owns the
      * bare prefix -- this wildcard POST is a distinct URI template to
      * ESP-IDF's matcher, same non-collision every other exact+wildcard pair
-     * in this file already relies on (e.g. "/api/v1/nodes" vs "/api/v1/nodes/*"). */
+     * in this file already relies on (e.g. "/api/v1/nodes" exact vs wildcard). */
     httpd_uri_t devices_post = { .uri = "/api/v1/devices/*", .method = HTTP_POST, .handler = devices_post_dispatch };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &devices_post));
 }
