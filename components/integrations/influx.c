@@ -8,8 +8,9 @@
  * (mqtt_pub.c), the same way it calls start_mqtt(): this file applies its
  * own influx.enabled check, exactly like start_mqtt() handles mqtt.enabled.
  *
- * Design: one task, one static line-protocol batch buffer, one
- * esp_http_client POST every 300s. No retry queue on a failed POST -- the
+ * Design: one task, one line-protocol batch buffer (heap-allocated only
+ * when enabled -- see below), one esp_http_client POST every 300s. No
+ * retry queue on a failed POST -- the
  * next cycle re-reports whatever is still current in the registry, which
  * is simpler and correct enough (YAGNI, per the plan) since an Influx
  * point is last-value-wins per (measurement, tag set, timestamp) anyway.
@@ -25,7 +26,12 @@
  *
  * cfg is received by pointer at influx_start() time and the caller's
  * struct is stack-local (mqtt_pub.c's integrations_start()), so the parts
- * this file needs are copied into statics before the task is spawned.
+ * this file needs are copied into a HEAP-allocated block before the task
+ * is spawned -- see s_cfg/s_batch/s_url/s_auth_header's own comment
+ * (M2 Task 7 hardware round: these used to be plain statics, paid by every
+ * hub's .bss whether or not Influx was ever turned on; on a C3 juggling
+ * WiFi+BLE+MQTT in ~300 KB of DRAM, an unconditional 8.6 KB was enough on
+ * its own to starve esp-mqtt of a usable free block -- see influx_start()).
  */
 #include "integr_private.h"
 #include "lineproto.h"
@@ -44,6 +50,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static const char *TAG = "influx";
 
@@ -55,18 +62,37 @@ static const char *TAG = "influx";
  * (16) `plant` lines -- an entirely new class of lines V1 never had --
  * where before it emitted only up to 16 assigned-plant lines. Worst case
  * (every line carrying all CAPABILITY_COUNT=8 fields) no longer fits 4096;
- * 8192 covers 32 worst-case lines (~215 B each) with headroom. +4096 B
- * static over V1. */
+ * 8192 covers 32 worst-case lines (~215 B each) with headroom. This used to
+ * cost every hub +4096 B of static .bss over V1 unconditionally; as of the
+ * hardware round below it's a heap allocation instead, made only when
+ * Influx is actually enabled. */
 #define INFLUX_BATCH_CAP   8192
 #define INFLUX_URL_CAP     256   /* url[97] + "/api/v2/write?org=" + org[33] + "&bucket=" + bucket[33] + "&precision=s" */
 #define INFLUX_AUTH_CAP    160   /* "Token " + token[129] */
 
-/* Config copy + static buffers: everything the task needs lives here, none
- * of it on the task's own stack and none of it allocated per-cycle. */
-static integr_config_t s_cfg;
-static char s_batch[INFLUX_BATCH_CAP];
-static char s_url[INFLUX_URL_CAP];
-static char s_auth_header[INFLUX_AUTH_CAP];
+/* Config copy + working buffers: everything the task needs lives here, none
+ * of it on the task's own stack and none of it allocated per-cycle.
+ *
+ * HEAP, not static (M2 Task 7 hardware round -- see task-7-report.md's
+ * heap-reclaim section): a static array here costs every hub's .bss the
+ * same whether or not integr_config_t.influx.enabled is ever true, and on
+ * the C3 that was the single biggest contributor to a heap regression that
+ * broke MQTT (esp-mqtt couldn't get a usable free block, "delayed connect
+ * error" reconnect-storming the WiFi link) -- on a board with Influx
+ * disabled (most hubs, including the one that reproduced this), that
+ * 8.6 KB combined was pure waste. malloc'd once, here, only when
+ * cfg->influx.enabled (never freed -- there is no runtime "turn Influx
+ * off" path; a config change reboots the hub, see integr_config_set()'s
+ * callers, so this is a one-shot cost for the process lifetime, exactly
+ * like the static it replaces, just conditional instead of unconditional).
+ * NULL on a disabled board for the rest of the process's life; every
+ * reader of these four pointers (build_batch()/post_batch()/influx_task())
+ * only ever runs on influx_task, which itself is never created unless
+ * they were all successfully allocated first -- see influx_start(). */
+static integr_config_t *s_cfg;
+static char *s_batch;
+static char *s_url;
+static char *s_auth_header;
 
 /* Appends one plant's line, if it has at least one live bound-capability
  * value: walks plant_id's current bindings (plants_bindings()) and reads
@@ -91,7 +117,7 @@ static void append_plant(uint8_t plant_id, const registry_t *reg, int64_t epoch_
         p.fields.value[cap_id] = value;
     }
 
-    if (!lineproto_append_plant(s_batch, sizeof(s_batch), off, &p)) {
+    if (!lineproto_append_plant(s_batch, INFLUX_BATCH_CAP, off, &p)) {
         ESP_LOGD(TAG, "line for plant %u did not fit or had no fields; skipped", plant_id);
     }
 }
@@ -114,7 +140,7 @@ static void append_device(const device_entry_t *d, uint32_t now_uptime_s, int64_
         p.fields.value[cap_id] = capability_decode(cap_id, slot->raw);
     }
 
-    if (!lineproto_append_device(s_batch, sizeof(s_batch), off, &p)) {
+    if (!lineproto_append_device(s_batch, INFLUX_BATCH_CAP, off, &p)) {
         ESP_LOGD(TAG, "line for device %s did not fit or had no fields; skipped", p.dev_id_str);
     }
 }
@@ -153,9 +179,9 @@ static size_t build_batch(void)
  * error) is logged at WARN and the batch is dropped -- no retry queue. */
 static void post_batch(size_t len)
 {
-    snprintf(s_url, sizeof(s_url), "%s/api/v2/write?org=%s&bucket=%s&precision=s",
-             s_cfg.influx.url, s_cfg.influx.org, s_cfg.influx.bucket);
-    snprintf(s_auth_header, sizeof(s_auth_header), "Token %s", s_cfg.influx.token);
+    snprintf(s_url, INFLUX_URL_CAP, "%s/api/v2/write?org=%s&bucket=%s&precision=s",
+             s_cfg->influx.url, s_cfg->influx.org, s_cfg->influx.bucket);
+    snprintf(s_auth_header, INFLUX_AUTH_CAP, "Token %s", s_cfg->influx.token);
 
     esp_http_client_config_t http_cfg = {
         .url = s_url,
@@ -231,7 +257,21 @@ esp_err_t influx_start(const integr_config_t *cfg)
     }
 #endif
 
-    s_cfg = *cfg; /* caller's struct is stack-local; copy before the task outlives it */
+    /* Heap, not static -- see s_cfg's own declaration comment. Allocated
+     * only on this (the enabled) path; a disabled board never calls
+     * malloc() here at all, and pays exactly 0 bytes for any of the four. */
+    s_cfg = malloc(sizeof(*s_cfg));
+    s_batch = malloc(INFLUX_BATCH_CAP);
+    s_url = malloc(INFLUX_URL_CAP);
+    s_auth_header = malloc(INFLUX_AUTH_CAP);
+    if (!s_cfg || !s_batch || !s_url || !s_auth_header) {
+        ESP_LOGE(TAG, "influx buffer allocation failed (%u B requested); influx disabled this boot",
+                 (unsigned)(sizeof(*s_cfg) + INFLUX_BATCH_CAP + INFLUX_URL_CAP + INFLUX_AUTH_CAP));
+        free(s_cfg); free(s_batch); free(s_url); free(s_auth_header);
+        s_cfg = NULL; s_batch = NULL; s_url = NULL; s_auth_header = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    *s_cfg = *cfg; /* caller's struct is stack-local; copy before the task outlives it */
 
     BaseType_t ok = xTaskCreate(influx_task, "influx", INFLUX_TASK_STACK, NULL, INFLUX_TASK_PRIO, NULL);
     if (ok != pdPASS) {
@@ -239,6 +279,6 @@ esp_err_t influx_start(const integr_config_t *cfg)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "influx starting: url=%s org=%s bucket=%s", s_cfg.influx.url, s_cfg.influx.org, s_cfg.influx.bucket);
+    ESP_LOGI(TAG, "influx starting: url=%s org=%s bucket=%s", s_cfg->influx.url, s_cfg->influx.org, s_cfg->influx.bucket);
     return ESP_OK;
 }

@@ -53,6 +53,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static const char *TAG = "mqtt_pub";
 
@@ -151,8 +152,18 @@ static char    s_slot_name[PLANTS_MAX][PLANT_NAME_LEN + 1]; /* last name discove
  * once created (registry.c never evicts an entry -- see plants.h's
  * plants_adopt_from_registry() doc comment), so this needs no
  * generation/reuse guard the way s_slot_plant_id above does. Cleared
- * whole-table on reconnect, same as s_discovery_sent. 16*8 = 128 B. */
-static bool s_device_disc_sent[REGISTRY_MAX_DEVICES][CAPABILITY_COUNT];
+ * whole-table on reconnect, same as s_discovery_sent.
+ *
+ * HEAP, not static (M2 Task 7 hardware round -- see task-7-report.md's
+ * heap-reclaim section, same rationale as influx.c's s_batch): 128 B is
+ * small next to that file's 8.6 KB, but it is still 128 B every hub's
+ * .bss paid regardless of mqtt.enabled, and every byte mattered on the C3
+ * repro. calloc'd (zero-initialised, matching the old static's implicit
+ * zero-init) in start_mqtt() only when MQTT is actually starting; NULL
+ * otherwise, which is safe because every reader of it
+ * (publish_device_discovery(), and the memset on reconnect) only runs
+ * once start_mqtt() has already succeeded. */
+static bool (*s_device_disc_sent)[CAPABILITY_COUNT];
 
 /* Publishes one HA discovery config (retained, qos 1) per capability
  * CURRENTLY bound on plant_id (plants_bindings()) -- unlike V1's fixed
@@ -633,7 +644,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
          * always another opportunity, so nothing here can justify blocking
          * esp-mqtt's task to guarantee delivery. */
         memset(s_discovery_sent, 0, sizeof(s_discovery_sent));
-        memset(s_device_disc_sent, 0, sizeof(s_device_disc_sent));
+        /* s_device_disc_sent is heap now, not a static array -- sizeof() on
+         * the pointer itself would be wrong (pointer width, not the
+         * REGISTRY_MAX_DEVICES*CAPABILITY_COUNT bools behind it). NULL-safe:
+         * this handler can only run after start_mqtt() succeeded, which is
+         * the only place s_device_disc_sent is ever assigned (never freed). */
+        memset(s_device_disc_sent, 0, REGISTRY_MAX_DEVICES * sizeof(*s_device_disc_sent));
         if (s_queue) {
             mqtt_pub_msg_t msg = { .type = MQTT_PUB_MSG_RESYNC_DISCOVERY };
             if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
@@ -657,9 +673,20 @@ static esp_err_t start_mqtt(const integr_config_t *cfg)
 {
     app_config_hub_name(s_hub);
 
+    /* Heap, not static -- see s_device_disc_sent's own declaration comment.
+     * calloc() zero-initialises, matching a static array's implicit
+     * zero-init (every capability starts "not yet sent", correctly). */
+    s_device_disc_sent = calloc(REGISTRY_MAX_DEVICES, sizeof(*s_device_disc_sent));
+    if (!s_device_disc_sent) {
+        ESP_LOGE(TAG, "device-discovery bitmap allocation failed");
+        return ESP_ERR_NO_MEM;
+    }
+
     s_queue = xQueueCreate(MQTT_PUB_QUEUE_DEPTH, sizeof(mqtt_pub_msg_t));
     if (!s_queue) {
         ESP_LOGE(TAG, "xQueueCreate failed");
+        free(s_device_disc_sent);
+        s_device_disc_sent = NULL;
         return ESP_ERR_NO_MEM;
     }
 
