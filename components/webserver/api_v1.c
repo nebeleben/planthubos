@@ -44,16 +44,12 @@ static const char *TAG = "api_v1";
 static registry_t s_api_reg_snap;
 static plants_table_t s_api_plant_snap;
 
-/* M2-SHIM (registry_compat.h): the ONE remaining use in this file, forced
- * by plants_adopt_from_registry()'s own still-V1-shaped signature
- * (plants.h) -- that header belongs to an earlier task and isn't touched
- * here (RULING-1, task-6-report.md's Deviations section). A second static
- * rather than reusing s_api_reg_snap above: the two types aren't
- * interchangeable (legacy_registry_t is a decoded mibeacon_t view,
- * registry_t is the real per-capability one), and plants_get() needs BOTH
- * live at once -- this one just for the adopt-sweep call, s_api_reg_snap
- * right after for the real bindings/values the response actually renders. */
-static legacy_registry_t s_api_plants_adopt_snap;   /* M2-SHIM */
+/* mqtt_pub.c: MQTT retained-topic cleanup on plant delete / capability
+ * unbind (spec Sec.6, M2 Task 7) -- same "no header of its own" convention
+ * as mqtt_pub_event() there. Safe no-ops when MQTT is disabled/not
+ * started. */
+extern void mqtt_pub_plant_deleted(uint8_t plant_id);
+extern void mqtt_pub_cap_unbound(uint8_t plant_id, uint8_t cap_id);
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -421,8 +417,8 @@ static uint8_t parse_plant_id(const char *s, const char **tail_out)
  * the ONLY driver of plant auto-creation -- a fresh hub could show "No
  * plants yet" for up to CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN minutes even
  * with a probe already reporting. plants_adopt_from_registry() is safe to
- * call from here specifically because `s_api_plants_adopt_snap` below is
- * itself a registry SNAPSHOT (data_core_snapshot_legacy()), never anything
+ * call from here specifically because `s_api_reg_snap` below is itself a
+ * registry SNAPSHOT (data_core_snapshot()), never anything
  * request-supplied -- the DoS rule stays airtight: an unauthenticated
  * caller still can't seed a plant from data it controls, it can only nudge
  * an already-live sensor's plant into existing sooner. httpd task context;
@@ -430,22 +426,24 @@ static uint8_t parse_plant_id(const char *s, const char **tail_out)
  * in plants.h. */
 static esp_err_t plants_get(httpd_req_t *req)
 {
-    /* s_api_plants_adopt_snap: M2-SHIM, see its declaration comment (L5) --
-     * forced by plants_adopt_from_registry()'s own still-V1-shaped
-     * signature, the one shim call site this task could not remove. */
-    data_core_snapshot_legacy(&s_api_plants_adopt_snap);   /* M2-SHIM */
+    /* s_api_reg_snap: too big for the httpd task stack; shared across this
+     * file's handlers, see its declaration comment (L5). One snapshot
+     * serves both the adopt-sweep call below AND the response rendering
+     * further down -- the sweep only reads the registry (never mutates
+     * it), so unlike plants_snapshot() there is no reason to re-snapshot
+     * after it (M2 Task 7: plants_adopt_from_registry() moved onto a real
+     * registry_t*, removing the second, legacy-shaped snapshot this used
+     * to need). */
+    data_core_snapshot(&s_api_reg_snap);
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
-    plants_adopt_from_registry(&s_api_plants_adopt_snap, now_uptime_s,   /* M2-SHIM */
+    plants_adopt_from_registry(&s_api_reg_snap, now_uptime_s,
                                 CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN * 60);
 
-    /* Re-snapshot AFTER the sweep above (not reusing an earlier one) so a
-     * plant it just created shows up in THIS response, not the next poll --
-     * the whole point of M3's latency fix. s_api_reg_snap/s_api_plant_snap:
-     * too big for the httpd task stack; shared across this file's handlers,
-     * see s_api_reg_snap's declaration comment (L5). */
+    /* Re-snapshot the PLANTS table AFTER the sweep above (not reusing an
+     * earlier one) so a plant it just created shows up in THIS response,
+     * not the next poll -- the whole point of M3's latency fix. */
     plants_snapshot(&s_api_plant_snap);
-    data_core_snapshot(&s_api_reg_snap);
 
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(root, "plants");
@@ -814,10 +812,12 @@ static esp_err_t plants_bind_post(httpd_req_t *req, uint8_t id)
     cJSON_Delete(json);
 
     bool ok;
+    bool unbind = false;
     if (!cap_null && !dev_null) {
         ok = plants_bind_cap(id, cap_id, &dev);
-    } else if (!cap_null) {   /* dev_null */
+    } else if (!cap_null) {   /* dev_null: unbinding one capability */
         ok = plants_bind_cap(id, cap_id, NULL);
+        unbind = true;
     } else if (!dev_null) {   /* cap_null */
         /* s_api_reg_snap: too big for the httpd task stack; shared across
          * this file's handlers, see its declaration comment (L5). */
@@ -832,6 +832,12 @@ static esp_err_t plants_bind_post(httpd_req_t *req, uint8_t id)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bind failed");
         return ESP_OK;
     }
+    /* Retained-topic cleanup (spec Sec.6, M2 Task 7): a true unbind (cap
+     * given, device null) drops that capability's HA discovery entity --
+     * see mqtt_pub_cap_unbound()'s doc comment. A plain rebind (cap AND
+     * device given) keeps the same entity, just pointed at a new device, so
+     * no cleanup is needed there. */
+    if (unbind) mqtt_pub_cap_unbound(id, cap_id);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
@@ -906,6 +912,12 @@ static esp_err_t plants_delete_delete(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown plant");
         return ESP_OK;
     }
+    /* Retained-topic cleanup (spec Sec.6, M2 Task 7): fired regardless of
+     * the persist outcome checked below, same as plants_delete()'s own
+     * remove_ring_files()/storage_drop() -- a persist failure still means
+     * the RAM table (what plants_get() etc. actually serve) already
+     * dropped the plant; see plants_delete()'s doc comment. */
+    mqtt_pub_plant_deleted(id);
     if (err != ESP_OK) {
         /* Unlike rename/probe's "collapse into 400" convention: there is no
          * client-input interpretation of a delete failure here (the id was

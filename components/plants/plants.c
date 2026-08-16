@@ -2,8 +2,6 @@
 #include "plants_migrate.h"
 #include "capability.h"
 #include "storage.h"
-#include "storage_compat.h"   /* M2-SHIM */
-#include "timekeeper.h"
 #include "app_config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -100,7 +98,7 @@ typedef struct __attribute__((packed)) {
  *
  *   - s_persist_mutex guards the actual plants.bin write (write_file()'s
  *     tmp-then-rename), performed by persist_table() below. Every mutating
- *     call (plants_resolve_or_create, plants_rename, plants_assign,
+ *     call (plants_resolve_or_create, plants_rename, plants_bind_cap,
  *     plants_create, plants_delete) follows the same shape: PHASE 1 (RAM,
  *     under s_mutex only) mutates s_table and releases s_mutex completely;
  *     PHASE 2 (persist_table()) takes s_persist_mutex, briefly RE-takes
@@ -145,30 +143,6 @@ static const char *s_storage_base;   /* "/storage", or NULL: see plants_init() *
  * growth -- see task-4-report.md's "Fix round" section. Do NOT reuse this
  * for anything reachable outside plants_init()'s one-boot load sequence. */
 static plants_blob_t s_boot_blob_scratch;
-
-/* plants_last_values() RAM cache -- guarded by its own mutex, deliberately
- * separate from s_mutex/s_persist_mutex above: it is populated by a
- * storage_query() file scan (real I/O), which must never run while holding
- * a lock that plants_snapshot()/plants_resolve_or_create() etc. might be
- * waiting on. One slot per currently-existing plant is always enough
- * (PLANTS_MAX), because plants_delete() below drops a plant's cache slot
- * (see lv_cache_drop()) in the same call that frees its plants_table.h
- * slot for a new plant -- a deleted plant can never hold a cache slot
- * hostage. */
-#define LAST_VALUES_CACHE_CAP PLANTS_MAX
-typedef struct {
-    bool     used;
-    uint8_t  id;
-    bool     found;             /* false = queried once, plant had no history */
-    int16_t  temp_dc;
-    uint8_t  moisture_pct;
-    uint32_t lux;
-    uint16_t conductivity_us;
-    uint8_t  battery_pct;
-    uint32_t epoch;
-} last_values_cache_t;
-static SemaphoreHandle_t s_lv_mutex;
-static last_values_cache_t s_last_values[LAST_VALUES_CACHE_CAP];
 
 /* "plant table full" is logged at most once per distinct mac per boot,
  * mirroring battery_sched.h's small fixed-size in_use table -- otherwise a
@@ -270,7 +244,7 @@ static void unpack_blob(const plants_blob_t *blob, plants_table_t *out)
  * from persist_table() while it holds s_persist_mutex for that function's
  * ENTIRE body, so exactly one task is ever inside this function at a time
  * no matter which of plants_resolve_or_create()/plants_rename()/
- * plants_assign()/plants_create()/plants_delete() called it in -- including
+ * plants_bind_cap()/plants_create()/plants_delete() called it in -- including
  * the sampler task, which only has a 4096-byte stack to begin with. Do not
  * call write_file() from anywhere else without re-establishing that same
  * guarantee first. */
@@ -337,7 +311,7 @@ static esp_err_t write_file(const plants_blob_t *blob)
  * task is ever inside this critical section at a time, which is what makes
  * a ~1954-byte static safe despite persist_table() being reachable from
  * FOUR different task contexts (plants_resolve_or_create() off the
- * sampler/BLE ingestion path, plants_rename()/plants_assign()/
+ * sampler/BLE ingestion path, plants_rename()/plants_bind_cap()/
  * plants_create()/plants_delete() off the httpd task, plus MQTT-adjacent
  * callers). Before the original fix this was a plain stack local in a
  * function reachable from the sampler task's 4096-byte stack under normal
@@ -784,7 +758,7 @@ static void plants_run_migration(void)
     if (n_inputs == 0) return;
 
     /* Phase 1 (RAM only, s_mutex held) -- same two-phase split as
-     * plants_rename()/plants_assign()/plants_create()/plants_delete()
+     * plants_rename()/plants_bind_cap()/plants_create()/plants_delete()
      * above: plants_migrate_plan() only ever touches *t (the `in`/`out`
      * arrays are this function's own local buffers, never shared), so the
      * lock only needs to span this one call, not the file/NVS work below.
@@ -814,28 +788,6 @@ static void plants_run_migration(void)
         migrate_execute_action(&actions[i]);
     }
     ESP_LOGI(TAG, "migration: %d plant(s) migrated from sensor-keyed state", n_actions);
-}
-
-/* plants_last_values() cache helpers -- see s_last_values' declaration
- * comment for the slot-capacity argument. Moved ahead of
- * plants_init()/plants_resolve_or_create()/plants_assign() (final M8 review,
- * M1) so plants_assign() below can call lv_cache_drop() without a forward
- * declaration -- it used to only be needed from plants_delete(), further
- * down. */
-static int lv_cache_find(uint8_t id)
-{
-    for (int i = 0; i < LAST_VALUES_CACHE_CAP; i++) {
-        if (s_last_values[i].used && s_last_values[i].id == id) return i;
-    }
-    return -1;
-}
-
-static void lv_cache_drop(uint8_t id)
-{
-    xSemaphoreTake(s_lv_mutex, portMAX_DELAY);
-    int idx = lv_cache_find(id);
-    if (idx >= 0) s_last_values[idx].used = false;
-    xSemaphoreGive(s_lv_mutex);
 }
 
 /* One-boot self-migration (this fix, not M8 Task 4's sensor-keyed migration
@@ -976,12 +928,10 @@ esp_err_t plants_init(const char *storage_base)
     plants_log_heap("entry");
     s_mutex = xSemaphoreCreateMutex();
     s_persist_mutex = xSemaphoreCreateMutex();
-    s_lv_mutex = xSemaphoreCreateMutex();
-    if (!s_mutex || !s_persist_mutex || !s_lv_mutex) return ESP_ERR_NO_MEM;
+    if (!s_mutex || !s_persist_mutex) return ESP_ERR_NO_MEM;
 
     s_storage_base = storage_base;
     memset(s_full_logged, 0, sizeof(s_full_logged));
-    memset(s_last_values, 0, sizeof(s_last_values));
     plants_table_init(&s_table);
 
     if (s_storage_base) {
@@ -1066,19 +1016,20 @@ uint8_t plants_resolve_or_create(const uint8_t mac[6])
  * atomically under s_mutex, so pre-checking plants_table_find_mac() against
  * a locally-snapshotted table was redundant -- a benign double-check at
  * best, a stale answer (racing a concurrent assign/delete) at worst.
- * Bounded REGISTRY_MAX_SENSORS mutex-guarded lookups; no allocation, no
- * caller-stack table. */
-void plants_adopt_from_registry(const legacy_registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s)   /* M2-SHIM */
+ * Bounded REGISTRY_MAX_DEVICES mutex-guarded lookups; no allocation, no
+ * caller-stack table. Only DEV_KIND_BLE devices are considered -- see
+ * plants.h's doc comment. */
+void plants_adopt_from_registry(const registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s)
 {
     if (!reg) return;
-    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
-        const sensor_entry_t *e = &reg->sensors[i];
-        if (!e->in_use) continue;
+    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
+        const device_entry_t *e = &reg->devices[i];
+        if (!e->in_use || e->id.kind != DEV_KIND_BLE) continue;
         /* Liveness gate (H1): skip a probe that's gone dark rather than
          * adopting it into an undeletable ghost plant -- see this
          * function's doc comment in plants.h. */
         if (now_uptime_s - e->last_seen_s > liveness_s) continue;
-        plants_resolve_or_create(e->mac);
+        plants_resolve_or_create(e->id.addr);
     }
 }
 
@@ -1142,43 +1093,6 @@ esp_err_t plants_rename(uint8_t id, const char *name)
     return err;
 }
 
-esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null)   /* M2-SHIM: see plants.h */
-{
-    /* Same uninitialised-registry guard as plants_rename() above. */
-    if (!s_mutex) return ESP_ERR_NOT_FOUND;
-
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* Capture which plant (if any) currently holds mac_or_null BEFORE the
-     * mutation below -- plants_table_assign()'s "assigning a mac already
-     * assigned elsewhere MOVES it" semantics (plants_table.h) means that
-     * plant loses its probe as a side effect of this one call, so its
-     * plants_last_values() cache entry needs dropping too, not just id's
-     * (final M8 review, M1). NULL mac_or_null (unassign) has nothing to
-     * look up here -- other_id stays 0. */
-    int other_idx = mac_or_null ? plants_table_find_mac(&s_table, mac_or_null) : -1;
-    uint8_t other_id = (other_idx >= 0) ? s_table.p[other_idx].id : 0;
-    bool ok = plants_table_assign(&s_table, id, mac_or_null);
-    xSemaphoreGive(s_mutex);
-    if (!ok) return ESP_ERR_NOT_FOUND;
-
-    esp_err_t err = persist_table();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "plants_assign(%u): plants.bin write failed (%s); RAM cache already reflects "
-                      "the new assignment and will not revert until the next successful write "
-                      "or a reboot", id, esp_err_to_name(err));
-    }
-    /* Drop BOTH the target plant's cache slot and the losing plant's (M1):
-     * without this, a last_values hit cached before this call could keep
-     * serving a plant's old probe reading after that plant is later
-     * unassigned -- exactly the stale pre-assignment tail plants_delete()'s
-     * own lv_cache_drop() already guards against for a deleted id. Done
-     * regardless of the persist result above, same as plants_delete(): the
-     * RAM table (and therefore what SHOULD be cached) already moved. */
-    lv_cache_drop(id);
-    if (other_id != 0 && other_id != id) lv_cache_drop(other_id);
-    return err;
-}
-
 uint8_t plants_create(void)
 {
     /* Same uninitialised-registry guard as plants_rename() above -- reuses
@@ -1226,11 +1140,9 @@ static void remove_ring_files(uint8_t id)
 
 esp_err_t plants_delete(uint8_t id)
 {
-    /* Same uninitialised-registry guard as plants_rename()/plants_assign()
-     * above. remove_ring_files()/lv_cache_drop() below are both no-ops in
-     * this state too (s_storage_base is NULL until plants_init() runs, and
-     * s_lv_mutex is NULL so lv_cache_drop() would itself need the same
-     * guard -- moot here since we return before reaching it). */
+    /* Same uninitialised-registry guard as plants_rename() above.
+     * remove_ring_files() below is a no-op in this state too
+     * (s_storage_base is NULL until plants_init() runs). */
     if (!s_mutex) return ESP_ERR_NOT_FOUND;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -1256,17 +1168,12 @@ esp_err_t plants_delete(uint8_t id)
      * storage.c's in-RAM cache, not the filesystem, and storage_drop() is a
      * safe no-op for an id with no cached slot either way. */
     storage_drop(id);
-    /* plants_last_values()'s RAM cache is dropped here too: ids are never
-     * reused (plants_table.h), so this id will never be looked up again as
-     * a live plant, but a stray caller holding onto a stale id must still
-     * see "no history" rather than whatever was cached before the delete. */
-    lv_cache_drop(id);
     return err;
 }
 
 /* ---------------- Capability bindings (M2 Task 4) ----------------
  *
- * Same two-phase discipline as plants_rename()/plants_assign()/etc. above:
+ * Same two-phase discipline as plants_rename()/plants_create()/etc. above:
  * mutate s_table under s_mutex (a bounded, allocation-free
  * plants_table_bind_cap() call), release s_mutex, THEN persist_table() --
  * which re-reads the current s_table under its own brief s_mutex hold, so
@@ -1354,124 +1261,3 @@ bool plants_cap_value(uint8_t plant_id, uint8_t cap_id, const registry_t *reg,
     return true;
 }
 
-/* Same boot-table resolve api_v1.c's history_get wires storage_query's
- * resolve_fn to (its resolve_shim there does the identical one-line
- * forward) -- boot_id/rel_s -> wall-clock epoch is timekeeper's job, not
- * storage.c's or plants.c's. */
-static bool lv_resolve(void *rctx, uint16_t boot_id, uint32_t rel_s, uint32_t *epoch_out)
-{
-    (void)rctx;
-    return timekeeper_resolve(boot_id, rel_s, epoch_out);
-}
-
-typedef struct {
-    bool             found;
-    uint32_t         epoch;
-    storage_rec_v1_t rec;   /* M2-SHIM */
-} lv_scan_ctx_t;
-
-/* storage_query() emits rows in ring order, strictly oldest-to-newest (see
- * storage.c and test_storage.c's wraparound-order assertions) -- so simply
- * overwriting on every call, with no comparison, leaves the newest row in
- * *ctx once the scan completes. */
-static void lv_row(void *vctx, uint32_t epoch, const storage_rec_v1_t *rec)   /* M2-SHIM */
-{
-    lv_scan_ctx_t *c = vctx;
-    c->found = true;
-    c->epoch = epoch;
-    c->rec = *rec;
-}
-
-bool plants_last_values(uint8_t id, int16_t *temp_dc, uint8_t *moisture,   /* M2-SHIM: see plants.h */
-                        uint32_t *lux, uint16_t *conductivity, uint8_t *battery,
-                        uint32_t *epoch_out)
-{
-    /* Same "uninitialised registry" guard as plants_resolve_or_create()
-     * above -- s_lv_mutex is NULL until plants_init() (hub role only) has
-     * run. No caller reaches this yet (Task 3 does not wire one up), but
-     * the guard costs nothing and keeps this function safe to call from any
-     * role the moment Tasks 5/6 do wire it up. */
-    if (id == 0 || !s_lv_mutex) return false;
-
-    xSemaphoreTake(s_lv_mutex, portMAX_DELAY);
-    int idx = lv_cache_find(id);
-    if (idx >= 0) {
-        /* Every cached slot is a genuine hit (see below -- a miss is never
-         * written), so there's nothing left to check beyond "is it there". */
-        last_values_cache_t c = s_last_values[idx];
-        xSemaphoreGive(s_lv_mutex);
-        if (temp_dc)       *temp_dc = c.temp_dc;
-        if (moisture)      *moisture = c.moisture_pct;
-        if (lux)           *lux = c.lux;
-        if (conductivity)  *conductivity = c.conductivity_us;
-        if (battery)       *battery = c.battery_pct;
-        if (epoch_out)     *epoch_out = c.epoch;
-        return true;
-    }
-    xSemaphoreGive(s_lv_mutex);
-
-    /* Cache miss: scan storage.c's raw ring for this plant id. Widest
-     * possible epoch range -- this call wants the ring tail, not a
-     * window -- and storage_query() itself tolerates a NULL/unmounted
-     * s_storage_base the same way it tolerates a plant with no ring file
-     * yet: fopen() fails, 0 rows emitted, "not found" below. */
-    lv_scan_ctx_t scan = { .found = false };
-    if (s_storage_base) {
-        storage_query_v1(s_storage_base, id, STORAGE_TIER_RAW, 0, 0xFFFFFFFFu,   /* M2-SHIM */
-                         lv_resolve, NULL, lv_row, &scan);
-    }
-
-    /* Cache ONLY a genuine hit obtained under a synced clock (M8 Task 6
-     * review fix -- MEDIUM 2). This used to cache found=false too ("found
-     * or not", keyed by id) on the theory that a plant with genuinely no
-     * history shouldn't re-scan its non-existent ring file forever. That
-     * reasoning breaks the moment the clock isn't synced yet: every record
-     * in the ring becomes momentarily unresolvable (lv_resolve() ->
-     * timekeeper_resolve() fails for every row, storage_query() skips them
-     * all -- see storage.c), so scan.found comes back false for a plant
-     * that has REAL history, and the old first-read-wins cache pinned that
-     * false result for the rest of the boot -- a GET that merely raced NTP
-     * would permanently blank a probe-less plant's last values, exactly
-     * the "nothing is blanked" guarantee plants.h promises. Not caching a
-     * miss (synced or not) costs at most a repeat scan of one plant's raw
-     * ring on the next call -- bounded and cheap -- versus a wrong answer
-     * that sticks until reboot. */
-    if (scan.found && timekeeper_synced()) {
-        xSemaphoreTake(s_lv_mutex, portMAX_DELAY);
-        idx = lv_cache_find(id);
-        if (idx < 0) {
-            for (int i = 0; i < LAST_VALUES_CACHE_CAP; i++) {
-                if (!s_last_values[i].used) { idx = i; break; }
-            }
-        }
-        if (idx >= 0) {
-            last_values_cache_t *c = &s_last_values[idx];
-            c->used = true;
-            c->id = id;
-            c->found = true;
-            c->temp_dc = scan.rec.temp_dc;
-            c->moisture_pct = scan.rec.moisture_pct;
-            c->lux = scan.rec.lux;
-            c->conductivity_us = scan.rec.conductivity_us;
-            c->battery_pct = scan.rec.battery_pct;
-            c->epoch = scan.epoch;
-        } else {
-            /* Cache exhausted -- cannot happen in practice (capacity ==
-             * PLANTS_MAX and plants_delete() always frees its slot), but if
-             * it ever does this call still answers correctly, it just
-             * re-scans storage on every future call for this id instead of
-             * caching. */
-            ESP_LOGW(TAG, "plants_last_values(%u): last-values cache full; not caching this result", id);
-        }
-        xSemaphoreGive(s_lv_mutex);
-    }
-
-    if (!scan.found) return false;
-    if (temp_dc)       *temp_dc = scan.rec.temp_dc;
-    if (moisture)      *moisture = scan.rec.moisture_pct;
-    if (lux)           *lux = scan.rec.lux;
-    if (conductivity)  *conductivity = scan.rec.conductivity_us;
-    if (battery)       *battery = scan.rec.battery_pct;
-    if (epoch_out)      *epoch_out = scan.epoch;
-    return true;
-}

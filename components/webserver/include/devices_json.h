@@ -6,8 +6,7 @@
 /* Task 6 (M2 spec Sec.6/Sec.7): device+capability JSON builders. Renamed
  * from sensors_json.h/.c (kept the CMakeLists SRCS churn to a rename, not a
  * new file) now that the primary registry shape is registry.h's
- * device_entry_t rather than V1's mac-keyed sensor_entry_t/mibeacon_t --
- * see registry_compat.h ("M2-SHIM") for the shim this file no longer uses.
+ * device_entry_t rather than V1's mac-keyed sensor_entry_t/mibeacon_t.
  * Two builders, one file, same "shared JSON builder for both plant and
  * device JSON" convention the pre-rename file used:
  *

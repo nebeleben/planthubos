@@ -13,10 +13,16 @@
  * different capabilities to different devices (e.g. soil moisture from one
  * probe, air temperature from another), and the same device may be bound
  * by more than one plant (V2 lifts V1's "one probe, one plant" restriction
- * -- see plants_table_bind_cap()). mac/mac_valid below are the OLDER,
- * still-live V1 single-probe-per-plant fields (auto-create/resolve flow,
- * sensors_json.c/influx.c/rules_resolver.c/mqtt_pub.c/api_v1.c) -- bindings
- * are additive, not a replacement for them; see task-4-report.md. */
+ * -- see plants_table_bind_cap()). mac/mac_valid below are the OLDER V1
+ * single-probe-per-plant fields, still live internally for plants.c's
+ * mac-keyed auto-create/resolve flow (plants_table_resolve()/
+ * plants_table_create()/the sensor-keyed migration, plants_migrate.c) --
+ * bindings are additive, not a replacement for them; see task-4-report.md.
+ * As of Task 7 (task-7-report.md), every EXTERNAL consumer that used to
+ * read mac/mac_valid directly for display/publish purposes
+ * (sensors_json.c, now deleted; influx.c, mqtt_pub.c) reads capability
+ * bindings instead (plants_bindings()/plants_cap_value()) -- these two
+ * fields are internal plumbing now, not a second public identity. */
 typedef struct {
     bool    in_use;
     uint8_t id;                       /* 1-based, never reused */

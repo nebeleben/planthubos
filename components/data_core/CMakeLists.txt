@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "registry.c" "data_core.c" "registry_compat.c"
+    SRCS "registry.c" "data_core.c"
     INCLUDE_DIRS "include"
     REQUIRES mibeacon capability esp_event
     PRIV_REQUIRES esp_timer

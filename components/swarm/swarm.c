@@ -16,6 +16,7 @@
 #include "pairing.h"
 #include "data_core.h"
 #include "registry.h"
+#include "capability.h"
 #include "mibeacon.h"
 #include "app_config.h"
 #include "rules.h"
@@ -36,6 +37,7 @@
 #include "freertos/semphr.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -1003,33 +1005,52 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
 {
     (void)arg; (void)base; (void)id;
     const uint8_t *mac = data;
-    static legacy_registry_t snap;      /* M2-SHIM; event-loop task only */
-    data_core_snapshot_legacy(&snap);   /* M2-SHIM */
-    int idx = legacy_registry_find(&snap, mac);   /* M2-SHIM */
-    if (idx < 0) return;
-    const sensor_entry_t *se = &snap.sensors[idx];
-    const mibeacon_t *m = &se->latest;
+    /* Single-device lookup (data_core_get_device(), ~124 B out-param) rather
+     * than a full registry_t snapshot: this handler runs on the default
+     * event-loop task, which this file's own comments document as having
+     * only ~2304 bytes of stack -- see data_core.h's doc comment on
+     * data_core_get_device() for the same reasoning applied there. */
+    device_id_t dev = device_id_from_mac(DEV_KIND_BLE, mac);
+    device_entry_t d;
+    if (!data_core_get_device(&dev, &d)) return;
 
+    /* Decode each capability slot back to its V1 swarm_reading_t field
+     * shape (deci-C, %, lux, uS/cm, %) -- same conversions the M2 registry-
+     * compat shim used to do (data_core.c's snapshot_legacy_one(), deleted
+     * Task 7); replicated locally here since swarm_reading_t's wire format
+     * (this file's swarm_frame.h) is fixed V1-shape and out of scope for
+     * this milestone to change. */
     swarm_reading_t r = {
         .version = SWARM_PROTO_VERSION,
         .type = SWARM_MSG_READING,
-        .frame_cnt = m->frame_cnt,
-        .temp_dc = m->has_temp ? m->temp_dc : INT16_MIN,
-        .moisture_pct = m->has_moisture ? m->moisture_pct : 0xFF,
-        .battery_pct = m->has_battery ? m->battery_pct : 0xFF,
-        .lux = m->has_lux ? m->lux : 0xFFFFFFFFu,
-        .conductivity_us = m->has_conductivity ? m->conductivity_us : 0xFFFF,
+        .frame_cnt = d.last_frame_cnt,
+        .temp_dc = d.caps[CAP_AIR_TEMPERATURE].valid
+            ? (int16_t)lroundf(capability_decode(CAP_AIR_TEMPERATURE, d.caps[CAP_AIR_TEMPERATURE].raw) * 10.0f)
+            : INT16_MIN,
+        .moisture_pct = d.caps[CAP_SOIL_MOISTURE].valid
+            ? (uint8_t)lroundf(capability_decode(CAP_SOIL_MOISTURE, d.caps[CAP_SOIL_MOISTURE].raw))
+            : 0xFF,
+        .battery_pct = d.caps[CAP_BATTERY_LEVEL].valid
+            ? (uint8_t)lroundf(capability_decode(CAP_BATTERY_LEVEL, d.caps[CAP_BATTERY_LEVEL].raw))
+            : 0xFF,
+        .lux = d.caps[CAP_LIGHT_ILLUMINANCE].valid
+            ? (uint32_t)lroundf(capability_decode(CAP_LIGHT_ILLUMINANCE, d.caps[CAP_LIGHT_ILLUMINANCE].raw))
+            : 0xFFFFFFFFu,
+        .conductivity_us = d.caps[CAP_SOIL_CONDUCTIVITY].valid
+            ? (uint16_t)lroundf(capability_decode(CAP_SOIL_CONDUCTIVITY, d.caps[CAP_SOIL_CONDUCTIVITY].raw))
+            : 0xFFFF,
         /* This node's own BLE signal to the sensor -- Task 1 (M5b) added
-         * best_rssi to sensor_entry_t precisely so this is available here.
-         * On a node, data_core_submit_from() is only ever called locally
-         * with via_node == NULL (ble_collector hears the sensor directly,
-         * same as on a hub), so best_rssi IS this node's own reading of
-         * it, never another node's -- there is no node-to-node relaying in
-         * M5b. This is the hub's "strongest RSSI wins" attribution input
-         * (registry_update_from()); reporting a hardcoded 0 here (as M5a
-         * did, before best_rssi existed) made every node's contribution
-         * look identically weak and left that attribution inert. */
-        .rssi = se->best_rssi,
+         * best_rssi to device_entry_t's attribution fields precisely so
+         * this is available here. On a node, data_core_submit_from() is
+         * only ever called locally with via_node == NULL (ble_collector
+         * hears the sensor directly, same as on a hub), so best_rssi IS
+         * this node's own reading of it, never another node's -- there is
+         * no node-to-node relaying in M5b. This is the hub's "strongest
+         * RSSI wins" attribution input (registry_attribute()); reporting a
+         * hardcoded 0 here (as M5a did, before best_rssi existed) made
+         * every node's contribution look identically weak and left that
+         * attribution inert. */
+        .rssi = d.best_rssi,
         .age_s = 0,  /* just heard */
         ._pad = 0,
     };

@@ -140,44 +140,25 @@ static bool id_in_list(const uint8_t *ids, size_t n, uint8_t id)
  * fine: the alternative (special-casing a just-created plant into this
  * tick) buys one sample interval of latency at the cost of real complexity.
  *
- * M2 Task 4 hardware hotfix: this used to go through plants_adopt_from_registry()
- * (plants.h, M2-SHIM), which took a SECOND, ~832-byte legacy_registry_t
- * snapshot (data_core_snapshot_legacy()) purely so it could read mac-shaped
- * sensor_entry_t.mac -- a whole extra full-table registry copy that existed
- * only to decode something already sitting in `reg`, undecoded: for a
- * DEV_KIND_BLE device, `id.addr[0..5]` IS the 6-byte mac
- * plants_resolve_or_create() wants (device_id_from_mac() pads 6->8 with
- * zero -- capability.h). That second snapshot was one of the static buffers
- * that pushed the sampler task's own xTaskCreate() into ESP_ERR_NO_MEM right
- * after WiFi/BLE init on a C3 -- see task-4-report.md's "Hardware hotfix"
- * section. Only DEV_KIND_BLE devices are considered, matching
- * legacy_registry_t's own "BLE-kind devices only, others skipped" contract
- * (registry_compat.h) -- ESP-NOW/Zigbee auto-create isn't a V1 concept and
- * isn't introduced here. Liveness-gated exactly like the retired shim call
- * was: a dead device is not re-adopted into a plant (see plants.h's
- * plants_adopt_from_registry() doc comment for the full rationale, still
- * accurate -- this reproduces the same gate, just reading `reg` directly). */
-static void adopt_from_registry(const registry_t *reg, uint32_t now_s, uint32_t liveness_s)
-{
-    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
-        const device_entry_t *e = &reg->devices[i];
-        if (!e->in_use || e->id.kind != DEV_KIND_BLE) continue;
-        if (now_s - e->last_seen_s > liveness_s) continue;
-        plants_resolve_or_create(e->id.addr);
-    }
-}
+ * plants.h's plants_adopt_from_registry() does exactly this (same
+ * signature, same DEV_KIND_BLE-only/liveness-gated behaviour) -- Task 7
+ * moved it off the M2 registry-compat shim onto a real registry_t*, so
+ * sample_once() below just calls it directly on `reg_snap` instead of
+ * keeping a second, duplicate copy of this loop (M2 Task 4's hardware
+ * hotfix note that used to live here -- a SECOND, ~832-byte legacy_registry_t
+ * snapshot the shim needed just to read mac-shaped sensor_entry_t.mac -- no
+ * longer applies now that the shim is gone; see task-7-report.md). */
 
 static void sample_once(void)
 {
-    /* only touched on the sampler task. M2 Task 4 hardware hotfix: `reg_snap`
-     * is the only full-table registry snapshot needed now (the legacy
-     * shim's second copy is gone, see adopt_from_registry() above), and
-     * `plant_ids` replaces a full plants_snapshot() (~1953-byte
-     * plants_table_t) with just the up-to-PLANTS_MAX id bytes this loop
-     * actually needs (plants.h's plants_ids()) -- everything else per plant
-     * (bindings, values) is read live, per id, via plants_bindings()/
-     * plants_cap_value() below anyway, so the snapshot's mac/name/binding
-     * fields were always dead weight here. */
+    /* only touched on the sampler task. `reg_snap` is the only full-table
+     * registry snapshot needed here, and `plant_ids` replaces a full
+     * plants_snapshot() (~1953-byte plants_table_t) with just the
+     * up-to-PLANTS_MAX id bytes this loop actually needs (plants.h's
+     * plants_ids()) -- everything else per plant (bindings, values) is read
+     * live, per id, via plants_bindings()/plants_cap_value() below anyway,
+     * so the snapshot's mac/name/binding fields were always dead weight
+     * here. */
     static registry_t reg_snap;
     static uint8_t plant_ids[PLANTS_MAX];
     data_core_snapshot(&reg_snap);
@@ -275,7 +256,7 @@ static void sample_once(void)
         }
     }
 
-    adopt_from_registry(&reg_snap, now, interval_s);
+    plants_adopt_from_registry(&reg_snap, now, interval_s);
 }
 
 static void sampler_task(void *arg)

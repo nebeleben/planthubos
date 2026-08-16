@@ -1,7 +1,8 @@
-/* MQTT publisher -- Task 4 of the M6 integrations plan. Owns
- * integrations_start() (declared in integrations.h): reads the config once,
- * starts the esp-mqtt client itself when mqtt.enabled, then always calls
- * influx_start() (integr_private.h, Task 5's stub for now).
+/* MQTT publisher -- Task 4 of the M6 integrations plan, generalised onto
+ * the capability table (registry v2/plants bindings) by M2 Task 7 (spec
+ * Sec.6). Owns integrations_start() (declared in integrations.h): reads the
+ * config once, starts the esp-mqtt client itself when mqtt.enabled, then
+ * always calls influx_start() (integr_private.h, Task 5's stub for now).
  *
  * Off by default: mqtt.enabled == false means this file never touches
  * esp-mqtt at all -- start_mqtt() is simply never called.
@@ -20,18 +21,22 @@
  * registry and publishing discovery configs itself. That loop used to run
  * inline on esp-mqtt's task on every (re)connect -- up to 16 cold NVS name
  * reads plus up to 80 QoS-1 publishes, on a stack esp-mqtt sized for its
- * own needs, not this component's. All of that work (state publishes AND
- * discovery, whether triggered by a queued sensor update or by
- * RESYNC_DISCOVERY) now happens exclusively on the dedicated mqtt_pub task
- * below, which is the only thing that ever calls esp_mqtt_client_publish()
- * for state/discovery traffic, on its own stack sized for it (see
- * MQTT_PUB_TASK_STACK). */
+ * own needs, not this component's. All of that work (state publishes,
+ * discovery, and retained-topic cleanup on plant delete/capability unbind/
+ * device removal -- Task 7) now happens exclusively on the dedicated
+ * mqtt_pub task below, which is the only thing that ever calls
+ * esp_mqtt_client_publish() for state/discovery/cleanup traffic, on its own
+ * stack sized for it (see MQTT_PUB_TASK_STACK). api_v1.c's plant-delete and
+ * capability-unbind handlers, like every other caller here, only ever
+ * ENQUEUE (mqtt_pub_plant_deleted()/mqtt_pub_cap_unbound()/
+ * mqtt_pub_device_removed() below) -- never publish directly. */
 #include "integrations.h"
 #include "integr_config.h"
 #include "integr_private.h"
 #include "mqtt_json.h"
 #include "data_core.h"
 #include "registry.h"
+#include "capability.h"
 #include "app_config.h"
 #include "plants.h"
 #include "plants_table.h"
@@ -58,7 +63,10 @@ static const char *TAG = "mqtt_pub";
  * it instantly: a "Stack protection fault" panic in task mqtt_pub the
  * moment the broker accepted the connection, crash-looping the whole hub
  * (observed as the broker logging connect -> "connection closed by
- * client" every ~15s while the LWT flapped online/offline). */
+ * client" every ~15s while the LWT flapped online/offline). M2 Task 7:
+ * mqtt_pub_task()'s reg_snap is now a REAL registry_t (~2KB, up from the
+ * ~832B M2 registry-compat shim it replaced) -- exactly the size this
+ * stack was already budgeted for above, so 8192 stays unchanged. */
 #define MQTT_PUB_TASK_STACK      8192
 #define MQTT_PUB_TASK_PRIO       3
 /* Per-sensor state-publish throttle -- see the plan. A dropped/skipped
@@ -67,37 +75,37 @@ static const char *TAG = "mqtt_pub";
 #define MQTT_PUB_MIN_INTERVAL_US ((int64_t)30 * 1000000)
 
 #define TOPIC_BUF_SIZE      128
-#define STATE_JSON_BUF_SIZE 256
-#define DISC_JSON_BUF_SIZE  640
-
-static const char *const METRICS[] = { "temp", "moisture", "lux", "conductivity", "battery" };
-#define METRIC_COUNT (sizeof(METRICS) / sizeof(METRICS[0]))
+#define STATE_JSON_BUF_SIZE 320   /* up to CAPABILITY_COUNT fields keyed by full capability name (M2 Task 7, up from V1's 256) */
+#define DISC_JSON_BUF_SIZE  1024  /* longer capability names + suggested_display_precision (M2 Task 7, up from V1's 640) */
 
 /* s_queue items: a tagged union rather than a bare MAC, so the same queue
- * can carry both a per-sensor state update (from data_event_handler(), the
- * default esp_event loop task) and a RESYNC_DISCOVERY control message (from
- * mqtt_event_handler()'s MQTT_EVENT_CONNECTED case, esp-mqtt's task) --
- * both without either producer blocking or doing publish/NVS work itself.
- * mac is meaningful only for MQTT_PUB_MSG_STATE_UPDATE. */
-/* MQTT_PUB_MSG_EVENT (Task 6, spec §5/§6): carries a rules/event_log
- * event's already-built JSON payload from mqtt_pub_event() (the event_log
- * hook's MQTT leg, wired in main.c) to mqtt_pub_task() for publish to
- * planthub/<hub>/event -- same single-publisher discipline as the two
- * message types above; only mqtt_pub_task() ever calls
- * esp_mqtt_client_publish(). */
+ * can carry a per-sensor state update (from data_event_handler(), the
+ * default esp_event loop task), a RESYNC_DISCOVERY control message (from
+ * mqtt_event_handler()'s MQTT_EVENT_CONNECTED case, esp-mqtt's task), an
+ * event payload (mqtt_pub_event(), main.c's event_log hook) or a
+ * retained-topic cleanup request (mqtt_pub_plant_deleted()/
+ * mqtt_pub_cap_unbound()/mqtt_pub_device_removed(), api_v1.c -- M2 Task 7)
+ * -- all without any producer blocking or doing publish/NVS work itself.
+ * Only the field(s) documented for a message's own type are meaningful. */
 typedef enum {
     MQTT_PUB_MSG_STATE_UPDATE,
     MQTT_PUB_MSG_RESYNC_DISCOVERY,
     MQTT_PUB_MSG_EVENT,
+    MQTT_PUB_MSG_PLANT_DELETED,
+    MQTT_PUB_MSG_CAP_UNBOUND,
+    MQTT_PUB_MSG_DEVICE_REMOVED,
 } mqtt_pub_msg_type_t;
 
 typedef struct {
     mqtt_pub_msg_type_t type;
-    uint8_t              mac[6];
-    /* MQTT_PUB_MSG_EVENT only: heap copy made by mqtt_pub_event() (the
-     * caller's own json buffer is not retained past that call); freed by
-     * mqtt_pub_task() after publish, or immediately by mqtt_pub_event()
-     * itself if the queue send fails. */
+    uint8_t              mac[6];       /* STATE_UPDATE only */
+    uint8_t               plant_id;     /* PLANT_DELETED, CAP_UNBOUND */
+    uint8_t               cap_id;       /* CAP_UNBOUND only */
+    device_id_t            dev;          /* DEVICE_REMOVED only */
+    /* EVENT only: heap copy made by mqtt_pub_event() (the caller's own json
+     * buffer is not retained past that call); freed by mqtt_pub_task()
+     * after publish, or immediately by mqtt_pub_event() itself if the
+     * queue send fails. */
     char                 *event_json;
 } mqtt_pub_msg_t;
 
@@ -107,7 +115,7 @@ static char                     s_hub[16];
 
 /* Per-plants-table-slot state, indexed by the same slot plants_snapshot()'s
  * plants_table_t reports (plants_table_find_id() gives the index) -- sized
- * PLANTS_MAX (16), not REGISTRY_MAX_SENSORS: a plant id is bounded (1..255,
+ * PLANTS_MAX (16), not REGISTRY_MAX_DEVICES: a plant id is bounded (1..255,
  * never reused) but the table slot it currently occupies is what's bounded
  * *and* stable enough to index an array with, exactly like registry slots
  * were before this file went plant-centric. Unlike ids, slots CAN be reused
@@ -132,50 +140,64 @@ static int64_t s_last_pub_us[PLANTS_MAX];
 static uint8_t s_slot_plant_id[PLANTS_MAX];              /* 0 = never published from this slot */
 static char    s_slot_name[PLANTS_MAX][PLANT_NAME_LEN + 1]; /* last name discovery was published with */
 
-/* Publishes all 5 HA discovery configs (retained, qos 1) for one plant,
- * unconditionally -- not gated by latest.has_* (per the plan: a metric that
- * only starts appearing later would otherwise never get a discovery
- * config, and HA tolerates a config whose value template briefly yields
- * nothing). name is the plant's current display name or "" (mqtt_json.h's
- * mqtt_json_discovery() supplies the "Plant <id>" fallback). */
+/* Publishes one HA discovery config (retained, qos 1) per capability
+ * CURRENTLY bound on plant_id (plants_bindings()) -- unlike V1's fixed
+ * 5-metric loop, a plant may have any subset of CAPABILITY_COUNT bound, and
+ * this only publishes for those, per the spec's "one entity per bound
+ * capability". Unconditional per binding (not gated by whether the
+ * capability has a live value yet): a metric that only starts appearing
+ * later would otherwise never get a discovery config, and HA tolerates a
+ * config whose value template briefly yields nothing. name is the plant's
+ * current display name or "" (mqtt_json.h's mqtt_json_discovery() supplies
+ * the "Plant <id>" fallback). */
 static void publish_discovery(uint8_t plant_id, const char *name)
 {
     if (!s_client) return;
 
+    plant_binding_t bindings[CAPABILITY_COUNT];
+    size_t n = plants_bindings(plant_id, bindings, CAPABILITY_COUNT);
+
     char topic[TOPIC_BUF_SIZE];
     char json[DISC_JSON_BUF_SIZE];
-    for (size_t i = 0; i < METRIC_COUNT; i++) {
-        if (!mqtt_topic_discovery(topic, sizeof(topic), plant_id, METRICS[i])) {
-            ESP_LOGW(TAG, "discovery topic for plant %u/%s did not fit", plant_id, METRICS[i]);
+    for (size_t i = 0; i < n; i++) {
+        uint8_t cap_id = bindings[i].cap_id;
+        if (!mqtt_topic_discovery(topic, sizeof(topic), plant_id, cap_id)) {
+            ESP_LOGW(TAG, "discovery topic for plant %u/cap %u did not fit", plant_id, cap_id);
             continue;
         }
-        if (!mqtt_json_discovery(json, sizeof(json), s_hub, plant_id, name, METRICS[i])) {
-            ESP_LOGW(TAG, "discovery payload for plant %u/%s did not fit", plant_id, METRICS[i]);
+        if (!mqtt_json_discovery(json, sizeof(json), s_hub, plant_id, name, cap_id)) {
+            ESP_LOGW(TAG, "discovery payload for plant %u/cap %u did not fit", plant_id, cap_id);
             continue;
         }
         esp_mqtt_client_publish(s_client, topic, json, 0, 1, 1);
     }
 }
 
-/* Publishes the retained state payload for one plant, qos 0. e is the
- * registry entry for the plant's currently-assigned probe. */
-static void publish_state(uint8_t plant_id, const sensor_entry_t *e)   /* M2-SHIM: sensor_entry_t */
+/* Publishes the retained state payload for one plant, qos 0: one field per
+ * CURRENTLY bound capability with a live (non-stale-checked -- this is the
+ * live event-triggered path, not influx.c's periodic stale-filtered sweep)
+ * value, read straight off `reg` via plants_cap_value(). A plant with no
+ * bound capability yet reporting a value publishes nothing (mirrors V1's
+ * "nothing to say yet" case). */
+static void publish_state(uint8_t plant_id, const registry_t *reg)
 {
     if (!s_client) return;
 
-    mqtt_state_t st = {
-        .has_temp         = e->latest.has_temp,
-        .has_moisture     = e->latest.has_moisture,
-        .has_lux          = e->latest.has_lux,
-        .has_conductivity = e->latest.has_conductivity,
-        .has_battery      = e->latest.has_battery,
-        .temp_c           = e->latest.temp_dc / 10.0f,
-        .moisture_pct     = e->latest.moisture_pct,
-        .lux              = e->latest.lux,
-        .conductivity     = e->latest.conductivity_us,
-        .battery_pct      = e->latest.battery_pct,
-        .rssi             = e->best_rssi,
-    };
+    plant_binding_t bindings[CAPABILITY_COUNT];
+    size_t n = plants_bindings(plant_id, bindings, CAPABILITY_COUNT);
+
+    mqtt_state_t st = { 0 };
+    bool any = false;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t cap_id = bindings[i].cap_id;
+        float value;
+        uint32_t age_s;
+        if (!plants_cap_value(plant_id, cap_id, reg, &value, &age_s)) continue;
+        st.present[cap_id] = true;
+        st.value[cap_id] = value;
+        any = true;
+    }
+    if (!any) return;
 
     char topic[TOPIC_BUF_SIZE];
     char json[STATE_JSON_BUF_SIZE];
@@ -191,15 +213,15 @@ static void publish_state(uint8_t plant_id, const sensor_entry_t *e)   /* M2-SHI
 }
 
 /* Publishes discovery configs for every plant currently in the plants table
- * (whether or not it has a probe assigned -- discovery just declares the HA
- * entity, and per-plant state publishing already only happens once that
- * plant has actually reported data) and marks their bitmap slots sent --
- * runs on mqtt_pub_task in response to a RESYNC_DISCOVERY message, so
- * mqtt_pub_task() itself doesn't redundantly resend them the first time
- * each plant's next state publish comes through. plants_table_t lives on
- * mqtt_pub_task's own stack here, same as registry_t/plants_table_t in
- * mqtt_pub_task() below -- both are fine on its stack (see
- * MQTT_PUB_TASK_STACK's comment for the sizing history). */
+ * (whether or not any capability has reported yet -- discovery just
+ * declares the HA entity, and per-plant state publishing already only
+ * happens once that plant has actually reported data) and marks their
+ * bitmap slots sent -- runs on mqtt_pub_task in response to a
+ * RESYNC_DISCOVERY message, so mqtt_pub_task() itself doesn't redundantly
+ * resend them the first time each plant's next state publish comes
+ * through. plants_table_t lives on mqtt_pub_task's own stack here, same as
+ * registry_t/plants_table_t in mqtt_pub_task() below -- both are fine on
+ * its stack (see MQTT_PUB_TASK_STACK's comment for the sizing history). */
 static void publish_all_discovery(void)
 {
     plants_table_t snap;
@@ -214,27 +236,83 @@ static void publish_all_discovery(void)
     }
 }
 
-/* The one task that ever calls esp_mqtt_client_publish() for state/discovery
- * traffic. Drains s_queue: a STATE_UPDATE resolves the reporting mac to its
- * plant (plants_resolve_or_create() -- task context, allowed; this is one
- * of the sanctioned lazy-create call sites, since a DATA_EVENT mac is
- * always a real registry mac by construction), throttles to one state
- * publish per plant slot per 30s, and sends discovery first whenever that
- * slot hasn't seen it this MQTT session OR the plant's name has changed
- * since the cached one (a rename must re-publish discovery -- see
- * s_slot_name's comment); a RESYNC_DISCOVERY (posted by
+/* Retained-topic cleanup (spec Sec.6, M2 Task 7): an empty retained payload
+ * (MQTT_CLEANUP_PAYLOAD, mqtt_json.h) makes the broker delete the retained
+ * message, so a stale entity/value disappears from HA instead of sitting
+ * there forever. cleanup_plant() clears every POSSIBLE discovery topic
+ * (cap_id 0..CAPABILITY_COUNT-1), not just whatever happened to be bound at
+ * delete time: plants_delete() has already dropped the plant's binding
+ * table by the time mqtt_pub_plant_deleted() is enqueued (api_v1.c), so
+ * there is nothing left to consult for "what was actually published" --
+ * clearing every possible topic is cheap (at most 8 retained-delete
+ * publishes) and guarantees no orphan survives. Publishing an empty
+ * retained payload to a topic that was never actually populated is a
+ * harmless no-op on the broker/HA side. */
+static void cleanup_plant(uint8_t plant_id)
+{
+    if (!s_client) return;
+
+    char topic[TOPIC_BUF_SIZE];
+    if (mqtt_topic_state(topic, sizeof(topic), s_hub, plant_id)) {
+        esp_mqtt_client_publish(s_client, topic, MQTT_CLEANUP_PAYLOAD, 0, 0, 1);
+    }
+    for (uint8_t cap_id = 0; cap_id < CAPABILITY_COUNT; cap_id++) {
+        if (mqtt_topic_discovery(topic, sizeof(topic), plant_id, cap_id)) {
+            esp_mqtt_client_publish(s_client, topic, MQTT_CLEANUP_PAYLOAD, 0, 1, 1);
+        }
+    }
+}
+
+/* Unbinding one capability only clears ITS discovery entity -- the plant's
+ * state topic is untouched (it just stops carrying that field on the next
+ * publish; the other bound capabilities' entities are unaffected). */
+static void cleanup_cap(uint8_t plant_id, uint8_t cap_id)
+{
+    if (!s_client) return;
+
+    char topic[TOPIC_BUF_SIZE];
+    if (mqtt_topic_discovery(topic, sizeof(topic), plant_id, cap_id)) {
+        esp_mqtt_client_publish(s_client, topic, MQTT_CLEANUP_PAYLOAD, 0, 1, 1);
+    }
+}
+
+/* Devices have no discovery entities of their own (plants primary/devices
+ * secondary, spec Sec.0) -- only their state topic needs clearing. */
+static void cleanup_device(const device_id_t *dev)
+{
+    if (!s_client) return;
+
+    char idstr[24];
+    device_id_format(dev, idstr, sizeof(idstr));
+    char topic[TOPIC_BUF_SIZE];
+    if (mqtt_topic_device_state(topic, sizeof(topic), s_hub, idstr)) {
+        esp_mqtt_client_publish(s_client, topic, MQTT_CLEANUP_PAYLOAD, 0, 0, 1);
+    }
+}
+
+/* The one task that ever calls esp_mqtt_client_publish() for state/
+ * discovery/cleanup traffic. Drains s_queue: a STATE_UPDATE resolves the
+ * reporting mac to its plant (plants_resolve_or_create() -- task context,
+ * allowed; this is one of the sanctioned lazy-create call sites, since a
+ * DATA_EVENT mac is always a real registry mac by construction), throttles
+ * to one state publish per plant slot per 30s, and sends discovery first
+ * whenever that slot hasn't seen it this MQTT session OR the plant's name
+ * has changed since the cached one (a rename must re-publish discovery --
+ * see s_slot_name's comment); a RESYNC_DISCOVERY (posted by
  * mqtt_event_handler() right after MQTT_EVENT_CONNECTED, see the file
  * header) walks the whole plants table and (re)sends discovery for every
- * plant in it -- both the per-plant discovery publishes and this
- * full-table walk used to happen inline on esp-mqtt's own task; they
- * happen here now instead. registry_t/plants_table_t (~1KB each) live on
- * this task's own stack -- fine per the plan, this is the one place in the
+ * plant in it; PLANT_DELETED/CAP_UNBOUND/DEVICE_REMOVED (posted by
+ * api_v1.c, M2 Task 7) each publish the matching retained-cleanup
+ * payload(s) -- both the per-plant discovery publishes and the full-table
+ * resync walk used to happen inline on esp-mqtt's own task; they happen
+ * here now instead. registry_t/plants_table_t (~2KB each) live on this
+ * task's own stack -- fine per the plan, this is the one place in the
  * component that does it. */
 static void mqtt_pub_task(void *arg)
 {
     (void)arg;
     mqtt_pub_msg_t msg;
-    legacy_registry_t reg_snap;   /* M2-SHIM */
+    registry_t reg_snap;
     plants_table_t plants_snap;
 
     for (;;) {
@@ -259,13 +337,25 @@ static void mqtt_pub_task(void *arg)
             continue;
         }
 
+        if (msg.type == MQTT_PUB_MSG_PLANT_DELETED) {
+            cleanup_plant(msg.plant_id);
+            continue;
+        }
+
+        if (msg.type == MQTT_PUB_MSG_CAP_UNBOUND) {
+            cleanup_cap(msg.plant_id, msg.cap_id);
+            continue;
+        }
+
+        if (msg.type == MQTT_PUB_MSG_DEVICE_REMOVED) {
+            cleanup_device(&msg.dev);
+            continue;
+        }
+
         uint8_t plant_id = plants_resolve_or_create(msg.mac);
         if (plant_id == 0) continue;   /* plants table full; already logged once/mac/boot */
 
-        data_core_snapshot_legacy(&reg_snap);   /* M2-SHIM */
-        int ridx = legacy_registry_find(&reg_snap, msg.mac);   /* M2-SHIM */
-        if (ridx < 0) continue;   /* defensive: shouldn't happen, registry entries are never removed */
-
+        data_core_snapshot(&reg_snap);
         plants_snapshot(&plants_snap);
         int slot = plants_table_find_id(&plants_snap, plant_id);
         if (slot < 0) continue;   /* defensive: plants_resolve_or_create() just created/found it */
@@ -292,7 +382,7 @@ static void mqtt_pub_task(void *arg)
             strncpy(s_slot_name[slot], name, PLANT_NAME_LEN);
             s_slot_name[slot][PLANT_NAME_LEN] = '\0';
         }
-        publish_state(plant_id, &reg_snap.sensors[ridx]);
+        publish_state(plant_id, &reg_snap);
     }
 }
 
@@ -463,5 +553,47 @@ void mqtt_pub_event(const char *json)
     if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
         ESP_LOGW(TAG, "mqtt_pub queue full; dropping event publish");
         free(copy);
+    }
+}
+
+/* Retained-topic cleanup entry points (spec Sec.6, M2 Task 7) -- api_v1.c
+ * calls these right after plants_delete()/plants_bind_cap(..., NULL)
+ * succeeds; see cleanup_plant()/cleanup_cap()/cleanup_device() above for
+ * what each actually publishes. Same "no header of its own", "queue and
+ * return, no-op when MQTT isn't running" conventions as mqtt_pub_event()
+ * above. Best-effort on a full queue (logged, dropped) -- same rationale as
+ * mqtt_pub_event(): a missed cleanup leaves a stale HA entity a little
+ * longer, never a wrong/duplicated one. */
+void mqtt_pub_plant_deleted(uint8_t plant_id)
+{
+    if (!s_client || !s_queue) return;
+    mqtt_pub_msg_t msg = { .type = MQTT_PUB_MSG_PLANT_DELETED, .plant_id = plant_id };
+    if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "mqtt_pub queue full; dropping plant %u delete cleanup", plant_id);
+    }
+}
+
+void mqtt_pub_cap_unbound(uint8_t plant_id, uint8_t cap_id)
+{
+    if (!s_client || !s_queue) return;
+    mqtt_pub_msg_t msg = { .type = MQTT_PUB_MSG_CAP_UNBOUND, .plant_id = plant_id, .cap_id = cap_id };
+    if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "mqtt_pub queue full; dropping plant %u cap %u unbind cleanup", plant_id, cap_id);
+    }
+}
+
+/* No current caller: the M2 registry (registry.h) never evicts a device
+ * entry once created ("registry.c never evicts an entry" -- see
+ * plants.h's plants_adopt_from_registry() doc comment), so there is no
+ * "device removed" event anywhere yet in this milestone. Implemented now
+ * (spec Sec.6 lists it alongside plant-delete/cap-unbind as a retained-
+ * cleanup trigger) so a future milestone that adds device eviction only
+ * needs to call this, not design the cleanup itself. */
+void mqtt_pub_device_removed(const device_id_t *dev)
+{
+    if (!s_client || !s_queue || !dev) return;
+    mqtt_pub_msg_t msg = { .type = MQTT_PUB_MSG_DEVICE_REMOVED, .dev = *dev };
+    if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "mqtt_pub queue full; dropping device removal cleanup");
     }
 }

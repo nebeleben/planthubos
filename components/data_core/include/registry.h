@@ -10,9 +10,10 @@
  * .superpowers/sdd/2026-08-16-planthub-v2-m2-device-model/ for the design.
  *
  * V1's sensor_entry_t/mibeacon_t-shaped registry (mac-keyed, one fixed set
- * of MiFlora fields) is gone from this file; consumers not yet rewired onto
- * capability ids (Tasks 3-7) read a temporary compatibility shim instead --
- * see registry_compat.h, every symbol there tagged M2-SHIM. */
+ * of MiFlora fields) is gone from this file; every consumer reads
+ * capability ids directly now (Tasks 2-7 rewired the last holdouts --
+ * see task-7-report.md, "RULING-1" -- the temporary registry_compat.h/
+ * storage_compat.h compatibility shims Tasks 2-4 introduced are deleted). */
 
 #define REGISTRY_MAX_DEVICES 16
 

@@ -2,8 +2,8 @@
 #include "esp_err.h"
 #include "esp_event.h"
 #include "registry.h"
+#include "capability.h"
 #include "mibeacon.h"
-#include "registry_compat.h"   /* M2-SHIM: v1-shaped read API, see that header */
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -59,6 +59,14 @@ void data_core_submit_from(const mibeacon_t *m, const uint8_t via_node[6],
                             int8_t rssi, uint16_t age_s);
 
 void      data_core_snapshot(registry_t *out);
+
+/* Single-device lookup, for a caller that only needs one entry rather than
+ * the full ~2KB registry_t (e.g. swarm.c's on_sensor_update(), which runs
+ * on the default event-loop task's ~2304 B stack -- see that file). Copies
+ * the live device_entry_t (~124 B) for *id into *out under s_mutex, the
+ * same locking this file's other accessors use; bounded, allocation-free.
+ * Returns false (*out untouched) when the device isn't in the registry. */
+bool      data_core_get_device(const device_id_t *id, device_entry_t *out);
 
 /* Forgetting a node must fully forget it: clears via-node attribution (see
  * registry_clear_attribution()) for every device currently attributed to

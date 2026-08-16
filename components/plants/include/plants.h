@@ -5,7 +5,6 @@
 #include "esp_err.h"
 #include "plants_table.h"
 #include "registry.h"          /* registry_t: plants_bind_device()/plants_cap_value() */
-#include "registry_compat.h"   /* M2-SHIM: legacy_registry_t, see that header */
 
 /* LittleFS-backed plant registry: a single blob at <storage_base>/plants.bin
  * (M8 hardware bring-up fix -- this used to be an NVS blob keyed "plants" in
@@ -77,14 +76,6 @@ esp_err_t plants_rename(uint8_t id, const char *name);
 uint8_t   plants_create(void);                       /* 0 = full (or uninitialised) */
 esp_err_t plants_delete(uint8_t id);                 /* also deletes P<id> ring files */
 
-/* M2-SHIM: V1's single-probe-per-plant assignment (mac_valid/mac,
- * plants_table_assign()'s "assigning a mac already assigned elsewhere MOVES
- * it" semantics). The M2 model (below) replaces "assign a probe" with "bind
- * the capabilities that probe reports" -- api_v1.c's probe-assignment route
- * is the only remaining caller, and it is not rewired by this task (RULING-1,
- * task-4-report.md). DELETE once that route moves to plants_bind_device(). */
-esp_err_t plants_assign(uint8_t id, const uint8_t *mac_or_null);   /* M2-SHIM */
-
 /* plant_binding_t is declared in plants_table.h (included above). */
 
 /* Bind one capability on `plant_id` to `dev` (dev == NULL clears just that
@@ -145,7 +136,7 @@ bool plants_cap_value(uint8_t plant_id, uint8_t cap_id, const registry_t *reg,
  * eligible for re-adoption, instead of clawing its way back into a plant on
  * the very next sweep.
  *
- * Bounded REGISTRY_MAX_SENSORS mutex-guarded plants_resolve_or_create()
+ * Bounded REGISTRY_MAX_DEVICES mutex-guarded plants_resolve_or_create()
  * calls; allocation-free and -- deliberately -- takes NO plants_table_t
  * snapshot of its own (re-review fix after H1+M3 landed): this function
  * runs on two different task stacks (the sampler task, AND api_v1.c's
@@ -155,28 +146,10 @@ bool plants_cap_value(uint8_t plant_id, uint8_t cap_id, const registry_t *reg,
  * already does its own find-or-create atomically under s_mutex, so there is
  * nothing to pre-check a snapshot against. Safe to call from any task
  * context -- see plants_resolve_or_create()'s own TASK CONTEXT ONLY note,
- * which this inherits. */
-void plants_adopt_from_registry(const legacy_registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s);   /* M2-SHIM */
-
-/* M2-SHIM: probe-less last values, V1's fixed 5-field shape (storage_compat.h's
- * storage_rec_v1_t) rather than plants_cap_value()'s per-capability one.
- * sensors_json.c is the only remaining caller and is not rewired by this
- * task (RULING-1, task-4-report.md) -- DELETE once it moves to
- * plants_bindings()/plants_cap_value(). Kept working exactly as before:
- * the plant's last history record (ring tail),
- * read via storage_query() (storage.h) over the plant's own P<id>_raw.bin
- * ring -- id-keyed since M8 Task 3, so this works for a plant with no
- * assigned sensor, or one whose probe was unplugged/reassigned elsewhere,
- * exactly the case this function exists to serve (a mac-keyed lookup would
- * have no mac to query by, or would go stale the moment
- * plants_table_assign() moves that mac to a different plant).
+ * which this inherits.
  *
- * Cached in RAM after first read (found or not), invalidated only by
- * plants_delete() -- deliberately not refreshed on every call: a probe-less
- * plant's ring is static (nothing appends to it once its probe is gone), so
- * the first scan's result stays correct until the plant itself is deleted.
- * Returns false when the plant has no history (id unknown, no ring file
- * yet, or the ring is empty). Fields use storage.h NONE sentinels. */
-bool plants_last_values(uint8_t id, int16_t *temp_dc, uint8_t *moisture,   /* M2-SHIM */
-                        uint32_t *lux, uint16_t *conductivity, uint8_t *battery,
-                        uint32_t *epoch_out);
+ * Only DEV_KIND_BLE entries are considered (device_id_t's addr[0..5] is fed
+ * straight to plants_resolve_or_create() as the mac) -- ESP-NOW/Zigbee
+ * auto-create isn't a V1 concept and isn't introduced here; a future
+ * milestone that wants it gets to design that separately. */
+void plants_adopt_from_registry(const registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s);

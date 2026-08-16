@@ -4,7 +4,6 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include <math.h>
 #include <string.h>
 
 #define MACSTR_FMT "%02X:%02X:%02X:%02X:%02X:%02X"
@@ -150,71 +149,22 @@ void data_core_snapshot(registry_t *out)
     xSemaphoreGive(s_mutex);
 }
 
-/* M2-SHIM: decodes one live device_entry_t into its V1 sensor_entry_t shape
- * -- see registry_compat.h. Caller must hold s_mutex. */
-static void snapshot_legacy_one(sensor_entry_t *e, const device_entry_t *d)
+/* Single-device lookup -- see data_core.h's doc comment. Deliberately NOT
+ * implemented as "take a full registry_t snapshot via data_core_snapshot(),
+ * then registry_find() into that" (which would be simpler): several callers
+ * (webserver/sse.c, swarm.c's on_sensor_update()) run on the default
+ * event-loop task, which both files' own comments document as having only
+ * ~2304 bytes of stack; a 2048-byte registry_t local on top of that call
+ * chain would risk overflowing it. Bounded, allocation-free -- same
+ * critical-section cost shape as data_core_snapshot()'s own memcpy. */
+bool data_core_get_device(const device_id_t *id, device_entry_t *out)
 {
-    memset(e, 0, sizeof(*e));
-    e->in_use = true;
-    memcpy(e->mac, d->id.addr, 6);
-    e->last_seen_s = d->last_seen_s;
-    e->via_node_valid = d->via_node_valid;
-    memcpy(e->via_node, d->via_node, 6);
-    e->best_rssi = d->best_rssi;
-    e->attributed_s = d->attributed_s;
-
-    memcpy(e->latest.mac, e->mac, 6);
-    e->latest.product_id = MIBEACON_PRODUCT_MIFLORA;   /* the only kind V1's registry ever held */
-    e->latest.frame_cnt = d->last_frame_cnt;
-
-    if (d->caps[CAP_AIR_TEMPERATURE].valid) {
-        e->latest.has_temp = true;
-        e->latest.temp_dc = (int16_t)lroundf(
-            capability_decode(CAP_AIR_TEMPERATURE, d->caps[CAP_AIR_TEMPERATURE].raw) * 10.0f);
-    }
-    if (d->caps[CAP_SOIL_MOISTURE].valid) {
-        e->latest.has_moisture = true;
-        e->latest.moisture_pct = (uint8_t)lroundf(
-            capability_decode(CAP_SOIL_MOISTURE, d->caps[CAP_SOIL_MOISTURE].raw));
-    }
-    if (d->caps[CAP_LIGHT_ILLUMINANCE].valid) {
-        e->latest.has_lux = true;
-        e->latest.lux = (uint32_t)lroundf(
-            capability_decode(CAP_LIGHT_ILLUMINANCE, d->caps[CAP_LIGHT_ILLUMINANCE].raw));
-    }
-    if (d->caps[CAP_SOIL_CONDUCTIVITY].valid) {
-        e->latest.has_conductivity = true;
-        e->latest.conductivity_us = (uint16_t)lroundf(
-            capability_decode(CAP_SOIL_CONDUCTIVITY, d->caps[CAP_SOIL_CONDUCTIVITY].raw));
-    }
-    if (d->caps[CAP_BATTERY_LEVEL].valid) {
-        e->latest.has_battery = true;
-        e->latest.battery_pct = (uint8_t)lroundf(
-            capability_decode(CAP_BATTERY_LEVEL, d->caps[CAP_BATTERY_LEVEL].raw));
-    }
-}
-
-/* M2-SHIM: see registry_compat.h. Decodes directly out of the live
- * s_registry under s_mutex -- deliberately NOT implemented as "take a full
- * registry_t snapshot via data_core_snapshot(), then decode that" (which
- * would be simpler) because several callers of this shim (webserver/sse.c,
- * swarm.c's on_sensor_update()) run on the default event-loop task, which
- * both files' own comments document as having only ~2304 bytes of stack; a
- * second 2048-byte registry_t local on top of that call chain would risk
- * overflowing it. Bounded, allocation-free -- same critical-section cost
- * shape as data_core_snapshot()'s own memcpy. */
-void data_core_snapshot_legacy(legacy_registry_t *out)
-{
-    memset(out, 0, sizeof(*out));
-    int oi = 0;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    for (int i = 0; i < REGISTRY_MAX_DEVICES && oi < REGISTRY_MAX_SENSORS; i++) {
-        const device_entry_t *d = &s_registry.devices[i];
-        if (!d->in_use || d->id.kind != DEV_KIND_BLE) continue;
-        snapshot_legacy_one(&out->sensors[oi], d);
-        oi++;
-    }
+    int idx = registry_find(&s_registry, id);
+    bool found = idx >= 0;
+    if (found) memcpy(out, &s_registry.devices[idx], sizeof(*out));
     xSemaphoreGive(s_mutex);
+    return found;
 }
 
 void data_core_clear_node_attribution(const uint8_t node_mac[6])

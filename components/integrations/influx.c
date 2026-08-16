@@ -1,13 +1,27 @@
 /* InfluxDB v2 line-protocol batch push -- Task 5 of the M6 integrations
- * plan. influx_start() is called unconditionally from integrations_start()
+ * plan, generalised onto the capability table by M2 Task 7 (spec Sec.6):
+ * one `plant` line per plant with any live bound-capability value, one
+ * `device` line per registry device with any live capability value --
+ * field names from capability.h's influx_field (V1 spellings kept:
+ * moisture, temp, lux, conductivity, battery; humidity/pressure/rssi are
+ * new). influx_start() is called unconditionally from integrations_start()
  * (mqtt_pub.c), the same way it calls start_mqtt(): this file applies its
  * own influx.enabled check, exactly like start_mqtt() handles mqtt.enabled.
  *
- * Design: one task, one static 4KB line-protocol batch buffer, one
+ * Design: one task, one static line-protocol batch buffer, one
  * esp_http_client POST every 300s. No retry queue on a failed POST -- the
  * next cycle re-reports whatever is still current in the registry, which
  * is simpler and correct enough (YAGNI, per the plan) since an Influx
  * point is last-value-wins per (measurement, tag set, timestamp) anyway.
+ * Both plant and device lines share ONE timestamp per cycle (epoch_now,
+ * this cycle's wall-clock read) rather than V1's per-point "back-date by
+ * this device's staleness" -- V1 had exactly one device behind each point,
+ * so its own age was an unambiguous timestamp; a plant can now draw
+ * capabilities from several devices with different ages, so there is no
+ * single honest back-dated timestamp for the point as a whole. Individual
+ * capabilities that have gone stale (age_s > DATA_CORE_MAX_AGE_S) are still
+ * excluded, same intent as V1's staleness skip, just per-capability instead
+ * of per-device.
  *
  * cfg is received by pointer at influx_start() time and the caller's
  * struct is stack-local (mqtt_pub.c's integrations_start()), so the parts
@@ -17,6 +31,7 @@
 #include "lineproto.h"
 #include "data_core.h"
 #include "registry.h"
+#include "capability.h"
 #include "plants.h"
 #include "plants_table.h"
 #include "timekeeper.h"
@@ -35,7 +50,14 @@ static const char *TAG = "influx";
 #define INFLUX_TASK_STACK 6144   /* TLS-ready headroom, see the plan */
 #define INFLUX_TASK_PRIO   2
 #define INFLUX_INTERVAL_S  300
-#define INFLUX_BATCH_CAP   4096  /* 16 sensors x ~200B/line fits comfortably */
+/* 8192, not V1's 4096 (M2 Task 7): this file now emits up to
+ * REGISTRY_MAX_DEVICES (16) `device` lines in addition to up to PLANTS_MAX
+ * (16) `plant` lines -- an entirely new class of lines V1 never had --
+ * where before it emitted only up to 16 assigned-plant lines. Worst case
+ * (every line carrying all CAPABILITY_COUNT=8 fields) no longer fits 4096;
+ * 8192 covers 32 worst-case lines (~215 B each) with headroom. +4096 B
+ * static over V1. */
+#define INFLUX_BATCH_CAP   8192
 #define INFLUX_URL_CAP     256   /* url[97] + "/api/v2/write?org=" + org[33] + "&bucket=" + bucket[33] + "&precision=s" */
 #define INFLUX_AUTH_CAP    160   /* "Token " + token[129] */
 
@@ -46,58 +68,81 @@ static char s_batch[INFLUX_BATCH_CAP];
 static char s_url[INFLUX_URL_CAP];
 static char s_auth_header[INFLUX_AUTH_CAP];
 
-/* Snapshots the plants table and the registry, and appends every assigned
- * plant's live (non-stale) reading as a line-protocol line to s_batch --
- * unassigned plants (no probe) are skipped, as are assigned plants whose
- * probe mac has no registry entry yet (never reported to the hub) or whose
- * last report has aged out. now_uptime_s is esp_timer-based uptime seconds,
- * the same clock last_seen_s is stamped in (see data_core.c); epoch_s per
- * point is computed by walking that age back off the real wall-clock time.
- * Returns the number of bytes written to s_batch (0 == nothing to send). */
+/* Appends one plant's line, if it has at least one live bound-capability
+ * value: walks plant_id's current bindings (plants_bindings()) and reads
+ * each through plants_cap_value() -- which already does the
+ * binding->device->cap_slot_t resolution against `reg` -- skipping a
+ * capability that's unbound-in-practice (bound device not in this
+ * snapshot, or no value yet) or has aged out. */
+static void append_plant(uint8_t plant_id, const registry_t *reg, int64_t epoch_now, size_t *off)
+{
+    plant_binding_t bindings[CAPABILITY_COUNT];
+    size_t n = plants_bindings(plant_id, bindings, CAPABILITY_COUNT);
+    if (n == 0) return;
+
+    lp_plant_point_t p = { .plant_id = plant_id, .epoch_s = epoch_now };
+    for (size_t i = 0; i < n; i++) {
+        uint8_t cap_id = bindings[i].cap_id;
+        float value;
+        uint32_t age_s;
+        if (!plants_cap_value(plant_id, cap_id, reg, &value, &age_s)) continue;
+        if (age_s > DATA_CORE_MAX_AGE_S) continue;
+        p.fields.present[cap_id] = true;
+        p.fields.value[cap_id] = value;
+    }
+
+    if (!lineproto_append_plant(s_batch, sizeof(s_batch), off, &p)) {
+        ESP_LOGD(TAG, "line for plant %u did not fit or had no fields; skipped", plant_id);
+    }
+}
+
+/* Appends one device's line, if it has at least one live capability value
+ * -- every registry device, bound to a plant or not (spec Sec.6: "measurement
+ * device ... field per capability", the plants-primary/devices-secondary
+ * decision means devices get reported independently of plant bindings). */
+static void append_device(const device_entry_t *d, uint32_t now_uptime_s, int64_t epoch_now, size_t *off)
+{
+    lp_device_point_t p = { .epoch_s = epoch_now };
+    device_id_format(&d->id, p.dev_id_str, sizeof(p.dev_id_str));
+
+    for (uint8_t cap_id = 0; cap_id < CAPABILITY_COUNT; cap_id++) {
+        const cap_slot_t *slot = &d->caps[cap_id];
+        if (!slot->valid) continue;
+        uint32_t age_s = (now_uptime_s >= slot->updated_s) ? now_uptime_s - slot->updated_s : 0;
+        if (age_s > DATA_CORE_MAX_AGE_S) continue;
+        p.fields.present[cap_id] = true;
+        p.fields.value[cap_id] = capability_decode(cap_id, slot->raw);
+    }
+
+    if (!lineproto_append_device(s_batch, sizeof(s_batch), off, &p)) {
+        ESP_LOGD(TAG, "line for device %s did not fit or had no fields; skipped", p.dev_id_str);
+    }
+}
+
+/* Snapshots the plants table and the registry once, then appends every
+ * plant's and every device's line (see append_plant()/append_device()
+ * above). Returns the number of bytes written to s_batch (0 == nothing to
+ * send). */
 static size_t build_batch(void)
 {
     plants_table_t plants_snap;
     plants_snapshot(&plants_snap);
 
-    legacy_registry_t reg_snap;   /* M2-SHIM */
-    data_core_snapshot_legacy(&reg_snap);   /* M2-SHIM */
+    registry_t reg_snap;
+    data_core_snapshot(&reg_snap);
 
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
-    uint32_t epoch_now = timekeeper_now();
+    int64_t epoch_now = (int64_t)timekeeper_now();
     size_t off = 0;
 
     for (int i = 0; i < PLANTS_MAX; i++) {
-        const plant_entry_t *pe = &plants_snap.p[i];
-        if (!pe->in_use || !pe->mac_valid) continue;   /* assigned only */
+        if (!plants_snap.p[i].in_use) continue;
+        append_plant(plants_snap.p[i].id, &reg_snap, epoch_now, &off);
+    }
 
-        int ridx = legacy_registry_find(&reg_snap, pe->mac);   /* M2-SHIM */
-        if (ridx < 0) continue;   /* probe never reported to this hub */
-
-        const sensor_entry_t *e = &reg_snap.sensors[ridx];
-        uint32_t age_s = now_uptime_s - e->last_seen_s;
-        if (age_s > DATA_CORE_MAX_AGE_S) continue;
-
-        lp_point_t p = {0};
-        p.plant_id = pe->id;
-        strncpy(p.name, pe->name, sizeof(p.name) - 1);
-        snprintf(p.sensor_mac12, sizeof(p.sensor_mac12), "%02X%02X%02X%02X%02X%02X",
-                 pe->mac[0], pe->mac[1], pe->mac[2], pe->mac[3], pe->mac[4], pe->mac[5]);
-
-        p.has_temp = e->latest.has_temp;
-        p.temp_c = e->latest.temp_dc / 10.0f;
-        p.has_moisture = e->latest.has_moisture;
-        p.moisture_pct = e->latest.moisture_pct;
-        p.has_lux = e->latest.has_lux;
-        p.lux = e->latest.lux;
-        p.has_conductivity = e->latest.has_conductivity;
-        p.conductivity = e->latest.conductivity_us;
-        p.has_battery = e->latest.has_battery;
-        p.battery_pct = e->latest.battery_pct;
-        p.epoch_s = (int64_t)epoch_now - (int64_t)age_s;
-
-        if (!lineproto_append(s_batch, sizeof(s_batch), &off, &p)) {
-            ESP_LOGD(TAG, "line for plant %u did not fit or had no fields; skipped", pe->id);
-        }
+    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
+        if (!reg_snap.devices[i].in_use) continue;
+        append_device(&reg_snap.devices[i], now_uptime_s, epoch_now, &off);
     }
 
     return off;

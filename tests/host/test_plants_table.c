@@ -67,9 +67,12 @@ int main(void)
     assert(id_c == 3);
     assert(t.next_id == 4);
 
-    /* plants_table_assign() is still live behind the plants_assign()
-     * M2-SHIM (plants.h; Task 7 deletes it) -- minimal coverage: assigning
-     * a mac already assigned elsewhere moves it, and NULL unassigns. */
+    /* plants_table_assign() has no production caller left as of Task 7
+     * (plants.h's plants_assign() wrapper -- the last one -- was deleted
+     * along with the rest of the M2 registry/storage compatibility shims,
+     * RULING-1), but the primitive itself stays: minimal coverage here for
+     * its V1 "assigning a mac already assigned elsewhere MOVES it"
+     * semantics, and NULL unassigns. */
     assert(plants_table_assign(&t, id_empty, MAC_C) == true);   /* moves MAC_C off id_c onto id_empty */
     assert(plants_table_find_mac(&t, MAC_C) == plants_table_find_id(&t, id_empty));
     assert(t.p[plants_table_find_id(&t, id_c)].mac_valid == false);
