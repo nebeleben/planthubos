@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 import { loadCaps, capLabel, fmtCap } from '../lib/caps.js'
+import { hasAiKey } from '../lib/ai/settings.js'
 
 function fmtAge(ageS) {
   if (ageS == null) return 'never'
@@ -185,11 +186,18 @@ function fmtHexBytes(hex) {
 
 // Same collapsible node-card shape as DeviceCard: header carries the
 // device-id + age, body carries RSSI, every captured sample's hex payload,
-// and the Add-wrapper hop into WrappersTab (M3 Task 8, spec §5/§6's
-// unknown-device discovery surface -- devices no wrapper currently claims,
-// captured so an operator/M4's AI can write one). GET /api/v1/unknown's
-// shape (id/rssi/last_seen_s/samples[{hex,len,ts}]) is M4's own input
-// contract -- rendered here as-is, never reshaped.
+// and two hops into WrappersTab's editor (M3 Task 8's hand-written "Add
+// wrapper", M4 Task 7's "Generate wrapper with AI" alongside it) --
+// spec §5/§6's unknown-device discovery surface, devices no wrapper
+// currently claims, captured so an operator or M4's AI can write one for
+// it. Both buttons hand app.jsx the whole raw device (onAddWrapper's
+// contract changed in M4 Task 7 from just the newest hex to the full
+// device -- app.jsx derives the newest hex itself, same as this card used
+// to) since Generate needs every captured sample to build a prompt, not
+// just one; WrapperTemplate.build({device}) / redact.js do the actual
+// redaction, this file never touches device fields for that purpose.
+// GET /api/v1/unknown's shape (id/rssi/last_seen_s/samples[{hex,len,ts}])
+// is M4's own input contract -- rendered here as-is, never reshaped.
 function UnknownDeviceCard({ d, open, onToggle, onAddWrapper }) {
   const newest = d.samples[d.samples.length - 1]   // s[] is oldest-first, newest-last (api_v1.c's unknown_get)
   return (
@@ -221,8 +229,13 @@ function UnknownDeviceCard({ d, open, onToggle, onAddWrapper }) {
           </table>
         </div>
         <div class="node-card-footer">
-          <button type="button" class="btn-primary" onClick={() => onAddWrapper(newest.hex)}>
+          <button type="button" class="btn-primary" onClick={() => onAddWrapper(d)}>
             Add wrapper
+          </button>
+          {' '}
+          <button type="button" onClick={() => onAddWrapper(d)} disabled={!hasAiKey()}
+                  title={hasAiKey() ? undefined : 'Set an API key in Config to use AI generation'}>
+            Generate wrapper with AI
           </button>
         </div>
       </div>

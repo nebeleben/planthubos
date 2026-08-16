@@ -1,6 +1,10 @@
-import { useEffect, useState } from 'preact/hooks'
+import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 import { compileWrapper, disassemble } from '../lib/psc/index.js'
+import { getAiSettings, hasAiKey } from '../lib/ai/settings.js'
+import { aiComplete, AiError } from '../lib/ai/provider.js'
+import { WRAPPER_TEMPLATE } from '../lib/ai/prompts/wrapper.js'
+import { extractSource, provenance } from '../lib/ai/extract.js'
 
 // Same "duplicated locally, not shared" idiom every tab's own fmtAge copy
 // follows (rules.jsx/devices.jsx/nodes.jsx) -- last_seen_s/last_fire_age_s
@@ -33,6 +37,64 @@ const TEMPLATE = `# wrapper "ruuvi" match manufacturer 0x0499
 #   emit air.temperature   i16_be(payload, 1) * 0.005
 #   emit air.humidity      u16_be(payload, 3) * 0.0025
 `
+
+// Bytes a wrapper actually receives are NOT the raw advert GET
+// /api/v1/unknown hands back -- they are sliced first, per
+// components/ble_collector/ble_collector.c's decode_adv_item() (the
+// comment directly above its `switch (wrapper_index_kind_of(...))`, M3
+// spec §3): a `service` match gets the bytes after that AD structure's own
+// 2-byte UUID, a `manufacturer` match gets the bytes after its 2-byte
+// company id, and `mac_prefix` has no header to skip and gets the whole
+// captured advertisement unslicced. When the advert doesn't contain the
+// structure a service/manufacturer wrapper matches on, the firmware hands
+// the wrapper a NULL/zero-length payload -- NOT the raw advert -- so this
+// mirrors that with an empty hex string, never a fallback to the whole
+// thing. Get this wrong and a correct wrapper decodes the id bytes as if
+// they were sensor data. `matchKind` is the NUMERIC form (0 service, 1
+// manufacturer, 2 mac_prefix) straight off a fresh compileWrapper() result
+// -- see this file's own top-of-file MATCH_KEY_WIDTH comment on why the
+// string form (off GET /api/v1/wrappers) must never be passed here.
+const AD_TYPE_SERVICE_DATA_16 = 0x16
+const AD_TYPE_MANUFACTURER = 0xff
+
+function hexToBytes(hex) {
+  const clean = String(hex || '').trim()
+  const out = []
+  for (let i = 0; i + 1 < clean.length; i += 2) out.push(parseInt(clean.slice(i, i + 2), 16))
+  return out
+}
+
+function bytesToHex(bytes) {
+  return bytes.map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+// Finds the FIRST AD structure of `adType` in a raw advertisement and
+// returns the bytes that follow its own 2-byte id, or null if the advert
+// has no such structure (or too short a one to hold an id). "First" mirrors
+// api_v1.c's wrapper_ad_find_u16() -- the same convention the hub itself
+// uses to pick which captured sample previews a wrapper.
+function firstAdStructureAfterId(bytes, adType) {
+  let i = 0
+  while (i < bytes.length) {
+    const segLen = bytes[i]
+    if (segLen === 0) break
+    if (i + 1 + segLen > bytes.length) break
+    const segType = bytes[i + 1]
+    if (segType === adType && segLen >= 3) return bytes.slice(i + 4, i + 1 + segLen)
+    i += 1 + segLen
+  }
+  return null
+}
+
+// The payload-slice this file reimplements client-side (see the block
+// comment above) -- named to match what it does, called from exactly one
+// place: right before a captured sample is sent to /api/v1/wrappers/test.
+function sliceWrapperPayload(hex, matchKind) {
+  if (matchKind === 2) return hex   // mac_prefix: whole raw advert, unsliced
+  const adType = matchKind === 0 ? AD_TYPE_SERVICE_DATA_16 : AD_TYPE_MANUFACTURER
+  const body = firstAdStructureAfterId(hexToBytes(hex), adType)
+  return body ? bytesToHex(body) : ''   // structure absent -- empty, never the raw advert
+}
 
 // POST /wrappers/<id>/test's response (spec §6, ruling: render exactly what
 // the endpoint returns -- cap name/unit are already joined server-side, no
@@ -113,13 +175,18 @@ function WrapperCard({ w, open, onToggle, onToggleEnabled, enabling, onEdit, onD
   )
 }
 
-// prefillHex/onPrefillConsumed: cross-tab "Add wrapper" hop from the Devices
-// tab's Unknown devices section (app.jsx owns the value, per the controller
-// ruling -- localStorage is rules.jsx's own unrelated unseen-events-badge
-// mechanism, not a pattern to copy here). Consumed once on mount/change,
-// then cleared via onPrefillConsumed() so a later plain visit to this tab
+// prefill/onPrefillConsumed: cross-tab "Add wrapper" / "Generate wrapper
+// with AI" hop from the Devices tab's Unknown devices section (app.jsx owns
+// the value, per the controller ruling -- localStorage is rules.jsx's own
+// unrelated unseen-events-badge mechanism, not a pattern to copy here).
+// {hex, device}: hex prefills the editor exactly as M3 Task 8 always did,
+// device is the whole raw GET /api/v1/unknown entry M4 Task 7 adds, held
+// onto as `capturedDevice` for the Generate button (WRAPPER_TEMPLATE.build
+// needs every sample, not just one) and for Step 4's auto-test (needs a
+// captured sample to slice and send). Consumed once on mount/change, then
+// cleared via onPrefillConsumed() so a later plain visit to this tab
 // doesn't re-apply a stale prefill.
-export function WrappersTab({ prefillHex, onPrefillConsumed }) {
+export function WrappersTab({ prefill, onPrefillConsumed }) {
   const [wrappers, setWrappers] = useState(null)
   const [error, setError] = useState(false)
   const [openMap, setOpenMap] = useState({})
@@ -140,6 +207,21 @@ export function WrappersTab({ prefillHex, onPrefillConsumed }) {
   const [compileResult, setCompileResult] = useState(null)
   const [saveState, setSaveState] = useState('idle')  // idle | saving | saved | error | unauth
   const [saveMsg, setSaveMsg] = useState('')
+
+  // M4 Task 7: the device this editor session was prefilled from (or null
+  // for a from-scratch/Edit-an-existing-wrapper session). Drives both the
+  // Generate button (needs every captured sample to build a prompt) and
+  // Step 4's auto-test-on-clean-compile (needs a captured sample to slice
+  // and POST to /api/v1/wrappers/test). Cleared on New/Edit so an unrelated
+  // wrapper never gets auto-tested against a stale device's bytes.
+  const [capturedDevice, setCapturedDevice] = useState(null)
+  const [aiBusy, setAiBusy] = useState(false)
+  const [aiError, setAiError] = useState(null)          // {message, detail} | null
+  const [aiRawResponse, setAiRawResponse] = useState(null)  // set only when extractSource() found no code block
+  const [autoTestResult, setAutoTestResult] = useState(null)
+  const [autoTestBusy, setAutoTestBusy] = useState(false)
+  const [autoTestError, setAutoTestError] = useState('')
+  const abortRef = useRef(null)   // current in-flight aiComplete()'s AbortController, for the Cancel button
 
   function refreshWrappers(signal) {
     return fetch('/api/v1/wrappers', { signal })
@@ -162,6 +244,28 @@ export function WrappersTab({ prefillHex, onPrefillConsumed }) {
     return () => { clearInterval(id); controller.abort() }
   }, [])
 
+  // Clears every piece of AI-generation state (Generate result, any error,
+  // the auto-test) -- shared by startNewWrapper/onEdit/the prefill effect
+  // below, all of which start a session an old generation/test no longer
+  // applies to. Aborts a still-in-flight aiComplete() first: a response
+  // that lands after the editor has moved on to a different wrapper must
+  // never write into it.
+  function resetAiState() {
+    if (abortRef.current) abortRef.current.abort()
+    // Nulled (not just aborted) so a since-superseded onGenerate's own
+    // catch handler -- which checks `abortRef.current === <its own
+    // controller>` before touching state -- recognises this session as
+    // stale and stays silent, instead of painting a "Generation cancelled"
+    // message into whatever New-wrapper/Edit/prefill session replaced it.
+    abortRef.current = null
+    setAiBusy(false)
+    setAiError(null)
+    setAiRawResponse(null)
+    setAutoTestResult(null)
+    setAutoTestBusy(false)
+    setAutoTestError('')
+  }
+
   function startNewWrapper() {
     setEditingId(null)
     setEditingEnabled(true)
@@ -169,22 +273,29 @@ export function WrappersTab({ prefillHex, onPrefillConsumed }) {
     setCompileResult(null)
     setSaveState('idle')
     setSaveMsg('')
+    setCapturedDevice(null)
+    resetAiState()
   }
 
   // Consumes app.jsx's prefill exactly once: drops the captured hex in as a
   // leading comment above the usual blank-editor template, then hands the
-  // value back so a later plain tab switch doesn't re-apply it.
+  // value back so a later plain tab switch doesn't re-apply it. Also keeps
+  // the whole device around (capturedDevice) for the Generate button and
+  // Step 4's auto-test, both M4 Task 7 additions -- prefillHex alone (the
+  // M3 shape) was never enough to build a prompt from every sample.
   useEffect(() => {
-    if (prefillHex == null) return
+    if (prefill == null) return
     setEditingId(null)
     setEditingEnabled(true)
-    setSource(`# captured payload: ${prefillHex}\n${TEMPLATE}`)
+    setSource(`# captured payload: ${prefill.hex}\n${TEMPLATE}`)
     setCompileResult(null)
     setSaveState('idle')
     setSaveMsg('')
+    setCapturedDevice(prefill.device || null)
+    resetAiState()
     onPrefillConsumed()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prefillHex])
+  }, [prefill])
 
   function toggleWrapper(id) {
     setOpenMap((prev) => ({ ...prev, [id]: !prev[id] }))
@@ -291,6 +402,12 @@ export function WrappersTab({ prefillHex, onPrefillConsumed }) {
       setCompileResult(null)
       setSaveState('idle')
       setSaveMsg('')
+      // Editing an existing wrapper by id has no associated captured device
+      // -- carrying one forward from a previous prefill would auto-test
+      // this unrelated wrapper against a stale sample (see resetAiState's
+      // own doc comment).
+      setCapturedDevice(null)
+      resetAiState()
     } catch {
       setActionError(id, 'hub not reachable')
     }
@@ -299,14 +416,116 @@ export function WrappersTab({ prefillHex, onPrefillConsumed }) {
   function onSourceChange(v) {
     setSource(v)
     // Any edit invalidates the last Compile -- Save stays gated on a clean
-    // compile of the CURRENT text, never a stale one.
+    // compile of the CURRENT text, never a stale one. Same reasoning
+    // extends to a stale Generate error/result and a stale auto-test: none
+    // of them describe the text now in the editor.
     setCompileResult(null)
     setSaveState('idle')
     setSaveMsg('')
+    setAiError(null)
+    setAiRawResponse(null)
+    setAutoTestResult(null)
+    setAutoTestError('')
+  }
+
+  // Compiles `src` and, if that succeeds and a captured device is on hand,
+  // auto-tests it (Step 4, spec §6/M4 task-7-brief: "the milestone's proof
+  // path") -- shared by the Compile button and Generate's own "triggers the
+  // existing Compile path" step, so both a hand-written and an AI-written
+  // wrapper get the identical verification once they compile clean.
+  function runCompile(src) {
+    const result = compileWrapper(src)
+    setCompileResult(result)
+    setAutoTestResult(null)
+    setAutoTestError('')
+    const samples = capturedDevice?.samples
+    if (result.ok && samples && samples.length > 0) {
+      runAutoTest(result, samples[samples.length - 1].hex)
+    }
+    return result
   }
 
   function onCompile() {
-    setCompileResult(compileWrapper(source))
+    runCompile(source)
+  }
+
+  // Step 4: proves a clean compile against the real bytes it was written
+  // for, using sliceWrapperPayload() (this file's top-of-file block
+  // comment) so the wrapper sees exactly what the firmware would hand it.
+  // Writes nothing and installs nothing (POST /wrappers/test, not
+  // /wrappers) -- this is a dry run the operator reviews, same as the
+  // per-wrapper Test button below already does for saved wrappers.
+  async function runAutoTest(compiled, capturedHex) {
+    const hex = sliceWrapperPayload(capturedHex, compiled.match.kind)
+    setAutoTestBusy(true)
+    setAutoTestError('')
+    try {
+      const res = await fetch('/api/v1/wrappers/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ bytecode_b64: btoa(String.fromCharCode(...compiled.bytecode)), hex }),
+      })
+      const d = await res.json().catch(() => ({}))
+      if (res.ok) {
+        setAutoTestResult(d)
+      } else {
+        setAutoTestError(res.status === 401 ? 'unauthorized — set the hub key in Config' : (d.error || 'test failed'))
+      }
+    } catch {
+      setAutoTestError('hub not reachable')
+    }
+    setAutoTestBusy(false)
+  }
+
+  // Step 3: builds the prompt from the whole captured device (redact.js
+  // does the actual redaction, inside WRAPPER_TEMPLATE.build -- this
+  // function never touches device fields itself), calls the provider with
+  // an AbortController so the Cancel button below can interrupt a
+  // tens-of-seconds request, and on success runs the identical path a
+  // human pasting code in would: extractSource -> prepend provenance ->
+  // into the editor -> runCompile(). No code path here reaches
+  // POST /api/v1/wrappers -- onSave (untouched) is still the only one.
+  async function onGenerate() {
+    if (!capturedDevice || aiBusy) return
+    setAiError(null)
+    setAiRawResponse(null)
+    setAiBusy(true)
+    const controller = new AbortController()
+    abortRef.current = controller
+    const settings = getAiSettings()
+    let text
+    try {
+      const { system, user } = WRAPPER_TEMPLATE.build({ device: capturedDevice })
+      text = await aiComplete({ system, user, signal: controller.signal, settings })
+    } catch (err) {
+      // Superseded by a New wrapper/Edit/prefill mid-flight (resetAiState
+      // nulls abortRef.current, see its own doc comment) -- that session
+      // already painted over this one, so stay silent rather than clobber
+      // it with a stale "cancelled" message.
+      if (abortRef.current === controller) {
+        if (err instanceof AiError) setAiError({ message: err.message, detail: err.detail })
+        setAiBusy(false)
+        abortRef.current = null
+      }
+      return
+    }
+    if (abortRef.current !== controller) return   // same supersede check, success side
+    const extracted = extractSource(text)
+    if (extracted == null) {
+      setAiRawResponse(text)
+    } else {
+      const generated = `${provenance('wrapper', WRAPPER_TEMPLATE.version, settings.model)}\n${extracted}`
+      setSource(generated)
+      setSaveState('idle')
+      setSaveMsg('')
+      runCompile(generated)
+    }
+    setAiBusy(false)
+    abortRef.current = null
+  }
+
+  function onCancelGenerate() {
+    if (abortRef.current) abortRef.current.abort()
   }
 
   async function onSave() {
@@ -379,10 +598,42 @@ export function WrappersTab({ prefillHex, onPrefillConsumed }) {
           </button>
           {' '}
           {editingId != null && <button type="button" onClick={startNewWrapper}>New wrapper</button>}
+          {' '}
+          {/* Generate only appears once a captured device is on hand (the
+              Devices tab hop) -- WRAPPER_TEMPLATE.build({device}) has
+              nothing to redact/prompt from otherwise. hasAiKey() gate and
+              title mirror the Devices tab's own "Generate wrapper with AI"
+              button so a user hits the same explanation wherever they meet
+              the feature disabled. */}
+          {capturedDevice && (
+            aiBusy ? (
+              <button type="button" onClick={onCancelGenerate}>Cancel</button>
+            ) : (
+              <button type="button" onClick={onGenerate} disabled={!hasAiKey()}
+                      title={hasAiKey() ? undefined : 'Set an API key in Config to use AI generation'}>
+                Generate with AI
+              </button>
+            )
+          )}
+          {aiBusy && <span class="hint"> Generating… this can take up to a minute.</span>}
           {saveState === 'saved' && <span class="hint"> Saved.</span>}
           {saveState === 'unauth' && <span class="error"> unauthorized — set the hub key in Config</span>}
           {saveState === 'error' && <span class="error"> {saveMsg}</span>}
         </p>
+        {aiError && (
+          <div class="infobox">
+            <p class="error">{aiError.message}</p>
+            {aiError.detail && (
+              <details><summary>Details</summary><pre class="mono">{aiError.detail}</pre></details>
+            )}
+          </div>
+        )}
+        {aiRawResponse != null && (
+          <div class="infobox">
+            <p class="error">The model did not return a code block.</p>
+            <details><summary>Raw response</summary><pre class="mono">{aiRawResponse}</pre></details>
+          </div>
+        )}
         {compileResult && !compileResult.ok && (
           <ul class="error">
             {compileResult.errors.map((e, i) => <li key={i}>{e.line}:{e.col} {e.message}</li>)}
@@ -400,6 +651,12 @@ export function WrappersTab({ prefillHex, onPrefillConsumed }) {
             </details>
           </div>
         )}
+        {/* Step 4: proof-path auto-test against the captured sample this
+            editor session was prefilled from -- see runCompile()'s own doc
+            comment for why this fires from both Compile and Generate. */}
+        {autoTestBusy && <p class="hint">Testing against captured sample…</p>}
+        {autoTestError && <p class="error">{autoTestError}</p>}
+        {autoTestResult && <WrapperTestResultBlock result={autoTestResult} />}
       </div>
     </div>
   )

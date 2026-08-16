@@ -91,13 +91,18 @@ export function App() {
   // "seen" bookmark for real.
   const [rulesUnseen, setRulesUnseen] = useState(false)
 
-  // Cross-tab "Add wrapper" hop from the Devices tab's Unknown devices
-  // section into the Wrappers tab's editor, prefilled with the captured
-  // hex payload. Held here (not localStorage, unlike the Rules tab's
-  // unseen-events badge above -- that's a reload-persistence problem, this
-  // is a same-session handoff) since app.jsx already owns which tab is
-  // showing. WrappersTab clears it back to null once consumed.
-  const [wrapperPrefillHex, setWrapperPrefillHex] = useState(null)
+  // Cross-tab "Add wrapper" / "Generate wrapper with AI" hop from the
+  // Devices tab's Unknown devices section into the Wrappers tab's editor.
+  // Carries {hex, device}: hex is the newest captured sample (what the
+  // hand-written "Add wrapper" path has always prefilled), device is the
+  // whole raw GET /api/v1/unknown entry (M4 Task 7: the Wrappers tab's own
+  // Generate button needs every captured sample, not just one, to build a
+  // prompt -- redact.js does the actual redaction, this just carries the
+  // raw object across the hop). Held here (not localStorage, unlike the
+  // Rules tab's unseen-events badge above -- that's a reload-persistence
+  // problem, this is a same-session handoff) since app.jsx already owns
+  // which tab is showing. WrappersTab clears it back to null once consumed.
+  const [wrapperPrefill, setWrapperPrefill] = useState(null)
 
   useEffect(() => {
     if (role === 'node' || role === 'unset') return   // no Rules tab there at all -- see TABS below
@@ -201,12 +206,16 @@ export function App() {
         {tab === 'Dashboard' ? <DashboardTab /> :
          tab === 'Plants' ? <PlantsTab /> :
          tab === 'Devices' ? (
-           <DevicesTab onAddWrapper={(hex) => { setWrapperPrefillHex(hex); setTab('Wrappers') }} />
+           <DevicesTab onAddWrapper={(device) => {
+             const newest = device.samples[device.samples.length - 1]
+             setWrapperPrefill({ hex: newest.hex, device })
+             setTab('Wrappers')
+           }} />
          ) :
          tab === 'History' ? <HistoryTab /> :
          tab === 'Rules' ? <RulesTab /> :
          tab === 'Wrappers' ? (
-           <WrappersTab prefillHex={wrapperPrefillHex} onPrefillConsumed={() => setWrapperPrefillHex(null)} />
+           <WrappersTab prefill={wrapperPrefill} onPrefillConsumed={() => setWrapperPrefill(null)} />
          ) :
          tab === 'Nodes' ? <NodesTab /> :
          tab === 'Config' ? <ConfigTab /> :
