@@ -93,15 +93,19 @@ export function App() {
 
   // Cross-tab "Add wrapper" / "Generate wrapper with AI" hop from the
   // Devices tab's Unknown devices section into the Wrappers tab's editor.
-  // Carries {hex, device}: hex is the newest captured sample (what the
-  // hand-written "Add wrapper" path has always prefilled), device is the
-  // whole raw GET /api/v1/unknown entry (M4 Task 7: the Wrappers tab's own
-  // Generate button needs every captured sample, not just one, to build a
-  // prompt -- redact.js does the actual redaction, this just carries the
-  // raw object across the hop). Held here (not localStorage, unlike the
-  // Rules tab's unseen-events badge above -- that's a reload-persistence
-  // problem, this is a same-session handoff) since app.jsx already owns
-  // which tab is showing. WrappersTab clears it back to null once consumed.
+  // Carries {hex, device, autoGenerate}: hex is the newest captured sample
+  // (what the hand-written "Add wrapper" path has always prefilled), device
+  // is the whole raw GET /api/v1/unknown entry (M4 Task 7: the Wrappers
+  // tab's own Generate button needs every captured sample, not just one, to
+  // build a prompt -- redact.js does the actual redaction, this just
+  // carries the raw object across the hop), autoGenerate tells WrappersTab
+  // whether to start a generation immediately (set only by "Generate
+  // wrapper with AI" -- fix round 1: the two buttons must behave
+  // differently, not just render differently). Held here (not localStorage,
+  // unlike the Rules tab's unseen-events badge above -- that's a
+  // reload-persistence problem, this is a same-session handoff) since
+  // app.jsx already owns which tab is showing. WrappersTab clears it back
+  // to null once consumed.
   const [wrapperPrefill, setWrapperPrefill] = useState(null)
 
   useEffect(() => {
@@ -131,6 +135,19 @@ export function App() {
     const next = theme === 'dark' ? 'light' : 'dark'
     setStoredTheme(next)
     setTheme(next)
+  }
+
+  // Shared by both Devices-tab hops into the Wrappers editor -- "Add
+  // wrapper" and "Generate wrapper with AI" differ only in `autoGenerate`
+  // (fix round 1: they used to be indistinguishable to WrappersTab, so the
+  // AI button's click never actually generated anything). Both still
+  // derive the newest captured sample's hex the same way this file always
+  // has, for the "captured payload: <hex>" comment WrappersTab drops into
+  // the editor regardless of which button was clicked.
+  function goToWrapperEditor(device, autoGenerate) {
+    const newest = device.samples[device.samples.length - 1]
+    setWrapperPrefill({ hex: newest.hex, device, autoGenerate })
+    setTab('Wrappers')
   }
 
   function refreshRole() {
@@ -206,11 +223,8 @@ export function App() {
         {tab === 'Dashboard' ? <DashboardTab /> :
          tab === 'Plants' ? <PlantsTab /> :
          tab === 'Devices' ? (
-           <DevicesTab onAddWrapper={(device) => {
-             const newest = device.samples[device.samples.length - 1]
-             setWrapperPrefill({ hex: newest.hex, device })
-             setTab('Wrappers')
-           }} />
+           <DevicesTab onAddWrapper={(device) => goToWrapperEditor(device, false)}
+                       onGenerateWrapper={(device) => goToWrapperEditor(device, true)} />
          ) :
          tab === 'History' ? <HistoryTab /> :
          tab === 'Rules' ? <RulesTab /> :

@@ -186,11 +186,11 @@ function fmtHexBytes(hex) {
 
 // Same collapsible node-card shape as DeviceCard: header carries the
 // device-id + age, body carries RSSI, every captured sample's hex payload,
-// and two hops into WrappersTab's editor (M3 Task 8's hand-written "Add
-// wrapper", M4 Task 7's "Generate wrapper with AI" alongside it) --
-// spec §5/§6's unknown-device discovery surface, devices no wrapper
-// currently claims, captured so an operator or M4's AI can write one for
-// it. Both buttons hand app.jsx the whole raw device (onAddWrapper's
+// and two DIFFERENT hops into WrappersTab's editor (M3 Task 8's
+// hand-written "Add wrapper", M4 Task 7's "Generate wrapper with AI"
+// alongside it) -- spec §5/§6's unknown-device discovery surface, devices
+// no wrapper currently claims, captured so an operator or M4's AI can
+// write one for it. Both hand app.jsx the whole raw device (onAddWrapper's
 // contract changed in M4 Task 7 from just the newest hex to the full
 // device -- app.jsx derives the newest hex itself, same as this card used
 // to) since Generate needs every captured sample to build a prompt, not
@@ -198,7 +198,15 @@ function fmtHexBytes(hex) {
 // redaction, this file never touches device fields for that purpose.
 // GET /api/v1/unknown's shape (id/rssi/last_seen_s/samples[{hex,len,ts}])
 // is M4's own input contract -- rendered here as-is, never reshaped.
-function UnknownDeviceCard({ d, open, onToggle, onAddWrapper }) {
+//
+// Fix round 1: the two buttons used to call the identical onAddWrapper(d)
+// and differ only in disabled state, so "Generate wrapper with AI" prefilled
+// and switched tabs same as "Add wrapper" without ever generating anything
+// -- a label promising something the click didn't do. onGenerateWrapper is
+// a distinct callback so app.jsx can tell WrappersTab to actually start a
+// generation on arrival; onAddWrapper (and its hand-written path) is
+// untouched.
+function UnknownDeviceCard({ d, open, onToggle, onAddWrapper, onGenerateWrapper }) {
   const newest = d.samples[d.samples.length - 1]   // s[] is oldest-first, newest-last (api_v1.c's unknown_get)
   return (
     <div class={`node-card${open ? ' open' : ''}`}>
@@ -233,7 +241,7 @@ function UnknownDeviceCard({ d, open, onToggle, onAddWrapper }) {
             Add wrapper
           </button>
           {' '}
-          <button type="button" onClick={() => onAddWrapper(d)} disabled={!hasAiKey()}
+          <button type="button" onClick={() => onGenerateWrapper(d)} disabled={!hasAiKey()}
                   title={hasAiKey() ? undefined : 'Set an API key in Config to use AI generation'}>
             Generate wrapper with AI
           </button>
@@ -243,7 +251,7 @@ function UnknownDeviceCard({ d, open, onToggle, onAddWrapper }) {
   )
 }
 
-function UnknownDevicesSection({ onAddWrapper }) {
+function UnknownDevicesSection({ onAddWrapper, onGenerateWrapper }) {
   const [devices, setDevices] = useState(null)
   const [error, setError] = useState(false)
   const [openMap, setOpenMap] = useState({})
@@ -282,7 +290,7 @@ function UnknownDevicesSection({ onAddWrapper }) {
         <div class="node-cards">
           {devices.map((d) => (
             <UnknownDeviceCard key={d.id} d={d} open={!!openMap[d.id]} onToggle={() => toggle(d.id)}
-                                onAddWrapper={onAddWrapper} />
+                                onAddWrapper={onAddWrapper} onGenerateWrapper={onGenerateWrapper} />
           ))}
         </div>
       )}
@@ -290,7 +298,7 @@ function UnknownDevicesSection({ onAddWrapper }) {
   )
 }
 
-export function DevicesTab({ onAddWrapper }) {
+export function DevicesTab({ onAddWrapper, onGenerateWrapper }) {
   const [caps, setCaps] = useState(null)
   const [devices, setDevices] = useState(null)
   const [plants, setPlants] = useState(null)
@@ -361,7 +369,7 @@ export function DevicesTab({ onAddWrapper }) {
           ))
         )}
       </div>
-      <UnknownDevicesSection onAddWrapper={onAddWrapper} />
+      <UnknownDevicesSection onAddWrapper={onAddWrapper} onGenerateWrapper={onGenerateWrapper} />
     </div>
   )
 }
