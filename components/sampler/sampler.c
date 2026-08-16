@@ -365,38 +365,83 @@ static void log_heap_diag(const char *what, esp_err_t err)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
 }
 
-/* Creates the sampler task and its two timers. Split out of sampler_start()
- * so it can be retried (see sampler_start()'s own doc comment for why one
- * retry is still kept despite the fixes below).
+/* Every resource sampler_bringup() creates, tracked so bring-up can be
+ * RE-ENTERED safely. See sampler_bringup()'s own comment for why that
+ * matters -- these four statics are the mechanism that makes the retry
+ * safe, not bookkeeping. All zero/NULL at boot (.bss). */
+static TaskHandle_t       s_task;             /* non-NULL once the task exists -- never create twice */
+static esp_timer_handle_t s_periodic_timer;   /* non-NULL once created */
+static esp_timer_handle_t s_first_timer;      /* non-NULL once created (best-effort resource) */
+static bool               s_periodic_running; /* true once esp_timer_start_periodic has succeeded */
+
+/* Brings up the sampler task and its two timers. Split out of
+ * sampler_start() so it can be retried (see sampler_start()'s own doc
+ * comment for why one retry is still kept despite the fixes below).
  *
- * The task itself is now created with xTaskCreateStatic() (s_sampler_stack/
- * s_sampler_tcb, file top) instead of xTaskCreate() -- see those statics'
- * doc comment for the fragmentation reasoning this responds to. With a
- * valid static buffer pair (always true here), xTaskCreateStatic() cannot
- * fail from heap pressure at all; the log_heap_diag() call on that path is
- * defense-in-depth for a future change to this function, not an expected
- * outcome. That leaves the two esp_timer_create() calls below as the only
- * plausible remaining source of an ESP_ERR_NO_MEM from this function --
- * each is a single small (roughly 100-150 byte) allocation, far less
- * likely to be blocked by fragmentation than the 4KB+ contiguous block the
- * task used to need, but not impossible, and now individually diagnosed
- * rather than lumped into one generic "bring-up failed". */
+ * IDEMPOTENT PER RESOURCE -- this is a correctness guarantee, not a style
+ * preference, and it is why the function reads as four independent `if
+ * (!already)` blocks rather than a straight-line sequence.
+ *
+ * Code review (round 6) found the previous all-or-nothing shape could
+ * corrupt a FreeRTOS list. The old function created the task
+ * unconditionally at its top, and then, if the FOLLOWING
+ * esp_timer_create() failed with ESP_ERR_NO_MEM, returned that error --
+ * with the task already created and running. sampler_start() treats
+ * ESP_ERR_NO_MEM as retryable and schedules sampler_retry_cb() 15 s later,
+ * which called this function again, re-running xTaskCreateStatic() on the
+ * SAME s_sampler_tcb/s_sampler_stack while the first task was alive and
+ * linked into a kernel list. Re-initialising a live TCB's embedded list
+ * items in place corrupts whichever ready/delayed/event list that task is
+ * currently on -- an arbitrary-behaviour bug, not a benign double-create.
+ * Static allocation is what makes it dangerous: xTaskCreate() would have
+ * returned a second, independent TCB (merely wasteful); xTaskCreateStatic()
+ * scribbles over the live one.
+ *
+ * Low probability today -- after the round-4 reorder there is ~81 KB free
+ * at this point and the timer allocation is ~150 B against a task creation
+ * that cannot fail at all -- but reachable, and precisely the kind of thing
+ * that surfaces on a future board with less headroom. The guarantee now
+ * belongs to the code: a retry can only ever attempt the resources that are
+ * still missing, so no resource here can be created twice however many
+ * times this function is called.
+ *
+ * On the task itself: xTaskCreateStatic() (s_sampler_stack/s_sampler_tcb,
+ * file top) instead of xTaskCreate() -- see those statics' doc comment for
+ * the fragmentation reasoning this responds to. With a valid static buffer
+ * pair (always true here) it cannot fail from heap pressure at all; the
+ * log_heap_diag() call on that path is defense-in-depth for a future change
+ * to this function, not an expected outcome. That leaves the two
+ * esp_timer_create() calls below as the only plausible source of an
+ * ESP_ERR_NO_MEM from this function -- each a single ~100-150 byte
+ * allocation, individually diagnosed rather than lumped into one generic
+ * "bring-up failed". */
 static esp_err_t sampler_bringup(void)
 {
-    TaskHandle_t task = xTaskCreateStatic(sampler_task, "sampler", sizeof(s_sampler_stack), NULL, 3,
-                                          s_sampler_stack, &s_sampler_tcb);
-    if (!task) {
-        log_heap_diag("xTaskCreateStatic(sampler)", ESP_ERR_NO_MEM);
-        return ESP_ERR_NO_MEM;
+    if (!s_task) {
+        s_task = xTaskCreateStatic(sampler_task, "sampler", sizeof(s_sampler_stack), NULL, 3,
+                                   s_sampler_stack, &s_sampler_tcb);
+        if (!s_task) {
+            log_heap_diag("xTaskCreateStatic(sampler)", ESP_ERR_NO_MEM);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
-    const esp_timer_create_args_t t = { .callback = timer_cb, .name = "sampler" };
-    esp_timer_handle_t timer;
-    esp_err_t err = esp_timer_create(&t, &timer);
-    if (err != ESP_OK) {
-        log_heap_diag("esp_timer_create(sampler, periodic)", err);
-        return err;
+    if (!s_periodic_timer) {
+        const esp_timer_create_args_t t = { .callback = timer_cb, .name = "sampler" };
+        /* Into a local, then published on success only: esp_timer_create()
+         * leaves *out_handle untouched on failure, so assigning it directly
+         * would risk leaving s_periodic_timer holding whatever it held
+         * before (here: NULL, correct by luck) -- this is correct by
+         * construction instead, which is what the retry path needs. */
+        esp_timer_handle_t timer = NULL;
+        esp_err_t err = esp_timer_create(&t, &timer);
+        if (err != ESP_OK) {
+            log_heap_diag("esp_timer_create(sampler, periodic)", err);
+            return err;
+        }
+        s_periodic_timer = timer;
     }
+
     /* One extra early sample ~2 minutes after boot: readings reach the
      * live registry within seconds, but the periodic timer's first tick is
      * a full interval out -- on a fresh (or just-rebooted) hub that left
@@ -408,16 +453,34 @@ static esp_err_t sampler_bringup(void)
      * losing the early sample costs nothing but the old wait -- but still
      * diagnosed on failure (not just silently skipped) since a second
      * small allocation failing right after the first one succeeded would
-     * itself be a useful data point. */
-    const esp_timer_create_args_t t1 = { .callback = timer_cb, .name = "sampler1st" };
-    esp_timer_handle_t first;
-    esp_err_t ferr = esp_timer_create(&t1, &first);
-    if (ferr == ESP_OK) {
-        esp_timer_start_once(first, 120ULL * 1000000ULL);
-    } else {
-        log_heap_diag("esp_timer_create(sampler1st, one-shot, non-fatal)", ferr);
+     * itself be a useful data point. Never fails bring-up, so a retry that
+     * gets this far with everything else already up still returns ESP_OK. */
+    if (!s_first_timer) {
+        const esp_timer_create_args_t t1 = { .callback = timer_cb, .name = "sampler1st" };
+        esp_timer_handle_t first = NULL;
+        esp_err_t ferr = esp_timer_create(&t1, &first);
+        if (ferr == ESP_OK) {
+            s_first_timer = first;
+            esp_timer_start_once(s_first_timer, 120ULL * 1000000ULL);
+        } else {
+            log_heap_diag("esp_timer_create(sampler1st, one-shot, non-fatal)", ferr);
+        }
     }
-    return esp_timer_start_periodic(timer, (uint64_t)CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN * 60 * 1000000ULL);
+
+    /* Guarded like the rest: esp_timer_start_periodic() on an
+     * already-running timer returns ESP_ERR_INVALID_STATE, which a retry
+     * would otherwise report as a bring-up failure even though sampling is
+     * live. */
+    if (!s_periodic_running) {
+        esp_err_t err = esp_timer_start_periodic(s_periodic_timer,
+                                                 (uint64_t)CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN * 60 * 1000000ULL);
+        if (err != ESP_OK) {
+            log_heap_diag("esp_timer_start_periodic(sampler)", err);
+            return err;
+        }
+        s_periodic_running = true;
+    }
+    return ESP_OK;
 }
 
 /* One-shot retry callback, fired ~15s after a bring-up that failed with
@@ -432,7 +495,15 @@ static esp_err_t sampler_bringup(void)
  * task allocation above is what actually addresses that. Logs the outcome
  * either way; a second failure leaves history sampling disabled for the
  * rest of this boot (no further retries -- see log_heap_diag()'s numbers
- * on that second failure to tell a standing shortage apart from bad luck). */
+ * on that second failure to tell a standing shortage apart from bad luck).
+ *
+ * Round 6: this callback is safe to run against a PARTIALLY brought-up
+ * sampler -- which is the normal case that reaches here, since the only
+ * plausible failure is a timer allocation AFTER the task already exists.
+ * sampler_bringup() is idempotent per resource (see there); it will not
+ * re-create the task, the semaphore, or any timer that already exists.
+ * Before that fix, this call is what turned a failed 150-byte allocation
+ * into a second xTaskCreateStatic() over a live TCB. */
 static void sampler_retry_cb(void *arg)
 {
     esp_err_t err = sampler_bringup();
@@ -449,12 +520,22 @@ esp_err_t sampler_start(const char *base_path)
     s_base = base_path;
     /* Static, not xSemaphoreCreateBinary() -- see s_wake_buf's doc comment
      * at the top of this file. Only fails on a bad buffer pointer (never,
-     * here), so this is defense-in-depth, same as sampler_bringup()'s task
-     * check. */
-    s_wake = xSemaphoreCreateBinaryStatic(&s_wake_buf);
+     * here), so the NULL check is defense-in-depth, same as
+     * sampler_bringup()'s task check.
+     *
+     * `if (!s_wake)` for the same reason sampler_bringup() guards every one
+     * of its resources (round 6): re-running xSemaphoreCreateBinaryStatic()
+     * on s_wake_buf would re-initialise a semaphore the live sampler task
+     * may be blocked on, dropping it off the queue's waiting-task list.
+     * main.c calls sampler_start() exactly once today, so this is
+     * unreachable -- but "unreachable today" is exactly what the retry path
+     * was assumed to be before review found it, and a guard costs nothing. */
     if (!s_wake) {
-        log_heap_diag("xSemaphoreCreateBinaryStatic(s_wake)", ESP_ERR_NO_MEM);
-        return ESP_ERR_NO_MEM;
+        s_wake = xSemaphoreCreateBinaryStatic(&s_wake_buf);
+        if (!s_wake) {
+            log_heap_diag("xSemaphoreCreateBinaryStatic(s_wake)", ESP_ERR_NO_MEM);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     esp_err_t err = sampler_bringup();
