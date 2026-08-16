@@ -2897,8 +2897,33 @@ static esp_err_t unknown_get(httpd_req_t *req)
     size_t n = unknown_capture_list(s_unknown_buf, UNKNOWN_DEVICES);
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
-    cJSON *root = cJSON_CreateObject();
-    cJSON *arr = cJSON_AddArrayToObject(root, "devices");
+    /* Streamed one device at a time rather than built as one cJSON tree and
+     * handed to send_json() (see its doc comment above): this endpoint's
+     * whole-document shape -- up to 8 devices x 2 samples, hundreds of
+     * small allocations followed by ONE contiguous ~1.2KB print request --
+     * is exactly what fails on a heap fragmented by BLE bring-up (largest
+     * free block ~7.6KB, measured on hardware). Peak allocation here is
+     * roughly one device (~200B) instead of the whole array: build one
+     * small cJSON object, print it, send it as a chunk, delete/free, move
+     * on. The array wrapper, commas and closing brace are sent as literal
+     * chunks around that.
+     *
+     * Headers and the 200 status are committed by the first chunk below, so
+     * unlike send_json() there is no way to fall back to a 503 if an
+     * allocation fails partway through -- see the oom handling at the
+     * bottom of the loop. */
+    httpd_resp_set_type(req, "application/json");
+    if (httpd_resp_sendstr_chunk(req, "{\"devices\":[") != ESP_OK) return ESP_FAIL;
+
+    /* Whether anything has actually been written yet -- NOT the same as
+     * "i > 0": the `if (d->n == 0) continue;` skip below means an earlier
+     * iteration can produce nothing, and deciding comma placement from the
+     * loop index would then emit either a leading comma (skip was first) or
+     * a doubled one (skip wasn't), either way malformed JSON. */
+    bool emitted = false;
+    bool oom = false;
+    size_t oom_at = 0;
+
     for (size_t i = 0; i < n; i++) {
         const unknown_dev_t *d = &s_unknown_buf[i];
         if (d->n == 0) continue;   /* defensive -- unknown_capture_add() never leaves a tracked device with zero samples, but this file doesn't get to assume that blindly across the component boundary */
@@ -2921,25 +2946,53 @@ static esp_err_t unknown_get(httpd_req_t *req)
         device_id_format(&did, idbuf, sizeof(idbuf));
 
         cJSON *o = cJSON_CreateObject();
+        if (!o) { oom = true; oom_at = i; break; }
         cJSON_AddStringToObject(o, "id", idbuf);
         cJSON_AddNumberToObject(o, "rssi", d->s[d->n - 1].rssi);   /* newest sample's rssi (s[] is oldest-first, newest-last) */
         cJSON_AddNumberToObject(o, "last_seen_s",
                                 (now_uptime_s >= d->last_seen_s) ? (now_uptime_s - d->last_seen_s) : 0);
 
         cJSON *samples = cJSON_AddArrayToObject(o, "samples");
+        if (!samples) { cJSON_Delete(o); oom = true; oom_at = i; break; }
         for (uint8_t j = 0; j < d->n; j++) {
             const unknown_sample_t *s = &d->s[j];
             char hex[2 * ADV_PAYLOAD_MAX + 1];
             hex_encode(s->payload, s->len, hex);
             cJSON *so = cJSON_CreateObject();
+            if (!so) { oom = true; oom_at = i; break; }
             cJSON_AddStringToObject(so, "hex", hex);
             cJSON_AddNumberToObject(so, "len", s->len);
             cJSON_AddNumberToObject(so, "ts", s->ts);
             cJSON_AddItemToArray(samples, so);
         }
-        cJSON_AddItemToArray(arr, o);
+        if (oom) { cJSON_Delete(o); break; }
+
+        char *body = cJSON_PrintUnformatted(o);
+        cJSON_Delete(o);
+        if (!body) { oom = true; oom_at = i; break; }
+
+        esp_err_t err = ESP_OK;
+        if (emitted) err = httpd_resp_sendstr_chunk(req, ",");
+        if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, body);
+        free(body);
+        if (err != ESP_OK) return ESP_FAIL;   /* client/socket gone; don't send trailing chunks over a dead connection, same convention history_get() uses */
+        emitted = true;
     }
-    return send_json(req, root);
+
+    if (oom) {
+        /* Headers and the 200 are already on the wire, so unlike
+         * send_json()'s 503 there is no way to tell the client this list is
+         * short -- close the array here (still valid JSON, just incomplete)
+         * and log loudly, so an operator (or M4's own tooling watching the
+         * log) can tell this apart from "that really is every unknown
+         * device the hub heard". */
+        ESP_LOGW(TAG, "unknown_get: allocation failed streaming device %u/%u, closing list early",
+                 (unsigned)oom_at, (unsigned)n);
+    }
+
+    if (httpd_resp_sendstr_chunk(req, "]}") != ESP_OK) return ESP_FAIL;
+    httpd_resp_sendstr_chunk(req, NULL);   /* end chunked response */
+    return ESP_OK;
 }
 
 /* POST /api/v1/devices/{id}/key {"key":"<32 hex chars>"|null} -- bind-key
