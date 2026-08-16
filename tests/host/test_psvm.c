@@ -417,18 +417,19 @@ static size_t build_limits_header(uint8_t *b, uint16_t nconst, uint16_t nref) {
 
 /* Dialect=2 (wrapper) blob with PSVM_FLAG_CONNECT_PLAN set and a trailing
  * connect-plan section (psvm.h's PSVM_FLAG_CONNECT_PLAN doc comment has the
- * on-blob layout). Code body is a bare HALT -- this builder's whole point
- * is the plan section that follows it, not the code that precedes it.
- * write_data/write_lens are parallel write_count-length arrays: write i's
- * declared payload is write_lens[i] bytes, each byte equal to write_data[i]
- * (every M5a test case here uses write_lens[i]==1, where this reduces to
- * exactly "the one byte you asked for"). bufsz is accepted to match the
- * brief's call shape; every case below fits comfortably so it is unused. */
+ * on-blob layout, including why interval_s is u32 rather than u16). Code
+ * body is a bare HALT -- this builder's whole point is the plan section
+ * that follows it, not the code that precedes it. write_data/write_lens
+ * are parallel write_count-length arrays: write i's declared payload is
+ * write_lens[i] bytes, each byte equal to write_data[i] (every M5a test
+ * case here uses write_lens[i]==1, where this reduces to exactly "the one
+ * byte you asked for"). bufsz is accepted to match the brief's call shape;
+ * every case below fits comfortably so it is unused. */
 static size_t build_wrapper_with_plan(uint8_t *b, size_t bufsz,
                                       uint8_t read_count, uint16_t *reads,
                                       uint8_t write_count, uint16_t *write_uuids,
                                       uint8_t *write_data, uint8_t *write_lens,
-                                      uint16_t interval_s) {
+                                      uint32_t interval_s) {
     (void)bufsz;
     uint8_t code[1] = { 0xFF };   /* HALT */
     size_t o = emit_header_d(b, PSVM_DIALECT_WRAPPERS, 0, 0, 0, (uint16_t)sizeof code);
@@ -440,7 +441,7 @@ static size_t build_wrapper_with_plan(uint8_t *b, size_t bufsz,
 
     b[o++] = read_count;
     b[o++] = write_count;
-    memcpy(b + o, &interval_s, 2); o += 2;
+    memcpy(b + o, &interval_s, 4); o += 4;
     for (uint8_t i = 0; i < read_count; i++) {
         memcpy(b + o, &reads[i], 2); o += 2;
     }
@@ -508,6 +509,32 @@ static void test_plan_limits(void) {
     n = build_wrapper_with_plan(blob, sizeof blob, 1, (uint16_t[]){1},
         0, NULL, NULL, NULL, 30);                                     /* interval too short */
     assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_ERR_LIMITS);
+}
+
+/* interval_s's exact boundary, both ends: 59 and 86401 rejected, 60 and
+ * 86400 accepted. The upper end is the case that motivated widening the
+ * field to u32 (psvm.h's PSVM_FLAG_CONNECT_PLAN doc comment has the full
+ * reasoning) -- without this test, a future narrowing of the field back to
+ * u16 would silently truncate 86400 to 20864 and this suite would not
+ * notice. */
+static void test_plan_interval_bounds(void) {
+    uint8_t blob[128]; psvm_prog_t p;
+
+    size_t n = build_wrapper_with_plan(blob, sizeof blob, 1, (uint16_t[]){1},
+        0, NULL, NULL, NULL, 59);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_ERR_LIMITS);
+
+    n = build_wrapper_with_plan(blob, sizeof blob, 1, (uint16_t[]){1},
+        0, NULL, NULL, NULL, 86401);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_ERR_LIMITS);
+
+    n = build_wrapper_with_plan(blob, sizeof blob, 1, (uint16_t[]){1},
+        0, NULL, NULL, NULL, 60);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_OK);
+
+    n = build_wrapper_with_plan(blob, sizeof blob, 1, (uint16_t[]){1},
+        0, NULL, NULL, NULL, 86400);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_OK);
 }
 
 /* A dialect-1 (rules) blob may never carry a plan. */
@@ -1039,6 +1066,7 @@ int main(void) {
     test_plan_parsed();
     test_plan_truncated();
     test_plan_limits();
+    test_plan_interval_bounds();
     test_plan_rejected_for_rules();
 
     printf("test_psvm: all passed\n");

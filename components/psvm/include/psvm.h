@@ -28,7 +28,25 @@
  * section after the code. Gated by this flag so every blob compiled before
  * M5a -- which sets flags to 0 -- is byte-identical and parses exactly as
  * it did. psvm_validate already tolerated trailing bytes, so an older hub
- * reading a newer blob ignores the plan rather than rejecting it. */
+ * reading a newer blob ignores the plan rather than rejecting it.
+ *
+ * On-blob layout (present only when this flag is set), all multi-byte
+ * fields little-endian like the rest of this format:
+ *   u8  read_count            (0..PSVM_PLAN_MAX_READS)
+ *   u8  write_count           (0..PSVM_PLAN_MAX_WRITES)
+ *   u32 interval_s            (60..86400)
+ *   read_count  x { u16 uuid16 }
+ *   write_count x { u16 uuid16; u8 len (1..PSVM_PLAN_WRITE_MAX); u8 data[len] }
+ *
+ * interval_s is u32, not u16: the cap's upper bound (86400 s, a full day)
+ * does not fit in a u16 (max 65535), and a narrower field would silently
+ * truncate a wrapper author's "every 24h" (86400) down to 20864 -- a
+ * silently wrong value produced from valid input, the exact failure shape
+ * this project has already spent three milestones eliminating elsewhere
+ * (the `>>` FLOOR fix, the payload-offset bug, the first-vs-last AD
+ * structure fix). Two extra bytes in a roughly twenty-byte section is not
+ * worth trading away correctness for, so both the lower AND upper bound are
+ * enforced at validate time (psvm.c) now that both are representable. */
 #define PSVM_FLAG_CONNECT_PLAN 0x0001u
 #define PSVM_PLAN_MAX_READS    4
 #define PSVM_PLAN_MAX_WRITES   2

@@ -201,20 +201,16 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
     uint16_t plan_section_len = 0;
     if (flags & PSVM_FLAG_CONNECT_PLAN) {
         size_t po = plan_off;
-        if (po + 4 > len) return PSVM_ERR_TRUNCATED;   /* read_count, write_count, interval_s */
+        if (po + 6 > len) return PSVM_ERR_TRUNCATED;   /* read_count, write_count, interval_s (u32) */
         uint8_t plan_read_count = blob[po];
         uint8_t plan_write_count = blob[po + 1];
-        uint16_t interval_s = rd_u16(blob + po + 2);
-        po += 4;
+        uint32_t interval_s = rd_u32(blob + po + 2);
+        po += 6;
         if (plan_read_count > PSVM_PLAN_MAX_READS) return PSVM_ERR_LIMITS;
         if (plan_write_count > PSVM_PLAN_MAX_WRITES) return PSVM_ERR_LIMITS;
-        /* Lower bound only: interval_s's own u16 width already caps every
-         * representable value at 65535, well under the spec's 86400 s upper
-         * bound, so a runtime check against that upper bound can never fire
-         * (and Clang's range analysis correctly rejects it as tautological
-         * under -Werror). See task-1-report.md for this flagged as a
-         * discrepancy between the wire layout and the caps list. */
-        if (interval_s < 60) return PSVM_ERR_LIMITS;
+        /* interval_s is u32 (psvm.h's PSVM_FLAG_CONNECT_PLAN doc comment has
+         * the reasoning): both bounds are representable and enforced. */
+        if (interval_s < 60 || interval_s > 86400) return PSVM_ERR_LIMITS;
 
         if (po + (size_t)plan_read_count * 2u > len) return PSVM_ERR_TRUNCATED;
         po += (size_t)plan_read_count * 2u;
