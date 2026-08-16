@@ -2977,10 +2977,10 @@ static esp_err_t wrappers_post_dispatch(httpd_req_t *req)
     const char *tail = req->uri + strlen("/api/v1/wrappers/");
 
     /* The id-less dry run (M4 spec section 5). Dispatched here rather than
-     * registered as its own route: "/api/v1/wrappers/*" is already
-     * registered with wildcard matching and already reaches this function,
-     * so a second exact route would only win if it were registered first --
-     * an ordering dependency for no benefit. Handler count stays 48. */
+     * registered as its own route: the wrappers wildcard route is already
+     * registered and already reaches this function, so a second exact route
+     * would only win if it were registered first -- an ordering dependency
+     * for no benefit. Handler count stays 48. */
     if (strncmp(tail, "test", 4) == 0 && (tail[4] == '\0' || tail[4] == '?'))
         return wrappers_inline_test_post(req);
 
