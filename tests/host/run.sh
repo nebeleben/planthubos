@@ -77,3 +77,11 @@ $CC -Wall -Wextra -Werror -I../../components/rules/include \
 $CC -Wall -Wextra -Werror -I../../components/event_log/include \
     test_event_ring.c ../../components/event_log/event_ring.c -o test_event_ring
 ./test_event_ring
+
+$CC -Wall -Wextra -Werror -I../../components/capability/include \
+    test_capability.c ../../components/capability/capability.c -o test_capability -lm
+./test_capability
+
+$CC -Wall -Wextra -Werror -I../../components/capability/include \
+    test_device_id.c ../../components/capability/device_id.c -o test_device_id
+./test_device_id
