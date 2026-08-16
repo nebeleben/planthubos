@@ -46,18 +46,18 @@ _Static_assert(CAPABILITY_COUNT <= 15, "s_cap_warned needs CAPABILITY_COUNT real
  * (registry_set_cap() only creates a slot on the SUCCESS branch -- see its
  * own doc comment) -- s_cap_warned above is keyed by registry index, so a
  * device that never registers has no slot to throttle against, and would
- * log unthrottled forever otherwise. Rather than a second, MAC-keyed
- * tracking structure (real RAM/complexity for a case that, unlike a
- * mis-scaled-but-otherwise-working wrapper, means NOTHING from that device
- * is usable at all), this is a single, global, once-per-boot line naming
- * the first offending MAC/capability/value -- enough to point an operator
- * at the problem (which device, which capability) without growing state
- * per bad device. A wrapper this broken needs fixing regardless of how
- * many devices trip it, so "the first one, once" carries the actionable
- * information; further occurrences (from the same or a different
- * never-registers device) are dropped at DEBUG, not WARN, so this can never
- * itself become the firehose. */
-static bool s_unregistered_cap_warned;
+ * log unthrottled forever otherwise. Bounded per-device throttle: each of up
+ * to 4 distinct MACs that never register gets exactly one WARN logged; older
+ * entries are evicted round-robin when the table fills. This allows several
+ * distinct misbehaving devices to each announce themselves rather than only
+ * the first one being visible. Bytes: 4 slots * (6 byte MAC + 1 byte used)
+ * + 1 byte next index = 29 B static. */
+#define UNREG_WARN_SLOTS 4
+static struct {
+    uint8_t mac[6];
+    bool used;
+} s_unreg_warned[UNREG_WARN_SLOTS];
+static uint8_t s_unreg_next;  /* round-robin eviction index */
 
 esp_err_t data_core_init(void)
 {
@@ -288,8 +288,29 @@ bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
             s_cap_warned[idx] |= bit;
         } else {
             unregistered = true;
-            already_warned = s_unregistered_cap_warned;
-            s_unregistered_cap_warned = true;
+            /* Check if this MAC is already in the bounded throttle table */
+            int slot = -1;
+            for (int i = 0; i < UNREG_WARN_SLOTS; i++) {
+                if (s_unreg_warned[i].used && memcmp(s_unreg_warned[i].mac, mac, 6) == 0) {
+                    already_warned = true;
+                    break;
+                }
+                if (!s_unreg_warned[i].used && slot < 0) {
+                    slot = i;
+                }
+            }
+            /* If not found and we have an unused slot, record it */
+            if (!already_warned && slot >= 0) {
+                memcpy(s_unreg_warned[slot].mac, mac, 6);
+                s_unreg_warned[slot].used = true;
+            }
+            /* If not found and no unused slot, evict the next slot round-robin */
+            if (!already_warned && slot < 0) {
+                slot = s_unreg_next;
+                memcpy(s_unreg_warned[slot].mac, mac, 6);
+                s_unreg_warned[slot].used = true;
+                s_unreg_next = (s_unreg_next + 1) % UNREG_WARN_SLOTS;
+            }
         }
         xSemaphoreGive(s_mutex);
 
