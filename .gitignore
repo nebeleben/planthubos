@@ -29,4 +29,5 @@ tests/host/test_capability
 tests/host/test_device_id
 tests/host/test_data_fmt
 tests/host/test_adv_queue
+tests/host/test_wrapper_index
 .DS_Store

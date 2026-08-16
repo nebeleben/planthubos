@@ -6,6 +6,7 @@
 #include "adv_queue.h"
 #include "swarm_store.h"
 #include "rules.h"
+#include "wrapper_index.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
@@ -42,6 +43,16 @@ static const char *TAG = "ble_collector";
  * across two independent tasks and can afford to take a real mutex. */
 static adv_ring_t s_adv_ring;
 static portMUX_TYPE s_adv_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* M3 Task 2 (spec §2): the match index, built once at boot by
+ * wrapper_store_load_all() (below, in ble_collector_start(), before the
+ * decoder task or NimBLE scanning can start) and read-only from then on --
+ * only Task 7's install/delete API will ever mutate it again (a later
+ * task). 16 * 12 B = 192 B static, exactly the spec §7 budget line;
+ * adv_decoder_task is the only reader, so this needs no lock of its own
+ * (same reasoning as s_batt_tab needing one and this not: unlike s_batt_tab,
+ * nothing outside the decoder task touches this table in M3 Task 2). */
+static wrapper_index_t s_wrapper_index;
 
 #define ADV_DECODER_TASK_STACK 3072
 /* Below the NimBLE host task (configMAX_PRIORITIES - 4, see
@@ -103,9 +114,37 @@ static void decode_adv_item(const adv_item_t *item)
 {
     struct ble_hs_adv_fields fields;
     if (ble_hs_adv_parse_fields(&fields, item->payload, item->len) != 0) return;
-    if (!fields.svc_data_uuid16 || fields.svc_data_uuid16_len < 2) return;
-    uint16_t uuid = (uint16_t)(fields.svc_data_uuid16[0] | (fields.svc_data_uuid16[1] << 8));
-    if (uuid != XIAOMI_SVC_UUID) return;
+
+    /* M3 Task 2 matcher (spec §2): parse the advert exactly once (above) and
+     * hand its service-UUID / manufacturer-id to the index, alongside the
+     * item's own MAC for a mac_prefix match. wrapper_index_lookup()'s
+     * contract is 0xFFFFFFFF for "this advert had none of that field" --
+     * never 0, which is a real (if unlikely) UUID/company id. This runs for
+     * every advert, MiFlora or not, since a non-MiFlora frame is exactly
+     * what a wrapper exists to decode.
+     *
+     * Wrapper EXECUTION is not part of this task (Task 5 adds the arena and
+     * the VM run) -- s_wrapper_index is only ever populated by
+     * wrapper_store_load_all() at boot, and nothing installs a wrapper
+     * before Task 7's API exists, so in practice this is always -1 today.
+     * The lookup and its log line are wired now so the matcher itself is
+     * exercised on real traffic ahead of Task 5 giving it something to do. */
+    uint32_t svc_uuid = 0xFFFFFFFFu;
+    if (fields.svc_data_uuid16 && fields.svc_data_uuid16_len >= 2) {
+        svc_uuid = (uint32_t)(fields.svc_data_uuid16[0] | (fields.svc_data_uuid16[1] << 8));
+    }
+    uint32_t manu_id = 0xFFFFFFFFu;
+    if (fields.mfg_data && fields.mfg_data_len >= 2) {
+        manu_id = (uint32_t)(fields.mfg_data[0] | (fields.mfg_data[1] << 8));
+    }
+    int wrapper_id = wrapper_index_lookup(&s_wrapper_index, svc_uuid, manu_id, item->mac);
+    if (wrapper_id >= 0) {
+        ESP_LOGD(TAG, "wrapper %d matched (execution lands in a later M3 task)", wrapper_id);
+    }
+
+    /* Native MiFlora path -- unchanged behaviour from before this task,
+     * just reusing the single parse above instead of a second one. */
+    if (!fields.svc_data_uuid16 || fields.svc_data_uuid16_len < 2 || svc_uuid != XIAOMI_SVC_UUID) return;
     mibeacon_t m;
     if (mibeacon_parse(fields.svc_data_uuid16 + 2, fields.svc_data_uuid16_len - 2, &m) != MIBEACON_OK) return;
     if (m.product_id != MIBEACON_PRODUCT_MIFLORA) return;
@@ -283,6 +322,13 @@ esp_err_t ble_collector_start(void)
      * heap cost this file's M3 pipeline adds, everything else above is
      * static. */
     adv_ring_init(&s_adv_ring);
+    /* Also before the decoder task/host task can run: wrapper_store_load_all()
+     * (M3 Task 2) does the boot's only wrapper-related LittleFS reads,
+     * leaving s_wrapper_index fully built before adv_decoder_task's first
+     * decode_adv_item() call can ever consult it. Static 192 B (16 * 12 B,
+     * spec §7); the LittleFS scan itself is transient stack/heap, freed
+     * before this returns. */
+    wrapper_store_load_all(&s_wrapper_index);
     log_heap("before adv_decoder_task");
     if (xTaskCreate(adv_decoder_task, "ble_adv_decoder", ADV_DECODER_TASK_STACK,
                      NULL, ADV_DECODER_TASK_PRIO, NULL) != pdPASS) {

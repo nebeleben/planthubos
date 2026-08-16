@@ -102,3 +102,7 @@ $CC -Wall -Wextra -Werror -I../../components/app_config/include -I../../componen
 $CC -Wall -Wextra -Werror -I../../components/ble_collector/include \
     test_adv_queue.c ../../components/ble_collector/adv_queue.c -o test_adv_queue
 ./test_adv_queue
+
+$CC -Wall -Wextra -Werror -I../../components/wrappers/include \
+    test_wrapper_index.c ../../components/wrappers/wrapper_index.c -o test_wrapper_index
+./test_wrapper_index
