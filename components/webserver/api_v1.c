@@ -62,6 +62,27 @@ static esp_err_t send_json(httpd_req_t *req, cJSON *root)
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
+
+    /* cJSON_PrintUnformatted returns NULL when it cannot allocate the one
+     * contiguous buffer the serialised body needs. Passing that NULL to
+     * httpd_resp_sendstr() ends the response cleanly, so the client receives
+     * 200 OK with a ZERO-BYTE body -- a memory failure that reads as valid
+     * emptiness. Observed on the M3 hardware gate: on the esp32c3, with the
+     * heap fragmented after BLE bring-up, GET /api/v1/unknown returned 200
+     * with no body while smaller endpoints kept working, and nothing in the
+     * log said why.
+     *
+     * That shape of failure is worst precisely here: /api/v1/unknown is M4's
+     * input contract, and an AI consumer cannot tell "this hub hears no
+     * unknown devices" from "this hub ran out of memory" -- one is a fact
+     * about the world, the other is a fact about the hub. Report it as the
+     * server error it is. */
+    if (!body) {
+        ESP_LOGW(TAG, "response serialisation failed (out of contiguous heap), sending 503");
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "{\"error\":\"out of memory serialising response\"}");
+    }
+
     esp_err_t err = httpd_resp_sendstr(req, body);
     free(body);
     return err;
