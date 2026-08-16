@@ -24,7 +24,8 @@ export const AI_DEFAULTS = {
 
 // Trailing slashes are stripped here rather than at every call site: the
 // request builders concatenate a path onto this, and "…:11434/" + "/v1/…"
-// is a 404 that looks like a wrong-endpoint error.
+// is a 404 that looks like a wrong-endpoint error. Empty string and only-slashes
+// endpoints silently revert to the default on read (via the g() fallback).
 function normEndpoint(v) {
   return String(v || '').trim().replace(/\/+$/, '')
 }
@@ -45,7 +46,17 @@ export function getAiSettings() {
 export function setAiSettings(partial) {
   for (const [field, storageKey] of Object.entries(K)) {
     if (!(field in partial)) continue
-    const v = field === 'endpoint' ? normEndpoint(partial[field]) : String(partial[field])
+    const rawValue = partial[field]
+
+    // Treat null/undefined as "remove this setting" to prevent silent corruption
+    // from stringifying them into literal "null"/"undefined" strings (which would
+    // then appear present and block further generation).
+    if (rawValue === null || rawValue === undefined) {
+      localStorage.removeItem(storageKey)
+      continue
+    }
+
+    const v = field === 'endpoint' ? normEndpoint(rawValue) : String(rawValue)
     localStorage.setItem(storageKey, v)
   }
 }

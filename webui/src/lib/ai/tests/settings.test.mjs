@@ -40,3 +40,33 @@ test('a blank key reads as absent', () => {
   setAiSettings({ key: '   ' })
   assert.equal(hasAiKey(), false)
 })
+
+test('null key clears the key and reverts to default', () => {
+  setAiSettings({ key: 'sk-test' })
+  assert.equal(hasAiKey(), true)
+  setAiSettings({ key: null })
+  assert.equal(hasAiKey(), false)
+  assert.equal(getAiSettings().key, '')
+})
+
+test('undefined key clears the key and reverts to default', () => {
+  setAiSettings({ key: 'sk-test' })
+  assert.equal(hasAiKey(), true)
+  setAiSettings({ key: undefined })
+  assert.equal(hasAiKey(), false)
+  assert.equal(getAiSettings().key, '')
+})
+
+test('empty string key is stored and does not clear (regression)', () => {
+  setAiSettings({ key: 'sk-test' })
+  setAiSettings({ key: '' })
+  assert.equal(getAiSettings().key, '')
+  assert.equal(hasAiKey(), false)
+})
+
+test('clearing one field does not disturb another', () => {
+  setAiSettings({ key: 'sk-test', model: 'claude-opus-5' })
+  setAiSettings({ key: null })
+  assert.equal(hasAiKey(), false)
+  assert.equal(getAiSettings().model, 'claude-opus-5', 'model must survive key removal')
+})
