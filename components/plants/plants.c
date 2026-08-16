@@ -1080,6 +1080,21 @@ void plants_snapshot(plants_table_t *out)
     xSemaphoreGive(s_mutex);
 }
 
+size_t plants_ids(uint8_t *out, size_t max)
+{
+    if (!out) return 0;
+    /* Same "uninitialised registry" guard as plants_snapshot() above. */
+    if (!s_mutex) return 0;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    size_t n = 0;
+    for (int i = 0; i < PLANTS_MAX && n < max; i++) {
+        if (s_table.p[i].in_use) out[n++] = s_table.p[i].id;
+    }
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
 esp_err_t plants_rename(uint8_t id, const char *name)
 {
     if (!name || strlen(name) > PLANT_NAME_LEN) return ESP_ERR_INVALID_ARG;

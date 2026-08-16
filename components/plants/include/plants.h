@@ -57,6 +57,17 @@ uint8_t plants_resolve_or_create(const uint8_t mac[6]);
  * empty plants_table_t rather than touching an uninitialised mutex. */
 void plants_snapshot(plants_table_t *out);
 
+/* Lighter enumeration for a caller that only needs to know WHICH plant ids
+ * currently exist, not their names/mac/bindings too (M2 Task 4 hardware
+ * hotfix: sampler.c used to take a full plants_snapshot() -- a ~1953-byte
+ * plants_table_t copy -- just to walk ids; that plus a second full registry
+ * snapshot pushed the sampler task's xTaskCreate() into ESP_ERR_NO_MEM right
+ * after WiFi/BLE init on a C3). Copies up to `max` in-use plant ids into
+ * out[] (same physical-slot walk order plants_snapshot() uses). Returns the
+ * count copied. Same "safe before plants_init()" contract as
+ * plants_snapshot() above -- returns 0. */
+size_t plants_ids(uint8_t *out, size_t max);
+
 /* Mutations (persisting; ESP_ERR_NOT_FOUND for unknown id / INVALID_ARG).
  * Like plants_snapshot() above, every one of these is also safe to call
  * before plants_init() has run -- they answer exactly as if the id given
