@@ -145,7 +145,11 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
     if (memcmp(blob, "PSBC", 4) != 0) return PSVM_ERR_HEADER;
     if (blob[4] != PSVM_FMT_VER || blob[5] != dialect) return PSVM_ERR_HEADER;
     uint16_t flags = rd_u16(blob + 6);
-    if (flags != 0) return PSVM_ERR_HEADER;
+    if (flags & ~(uint16_t)PSVM_FLAG_CONNECT_PLAN) return PSVM_ERR_HEADER;
+    /* A rules program has no radio: letting dialect=1 declare a GATT connect
+     * plan would be a category error, so it's refused outright at the
+     * header, before anything else in the blob is even looked at. */
+    if ((flags & PSVM_FLAG_CONNECT_PLAN) && dialect == PSVM_DIALECT_RULES) return PSVM_ERR_HEADER;
 
     uint32_t builtins = rd_u32(blob + 8);
     if (builtins & ~builtins_impl) return PSVM_ERR_LIMITS;
@@ -184,6 +188,50 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
     psvm_err_t emit_err = validate_emit_caps(blob + code_off, code_len, caps_max);
     if (emit_err != PSVM_OK) return emit_err;
 
+    /* M5a connect plan (PSVM_FLAG_CONNECT_PLAN): a trailing section right
+     * after the code, present only when the flag is set (psvm.h's own doc
+     * comment on the flag has the on-blob layout and the compatibility
+     * argument for why it rides as a trailing section behind a flag bit).
+     * Every field is bounds-checked against `len` before it is trusted --
+     * this validator is the only thing standing between a crafted blob from
+     * an authenticated HTTP client and the interpreter, and "authenticated"
+     * is not "well-formed". */
+    size_t plan_off = code_off + (size_t)code_len;
+    const uint8_t *plan_ptr = NULL;
+    uint16_t plan_section_len = 0;
+    if (flags & PSVM_FLAG_CONNECT_PLAN) {
+        size_t po = plan_off;
+        if (po + 4 > len) return PSVM_ERR_TRUNCATED;   /* read_count, write_count, interval_s */
+        uint8_t plan_read_count = blob[po];
+        uint8_t plan_write_count = blob[po + 1];
+        uint16_t interval_s = rd_u16(blob + po + 2);
+        po += 4;
+        if (plan_read_count > PSVM_PLAN_MAX_READS) return PSVM_ERR_LIMITS;
+        if (plan_write_count > PSVM_PLAN_MAX_WRITES) return PSVM_ERR_LIMITS;
+        /* Lower bound only: interval_s's own u16 width already caps every
+         * representable value at 65535, well under the spec's 86400 s upper
+         * bound, so a runtime check against that upper bound can never fire
+         * (and Clang's range analysis correctly rejects it as tautological
+         * under -Werror). See task-1-report.md for this flagged as a
+         * discrepancy between the wire layout and the caps list. */
+        if (interval_s < 60) return PSVM_ERR_LIMITS;
+
+        if (po + (size_t)plan_read_count * 2u > len) return PSVM_ERR_TRUNCATED;
+        po += (size_t)plan_read_count * 2u;
+
+        for (uint8_t i = 0; i < plan_write_count; i++) {
+            if (po + 3 > len) return PSVM_ERR_TRUNCATED;   /* uuid16 + len */
+            uint8_t wlen = blob[po + 2];
+            if (wlen < 1 || wlen > PSVM_PLAN_WRITE_MAX) return PSVM_ERR_LIMITS;
+            po += 3;
+            if (po + (size_t)wlen > len) return PSVM_ERR_TRUNCATED;
+            po += wlen;
+        }
+
+        plan_ptr = blob + plan_off;
+        plan_section_len = (uint16_t)(po - plan_off);
+    }
+
     if (out) {
         out->blob = blob;
         out->len = len;
@@ -194,6 +242,8 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
         out->consts = blob + consts_off;
         out->refs = blob + refs_off;
         out->code = blob + code_off;
+        out->plan = plan_ptr;
+        out->plan_len = plan_section_len;
     }
     return PSVM_OK;
 }

@@ -24,6 +24,16 @@
  * than once across a run. Fixed array, no allocation. */
 #define PSVM_MAX_EMITS    16
 
+/* M5a: a wrapper may carry a declarative GATT connect plan as a trailing
+ * section after the code. Gated by this flag so every blob compiled before
+ * M5a -- which sets flags to 0 -- is byte-identical and parses exactly as
+ * it did. psvm_validate already tolerated trailing bytes, so an older hub
+ * reading a newer blob ignores the plan rather than rejecting it. */
+#define PSVM_FLAG_CONNECT_PLAN 0x0001u
+#define PSVM_PLAN_MAX_READS    4
+#define PSVM_PLAN_MAX_WRITES   2
+#define PSVM_PLAN_WRITE_MAX    8
+
 typedef enum { PSVM_OK = 0, PSVM_ERR_HEADER, PSVM_ERR_LIMITS, PSVM_ERR_TRUNCATED,
                PSVM_ERR_BADOP, PSVM_ERR_STACK, PSVM_ERR_STEPS, PSVM_ERR_DIV0,
                PSVM_ERR_JUMP, PSVM_ERR_TYPE, PSVM_ERR_REF } psvm_err_t;
@@ -104,6 +114,11 @@ typedef struct {
     uint16_t const_count, ref_count, code_len;
     uint32_t builtins;                         /* header bitmap */
     const uint8_t *consts, *refs, *code;       /* section pointers */
+    /* M5a connect plan (PSVM_FLAG_CONNECT_PLAN): NULL/0 when the flag is
+     * clear, otherwise points at the validated trailing plan section (see
+     * PSVM_FLAG_CONNECT_PLAN's own doc comment above for the on-blob
+     * layout). Tasks 3 and 6 read these. */
+    const uint8_t *plan; uint16_t plan_len;
 } psvm_prog_t;
 
 /* Parses+bounds-checks the blob (spec section 2). dialect = the ONE

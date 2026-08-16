@@ -413,6 +413,111 @@ static size_t build_limits_header(uint8_t *b, uint16_t nconst, uint16_t nref) {
     return emit_header(b, 0, nconst, nref, 0);
 }
 
+/* --- M5a: PSBC trailing connect-plan section builders --- */
+
+/* Dialect=2 (wrapper) blob with PSVM_FLAG_CONNECT_PLAN set and a trailing
+ * connect-plan section (psvm.h's PSVM_FLAG_CONNECT_PLAN doc comment has the
+ * on-blob layout). Code body is a bare HALT -- this builder's whole point
+ * is the plan section that follows it, not the code that precedes it.
+ * write_data/write_lens are parallel write_count-length arrays: write i's
+ * declared payload is write_lens[i] bytes, each byte equal to write_data[i]
+ * (every M5a test case here uses write_lens[i]==1, where this reduces to
+ * exactly "the one byte you asked for"). bufsz is accepted to match the
+ * brief's call shape; every case below fits comfortably so it is unused. */
+static size_t build_wrapper_with_plan(uint8_t *b, size_t bufsz,
+                                      uint8_t read_count, uint16_t *reads,
+                                      uint8_t write_count, uint16_t *write_uuids,
+                                      uint8_t *write_data, uint8_t *write_lens,
+                                      uint16_t interval_s) {
+    (void)bufsz;
+    uint8_t code[1] = { 0xFF };   /* HALT */
+    size_t o = emit_header_d(b, PSVM_DIALECT_WRAPPERS, 0, 0, 0, (uint16_t)sizeof code);
+    memcpy(b + o, code, sizeof code);
+    o += sizeof code;
+
+    uint16_t flags = PSVM_FLAG_CONNECT_PLAN;
+    memcpy(b + 6, &flags, 2);
+
+    b[o++] = read_count;
+    b[o++] = write_count;
+    memcpy(b + o, &interval_s, 2); o += 2;
+    for (uint8_t i = 0; i < read_count; i++) {
+        memcpy(b + o, &reads[i], 2); o += 2;
+    }
+    for (uint8_t i = 0; i < write_count; i++) {
+        memcpy(b + o, &write_uuids[i], 2); o += 2;
+        b[o++] = write_lens[i];
+        for (uint8_t j = 0; j < write_lens[i]; j++) b[o++] = write_data[i];
+    }
+    return o;
+}
+
+/* Dialect=1 (rules) header-only blob with PSVM_FLAG_CONNECT_PLAN set --
+ * used to prove the validator refuses a plan on a rules blob outright, at
+ * the header, before parsing anything past it (a rules program has no
+ * radio). */
+static size_t build_rules_blob_with_plan_flag(uint8_t *b, size_t bufsz) {
+    (void)bufsz;
+    size_t o = emit_header(b, 0, 0, 0, 0);   /* dialect=RULES, empty body */
+    uint16_t flags = PSVM_FLAG_CONNECT_PLAN;
+    memcpy(b + 6, &flags, 2);
+    return o;
+}
+
+/* A dialect-2 blob with no plan flag must validate exactly as before and
+ * report no plan -- this is the M3/M4 compatibility guarantee. */
+static void test_no_plan_flag_unchanged(void) {
+    uint8_t blob[64];
+    size_t n = build_w_payload_len(blob);   /* existing helper: flags=0 wrapper blob */
+    psvm_prog_t p;
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_OK);
+    assert(p.plan == NULL && p.plan_len == 0);
+}
+
+/* Flag set, well-formed plan: pointer and length exposed. */
+static void test_plan_parsed(void) {
+    uint8_t blob[128];
+    size_t n = build_wrapper_with_plan(blob, sizeof blob,
+        /*reads*/  2, (uint16_t[]){0x2A6E, 0x2A6F},
+        /*writes*/ 1, (uint16_t[]){0x2A00}, (uint8_t[]){0x01}, (uint8_t[]){1},
+        /*interval*/ 600);
+    psvm_prog_t p;
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_OK);
+    assert(p.plan != NULL);
+    assert(p.plan[0] == 2 && p.plan[1] == 1);
+}
+
+/* Flag set but the section is missing or short. */
+static void test_plan_truncated(void) {
+    uint8_t blob[128];
+    size_t n = build_wrapper_with_plan(blob, sizeof blob, 2,
+        (uint16_t[]){0x2A6E, 0x2A6F}, 0, NULL, NULL, NULL, 600);
+    psvm_prog_t p;
+    assert(psvm_validate(blob, n - 1, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_ERR_TRUNCATED);
+}
+
+/* Every cap, at the boundary. */
+static void test_plan_limits(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_wrapper_with_plan(blob, sizeof blob, 5,
+        (uint16_t[]){1,2,3,4,5}, 0, NULL, NULL, NULL, 600);          /* 5 reads */
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_ERR_LIMITS);
+    n = build_wrapper_with_plan(blob, sizeof blob, 1, (uint16_t[]){1},
+        3, (uint16_t[]){1,2,3}, (uint8_t[]){1,1,1}, (uint8_t[]){1,1,1}, 600); /* 3 writes */
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_ERR_LIMITS);
+    n = build_wrapper_with_plan(blob, sizeof blob, 1, (uint16_t[]){1},
+        0, NULL, NULL, NULL, 30);                                     /* interval too short */
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_ERR_LIMITS);
+}
+
+/* A dialect-1 (rules) blob may never carry a plan. */
+static void test_plan_rejected_for_rules(void) {
+    uint8_t blob[128];
+    size_t n = build_rules_blob_with_plan_flag(blob, sizeof blob);
+    psvm_prog_t p;
+    assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 7, 0, &p) == PSVM_ERR_HEADER);
+}
+
 int main(void) {
     uint8_t blob[512]; psvm_prog_t p;
     size_t len = build_demo(blob);
@@ -928,6 +1033,13 @@ int main(void) {
         psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_REF);
     }
+
+    /* M5a: PSBC trailing connect-plan section */
+    test_no_plan_flag_unchanged();
+    test_plan_parsed();
+    test_plan_truncated();
+    test_plan_limits();
+    test_plan_rejected_for_rules();
 
     printf("test_psvm: all passed\n");
     return 0;
