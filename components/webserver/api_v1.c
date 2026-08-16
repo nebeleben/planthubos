@@ -2734,6 +2734,79 @@ static void wrapper_test_emit_sink(void *ctx, uint8_t capability, float value)
     (*t->n)++;
 }
 
+/* Validates a wrapper blob, runs it against one payload slice and replies.
+ * Shared by both dry-run entry points -- the id-based one (which loads
+ * bytecode from LittleFS) and M4's id-less one (which takes bytecode
+ * inline, spec section 5) -- so the two cannot diverge in what they accept
+ * or in how they report a failure. Writes nothing anywhere: no flash, no
+ * registry, no arena. `psbc` points at s_http_psbc in both cases. */
+static esp_err_t wrapper_run_and_reply(httpd_req_t *req, const uint8_t *psbc,
+                                       size_t psbc_len, const char *hex)
+{
+    uint8_t payload[PSVM_PAYLOAD_MAX];
+    uint8_t payload_len = 0;
+    size_t hexlen = strlen(hex);
+    if (hexlen % 2 != 0 || hexlen > (size_t)WRAPPER_TEST_HEX_MAX) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "hex must be an even-length hex string, up to 62 chars");
+        return ESP_OK;
+    }
+    payload_len = (uint8_t)(hexlen / 2);
+    bool valid_hex = true;
+    for (uint8_t i = 0; i < payload_len && valid_hex; i++) {
+        int hi = hexval(hex[i * 2]);
+        int lo = hexval(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) valid_hex = false;
+        else payload[i] = (uint8_t)((hi << 4) | lo);
+    }
+    if (!valid_hex) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "hex must contain only hex digits");
+        return ESP_OK;
+    }
+
+    psvm_prog_t prog;
+    psvm_err_t verr = psvm_validate(psbc, psbc_len, PSVM_DIALECT_WRAPPERS,
+                                    CAPABILITY_COUNT - 1, 0, &prog);
+    if (verr != PSVM_OK) {
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddArrayToObject(root, "emits");
+        cJSON_AddStringToObject(root, "error", psvm_err_short(verr));
+        return send_json(req, root);
+    }
+
+    wrapper_test_emit_t emits[PSVM_MAX_EMITS];
+    size_t nemits = 0;
+    wrapper_test_ctx_t tctx = { .emits = emits, .n = &nemits, .max = PSVM_MAX_EMITS };
+    psvm_wrapper_io_t wio = {
+        .payload = { .data = payload, .len = payload_len },
+        .emit = wrapper_test_emit_sink,
+        .emit_ctx = &tctx,
+        /* AES_CCM stays unwired here too -- same "no wrapper-generic nonce
+         * scheme exists in this codebase" reasoning wrapper_exec.h's own
+         * top comment gives; a dry-run of a wrapper calling
+         * aes_ccm_decrypt(...) fails identically to a real run. */
+        .aes_ccm = NULL,
+        .aes_ccm_ctx = NULL,
+    };
+    psvm_result_t res = psvm_run(&prog, NULL, &wio, NULL, NULL, false);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", res.err == PSVM_OK);
+    cJSON *arr = cJSON_AddArrayToObject(root, "emits");
+    for (size_t i = 0; i < nemits; i++) {
+        const capability_t *cap = capability_get(emits[i].cap);
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "cap", emits[i].cap);
+        cJSON_AddStringToObject(o, "name", cap ? cap->name : "?");
+        cJSON_AddNumberToObject(o, "value", emits[i].value);
+        cJSON_AddStringToObject(o, "unit", cap ? cap->unit : "");
+        cJSON_AddItemToArray(arr, o);
+    }
+    if (res.err != PSVM_OK) cJSON_AddStringToObject(root, "error", psvm_err_short(res.err));
+    return send_json(req, root);
+}
+
 /* POST /api/v1/wrappers/{id}/test {hex?: "..."} -- dry-run (spec §6, "the
  * wrapper equivalent of M1's rule dry-run"). Auth checked by
  * wrappers_post_dispatch() before this is ever reached. Never touches the
@@ -2791,31 +2864,20 @@ static esp_err_t wrappers_test_post(httpd_req_t *req, uint32_t id)
         cJSON_Delete(json);
     }
 
-    uint8_t payload[PSVM_PAYLOAD_MAX];
-    uint8_t payload_len = 0;
-    if (hexbuf[0] != '\0') {
-        size_t hexlen = strlen(hexbuf);
-        if (hexlen % 2 != 0 || hexlen > (size_t)WRAPPER_TEST_HEX_MAX) {
+    /* No hex in the body -- resolve the newest captured sample that matches
+     * this wrapper's own match rule, then hex-encode it back into hexbuf so
+     * the rest of this function (and wrapper_run_and_reply() below) has a
+     * single "hexbuf holds the bytes to test" path regardless of where they
+     * came from. */
+    if (hexbuf[0] == '\0') {
+        uint8_t payload[PSVM_PAYLOAD_MAX];
+        uint8_t payload_len = 0;
+        if (!wrapper_find_test_sample(w->match_kind, w->match_key, payload, &payload_len)) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                "hex must be an even-length hex string, up to 62 chars");
+                                "no hex supplied and no captured sample matches this wrapper yet");
             return ESP_OK;
         }
-        payload_len = (uint8_t)(hexlen / 2);
-        bool valid_hex = true;
-        for (uint8_t i = 0; i < payload_len && valid_hex; i++) {
-            int hi = hexval(hexbuf[i * 2]);
-            int lo = hexval(hexbuf[i * 2 + 1]);
-            if (hi < 0 || lo < 0) valid_hex = false;
-            else payload[i] = (uint8_t)((hi << 4) | lo);
-        }
-        if (!valid_hex) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "hex must contain only hex digits");
-            return ESP_OK;
-        }
-    } else if (!wrapper_find_test_sample(w->match_kind, w->match_key, payload, &payload_len)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "no hex supplied and no captured sample matches this wrapper yet");
-        return ESP_OK;
+        hex_encode(payload, payload_len, hexbuf);
     }
 
     size_t psbc_len = 0;
@@ -2827,47 +2889,81 @@ static esp_err_t wrappers_test_post(httpd_req_t *req, uint32_t id)
         return send_json(req, root);
     }
 
-    psvm_prog_t prog;
-    psvm_err_t verr = psvm_validate(s_http_psbc, psbc_len, PSVM_DIALECT_WRAPPERS,
-                                    CAPABILITY_COUNT - 1, 0, &prog);
-    if (verr != PSVM_OK) {
-        cJSON *root = cJSON_CreateObject();
-        cJSON_AddBoolToObject(root, "ok", false);
-        cJSON_AddArrayToObject(root, "emits");
-        cJSON_AddStringToObject(root, "error", psvm_err_short(verr));
-        return send_json(req, root);
+    return wrapper_run_and_reply(req, s_http_psbc, psbc_len, hexbuf);
+}
+
+/* POST /api/v1/wrappers/test {bytecode_b64, hex} -- M4 spec section 5.
+ * Runs a CANDIDATE wrapper that is not installed and never becomes
+ * installed by this call: nothing is written to flash, no wrapper slot is
+ * consumed, and the match index is untouched. This is what lets the
+ * browser show a user the real decoded values BEFORE they press Save,
+ * using the same interpreter that will run the wrapper in production --
+ * a second implementation in JavaScript would let a subtle numeric
+ * difference approve a decode the hub would not reproduce. */
+static esp_err_t wrappers_inline_test_post(httpd_req_t *req)
+{
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return ESP_OK;
+    }
+    if (req->content_len > sizeof(s_http_body) - 1) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, s_http_body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    s_http_body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(s_http_body);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return ESP_OK;
+    }
+    const cJSON *b64_j = cJSON_GetObjectItem(json, "bytecode_b64");
+    const cJSON *hex_j = cJSON_GetObjectItem(json, "hex");
+    if (!cJSON_IsString(b64_j) || !cJSON_IsString(hex_j)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bytecode_b64 and hex required");
+        return ESP_OK;
     }
 
-    wrapper_test_emit_t emits[PSVM_MAX_EMITS];
-    size_t nemits = 0;
-    wrapper_test_ctx_t tctx = { .emits = emits, .n = &nemits, .max = PSVM_MAX_EMITS };
-    psvm_wrapper_io_t wio = {
-        .payload = { .data = payload, .len = payload_len },
-        .emit = wrapper_test_emit_sink,
-        .emit_ctx = &tctx,
-        /* AES_CCM stays unwired here too -- same "no wrapper-generic nonce
-         * scheme exists in this codebase" reasoning wrapper_exec.h's own
-         * top comment gives; a dry-run of a wrapper calling
-         * aes_ccm_decrypt(...) fails identically to a real run. */
-        .aes_ccm = NULL,
-        .aes_ccm_ctx = NULL,
-    };
-    psvm_result_t res = psvm_run(&prog, NULL, &wio, NULL, NULL, false);
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddBoolToObject(root, "ok", res.err == PSVM_OK);
-    cJSON *arr = cJSON_AddArrayToObject(root, "emits");
-    for (size_t i = 0; i < nemits; i++) {
-        const capability_t *cap = capability_get(emits[i].cap);
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddNumberToObject(o, "cap", emits[i].cap);
-        cJSON_AddStringToObject(o, "name", cap ? cap->name : "?");
-        cJSON_AddNumberToObject(o, "value", emits[i].value);
-        cJSON_AddStringToObject(o, "unit", cap ? cap->unit : "");
-        cJSON_AddItemToArray(arr, o);
+    char hexbuf[WRAPPER_TEST_HEX_MAX + 1];
+    if (strlen(hex_j->valuestring) > WRAPPER_TEST_HEX_MAX) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "hex too long");
+        return ESP_OK;
     }
-    if (res.err != PSVM_OK) cJSON_AddStringToObject(root, "error", psvm_err_short(res.err));
-    return send_json(req, root);
+    strncpy(hexbuf, hex_j->valuestring, sizeof(hexbuf) - 1);
+    hexbuf[sizeof(hexbuf) - 1] = '\0';
+
+    /* Bound the encoded length BEFORE decoding, same order the install path
+     * uses -- mbedtls_base64_decode is given the buffer size as its hard
+     * cap, but checking first keeps an oversized body from being decoded at
+     * all. */
+    size_t b64len = strlen(b64_j->valuestring);
+    if (b64len > WRAPPER_B64_MAX) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bytecode too large");
+        return ESP_OK;
+    }
+    size_t psbc_len = 0;
+    int rc = mbedtls_base64_decode(s_http_psbc, sizeof(s_http_psbc), &psbc_len,
+                                   (const unsigned char *)b64_j->valuestring, b64len);
+    cJSON_Delete(json);
+    if (rc != 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad base64");
+        return ESP_OK;
+    }
+    return wrapper_run_and_reply(req, s_http_psbc, psbc_len, hexbuf);
 }
 
 /* POST /api/v1/wrappers/{id}/test -- the only POST sub-route wrappers have
@@ -2879,6 +2975,15 @@ static esp_err_t wrappers_post_dispatch(httpd_req_t *req)
     if (!api_auth_ok(req)) return api_send_401(req);
 
     const char *tail = req->uri + strlen("/api/v1/wrappers/");
+
+    /* The id-less dry run (M4 spec section 5). Dispatched here rather than
+     * registered as its own route: "/api/v1/wrappers/*" is already
+     * registered with wildcard matching and already reaches this function,
+     * so a second exact route would only win if it were registered first --
+     * an ordering dependency for no benefit. Handler count stays 48. */
+    if (strncmp(tail, "test", 4) == 0 && (tail[4] == '\0' || tail[4] == '?'))
+        return wrappers_inline_test_post(req);
+
     const char *suffix = NULL;
     uint32_t id = parse_wrapper_id(tail, &suffix);
     if (id == 0) {
