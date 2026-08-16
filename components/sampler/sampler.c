@@ -61,12 +61,55 @@ static bool s_agg_used[PLANTS_MAX];
  * sequence that has repeatedly proven tight on this board. A guaranteed
  * start is worth more here than 4.4 KB of pooled-vs-reserved bookkeeping.
  * What round 4 DID add is the measurement round 2 could not make: see
- * sampler_task()'s stack high-water-mark log -- if the boot log shows this
- * 4096 is largely unused, shrinking it is then a safe, evidence-backed
- * saving in a way that guessing never was. */
+ * sampler_task()'s stack high-water-mark log.
+ *
+ * ROUND 5 -- why 4096 STAYS, having been asked to cut it to 1536 on the
+ * strength of that first watermark reading (3692 B unused of 4096, i.e.
+ * 404 B used). It must not be cut, and the watermark is not why:
+ *
+ * That reading was taken on a tick that wrote nothing (see sampler_task()),
+ * so it never entered storage_append(). The number that matters is the
+ * worst-case CALL CHAIN, measured on the linked image itself -- every
+ * `addi sp,sp,-N` prologue in planthub.elf, walked as a call graph from
+ * sampler_task():
+ *
+ *   sampler_task 160 -> storage_col_for 176 -> open_or_create 48
+ *     -> create_fresh 320 -> fopen 32 -> _fopen_r 48 -> _open_r 48
+ *     -> vfs_littlefs_open 32 -> lfs_file_opencfg 32 + _ 96
+ *     -> lfs_file_close_ 16 -> lfs_file_sync_ 64 -> lfs_dir_commit 16
+ *     -> lfs_fs_deorphan 160 -> lfs_dir_orphaningcommit 160
+ *     -> lfs_dir_relocatingcommit 144 -> lfs_dir_split 80
+ *     -> lfs_dir_compact 128 -> lfs_dir_traverse x2 448      = 2208 B
+ *
+ * plus the flash tail below that traverse (lfs_dir_getslice 96, lfs_bd_read
+ * 64, littlefs_esp_part_read 32, esp_partition_read 48, esp_flash_read 80,
+ * HAL/ROM leaf) ~= 420 B, plus the RISC-V exception frame pushed on the
+ * task's own stack at interrupt entry (~200 B): **~2.8 KB worst case.**
+ *
+ * That is the ordinary first-write path, not an exotic one -- create_fresh()
+ * runs the first time any plant records to a tier, and the deorphan/split/
+ * compact chain is just LittleFS growing a directory. 4096 leaves ~1.3 KB
+ * (32%) of margin; 3072 would leave ~270 B; 1536 would overflow by ~1.3 KB
+ * and panic. It also matches this project's own standing rule, already
+ * written into sdkconfig.defaults for the event-loop task: "IDF recommends
+ * >=4KB stack for VFS file I/O". The sampler does VFS file I/O.
+ *
+ * The ~2.5 KB this would have returned to the heap is also no longer the
+ * lever it was: round 4 took free heap after BLE bring-up from 2624 B to a
+ * hardware-confirmed 16756 B. Trading a third of a task's stack margin for
+ * 15% more heap on a device that now has headroom is the wrong side of that
+ * trade. Revisit only with a watermark reading whose ring-file-write count
+ * is non-zero. */
 static StaticSemaphore_t s_wake_buf;
 static StackType_t s_sampler_stack[4096];
 static StaticTask_t s_sampler_tcb;
+
+/* Successful raw ring-file appends so far this boot. Not a statistic anyone
+ * consumes -- it exists so sampler_task()'s stack high-water-mark line can
+ * state whether the deepest path (storage_append -> fopen/fwrite -> LittleFS)
+ * has run at all by the time that mark was taken. Round 5 exists because a
+ * watermark read WITHOUT that qualifier was mistaken for a worst case. */
+static uint32_t s_ring_writes;
 
 static hourly_agg_t *agg_for(uint8_t plant_id)
 {
@@ -221,6 +264,9 @@ static void sample_once(void)
             ESP_LOGW(TAG, "raw append failed for plant %u", plant_id);
             continue;
         }
+        /* Counted purely so the stack high-water-mark line below can say
+         * whether the deep path has actually run yet -- see sampler_task(). */
+        s_ring_writes++;
         hourly_agg_t *agg = agg_for(plant_id);
         storage_rec_t hr;
         if (agg && hourly_agg_add(agg, &rec, &hr)) {
@@ -234,27 +280,42 @@ static void sample_once(void)
 
 static void sampler_task(void *arg)
 {
-    /* Round 4: the 4096-byte stack above has never been validated against a
-     * real run -- round 2 sized it by "keep whatever xTaskCreate() was
-     * asking for", explicitly refusing to guess a smaller number without
-     * hardware. This is that measurement, made permanent and free: after the
-     * first sample (the deepest pass this task ever makes -- registry
-     * snapshot, per-plant binding walk, storage_col_for()/storage_append()
-     * ring-file I/O, hourly aggregation), log the unused headroom once. A
-     * boot log line like `stack high-water mark: N B unused` is what a future
-     * round needs to shrink s_sampler_stack with evidence instead of nerve;
-     * it also catches the opposite case (a near-zero margin) before it
-     * becomes a stack-overflow panic. Logged once, not per sample: this task
-     * runs forever and the first pass is representative. */
-    bool watermark_logged = false;
+    /* Round 4 added this mark; round 5 fixed how it is reported, after the
+     * first reading was very nearly acted on as if it were a worst case.
+     *
+     * That reading was `3692 B unused of 4096 B` -- i.e. 404 B used -- taken
+     * on a hub whose plants had no bound capabilities yet. sample_once()
+     * `continue`s past every plant with no bindings and past every plant
+     * whose bindings produced no fresh value, BEFORE it ever reaches
+     * storage_col_for()/storage_append(). So that mark measured a tick that
+     * opened no file at all: a floor, not a bound. Sizing the stack from it
+     * (1536 B was proposed) would have overflowed it by ~1 KB the first time
+     * a real plant recorded a sample.
+     *
+     * Two consequences, both implemented here:
+     *
+     *   1. The mark is now NEW-LOW-triggered, not once-after-the-first-sample
+     *      (the same idiom rules_engine.c's engine_task uses, and for the same
+     *      reason): the deep pass is rare and data-dependent, so "the first
+     *      one" is exactly the wrong sample to trust. This line will re-fire
+     *      the first time a genuine ring-file write goes deeper.
+     *   2. It reports s_ring_writes alongside the mark. A reading with
+     *      `after 0 ring-file writes` is explicitly NOT a worst case and must
+     *      not be used to resize s_sampler_stack. Wait for a non-zero count.
+     *
+     * For why 4096 stays until then, see s_sampler_stack's own comment. */
+    static UBaseType_t lowest_free = (UBaseType_t)-1;
     while (1) {
         xSemaphoreTake(s_wake, portMAX_DELAY);
         sample_once();
-        if (!watermark_logged) {
-            watermark_logged = true;
-            ESP_LOGI(TAG, "sampler task stack high-water mark after first sample: %u B unused "
-                          "of %u B", (unsigned)(uxTaskGetStackHighWaterMark(NULL)),
-                     (unsigned)sizeof(s_sampler_stack));
+        UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL);
+        if (free_bytes < lowest_free) {
+            lowest_free = free_bytes;
+            ESP_LOGI(TAG, "sampler task stack high-water mark: %u B unused of %u B "
+                          "(after %u ring-file writes -- a mark taken after 0 writes has NOT "
+                          "exercised the LittleFS path and must not be used to resize the stack)",
+                     (unsigned)free_bytes, (unsigned)sizeof(s_sampler_stack),
+                     (unsigned)s_ring_writes);
         }
     }
 }
