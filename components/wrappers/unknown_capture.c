@@ -31,11 +31,17 @@
  *                                     + 3 tail pad, uint32_t/sample array
  *                                     both need 4-B alignment)
  *   s_tbl[8]                 = 768 B static -- the table itself
- *   StaticSemaphore_t s_mux  =  48 B static -- the mutex buffer (typical on
- *                                     Xtensa/RISC-V targets)
- *   Total                    = ~816 B static resident cost, close to spec
- *                                     section 5's "~700 B" estimate plus
- *                                     synchronisation overhead.
+ *   StaticSemaphore_t s_mux  =  84 B static -- the mutex buffer. MEASURED,
+ *                                     not assumed: `riscv32-esp-elf-nm
+ *                                     --print-size` reports 0x54 for
+ *                                     s_mux_buf on both esp32c3 and esp32c5
+ *                                     builds (IDF v5.5.5).
+ *   Total                    =  852 B static resident cost, against spec
+ *                                     section 5's "~700 B" estimate -- the
+ *                                     gap is alignment padding the spec's
+ *                                     back-of-envelope 8*2*37 didn't count,
+ *                                     plus this mutex, which section 5 did
+ *                                     not anticipate at all.
  */
 #include "unknown_capture.h"
 #include <string.h>
