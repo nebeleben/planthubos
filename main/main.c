@@ -139,6 +139,22 @@ void app_main(void)
     bool storage_ok = storage_err == ESP_OK;
     if (!storage_ok) ESP_LOGE(TAG, "littlefs mount failed (%s); running without on-device history", esp_err_to_name(storage_err));
 
+    /* M2 Task 5 (spec Sec.5): one-time V1->V2 data wipe, gated on NVS
+     * "data_fmt". Must run before ANYTHING that reads plants.bin or a
+     * history ring file (plants_init()/sampler_start() below both qualify),
+     * so this is the very next thing once NVS (app_config_init() above) and
+     * littlefs are both up -- earlier than even timekeeper_init(), which
+     * doesn't touch plants/history data but there is no reason to let it
+     * run first either. data_core_init() just below is deliberately NOT
+     * gated on data_fmt_safe(): it's an in-RAM pub/sub event registry with
+     * nothing persisted in plants.bin/ring format, so a downgraded
+     * firmware's refusal to touch data (see data_fmt_safe() below) doesn't
+     * apply to it. A NULL base (storage_ok false) makes data_fmt_apply()
+     * itself a no-op that retries on a later boot once storage mounts --
+     * same log-and-continue treatment as every other littlefs-dependent
+     * init in this function. */
+    data_fmt_apply(storage_ok ? "/storage" : NULL);
+
     /* timekeeper_init runs regardless of storage_ok: its boot counter lives
      * in NVS (a separate partition, unaffected by a littlefs failure) and
      * boottab_load already treats a missing/unreachable table file as an
@@ -248,8 +264,17 @@ void app_main(void)
              * boot on its own account (see plants.h) -- log-and-continue,
              * same treatment as littlefs/timekeeper above, not
              * ESP_ERROR_CHECK. */
-            esp_err_t perr = plants_init(storage_ok ? "/storage" : NULL);
-            if (perr != ESP_OK) ESP_LOGE(TAG, "plants_init failed (%s); plant registry unavailable", esp_err_to_name(perr));
+            /* Skipped outright on a FUTURE data_fmt (spec Sec.5 / Task 5):
+             * data_fmt_apply() above already refused to wipe or touch
+             * anything in that case (a downgraded firmware must not
+             * interpret a newer plants.bin format), so plants_init() must
+             * not open it either -- there is nothing safe for it to read. */
+            if (data_fmt_safe()) {
+                esp_err_t perr = plants_init(storage_ok ? "/storage" : NULL);
+                if (perr != ESP_OK) ESP_LOGE(TAG, "plants_init failed (%s); plant registry unavailable", esp_err_to_name(perr));
+            } else {
+                ESP_LOGE(TAG, "data_fmt: on-disk format is newer than this firmware supports; skipping plants_init");
+            }
 
             esp_err_t ierr = integrations_start();
             if (ierr != ESP_OK) ESP_LOGE(TAG, "integrations start failed (%s); continuing without them", esp_err_to_name(ierr));
@@ -329,10 +354,12 @@ void app_main(void)
      * minutes; starting it against a failed mount would just fail forever,
      * so skip it outright rather than let it retry into the void. Also
      * hub-only: a node keeps no local history to sample. */
-    if (storage_ok && role != SWARM_ROLE_NODE) {
+    if (storage_ok && role != SWARM_ROLE_NODE && data_fmt_safe()) {
         esp_err_t sampler_err = sampler_start("/storage");
         if (sampler_err != ESP_OK) ESP_LOGE(TAG, "sampler_start failed (%s); running without history sampling", esp_err_to_name(sampler_err));
     } else if (!storage_ok) {
         ESP_LOGW(TAG, "skipping sampler_start: storage unavailable");
+    } else if (storage_ok && role != SWARM_ROLE_NODE) {
+        ESP_LOGE(TAG, "data_fmt: on-disk format is newer than this firmware supports; skipping sampler_start");
     }
 }

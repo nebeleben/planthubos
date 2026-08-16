@@ -91,3 +91,8 @@ $CC -Wall -Wextra -Werror -I../../components/capability/include \
 $CC -Wall -Wextra -Werror -I../../components/capability/include \
     test_device_id.c ../../components/capability/device_id.c -o test_device_id
 ./test_device_id
+
+$CC -Wall -Wextra -Werror -I../../components/app_config/include -I../../components/plants/include \
+    -I../../components/capability/include \
+    test_data_fmt.c ../../components/app_config/data_fmt.c -o test_data_fmt
+./test_data_fmt

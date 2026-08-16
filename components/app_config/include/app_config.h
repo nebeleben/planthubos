@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "data_fmt.h"   /* Task 5 (M2 spec Sec.5): one-time V1 data wipe; see data_fmt.h */
 
 typedef struct {
     char ssid[33];

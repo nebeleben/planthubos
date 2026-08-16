@@ -27,4 +27,5 @@ tests/host/test_rules_fsm
 tests/host/test_event_ring
 tests/host/test_capability
 tests/host/test_device_id
+tests/host/test_data_fmt
 .DS_Store
