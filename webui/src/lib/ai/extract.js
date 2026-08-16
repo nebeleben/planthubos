@@ -5,9 +5,17 @@
 // verbatim rather than guessing at (spec section 6) -- silently treating
 // prose as source would put "I am unable to help" into the editor.
 export function extractSource(text) {
-  const m = /```([\s\S]*?)```/.exec(String(text || ''))
+  // The opening run is 3-OR-MORE backticks (`{3,}`, greedy -- it grabs the
+  // longest run present, e.g. all 4 of a four-backtick fence) and \1
+  // requires the SAME LENGTH run to close it. A fixed ``` /```...```/``
+  // pattern would treat a four-backtick fence's opening as only the first
+  // three backticks, leaving the fourth as a leading stray character that
+  // survives the info-string test below (it isn't a bare word) and becomes
+  // line 1 of the "extracted" source -- a confusing `unexpected character`
+  // compile error for source that was actually well-formed.
+  const m = /(`{3,})([\s\S]*?)\1/.exec(String(text || ''))
   if (!m) return null
-  let body = m[1]
+  let body = m[2]
   const nl = body.indexOf('\n')
   if (nl !== -1) {
     // The info string on a fenced code block is a bare word (```plantscript)

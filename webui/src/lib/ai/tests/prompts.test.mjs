@@ -93,6 +93,14 @@ test('a same-line wrapper header still survives after the CRLF/whitespace fix', 
   assert.equal(out, 'wrapper "ruuvi" match manufacturer 0x0499\ndecode\n  emit air.temperature i16_be(payload, 1) * 0.005')
 })
 
+// M4 fix wave finding 6: a four-backtick fence (some models emit this,
+// especially when the code body itself contains a triple-backtick) must
+// not leak a stray leading backtick as line 1 of the extracted source.
+test('extracts a four-backtick fenced block without leaking a stray backtick', () => {
+  const out = extractSource('````\nrule "x"\nwhen plant("A").soil.moisture < 20%\nthen log("y")\n````')
+  assert.equal(out, 'rule "x"\nwhen plant("A").soil.moisture < 20%\nthen log("y")')
+})
+
 // Fix round 1: RULE_DIALECT says mode/cooldown/every "must appear in that
 // order" but does not claim each may appear only once -- parser.js only
 // rejects a clause going backward (idx < orderIdx), not a repeat. Pin
