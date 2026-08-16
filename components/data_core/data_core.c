@@ -208,3 +208,33 @@ bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)
                    (void *)mac, 6, 0 /* don't block the battery poller task */);
     return true;
 }
+
+bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
+{
+    /* Same "encode before taking the mutex, skip the write (not a clear) on
+     * out-of-range" discipline as data_core_submit_battery() above -- see
+     * its comment and set_cap_or_warn()'s, both of which this mirrors. */
+    int16_t raw = capability_encode(cap_id, value);
+    if (raw == CAP_VALUE_NONE) {
+        const capability_t *c = capability_get(cap_id);
+        ESP_LOGW(TAG, "%s: value %.2f out of range, dropping reading for "
+                 MACSTR_FMT " (previous value kept)",
+                 c ? c->name : "?", (double)value, MAC_ARG(mac));
+        return false;
+    }
+
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    device_id_t id = device_id_from_mac(DEV_KIND_BLE, mac);
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int idx = registry_set_cap(&s_registry, &id, cap_id, raw, now_s);
+    xSemaphoreGive(s_mutex);
+
+    if (idx < 0) {
+        ESP_LOGW(TAG, "registry full, dropping cap %u reading for " MACSTR_FMT, cap_id, MAC_ARG(mac));
+        return false;
+    }
+    esp_event_post(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE,
+                   (void *)mac, 6, 0 /* don't block the calling task (adv_decoder_task for BTHome) */);
+    return true;
+}

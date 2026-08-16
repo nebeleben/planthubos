@@ -1,6 +1,7 @@
 #include "ble_collector.h"
 #include "data_core.h"
 #include "mibeacon.h"
+#include "bthome.h"
 #include "battery_sched.h"
 #include "ble_collector_internal.h"
 #include "adv_queue.h"
@@ -103,6 +104,71 @@ void ble_collector_resume_scan(void)
     start_scan();
 }
 
+/* M3 Task 3 (spec §4): BTHome v2 is a built-in decoder, matched by its
+ * service UUID exactly like a wrapper's WMATCH_SERVICE key would be, but
+ * dispatched here directly -- never through s_wrapper_index -- because it
+ * lives outside the 16-wrapper store entirely and costs none of a user's
+ * wrapper slots. Runs on adv_decoder_task, same as the rest of
+ * decode_adv_item() below (flash/NVS reads -- bindkey_get() -- are only
+ * safe off the NimBLE host task).
+ *
+ * gap_mac is the raw GAP address exactly as gap_event captured it
+ * (ble_addr_t.val[], on-air wire order) -- NOT yet the human/display order
+ * bthome_decode()'s mac[] contract requires (see bthome.h's doc comment on
+ * why: NimBLE's val[0] is the first octet transmitted, the byte order's
+ * OWN least-significant end, confirmed against nimble/ble.h's
+ * BLE_ADDR_IS_RPA family keying off val[5] for the address-type bits).
+ * Reversed once here into `mac`, which is then used consistently for both
+ * the AES-CCM nonce (inside bthome_decode()) and this device's identity
+ * (device_id_from_mac()) -- the same order data_core.c already uses
+ * everywhere else (via mibeacon.c's own reversed m.mac), so a BTHome
+ * device's dashboard/bind-key identity matches what a user would read off
+ * the device or a scanner app. */
+static void decode_bthome_item(const uint8_t *data, size_t len, const uint8_t gap_mac[6])
+{
+    uint8_t mac[6];
+    for (int i = 0; i < 6; i++) mac[i] = gap_mac[5 - i];
+
+    device_id_t id = device_id_from_mac(DEV_KIND_BLE, mac);
+    char dev_id[24];
+    device_id_format(&id, dev_id, sizeof dev_id);
+
+    uint8_t key_buf[16];
+    bool have_key = bindkey_get(dev_id, key_buf);
+
+    bthome_emit_t emits[BTHOME_MAX_EMITS];
+    size_t n = 0;
+    bthome_err_t err = bthome_decode(data, len, have_key ? key_buf : NULL, mac, emits, &n);
+    if (err != BTHOME_OK) {
+        /* Same low-noise convention as the MiFlora path just below (a
+         * mibeacon_parse() failure there is likewise never logged above
+         * DEBUG): a malformed/undecryptable frame from a real BTHome
+         * device is expected background noise (a wrong bind key, a frame
+         * clipped by the queue's 31-byte payload cap, ...), not something
+         * that should spam the log on every advertisement interval. */
+        ESP_LOGD(TAG, "bthome: %s decode failed (err=%d)", dev_id, (int)err);
+        return;
+    }
+
+    /* Each emit goes through data_core_submit_cap()'s own
+     * capability_encode() + skip-on-CAP_VALUE_NONE discipline (M3 Task 3
+     * brief: "the caller must SKIP the write in that case, never store the
+     * sentinel") -- this function never calls capability_encode() itself. */
+    bool wrote_any = false;
+    for (size_t i = 0; i < n; i++) {
+        if (data_core_submit_cap(mac, emits[i].cap_id, emits[i].value)) wrote_any = true;
+    }
+    /* Wake the rules engine only once real registry state changed --
+     * mirrors "fires after a successful registry update, as the MiFlora
+     * path does" (data_core_submit_from() -> rules_notify_value_update()
+     * below), not the MiFlora path's own "every accepted frame regardless
+     * of whether a value changed" looser trigger, since a BTHome frame with
+     * every object out-of-range or unmapped (n==0, or every
+     * data_core_submit_cap() skipped) wrote nothing for the engine to react
+     * to. */
+    if (wrote_any) rules_notify_value_update();
+}
+
 /* Runs on adv_decoder_task, never on the NimBLE host task -- this is where
  * flash reads / VM execution (Task 2 onward) are allowed to happen. For M3
  * Task 1 this is exactly the MiFlora decode that used to live inline in
@@ -137,6 +203,18 @@ static void decode_adv_item(const adv_item_t *item)
     if (fields.mfg_data && fields.mfg_data_len >= 2) {
         manu_id = (uint32_t)(fields.mfg_data[0] | (fields.mfg_data[1] << 8));
     }
+
+    /* M3 Task 3 (spec §4): BTHome dispatch happens BEFORE the wrapper index
+     * is consulted -- it is a built-in decoder, held outside the
+     * 16-wrapper store, never itself an entry in s_wrapper_index. A BTHome
+     * advert still carries its 0xFCD2 service-data UUID like any other
+     * service-keyed advert, so svc_uuid (computed just above) is reused
+     * as-is rather than re-parsed. */
+    if (svc_uuid == BTHOME_SVC_UUID) {
+        decode_bthome_item(fields.svc_data_uuid16 + 2, fields.svc_data_uuid16_len - 2, item->mac);
+        return;
+    }
+
     int wrapper_id = wrapper_index_lookup(&s_wrapper_index, svc_uuid, manu_id, item->mac);
     if (wrapper_id >= 0) {
         ESP_LOGD(TAG, "wrapper %d matched (execution lands in a later M3 task)", wrapper_id);

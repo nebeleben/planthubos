@@ -99,3 +99,25 @@ void      data_core_clear_node_attribution(const uint8_t node_mac[6]);
  * returns false, or a reading that was actually dropped would wrongly stop
  * being retried. */
 bool      data_core_submit_battery(const uint8_t mac[6], uint8_t pct);
+
+/* M3 Task 3 (native BTHome, spec §4) and, from Task 5 on, the wrapper VM's
+ * emit() builtin: a single capability reading from a source with no
+ * frame_cnt/attribution of its own -- generalises data_core_submit_battery()
+ * above (kept as its own function, unchanged, rather than rewritten in terms
+ * of this one: two independent, already-working submit paths is a smaller
+ * diff and a smaller risk than threading a new parameter through a tested
+ * one). Applies value to mac's cap_id slot via registry_set_cap(), bypassing
+ * M5b's frame_cnt arbitration entirely -- exactly like
+ * data_core_submit_battery()'s GATT poll, and for the same reason: BTHome
+ * (and a wrapper's decode) has no frame_cnt to arbitrate on either. Skips
+ * the write when capability_encode() can't represent value (out of that
+ * capability's encodable range) -- same "never pass CAP_VALUE_NONE through
+ * registry_set_cap()'s own clear-the-slot contract" discipline
+ * set_cap_or_warn()/data_core_submit_battery() already use; the previous
+ * stored value, if any, is left untouched, and a WARN is logged. Posts
+ * DATA_EVENT_SENSOR_UPDATE on a successful write, same as
+ * data_core_submit_battery(). Returns false when the write was skipped
+ * (out-of-range value) or the registry is full and the device is unknown
+ * (nothing created or modified either way) -- callers must not treat that
+ * as "this reading is now stored". */
+bool      data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value);

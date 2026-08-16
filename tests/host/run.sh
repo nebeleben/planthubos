@@ -106,3 +106,46 @@ $CC -Wall -Wextra -Werror -I../../components/ble_collector/include \
 $CC -Wall -Wextra -Werror -I../../components/wrappers/include \
     test_wrapper_index.c ../../components/wrappers/wrapper_index.c -o test_wrapper_index
 ./test_wrapper_index
+
+# test_bthome links mbedtls's AES-CCM for the one encrypted vector the M3
+# Task 3 brief asks for; the plain-cc host harness has no ESP-IDF mbedtls
+# component to draw on, so this looks for a host mbedtls (Homebrew's, if
+# present) and links it directly by full path (not -lmbedcrypto) to avoid
+# depending on the dylib search path at run time. When no host mbedtls is
+# found -- or it exists but won't actually link/run (e.g. this repo's own
+# dev machine has only an Intel-bottled Homebrew under Rosetta at
+# /usr/local, x86_64-only, while plain `cc` here targets arm64 natively; a
+# probe-compile below tries native first, then -arch x86_64 via Rosetta,
+# before giving up) -- the encrypted-vector case is compiled out
+# (BTHOME_NO_MBEDTLS_CCM) and test_bthome.c prints an explicit skip notice
+# instead of silently passing without ever running it. The device (ESP-IDF)
+# build always links the real mbedtls component and always exercises that
+# path (bthome.c has no such fallback there).
+BTHOME_CCM_FLAGS="-DBTHOME_NO_MBEDTLS_CCM=1"
+if command -v brew >/dev/null 2>&1 && MBEDTLS_PREFIX=$(brew --prefix mbedtls 2>/dev/null) \
+   && [ -f "$MBEDTLS_PREFIX/include/mbedtls/ccm.h" ] && [ -f "$MBEDTLS_PREFIX/lib/libmbedcrypto.a" ]; then
+    PROBE_BIN=$(mktemp /tmp/bthome_mbedtls_probe.XXXXXX)
+    PROBE_OK=0
+    for TRY_ARCH in "" "-arch x86_64"; do
+        if $CC $TRY_ARCH -I"$MBEDTLS_PREFIX/include" -o "$PROBE_BIN" -x c - -x none "$MBEDTLS_PREFIX/lib/libmbedcrypto.a" \
+             > /dev/null 2>&1 <<'EOF' && "$PROBE_BIN" > /dev/null 2>&1
+#include "mbedtls/ccm.h"
+int main(void) { mbedtls_ccm_context c; mbedtls_ccm_init(&c); mbedtls_ccm_free(&c); return 0; }
+EOF
+        then
+            BTHOME_CCM_FLAGS="$TRY_ARCH -I$MBEDTLS_PREFIX/include $MBEDTLS_PREFIX/lib/libmbedcrypto.a"
+            PROBE_OK=1
+            break
+        fi
+    done
+    rm -f "$PROBE_BIN"
+    if [ "$PROBE_OK" -ne 1 ]; then
+        echo "NOTE: host mbedtls found but would not link/run -- test_bthome will skip its encrypted-vector case (device build covers it)" >&2
+    fi
+else
+    echo "NOTE: host mbedtls not found -- test_bthome will skip its encrypted-vector case (device build covers it)" >&2
+fi
+$CC -Wall -Wextra -Werror -I../../components/bthome/include -I../../components/capability/include \
+    test_bthome.c ../../components/bthome/bthome.c ../../components/capability/capability.c \
+    $BTHOME_CCM_FLAGS -o test_bthome -lm
+./test_bthome
