@@ -45,6 +45,19 @@ bool mqtt_topic_discovery(char *out, size_t cap, uint8_t plant_id, uint8_t cap_i
     return n >= 0 && (size_t)n < cap;
 }
 
+bool mqtt_topic_device_discovery(char *out, size_t cap, const char *dev_id_str, uint8_t cap_id)
+{
+    const capability_t *c = capability_get(cap_id);
+    if (!c) return false;
+
+    char metric[32];
+    metric_segment(c->name, metric, sizeof metric);
+
+    int n = snprintf(out, cap, "homeassistant/sensor/planthub_device_%s_%s/config",
+                      dev_id_str, metric);
+    return n >= 0 && (size_t)n < cap;
+}
+
 bool mqtt_json_state(char *out, size_t cap, const mqtt_state_t *st)
 {
     size_t pos = 0;
@@ -121,8 +134,19 @@ static const char *ha_unit_json(const char *table_unit)
     return table_unit;
 }
 
-bool mqtt_json_discovery(char *out, size_t cap, const char *hub, uint8_t plant_id,
-                          const char *plant_name, uint8_t cap_id)
+/* Shared by mqtt_json_discovery()/mqtt_json_device_discovery() below: both
+ * emit the identical payload shape (spec Sec.6), differing only in WHOSE
+ * identity/topic they carry. uniq_prefix is both the "dev":{"ids":[...]}
+ * entry AND (with "_<metric>" appended) the uniq_id -- true for both a
+ * plant ("planthub_plant_7") and a device ("planthub_device_ble:AABBCC..")
+ * identity string. state_topic is the already-fully-built stat_t value
+ * (mqtt_topic_state()'s or mqtt_topic_device_state()'s shape -- callers
+ * build it, this function just embeds it). raw_display_name "" falls back
+ * to whatever the caller already decided (a plant's "Plant <id>" or a
+ * device's id string) -- callers resolve their own fallback before calling,
+ * this function only escapes and embeds it. */
+static bool build_discovery(char *out, size_t cap, const char *hub, const char *uniq_prefix,
+                            const char *state_topic, const char *raw_display_name, uint8_t cap_id)
 {
     const capability_t *c = capability_get(cap_id);
     if (!c) return false;
@@ -133,13 +157,6 @@ bool mqtt_json_discovery(char *out, size_t cap, const char *hub, uint8_t plant_i
     size_t pos = 0;
     int n;
 
-    /* Fall back to "Plant <id>" when plant_name is empty; either way, run
-     * the result through json_escape before it goes into either JSON string
-     * field below (the fallback never needs escaping, but running it
-     * through json_escape too keeps this branch-free). */
-    char fallback[16];   /* "Plant " + up to 3 digits + NUL */
-    snprintf(fallback, sizeof fallback, "Plant %u", (unsigned)plant_id);
-    const char *raw_display_name = (plant_name && *plant_name) ? plant_name : fallback;
     char display_name[6 * 32 + 1];   /* worst case: every byte of a 32-char name becomes \u00XX */
     json_escape(raw_display_name, display_name, sizeof display_name);
 
@@ -153,12 +170,12 @@ bool mqtt_json_discovery(char *out, size_t cap, const char *hub, uint8_t plant_i
     pos += (size_t)n;
 
     /* uniq_id: V1 entity-id pattern, spec Sec.6 */
-    n = snprintf(out + pos, cap - pos, "\"uniq_id\":\"planthub_plant_%u_%s\",", (unsigned)plant_id, metric);
+    n = snprintf(out + pos, cap - pos, "\"uniq_id\":\"%s_%s\",", uniq_prefix, metric);
     if (n < 0 || (size_t)n >= cap - pos) return false;
     pos += (size_t)n;
 
     /* stat_t */
-    n = snprintf(out + pos, cap - pos, "\"stat_t\":\"planthub/%s/plant/%u/state\",", hub, (unsigned)plant_id);
+    n = snprintf(out + pos, cap - pos, "\"stat_t\":\"%s\",", state_topic);
     if (n < 0 || (size_t)n >= cap - pos) return false;
     pos += (size_t)n;
 
@@ -196,10 +213,44 @@ bool mqtt_json_discovery(char *out, size_t cap, const char *hub, uint8_t plant_i
     pos += (size_t)n;
 
     /* dev object */
-    n = snprintf(out + pos, cap - pos, "\"dev\":{\"ids\":[\"planthub_plant_%u\"],\"name\":\"%s\",\"mf\":\"PlantHub\",\"via_device\":\"%s\"}}",
-                 (unsigned)plant_id, display_name, hub);
+    n = snprintf(out + pos, cap - pos, "\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s\",\"mf\":\"PlantHub\",\"via_device\":\"%s\"}}",
+                 uniq_prefix, display_name, hub);
     if (n < 0 || (size_t)n >= cap - pos) return false;
     pos += (size_t)n;
 
     return true;
+}
+
+bool mqtt_json_discovery(char *out, size_t cap, const char *hub, uint8_t plant_id,
+                          const char *plant_name, uint8_t cap_id)
+{
+    /* Fall back to "Plant <id>" when plant_name is empty -- build_discovery()
+     * escapes whichever raw name it's handed, so the fallback itself never
+     * needs escaping (it's built from a %u, not user input). */
+    char fallback[16];   /* "Plant " + up to 3 digits + NUL */
+    snprintf(fallback, sizeof fallback, "Plant %u", (unsigned)plant_id);
+    const char *raw_display_name = (plant_name && *plant_name) ? plant_name : fallback;
+
+    char uniq_prefix[24];   /* "planthub_plant_" + up to 3 digits + NUL */
+    snprintf(uniq_prefix, sizeof uniq_prefix, "planthub_plant_%u", (unsigned)plant_id);
+
+    char state_topic[64];
+    if (!mqtt_topic_state(state_topic, sizeof state_topic, hub, plant_id)) return false;
+
+    return build_discovery(out, cap, hub, uniq_prefix, state_topic, raw_display_name, cap_id);
+}
+
+bool mqtt_json_device_discovery(char *out, size_t cap, const char *hub, const char *dev_id_str,
+                                const char *display_name, uint8_t cap_id)
+{
+    const char *raw_display_name = (display_name && *display_name) ? display_name : dev_id_str;
+
+    char uniq_prefix[48];   /* "planthub_device_" + dev_id_str (<=23) + NUL */
+    int n = snprintf(uniq_prefix, sizeof uniq_prefix, "planthub_device_%s", dev_id_str);
+    if (n < 0 || (size_t)n >= sizeof uniq_prefix) return false;
+
+    char state_topic[96];
+    if (!mqtt_topic_device_state(state_topic, sizeof state_topic, hub, dev_id_str)) return false;
+
+    return build_discovery(out, cap, hub, uniq_prefix, state_topic, raw_display_name, cap_id);
 }

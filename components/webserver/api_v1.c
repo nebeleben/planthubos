@@ -50,6 +50,7 @@ static plants_table_t s_api_plant_snap;
  * started. */
 extern void mqtt_pub_plant_deleted(uint8_t plant_id);
 extern void mqtt_pub_cap_unbound(uint8_t plant_id, uint8_t cap_id);
+extern void mqtt_pub_device_cap_bound(const device_id_t *dev, uint8_t cap_id);
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -813,8 +814,11 @@ static esp_err_t plants_bind_post(httpd_req_t *req, uint8_t id)
 
     bool ok;
     bool unbind = false;
+    bool single_bind = false;
+    bool whole_device_bind = false;
     if (!cap_null && !dev_null) {
         ok = plants_bind_cap(id, cap_id, &dev);
+        single_bind = ok;
     } else if (!cap_null) {   /* dev_null: unbinding one capability */
         ok = plants_bind_cap(id, cap_id, NULL);
         unbind = true;
@@ -823,6 +827,7 @@ static esp_err_t plants_bind_post(httpd_req_t *req, uint8_t id)
          * this file's handlers, see its declaration comment (L5). */
         data_core_snapshot(&s_api_reg_snap);
         ok = plants_bind_device(id, &dev, &s_api_reg_snap) > 0;
+        whole_device_bind = ok;
     } else {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "cap and device both null");
         return ESP_OK;
@@ -832,12 +837,38 @@ static esp_err_t plants_bind_post(httpd_req_t *req, uint8_t id)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bind failed");
         return ESP_OK;
     }
-    /* Retained-topic cleanup (spec Sec.6, M2 Task 7): a true unbind (cap
-     * given, device null) drops that capability's HA discovery entity --
-     * see mqtt_pub_cap_unbound()'s doc comment. A plain rebind (cap AND
-     * device given) keeps the same entity, just pointed at a new device, so
-     * no cleanup is needed there. */
+    /* Retained-topic cleanup (spec Sec.6, M2 Task 7):
+     *   - a true unbind (cap given, device null) drops that capability's
+     *     plant-form HA discovery entity -- see mqtt_pub_cap_unbound()'s
+     *     doc comment. A plain rebind (cap AND device given, different
+     *     device) keeps the SAME plant-form entity, just pointed at a new
+     *     device, so no cleanup is needed there for the plant side.
+     *   - either bind shape (single-cap or whole-device) can newly cover a
+     *     capability that previously had no plant binding at all -- its
+     *     DEVICE-form entity (if the amended spec's dedup rule ever
+     *     published one) is now a duplicate and must be cleared
+     *     (mqtt_pub_device_cap_bound()). Fired unconditionally on every
+     *     successful bind (not just "first time bound"): plants_bind_cap()/
+     *     plants_bind_device() don't report whether a capability was
+     *     already covered before this call, and re-clearing an
+     *     already-cleared/never-sent device-form topic is a free no-op --
+     *     see cleanup_device_cap_discovery()'s own doc comment. Whole-device
+     *     bind covers every capability `dev` currently reports
+     *     (plants_bind_device()'s own contract) -- s_api_reg_snap (just
+     *     snapshotted above for that call) already has exactly that set,
+     *     via the same `caps[cap].valid` test plants_bind_device() itself
+     *     used. */
     if (unbind) mqtt_pub_cap_unbound(id, cap_id);
+    if (single_bind) mqtt_pub_device_cap_bound(&dev, cap_id);
+    if (whole_device_bind) {
+        int ridx = registry_find(&s_api_reg_snap, &dev);
+        if (ridx >= 0) {
+            const device_entry_t *de = &s_api_reg_snap.devices[ridx];
+            for (uint8_t c = 0; c < CAPABILITY_COUNT; c++) {
+                if (de->caps[c].valid) mqtt_pub_device_cap_bound(&dev, c);
+            }
+        }
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;

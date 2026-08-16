@@ -6,7 +6,7 @@
 
 int main(void)
 {
-    char t[128], j[640];
+    char t[128], j[1024];
 
     assert(mqtt_topic_state(t, sizeof t, "PlantHub-7814", 7));
     assert(strcmp(t, "planthub/PlantHub-7814/plant/7/state") == 0);
@@ -35,6 +35,20 @@ int main(void)
     mqtt_state_t none = { 0 };
     assert(mqtt_json_state(j, sizeof j, &none));
     assert(strcmp(j, "{}") == 0);
+
+    /* Device state: mqtt_json_state() is shape-agnostic (plant vs device is
+     * just which topic it's published to, mqtt_pub.c's job) -- this is the
+     * exact pairing mqtt_pub.c's publish_device_state() builds: device
+     * state topic + a state payload straight off a registry device's raw
+     * capability slots (bound to a plant or not, unlike the plant path
+     * which only ever includes currently-BOUND capabilities). */
+    assert(mqtt_topic_device_state(t, sizeof t, "PlantHub-7814", "ble:A4C138001122"));
+    assert(strcmp(t, "planthub/PlantHub-7814/device/ble:A4C138001122/state") == 0);
+    mqtt_state_t dev_st = { 0 };
+    dev_st.present[CAP_SOIL_MOISTURE] = true;   dev_st.value[CAP_SOIL_MOISTURE] = 42.0f;
+    dev_st.present[CAP_BATTERY_LEVEL] = true;   dev_st.value[CAP_BATTERY_LEVEL] = 64.0f;
+    assert(mqtt_json_state(j, sizeof j, &dev_st));
+    assert(strcmp(j, "{\"soil.moisture\":42,\"battery.level\":64}") == 0);
 
     /* discovery payload for soil.moisture: unit "%" and the V1 entity-id
      * pattern, metric segment derived from the capability name. */
@@ -79,6 +93,44 @@ int main(void)
     /* a name containing a backslash and a control char is escaped too. */
     assert(mqtt_json_discovery(j, sizeof j, "PlantHub-7814", 7, "a\\b\tc", CAP_AIR_TEMPERATURE));
     assert(strstr(j, "\"name\":\"a\\\\b\\u0009c air.temperature\"") != NULL);
+
+    /* Device-form discovery (spec Sec.6, amended): same shape as the plant
+     * form, but identified by the device id string, state topic pointed at
+     * the device state topic, and display_name falling back to the id
+     * string itself (a device has no numeric "Plant <id>" equivalent).
+     * mqtt_json_device_discovery() only ever builds a payload for whatever
+     * (device, cap) pair it's given -- the DEDUP decision (skip publishing
+     * this at all when the capability is already exposed through a plant
+     * binding, per the amended spec) is made by the caller, mqtt_pub.c's
+     * publish_device_discovery(), which consults the live plants table;
+     * that decision isn't reachable from this host-only layer, so it's not
+     * asserted here -- only the payload shape this function produces once
+     * the caller has already decided to call it (the "unbound" case). */
+    assert(mqtt_topic_device_discovery(t, sizeof t, "ble:A4C138001122", CAP_SOIL_MOISTURE));
+    assert(strcmp(t, "homeassistant/sensor/planthub_device_ble:A4C138001122_soil_moisture/config") == 0);
+    assert(!mqtt_topic_device_discovery(t, sizeof t, "ble:A4C138001122", CAPABILITY_COUNT));
+
+    assert(mqtt_json_device_discovery(j, sizeof j, "PlantHub-7814", "ble:A4C138001122", "", CAP_SOIL_MOISTURE));
+    assert(strstr(j, "\"uniq_id\":\"planthub_device_ble:A4C138001122_soil_moisture\"") != NULL);
+    assert(strstr(j, "\"stat_t\":\"planthub/PlantHub-7814/device/ble:A4C138001122/state\"") != NULL);
+    assert(strstr(j, "\"avty_t\":\"planthub/PlantHub-7814/status\"") != NULL);
+    assert(strstr(j, "\"val_tpl\":\"{{ value_json['soil.moisture'] }}\"") != NULL);
+    assert(strstr(j, "\"dev_cla\":\"moisture\"") != NULL);
+    assert(strstr(j, "\"unit_of_meas\":\"%\"") != NULL);
+    /* empty display_name falls back to the id string itself, both in
+     * "name" (paired with the capability name) and in dev.name/dev.ids. */
+    assert(strstr(j, "\"name\":\"ble:A4C138001122 soil.moisture\"") != NULL);
+    assert(strstr(j, "\"dev\":{\"ids\":[\"planthub_device_ble:A4C138001122\"],"
+                     "\"name\":\"ble:A4C138001122\",") != NULL);
+
+    /* a real display name (app_config's optional per-mac sensor name)
+     * overrides the id-string fallback. */
+    assert(mqtt_json_device_discovery(j, sizeof j, "PlantHub-7814", "ble:A4C138001122",
+                                       "Windowsill Probe", CAP_AIR_TEMPERATURE));
+    assert(strstr(j, "\"name\":\"Windowsill Probe air.temperature\"") != NULL);
+    assert(strstr(j, "\"unit_of_meas\":\"\\u00b0C\"") != NULL);   /* HA unit translation applies here too */
+
+    assert(!mqtt_json_device_discovery(j, sizeof j, "h", "ble:AA", "", CAPABILITY_COUNT));
 
     /* retained-topic cleanup (spec Sec.6): the payload is always empty --
      * the RETAINED flag itself is set by every mqtt_pub.c cleanup call

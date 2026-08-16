@@ -25,6 +25,10 @@ bool mqtt_topic_discovery(char *out, size_t cap, uint8_t plant_id, uint8_t cap_i
  *      <metric> is the capability's name (capability_get()->name) with
  *      every '.' turned into '_' (e.g. "soil.moisture" -> "soil_moisture").
  *      Returns false for an unknown cap_id too. */
+bool mqtt_topic_device_discovery(char *out, size_t cap, const char *dev_id_str, uint8_t cap_id);
+/*   -> "homeassistant/sensor/planthub_device_<id-string>_<metric>/config"
+ *      (spec Sec.6, amended -- see mqtt_json_device_discovery() below).
+ *      Returns false for an unknown cap_id too. */
 
 /* The retained-cleanup payload (spec Sec.6: "publishes an empty retained
  * payload" on plant delete / capability unbind / device removal): always
@@ -72,3 +76,26 @@ bool mqtt_json_state(char *out, size_t cap, const mqtt_state_t *st);
  * Returns false for an unknown cap_id or if it would not fit. */
 bool mqtt_json_discovery(char *out, size_t cap, const char *hub, uint8_t plant_id,
                           const char *plant_name, uint8_t cap_id);
+
+/* Device-form discovery config for dev_id_str's cap_id -- spec Sec.6,
+ * amended during M2 implementation (see the spec's own note): a device
+ * capability gets a discovery entity ONLY when that (device id, cap id)
+ * pair is not already exposed through a plant binding -- the literal
+ * original wording ("one entity per bound plant-capability and per device
+ * capability") would have surfaced a bound probe twice in HA, once as its
+ * plant and once as itself. mqtt_pub.c owns the dedup DECISION (it has to
+ * consult the plants table); this function just builds the payload once
+ * the caller has already decided to. Same shape as mqtt_json_discovery()
+ * above (device_class/unit_of_measurement/suggested_display_precision from
+ * the table, bracket-syntax value_template, HA unit translation) except:
+ *   - uniq_id/dev.ids: planthub_device_<id-string>_<metric> /
+ *     planthub_device_<id-string> (no numeric id to fall back to)
+ *   - stat_t: the device state topic (mqtt_topic_device_state()'s shape)
+ *   - display_name "" falls back to dev_id_str itself, not "Plant <id>"
+ * When a probe's capability later gets bound to a plant, ITS device-form
+ * entity becomes stale and must be cleared via the retained-cleanup path
+ * (mqtt_pub.c's mqtt_pub_device_cap_bound()) -- this function has no part
+ * in that; it only ever builds a fresh, currently-valid config.
+ * Returns false for an unknown cap_id or if it would not fit. */
+bool mqtt_json_device_discovery(char *out, size_t cap, const char *hub, const char *dev_id_str,
+                                const char *display_name, uint8_t cap_id);
