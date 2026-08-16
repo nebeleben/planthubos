@@ -98,3 +98,7 @@ $CC -Wall -Wextra -Werror -I../../components/app_config/include -I../../componen
     -I../../components/capability/include \
     test_data_fmt.c ../../components/app_config/data_fmt.c -o test_data_fmt
 ./test_data_fmt
+
+$CC -Wall -Wextra -Werror -I../../components/ble_collector/include \
+    test_adv_queue.c ../../components/ble_collector/adv_queue.c -o test_adv_queue
+./test_adv_queue

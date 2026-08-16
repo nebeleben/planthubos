@@ -11,6 +11,7 @@
 #include "ota_post.h"
 #include "swarm.h"
 #include "swarm_store.h"
+#include "ble_collector.h"
 #include "node_ota.h"
 #include "pairing.h"
 #include "integr_config.h"
@@ -185,6 +186,9 @@ static esp_err_t status_get(httpd_req_t *req)
     }
     cJSON_AddBoolToObject(root, "fs_warn", fs_warn);
     cJSON_AddNumberToObject(root, "heap_free", esp_get_free_heap_size());
+    /* M3 §1: raw-advert queue drop counter, so a saturated queue shows up
+     * here instead of silently losing advertisements. */
+    cJSON_AddNumberToObject(root, "adv_dropped", ble_collector_adv_dropped());
     const esp_partition_t *running = esp_ota_get_running_partition();
     if (running) cJSON_AddStringToObject(root, "partition", running->label);
     return send_json(req, root);
