@@ -11,12 +11,15 @@ import { RulesTab } from './tabs/rules.jsx'
 import { getStoredTheme, setStoredTheme, systemPrefersDark } from './lib/theme.js'
 
 // Post-M8 split: Dashboard is the live plant cards (DashboardTab),
-// Plants is plant management -- create/rename/delete plus per-plant probe
-// assignment (plants.jsx), and Probes is just the probe pool
-// (devices.jsx, which keeps its own sensor-side assign control). Rules
-// (M1 VM) sits after History, ahead of Nodes -- both mirror the same
-// "operate the fleet" grouping the tab order already implies.
-const ALL_TABS = ['Dashboard', 'Plants', 'Probes', 'History', 'Rules', 'Nodes', 'Config', 'Network']
+// Plants is plant management -- create/rename/delete plus per-plant,
+// per-capability binding (plants.jsx), and Devices is the device pool
+// across every radio (devices.jsx, M2 Task 8: renamed from "Probes" now
+// that it lists every device kind's live capabilities, not just MiFlora
+// probes -- binding itself moved onto the Plants tab with the M2
+// capability model, so this tab is read-only plus rename). Rules (M1 VM)
+// sits after History, ahead of Nodes -- both mirror the same "operate the
+// fleet" grouping the tab order already implies.
+const ALL_TABS = ['Dashboard', 'Plants', 'Devices', 'History', 'Rules', 'Nodes', 'Config', 'Network']
 
 // localStorage key the Rules tab's own event feed (rules.jsx) writes on
 // every fetch while mounted -- reading it here is how the tab bar knows
@@ -123,7 +126,7 @@ export function App() {
         // An unpaired node reaching the webui at all means it's sitting in
         // its portal after a failed pairing attempt (a paired node runs no
         // web server, and a searching one hasn't set up webserver either)
-        // -- Plants/Probes/History are all empty and pointless there,
+        // -- Plants/Devices/History are all empty and pointless there,
         // so land the user straight on the Config tab, where the retry /
         // switch-back-to-main controls live.
         if (r === 'node' && !st.paired) setTab('Config')
@@ -184,7 +187,7 @@ export function App() {
       <main>
         {tab === 'Dashboard' ? <DashboardTab /> :
          tab === 'Plants' ? <PlantsTab /> :
-         tab === 'Probes' ? <DevicesTab /> :
+         tab === 'Devices' ? <DevicesTab /> :
          tab === 'History' ? <HistoryTab /> :
          tab === 'Rules' ? <RulesTab /> :
          tab === 'Nodes' ? <NodesTab /> :

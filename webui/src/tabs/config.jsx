@@ -287,11 +287,32 @@ export function ConfigTab() {
             <tr><td>Firmware</td><td>{st.version}</td></tr>
             <tr><td>Uptime</td><td>{fmtUptime(st.uptime_s)}</td></tr>
             <tr><td>Clock</td><td>{st.time_synced ? 'synced' : 'not synced'}</td></tr>
-            <tr><td>Storage</td><td>{fmtBytes(st.fs_used)} / {fmtBytes(st.fs_total)}</td></tr>
+            <tr>
+              <td>Storage</td>
+              <td>
+                {fmtBytes(st.fs_used)} / {fmtBytes(st.fs_total)}
+                {st.fs_total > 0 && ` (${Math.round((st.fs_used / st.fs_total) * 100)}%)`}
+              </td>
+            </tr>
             <tr><td>Free heap</td><td>{fmtBytes(st.heap_free)}</td></tr>
             <tr><td>Claim state</td><td>{st.claimed ? 'claimed' : 'unclaimed'}</td></tr>
           </tbody>
         </table>
+        {st.fs_warn && (
+          // Storage-pressure ruling (task-6 finding, surfaced by Task 8):
+          // neither chip's history partition can hold full retention for
+          // all 16 plants, and a full-storage append fails silently
+          // (storage_append(), oldest-first ring eviction). st.fs_warn
+          // (api_v1.c's status_get) latches at 85% used -- calm and
+          // factual, not an alarm: nothing is broken, the ring buffer is
+          // doing exactly what it's designed to do.
+          <p class="infobox">
+            Storage is over 85% full. History is a ring buffer, so this is expected under
+            heavy use (many plants logging at once) — oldest samples are dropped first as
+            new ones arrive, nothing is lost that isn't meant to be. No action needed unless
+            you want more retention headroom.
+          </p>
+        )}
         <p>
           <label>
             Name

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
+import { loadCaps, capLabel, fmtCap } from '../lib/caps.js'
 
 function fmtAge(ageS) {
   if (ageS == null) return 'never'
@@ -8,121 +9,103 @@ function fmtAge(ageS) {
   return `${Math.round(ageS / 3600)}h ago`
 }
 
+const KIND_LABEL = { ble: 'Bluetooth', espnow: 'ESP-NOW', zb: 'Zigbee' }
+// Fixed display order regardless of which kinds are actually present --
+// stable groupings read better than "whatever order the registry happened
+// to return them in".
+const KIND_ORDER = ['ble', 'espnow', 'zb']
+
 function plantLabel(p) {
   return p.name || `Plant ${p.id}`
 }
 
-// One <select> per probe doubles as both the "currently assigned plant"
-// display (its selected value IS the current assignment -- an unassigned
-// probe shows the "— unassign —" placeholder selected) and the
-// reassignment control, the same "current state IS the control, no
-// separate Save step" pattern nodes.jsx's PowerModeControl already uses.
-function AssignControl({ s, plants, onAssigned }) {
-  const [state, setState] = useState('idle') // idle | saving | error | unauth
-
-  async function onChange(e) {
-    const val = e.currentTarget.value
-    setState('saving')
-    try {
-      let res
-      if (val === '') {
-        // Unassign: POST {"mac":null} to the plant that CURRENTLY owns
-        // this probe -- plants_table_assign()'s unassign semantics only
-        // apply through the owning plant's own /probe route, there's no
-        // "detach this mac from whatever it's on" call. Nothing to do if
-        // it's already unassigned (shouldn't normally fire -- the select
-        // would already show this option selected -- but guard anyway).
-        if (s.plant_id == null) { setState('idle'); return }
-        res = await fetch(`/api/v1/plants/${s.plant_id}/probe`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...authHeaders() },
-          body: JSON.stringify({ mac: null }),
-        })
-      } else {
-        // Assign or move: the TARGET plant's /probe route takes this
-        // probe's mac. If it was assigned elsewhere, the hub moves it
-        // there (plants_table_assign(), api_v1.c's plants_probe_post) --
-        // no separate unassign call against the old plant is needed.
-        res = await fetch(`/api/v1/plants/${val}/probe`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...authHeaders() },
-          body: JSON.stringify({ mac: s.mac }),
-        })
-      }
-      if (res.ok) { setState('idle'); onAssigned() }
-      else setState(res.status === 401 ? 'unauth' : 'error')
-    } catch {
-      setState('error')
-    }
-  }
-
-  return (
-    <span class="assign-control">
-      <select value={s.plant_id != null ? String(s.plant_id) : ''} disabled={state === 'saving'} onChange={onChange}>
-        <option value="">— unassign —</option>
-        {plants.map((p) => <option key={p.id} value={p.id}>{plantLabel(p)}</option>)}
-      </select>
-      {state === 'error' && <span class="error">failed</span>}
-      {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
-    </span>
-  )
+// GET /api/v1/devices' `id` is the canonical device-id string (spec §2,
+// e.g. "ble:A4C138xxxxxx") -- the rename route below is still mac-keyed
+// (POST /api/v1/sensors/{MAC12}, api_v1.c's sensors_rename_post) and only
+// ever resolves a name for BLE-kind devices (devices_json.c's device_json:
+// app_config_get_sensor_name() is only consulted when e->id.kind ==
+// DEV_KIND_BLE). Strips the "ble:" prefix to recover the bare 12 hex chars
+// that route expects.
+function mac12FromBleId(id) {
+  const i = id.indexOf(':')
+  return i < 0 ? id : id.slice(i + 1)
 }
 
-// Same collapsible-card shape as nodes.jsx's NodeCard: name/mac + last
-// seen while collapsed, details and controls in the body. The body stays
-// mounted (visibility toggled by the shared .node-card.open CSS), matching
-// the nodes tab's behavior.
-function ProbeCard({ s, plants, open, onToggle, onAssigned, onRenamed }) {
-  const [name, setName] = useState(s.name || '')
+// Same collapsible-card shape as nodes.jsx's NodeCard / rules.jsx's
+// RuleCard: name/id + last-seen while collapsed, details in the body.
+function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed }) {
+  const isBle = d.kind === 'ble'
+  const [name, setName] = useState(d.name || '')
   const [state, setState] = useState('idle') // idle | saving | saved | error | unauth
 
   async function save(e) {
     e.preventDefault()
     setState('saving')
     try {
-      const res = await fetch(`/api/v1/sensors/${s.mac.replaceAll(':', '')}`, {
+      const res = await fetch(`/api/v1/sensors/${mac12FromBleId(d.id)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ name }),
       })
-      if (res.ok) { setState('saved'); onRenamed(s.mac, name) }
+      if (res.ok) { setState('saved'); onRenamed(d.id, name) }
       else setState(res.status === 401 ? 'unauth' : 'error')
     } catch {
       setState('error')
     }
   }
 
+  const plantNames = d.plant_ids.map((id) => plantNameById.get(id) || `Plant ${id}`)
+
   return (
     <div class={`node-card${open ? ' open' : ''}`}>
       <button type="button" class="node-card-header" onClick={onToggle} aria-expanded={open}>
         <span class="node-card-chevron" aria-hidden="true">▸</span>
         <span class="node-card-title">
-          <span class="node-card-name">{s.name || s.mac}</span>
-          {s.name && <span class="node-card-mac mono">{s.mac}</span>}
+          <span class="node-card-name">{d.name || d.id}</span>
+          {d.name && <span class="node-card-mac mono">{d.id}</span>}
         </span>
-        <span class="node-card-age hint">{fmtAge(s.last_seen_s)}</span>
+        <span class="node-card-age hint">{fmtAge(d.last_seen_s)}</span>
       </button>
       <div class="node-card-body">
-        <form onSubmit={save} class="namef">
-          <input value={name} maxlength={32} placeholder={s.mac}
-                 onInput={(e) => { setName(e.currentTarget.value); setState('idle') }} />
-          <button type="submit" class="btn-primary" disabled={state === 'saving'}>
-            {state === 'saving' ? '…' : state === 'saved' ? '✓' : 'Save'}
-          </button>
-          {state === 'error' && <span class="error">failed</span>}
-          {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
-        </form>
+        {/* Only a BLE device's addr is mac-keyed, which is the only key the
+            rename store understands (see mac12FromBleId's doc comment) --
+            ESP-NOW/Zigbee devices have no display-name form yet. */}
+        {isBle && (
+          <form onSubmit={save} class="namef">
+            <input value={name} maxlength={32} placeholder={d.id}
+                   onInput={(e) => { setName(e.currentTarget.value); setState('idle') }} />
+            <button type="submit" class="btn-primary" disabled={state === 'saving'}>
+              {state === 'saving' ? '…' : state === 'saved' ? '✓' : 'Save'}
+            </button>
+            {state === 'error' && <span class="error">failed</span>}
+            {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
+          </form>
+        )}
         <div class="node-card-row">
-          <span class="hint">{s.battery != null ? `battery ${s.battery}%` : 'battery –'}</span>
-          <span class="hint">{s.rssi != null ? `${s.rssi} dBm` : '–'}</span>
-          {/* Direct BLE reception (the hub hearing it on its own radio) is
-              the strictly-better case and renders nothing; a non-null via
-              means a node currently relays this probe and names which. */}
-          {s.via && <span class="hint">via {s.via.name || s.via.mac} · {s.via.rssi} dBm</span>}
+          <span class="hint">{d.via ? `via ${d.via}` : 'direct'} · {d.rssi} dBm</span>
         </div>
+        {d.caps.length === 0 ? (
+          <p class="hint">No live capabilities yet.</p>
+        ) : (
+          <div class="table-scroll">
+            <table class="devices">
+              <thead><tr><th>Capability</th><th>Value</th><th>Age</th></tr></thead>
+              <tbody>
+                {d.caps.map((c) => (
+                  <tr key={c.id}>
+                    <td>{capLabel(caps, c.id)}</td>
+                    <td>{fmtCap(caps, c.id, c.value)}</td>
+                    <td class="hint">{fmtAge(c.age_s)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
         <div class="node-card-row">
-          <span class="hint">Assigned to</span>
-          <AssignControl s={s} plants={plants} onAssigned={onAssigned} />
+          <span class="hint">
+            {plantNames.length > 0 ? `Bound to ${plantNames.join(', ')}` : 'Not bound to any plant'}
+          </span>
         </div>
       </div>
     </div>
@@ -130,17 +113,22 @@ function ProbeCard({ s, plants, open, onToggle, onAssigned, onRenamed }) {
 }
 
 export function DevicesTab() {
-  const [sensors, setSensors] = useState(null)
+  const [caps, setCaps] = useState(null)
+  const [devices, setDevices] = useState(null)
   const [plants, setPlants] = useState(null)
   const [error, setError] = useState(false)
   const [openMap, setOpenMap] = useState({})
 
   function refresh(signal) {
     return Promise.all([
-      fetch('/api/v1/sensors', { signal }).then((r) => r.json()).then((d) => setSensors(d.sensors)),
+      fetch('/api/v1/devices', { signal }).then((r) => r.json()).then((d) => setDevices(d.devices)),
       fetch('/api/v1/plants', { signal }).then((r) => r.json()).then((d) => setPlants(d.plants)),
     ])
   }
+
+  useEffect(() => {
+    loadCaps().then(setCaps).catch(() => {})
+  }, [])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -148,40 +136,51 @@ export function DevicesTab() {
     return () => controller.abort()
   }, [])
 
-  function toggleProbe(mac) {
-    setOpenMap((prev) => ({ ...prev, [mac]: !prev[mac] }))
+  // Background keep-fresh poll -- same 10s cadence/discipline as
+  // rules.jsx's own rule-list poll: live values and ages change purely from
+  // radio activity the operator didn't initiate here.
+  useEffect(() => {
+    const controller = new AbortController()
+    const id = setInterval(() => refresh(controller.signal).catch(() => {}), 10000)
+    return () => { clearInterval(id); controller.abort() }
+  }, [])
+
+  function toggleDevice(id) {
+    setOpenMap((prev) => ({ ...prev, [id]: !prev[id] }))
   }
 
-  // Reassigning can touch TWO plants at once (the target gains a probe,
-  // whichever plant previously held that mac loses it) plus the probe
-  // pool's own plant_id/via -- a full refetch of both lists is simpler and
-  // more obviously correct than threading the old owner through every call
-  // site to patch state locally. (Plant create/rename/delete live on the
-  // Plants tab -- plants are fetched here only to feed the assign select.)
-  function onAssigned() {
-    return refresh()
-  }
-
-  function onRenamed(mac, name) {
-    setSensors((prev) => prev.map((s) => (s.mac === mac ? { ...s, name } : s)))
+  function onRenamed(id, name) {
+    setDevices((prev) => prev.map((d) => (d.id === id ? { ...d, name } : d)))
   }
 
   if (error) return <p class="error">Hub not reachable.</p>
-  if (!sensors || !plants) return <p class="placeholder">Loading…</p>
+  if (!devices || !plants || !caps) return <p class="placeholder">Loading…</p>
+
+  const plantNameById = new Map(plants.map((p) => [p.id, plantLabel(p)]))
+  const byKind = new Map()
+  for (const d of devices) {
+    if (!byKind.has(d.kind)) byKind.set(d.kind, [])
+    byKind.get(d.kind).push(d)
+  }
 
   return (
     <div>
       <div class="panel">
-        <h2>Probes</h2>
-        {sensors.length === 0 ? (
-          <p class="placeholder">No sensors discovered yet. MiFlora devices are discovered automatically — bring one in range.</p>
+        <h2>Devices</h2>
+        {devices.length === 0 ? (
+          <p class="placeholder">No devices discovered yet. MiFlora devices are discovered automatically — bring one in range.</p>
         ) : (
-          <div class="node-cards">
-            {sensors.map((s) => (
-              <ProbeCard key={s.mac} s={s} plants={plants} open={!!openMap[s.mac]}
-                         onToggle={() => toggleProbe(s.mac)} onAssigned={onAssigned} onRenamed={onRenamed} />
-            ))}
-          </div>
+          KIND_ORDER.filter((k) => byKind.has(k)).map((k) => (
+            <div key={k}>
+              <h3>{KIND_LABEL[k] || k}</h3>
+              <div class="node-cards">
+                {byKind.get(k).map((d) => (
+                  <DeviceCard key={d.id} d={d} caps={caps} plantNameById={plantNameById}
+                              open={!!openMap[d.id]} onToggle={() => toggleDevice(d.id)} onRenamed={onRenamed} />
+                ))}
+              </div>
+            </div>
+          ))
         )}
       </div>
     </div>
