@@ -74,6 +74,29 @@ int main(void)
     assert(wrapper_index_add(&full, WMATCH_SERVICE, 0x9999, 200) == 0);
     assert(wrapper_index_lookup(&full, 0x9999, 0xFFFFFFFF, MAC_C) == 200);
 
+    /* M3 review fix 3: WMATCH_MAC_PREFIX's key is display/human order
+     * (wrapper_index.h's top comment), pinned here against a realistic MAC
+     * so a future accidental reversal (e.g. a caller passing raw GAP order
+     * again) is caught by this suite instead of only failing silently on
+     * hardware. For display MAC D0:CF:13:E5:BC:CA, a wrapper registered as
+     * `match mac_prefix 0xD0CF13` (the prefix a human reads/types, and what
+     * GET /api/v1/unknown's `id` and wrapper_store.c's header parser both
+     * use) must match a lookup() call passed that MAC in the SAME
+     * mac[0]=0xD0 order -- and the reversed-order key (0xCABCE5, what a
+     * caller mistakenly passing raw GAP order would produce) must NOT. */
+    {
+        static const uint8_t MAC_DISPLAY[6] = {0xD0, 0xCF, 0x13, 0xE5, 0xBC, 0xCA};
+        wrapper_index_t ixp;
+        wrapper_index_init(&ixp);
+        assert(wrapper_index_add(&ixp, WMATCH_MAC_PREFIX, 0xD0CF13, 40) == 0);
+        assert(wrapper_index_lookup(&ixp, 0xFFFFFFFF, 0xFFFFFFFF, MAC_DISPLAY) == 40);
+
+        wrapper_index_t ixp_reversed;
+        wrapper_index_init(&ixp_reversed);
+        assert(wrapper_index_add(&ixp_reversed, WMATCH_MAC_PREFIX, 0xCABCE5, 41) == 0);
+        assert(wrapper_index_lookup(&ixp_reversed, 0xFFFFFFFF, 0xFFFFFFFF, MAC_DISPLAY) == -1);
+    }
+
     /* wrapper_index_kind_of() -- M3 Task 5 addition */
     assert(wrapper_index_kind_of(&ix, 10) == WMATCH_SERVICE);
     assert(wrapper_index_kind_of(&ix, 12) == WMATCH_MAC_PREFIX);

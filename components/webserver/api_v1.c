@@ -2660,14 +2660,16 @@ static bool wrapper_ad_find_u16(const uint8_t *adv, uint8_t len, uint8_t ad_type
  * captured payload POST /wrappers/{id}/test previews when the caller
  * supplies no `hex` of their own (spec §6: "runs against the supplied hex
  * or the device's newest captured sample"). WMATCH_MAC_PREFIX compares
- * against `d->mac`'s first 3 bytes UNREVERSED (raw GAP/wire order) --
- * NOT display order -- because that is what ble_collector.c's
- * decode_adv_item() actually passes to wrapper_index_lookup() at runtime
- * (`item->mac`, never the `mac_disp` it computes alongside it for device
- * identity); matching that exact convention here is what makes this
- * preview agree with what the decoder task would really do, not a
- * plausible-looking but wrong guess. unknown_capture.h's own top comment
- * confirms `d->mac` is stored in that same raw order. */
+ * against `d->mac` reversed into DISPLAY/human order first (M3 review fix
+ * 3): wrapper_index.h's `key` is packed from the human-typed/API-displayed
+ * prefix (`match mac_prefix 0xD0CF13`, parsed verbatim by wrapper_store.c,
+ * and the same order GET /api/v1/unknown's own `id` uses -- see that
+ * handler's own comment), and ble_collector.c's decode_adv_item() now
+ * passes wrapper_index_lookup() mac_disp (display order), not raw
+ * item->mac, for exactly this reason -- so this preview must reverse too,
+ * or it would silently disagree with what the decoder task actually does.
+ * unknown_capture.h's own top comment confirms `d->mac` is stored in raw
+ * GAP order, same as adv_item_t.mac, so the reversal below is required. */
 static bool wrapper_sample_matches(const unknown_dev_t *d, const unknown_sample_t *s,
                                    uint8_t match_kind, uint32_t match_key)
 {
@@ -2683,7 +2685,7 @@ static bool wrapper_sample_matches(const unknown_dev_t *d, const unknown_sample_
                mid == match_key;
     }
     case WMATCH_MAC_PREFIX: {
-        uint32_t mac_key = ((uint32_t)d->mac[0] << 16) | ((uint32_t)d->mac[1] << 8) | (uint32_t)d->mac[2];
+        uint32_t mac_key = ((uint32_t)d->mac[5] << 16) | ((uint32_t)d->mac[4] << 8) | (uint32_t)d->mac[3];
         return mac_key == match_key;
     }
     default:

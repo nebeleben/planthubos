@@ -269,14 +269,22 @@ static void decode_adv_item(const adv_item_t *item)
      * display/human byte order -- device_id_from_mac()'s and
      * wrapper_exec_run()'s own contract, same reversal
      * decode_bthome_item() does independently for its own MAC use (see its
-     * comment for why raw GAP order must never be used directly here). */
+     * comment for why raw GAP order must never be used directly here).
+     *
+     * M3 review fix 3: wrapper_index_lookup()'s `mac` parameter is ALSO
+     * display order (wrapper_index.h's top comment) -- a WMATCH_MAC_PREFIX
+     * entry's key is packed from the human-typed/API-displayed prefix (e.g.
+     * `match mac_prefix 0xD0CF13`, parsed verbatim by wrapper_store.c), not
+     * the raw GAP order this file otherwise works in. Passing mac_disp here
+     * (not item->mac) is what makes a mac_prefix wrapper actually fire on
+     * the prefix its author typed. */
     uint8_t mac_disp[6];
     for (int i = 0; i < 6; i++) mac_disp[i] = item->mac[5 - i];
     device_id_t wid = device_id_from_mac(DEV_KIND_BLE, mac_disp);
     int ridx = data_core_find_index(&wid);
     int wrapper_id = (ridx >= 0 && s_wrapper_memo[ridx] != WRAPPER_MEMO_NONE)
                           ? s_wrapper_memo[ridx]
-                          : wrapper_index_lookup(&s_wrapper_index, svc_uuid, manu_id, item->mac);
+                          : wrapper_index_lookup(&s_wrapper_index, svc_uuid, manu_id, mac_disp);
     if (wrapper_id >= 0) {
         /* M3 Task 6 (spec §5): this advert now resolves to a wrapper --
          * either it always did, or a wrapper install/reindex just made it

@@ -12,9 +12,24 @@
  *                          into `key`'s low 16 bits.
  *   - WMATCH_MANUFACTURER: the advert's 16-bit manufacturer-data company id,
  *                          same widening.
- *   - WMATCH_MAC_PREFIX:   the device's first 3 MAC bytes, packed
- *                          big-endian into `key`'s low 24 bits
- *                          (mac[0]<<16 | mac[1]<<8 | mac[2]).
+ *   - WMATCH_MAC_PREFIX:   the device's first 3 MAC bytes IN DISPLAY/HUMAN
+ *                          ORDER -- the same order printed on the device,
+ *                          shown in the Devices tab, and used by every other
+ *                          MAC-bearing surface in this codebase
+ *                          (device_id_from_mac(), GET /api/v1/unknown's
+ *                          `id`, etc.) -- packed big-endian into `key`'s low
+ *                          24 bits (mac[0]<<16 | mac[1]<<8 | mac[2], where
+ *                          mac[0] is the FIRST byte a human reads/types, e.g.
+ *                          0xD0 of D0:CF:13:E5:BC:CA). This is the OPPOSITE
+ *                          of the raw GAP/on-air order ble_addr_t.val[]
+ *                          uses, where val[0] is the LAST printed byte
+ *                          (M3 review fix 3) -- wrapper_index_lookup()'s
+ *                          `mac` parameter below must always be passed in
+ *                          this display order, never raw GAP order; callers
+ *                          that only have GAP order (ble_collector.c's
+ *                          adv_item_t.mac) must reverse it first, exactly as
+ *                          they already do to get mac_disp for
+ *                          device_id_from_mac().
  * wrapper_index_lookup()'s svc_uuid/manu_id callers pass 0xFFFFFFFF for
  * "this advert had none" -- see its own comment -- so a real key (always
  * <= 0xFFFFFF) can never collide with the sentinel. */
@@ -37,7 +52,9 @@ void wrapper_index_init(wrapper_index_t *ix);
 int  wrapper_index_add(wrapper_index_t *ix, uint8_t kind, uint32_t key, uint16_t id);
 bool wrapper_index_remove(wrapper_index_t *ix, uint16_t id);
 /* Returns the wrapper id, or -1. Caller supplies whatever the advert yielded:
- * svc_uuid/manu_id are 0xFFFFFFFF when absent. */
+ * svc_uuid/manu_id are 0xFFFFFFFF when absent. `mac` MUST be in display/
+ * human order (see this header's top comment on WMATCH_MAC_PREFIX) -- NOT
+ * the raw GAP order adv_item_t.mac/ble_addr_t.val[] use. */
 int  wrapper_index_lookup(const wrapper_index_t *ix, uint32_t svc_uuid,
                           uint32_t manu_id, const uint8_t mac[6]);
 

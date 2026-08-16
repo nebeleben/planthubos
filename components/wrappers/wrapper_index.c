@@ -60,7 +60,10 @@ bool wrapper_index_remove(wrapper_index_t *ix, uint16_t id)
 /* Packs a MAC's first 3 bytes big-endian into the low 24 bits of a u32 --
  * see wrapper_index.h's top comment for why this encoding was chosen (it
  * only has to be internally consistent between this and wrapper_index_add()
- * callers using WMATCH_MAC_PREFIX, which wrapper_store.c does). */
+ * callers using WMATCH_MAC_PREFIX, which wrapper_store.c does). `mac` MUST
+ * already be in display/human order by the time it reaches here (M3 review
+ * fix 3) -- this function itself does no reversal, so a caller handing it
+ * raw GAP order silently packs the wrong 3 bytes. */
 static uint32_t mac_prefix_key(const uint8_t mac[6])
 {
     return ((uint32_t)mac[0] << 16) | ((uint32_t)mac[1] << 8) | (uint32_t)mac[2];
