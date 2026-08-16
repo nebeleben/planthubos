@@ -129,26 +129,19 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
      * the only sound interpretation of a bare 6-byte mac payload. */
     const uint8_t *mac = data;
     /* static: this handler only ever runs on the single default event-loop
-     * task, which has just a 2304 B stack -- keep both the registry
-     * snapshot and the message buffer off it (same reasoning api_v1.c's
-     * s_api_reg_snap doc comment gives; only one instance of this handler
-     * ever runs at a time, so sharing is safe). registry_t is bigger than
-     * V1's legacy_registry_t shim it replaces (~2 KB vs ~0.9 KB) -- see
-     * task-6-report.md for the byte accounting. */
+     * task, which has just a 2304 B stack -- keep the registry snapshot
+     * off it (same reasoning api_v1.c's s_api_reg_snap doc comment gives;
+     * only one instance of this handler ever runs at a time, so sharing is
+     * safe). registry_t is bigger than V1's legacy_registry_t shim it
+     * replaces (~2 KB vs ~0.9 KB) -- see task-6-report.md for the byte
+     * accounting. The message buffer below is heap, not static -- see its
+     * own comment. */
     static registry_t snap;
-    /* device_json()'s device-shaped payload (Task 6, spec Sec.6/Sec.7) is
-     * bigger than V1's sensor_json() shape it replaces: a live BLE MiFlora
-     * can carry up to 6 valid capability slots (moisture/temp/lux/
-     * conductivity/battery + signal.rssi, data_core.c's
-     * data_core_submit_mibeacon() doc comment), each its own JSON object
-     * with a capability name/unit string -- worst case (longest names,
-     * 24-char via node name, 32-char sensor name) is comfortably under
-     * 900 B; 1024 keeps real margin above that without costing anything
-     * meaningful in static RAM. plant_ids is passed NULL (empty array) --
-     * this task is not worth a plants_table_t snapshot on this task's tiny
-     * stack, and the SSE push is a "something changed" nudge, not the
-     * plant-binding source of truth (GET /api/v1/plants is). */
-    static char buf[1024];
+    /* plant_ids is passed NULL (empty array) -- this handler is not worth
+     * a plants_table_t snapshot on this task's tiny stack, and the SSE
+     * push is a "something changed" nudge, not the plant-binding source of
+     * truth (GET /api/v1/plants is; see task-6-report.md's contract
+     * notes). */
     data_core_snapshot(&snap);
     device_id_t devid = device_id_from_mac(DEV_KIND_BLE, mac);
     int idx = registry_find(&snap, &devid);
@@ -158,9 +151,27 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
     char *json = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     if (!json) return;
-    int n = snprintf(buf, sizeof(buf), "data: %s\n\n", json);
+    /* Right-sized heap buffer, same pattern as sse_push_event() above --
+     * device_json()'s payload was already being heap-allocated twice
+     * (cJSON's print buffer, then a strdup() of a static scratch copy);
+     * one malloc() sized off the json string itself removes both the
+     * double-allocation and the 1024 B static buffer that only ever held
+     * an intermediate copy. "data: " (6) + json + "\n\n" (2) + NUL (1) = 9;
+     * +16 keeps a little slack without the wasted-until-huge sizing a
+     * fixed static needed. */
+    size_t cap = strlen(json) + 16;
+    char *buf = malloc(cap);
+    if (!buf) {
+        free(json);
+        return;
+    }
+    int n = snprintf(buf, cap, "data: %s\n\n", json);
     free(json);
-    if (n > 0 && n < (int)sizeof(buf)) queue_send(strdup(buf));
+    if (n <= 0 || (size_t)n >= cap) {
+        free(buf);
+        return;
+    }
+    queue_send(buf);
 }
 
 static void heartbeat(void *arg)
