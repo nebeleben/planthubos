@@ -26,7 +26,7 @@ decode
 
 service/manufacturer match keys are 16-bit (max 0xFFFF); mac_prefix is the
 device's 3-byte MAC prefix (max 0xFFFFFF). A wrapper may contain at most 16
-emit statements.
+emit statements. The wrapper name (in quotes) must be 1-48 characters.
 
 Payload accessors -- offset/lsb/width must be integer literals, never
 expressions, and are checked at compile time against the 31-byte payload
@@ -39,8 +39,9 @@ cap:
                                      i+ceil((lsb+width)/8)<=31
   len(payload)
 
-Arithmetic: + - * / and >> (>> is bit-exact and needs a non-negative left
-operand). Prefer bits() to >> for field extraction.
+Arithmetic: + - * / and >> (>> is bit-exact, needs a non-negative left
+operand, and its right operand must be an integer literal, never an
+expression, in 0-31). Prefer bits() to >> for field extraction.
 
 CRITICAL -- what "payload" is: the bytes AFTER the matched advertising
 structure's own header. A "manufacturer" match gets manufacturer data past
@@ -62,6 +63,8 @@ then <action>[; <action>...]
 mode edge|level           (optional, default edge)
 cooldown <duration>       (optional, e.g. 2h)
 every <duration>          (optional, e.g. 30min, allowed range 30s-24h)
+
+The rule name (in quotes) must be 1-48 characters.
 
 If given, mode/cooldown/every must appear in that order (each optional) --
 you cannot write cooldown before mode, for instance. A duration is a
