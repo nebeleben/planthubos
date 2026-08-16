@@ -2647,37 +2647,73 @@ static esp_err_t wrappers_delete_delete(httpd_req_t *req)
  * non-NULL) get the slice AFTER those two bytes -- the exact bytes
  * decode_adv_item() (ble_collector.c) hands a matching wrapper at runtime.
  *
- * LAST-WINS: if `ad_type` occurs more than once, every match overwrites the
- * previous one, so the function returns the LAST occurrence, not the
- * first. This mirrors NimBLE's own ble_hs_adv_parse_fields(), which
- * overwrites fields.mfg_data/svc_data_uuid16 on every matching AD structure
- * it walks with no already-set guard -- the same reasoning that made
- * payload.js's browser-side scanner last-wins. A preview built on a
- * first-wins scan could pick a different AD structure (and therefore a
- * different id and a different payload slice) than production actually
- * matches on, which is exactly the disagreement this function exists to
- * avoid. Returns false, leaving all output params untouched, if `ad_type`
- * never occurs. */
+ * LAST-WINS, but the two callers get there differently -- checked against
+ * the vendored NimBLE source directly, not just its header:
+ *
+ *   - WRAPPER_AD_TYPE_MANUFACTURER: ble_hs_adv_parse_fields() assigns
+ *     fields.mfg_data/fields.mfg_data_len on EVERY BLE_HS_ADV_TYPE_MFG_DATA
+ *     structure it walks, unconditionally, no length floor at all --
+ *     decode_adv_item() is what applies the `>= 2` floor afterwards, before
+ *     it will read a company id out of those fields. So a trailing
+ *     manufacturer structure too short for a company id doesn't leave an
+ *     earlier valid one standing in production: it clobbers it, and the
+ *     device resolves NO manufacturer id (manu_id stays the sentinel, never
+ *     equal to any real wrapper's match_key). This function mirrors that
+ *     two-step exactly: it last-wins on TYPE alone first (any length), then
+ *     only emits an id/payload if that LAST occurrence has enough data --
+ *     so a short trailing structure correctly poisons an earlier good one
+ *     and this returns false, same as production resolving no id.
+ *   - WRAPPER_AD_TYPE_SERVICE_DATA_16: a service-data structure shorter
+ *     than a UUID makes ble_hs_adv_parse_fields() reject the WHOLE
+ *     advertisement (nonzero return), so decode_adv_item() returns before
+ *     it ever reaches wrapper matching -- such an advert can never end up
+ *     in the unknown-capture buffer this scanner reads samples from. There
+ *     is no clobber-on-short case to reproduce here, so this keeps the
+ *     simpler original behaviour: a too-short occurrence just isn't a
+ *     match, and last-wins applies only among occurrences long enough to
+ *     carry a UUID.
+ *
+ * Either way, a preview built on a first-wins scan (or one blind to a
+ * length-poisoned last occurrence) could disagree with what production
+ * actually resolves -- exactly the disagreement this function exists to
+ * avoid. Returns false, leaving all output params untouched, if no usable
+ * occurrence of `ad_type` is found. */
 static bool wrapper_ad_find_slice(const uint8_t *adv, uint8_t len, uint8_t ad_type,
                                   uint16_t *out_id, const uint8_t **out_payload,
                                   uint8_t *out_len)
 {
-    bool found = false;
+    /* True iff the LAST occurrence of `ad_type` seen so far had >= 2 data
+     * bytes (enough for an id). For WRAPPER_AD_TYPE_MANUFACTURER this is
+     * reset on EVERY occurrence, valid or not -- a short one clobbers a
+     * previously valid `last_valid`, same as NimBLE clobbering
+     * fields.mfg_data_len. For service data it is only ever set (never
+     * cleared), since a too-short occurrence isn't tracked as "the last
+     * one" at all -- see the two bullets above. Starts false, which also
+     * correctly means "no occurrence of `ad_type` at all". */
+    bool last_valid = false;
+    uint16_t valid_i = 0;      /* index of that last valid occurrence */
     uint16_t i = 0;
     while ((uint16_t)(i + 1) < len) {
         uint8_t seg_len = adv[i];
         if (seg_len == 0) break;
         if ((uint16_t)(i + 1 + seg_len) > len) break;
         uint8_t seg_type = adv[i + 1];
-        if (seg_type == ad_type && seg_len >= 3) {
-            if (out_id)      *out_id      = (uint16_t)(adv[i + 2] | (adv[i + 3] << 8));
-            if (out_payload) *out_payload = &adv[i + 4];
-            if (out_len)     *out_len     = (uint8_t)(seg_len - 3);
-            found = true;
+        if (seg_type == ad_type) {
+            if (ad_type == WRAPPER_AD_TYPE_MANUFACTURER) {
+                last_valid = (seg_len >= 3);
+                if (last_valid) valid_i = i;
+            } else if (seg_len >= 3) {
+                last_valid = true;
+                valid_i = i;
+            }
         }
         i = (uint16_t)(i + 1 + seg_len);
     }
-    return found;
+    if (!last_valid) return false;
+    if (out_id)      *out_id      = (uint16_t)(adv[valid_i + 2] | (adv[valid_i + 3] << 8));
+    if (out_payload) *out_payload = &adv[valid_i + 4];
+    if (out_len)     *out_len     = (uint8_t)(adv[valid_i] - 3);
+    return true;
 }
 
 /* True iff captured sample `s` (from unknown device `d`) would resolve to
