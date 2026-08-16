@@ -5,9 +5,20 @@
 // verbatim rather than guessing at (spec section 6) -- silently treating
 // prose as source would put "I am unable to help" into the editor.
 export function extractSource(text) {
-  const m = /```[^\n]*\n([\s\S]*?)```/.exec(String(text || ''))
+  const m = /```([\s\S]*?)```/.exec(String(text || ''))
   if (!m) return null
-  const body = m[1].replace(/\s+$/, '')
+  let body = m[1]
+  const nl = body.indexOf('\n')
+  if (nl !== -1) {
+    // The info string on a fenced code block is a bare word (```plantscript)
+    // with no spaces or punctuation. Only strip a first line that actually
+    // looks like one -- a model that puts code on the fence's own line
+    // (```wrapper "x" match service 0x1234) must keep that line, since for
+    // a wrapper it is the header and the single most load-bearing line.
+    const firstLine = body.slice(0, nl)
+    if (/^[A-Za-z0-9_+-]*$/.test(firstLine)) body = body.slice(nl + 1)
+  }
+  body = body.replace(/\s+$/, '')
   return body.length > 0 ? body : null
 }
 

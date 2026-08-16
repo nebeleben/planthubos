@@ -11,7 +11,10 @@ export const RULE_TEMPLATE = {
       ? 'This hub has no plants configured yet.'
       : p.map((x) => {
           const caps = x.capabilities.map((c) => `${c.name} (${c.unit})`).join(', ')
-          return `  plant ${x.id} "${x.name}": ${caps || 'no capabilities bound'}`
+          // No id here: rules reference plants by name string
+          // (plant("<name>")), never by id, and "plant <int>" reads as
+          // an echo of the non-parsing plant(<id>) form.
+          return `  plant "${x.name}": ${caps || 'no capabilities bound'}`
         }).join('\n')
 
     const system = `You write PlantScript rules for a plant-monitoring hub.

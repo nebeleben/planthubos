@@ -63,9 +63,9 @@ mode edge|level           (optional, default edge)
 cooldown <duration>       (optional, e.g. 2h)
 every <duration>          (optional, e.g. 30min, allowed range 30s-24h)
 
-If given, mode/cooldown/every must appear in that order (each optional,
-each at most once). A duration is a number plus a unit: s/sec, m/min, or
-h/hr.
+If given, mode/cooldown/every must appear in that order (each optional) --
+you cannot write cooldown before mode, for instance. A duration is a
+number plus a unit: s/sec, m/min, or h/hr.
 
 Conditions reference a plant or device BY NAME, never by numeric id, and
 compare its capability to a literal carrying a matching unit, e.g.
@@ -77,8 +77,8 @@ its value, and compares against a plain number with no unit, e.g.
   device("AA:BB:CC:DD:EE:FF").air.temperature.age > 3600
 
 Actions: log("<message>") or notify("<message>") -- no other actions
-exist. A message may interpolate a reference in braces; escape its inner
-quotes, since it is still inside the outer string literal:
+exist. A message may interpolate a reference in braces; quotes inside
+{...} may be written bare or escaped, both compile the same way:
   notify("Monstera is dry: {plant(\\"Monstera\\").soil.moisture}%")
 
 Modes: edge fires once on the transition into true; level fires on every
