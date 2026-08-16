@@ -1,32 +1,33 @@
-/* rules_resolver.c -- capability shim (spec §4 "Resolver"): turns a PSBC
- * ref (plant("X").cap / device("id").cap) into a resolved f32 + age_s +
- * ready, by scanning the plants table and the live sensor registry. Runs at
- * every evaluation (spec: "cheap table scans, <=32 sensors") -- no caching,
- * so a rename/rebind is visible on the very next evaluation with no rule
- * reload. This is the M1 shim spec §4 says M2 will swap the internals of;
- * the rules_resolve() signature is the part that survives. */
+/* rules_resolver.c -- turns a PSBC ref (plant("X").cap / device("id").cap)
+ * into a resolved f32 + age_s + ready, by scanning the plants table and the
+ * live device registry. Runs at every evaluation (spec: "cheap table scans,
+ * <=32 sensors") -- no caching, so a rename/rebind is visible on the very
+ * next evaluation with no rule reload.
+ *
+ * Task 6 (M2 spec Sec.7): rules_resolve()'s signature is UNCHANGED from M1
+ * -- only these internals move off the V1 MiFlora-shaped registry shim
+ * (registry_compat.h) onto the real V2 registry (registry.h/capability.h):
+ * plant refs now go through plants_cap_value() (plants.h), device refs
+ * through registry_find() + the capability slot directly. M1's stored
+ * bytecode and saved rules reference capability ids 0-4 numerically
+ * (RULES_CAP_MAX_ID, rules_internal.h) -- those are capability.h's frozen
+ * ids (soil.moisture..battery.level), so an unmodified M1 rule resolves
+ * identically through this new path. */
 #include "rules_internal.h"
 #include "plants.h"
 #include "plants_table.h"
 #include "data_core.h"
 #include "registry.h"
+#include "capability.h"
 #include "app_config.h"
 #include "esp_timer.h"
 #include <string.h>
 #include <stdio.h>
 
-/* Capability ids, spec §2: 0 soil.moisture, 1 air.temperature,
- * 2 light.illuminance, 3 soil.conductivity, 4 battery.level. */
-static const char *const CAP_NAMES[] = {
-    "soil.moisture", "air.temperature", "light.illuminance",
-    "soil.conductivity", "battery.level",
-};
-#define CAP_COUNT (sizeof(CAP_NAMES) / sizeof(CAP_NAMES[0]))
-
 const char *rules_cap_name(uint8_t capability_id)
 {
-    if (capability_id >= CAP_COUNT) return "?";
-    return CAP_NAMES[capability_id];
+    const capability_t *c = capability_get(capability_id);
+    return c ? c->name : "?";
 }
 
 static void ref_not_ready(psvm_ref_val_t *out)
@@ -42,67 +43,25 @@ static void set_why(char *why, size_t whylen, const char *fmt, const char *arg)
     snprintf(why, whylen, fmt, arg);
 }
 
-static int hex_nibble(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
-
-/* True + fills 6-byte mac iff s is exactly "AA:BB:CC:DD:EE:FF" (upper or
- * lower hex, spec §1 grammar) -- strict: exactly two hex digits per byte,
- * ':' separators in exactly the right five spots, nothing else. */
-static bool parse_mac_literal(const char *s, uint8_t mac[6])
-{
-    if (!s || strlen(s) != 17) return false;
-    for (int i = 0; i < 6; i++) {
-        int hi = hex_nibble(s[i * 3]);
-        int lo = hex_nibble(s[i * 3 + 1]);
-        if (hi < 0 || lo < 0) return false;
-        if (i < 5 && s[i * 3 + 2] != ':') return false;
-        mac[i] = (uint8_t)((hi << 4) | lo);
-    }
-    return true;
-}
-
-/* Fills *out/why from one sensor_entry_t's field (spec §2 capability ids,
- * §1 ".age" semantics: never-heard is not-ready, not infinity). kind_word is
- * "plant"/"device", name is that ref's display name, purely for the message. */
-static bool resolve_from_entry(const sensor_entry_t *e, uint8_t capability, uint8_t field,
-                               uint32_t now_uptime_s, const char *kind_word, const char *name,
-                               psvm_ref_val_t *out, char *why, size_t whylen)
-{
-    const mibeacon_t *m = &e->latest;
-    bool has;
-    float value = 0.0f;
-    switch (capability) {
-    case 0: has = m->has_moisture;     value = (float)m->moisture_pct;      break;
-    case 1: has = m->has_temp;         value = (float)m->temp_dc / 10.0f;   break;
-    case 2: has = m->has_lux;          value = (float)m->lux;               break;
-    case 3: has = m->has_conductivity; value = (float)m->conductivity_us;   break;
-    case 4: has = m->has_battery;      value = (float)m->battery_pct;       break;
-    default: has = false; break;
-    }
-    if (!has) {
-        ref_not_ready(out);
-        if (why && whylen) {
-            snprintf(why, whylen, "%s \"%s\" %s never reported", kind_word, name, rules_cap_name(capability));
-        }
-        return false;
-    }
-    out->ready = true;
-    out->age_s = (now_uptime_s >= e->last_seen_s) ? (now_uptime_s - e->last_seen_s) : 0;
-    out->value = (field == 1) ? (float)out->age_s : value;
-    return true;
-}
-
-/* plant("<name>") kind: name -> plants table entry -> bound mac -> registry
- * entry -> field (spec §1 resolver bullet's exact wording for the two
- * failure reasons). */
+/* plant("<name>") kind: name -> plants table entry -> that capability's
+ * binding -> registry value, via plants_cap_value() (plants.h), which does
+ * the binding lookup + registry_find() + slot read in one call over a
+ * registry snapshot this function already took. Failure reasons (spec Sec.7
+ * / task-6 brief step 3): "no plant X" (unknown name), "plant X has no
+ * <cap> bound" (name known, but this ref's capability was never bound on
+ * it -- was "plant X has no probe" pre-M2), "device never heard" (bound,
+ * but plants_cap_value() still can't produce a value -- the bound device
+ * isn't in this snapshot, or its slot has never been written; was "probe
+ * never heard" pre-M2). */
 static bool resolve_plant(const char *name, uint8_t capability, uint8_t field,
                           uint32_t now_uptime_s, psvm_ref_val_t *out, char *why, size_t whylen)
 {
+    /* plants_cap_value() takes its own wall-clock read for age_s (see its
+     * doc comment in plants.h) -- this function has no use for the shared
+     * now_uptime_s resolve_device() below needs for its own registry-slot
+     * math, but keeps the parameter so both resolver kinds share one call
+     * shape off rules_resolve(). */
+    (void)now_uptime_s;
     /* static: only ever touched from the caller's task (engine task, or a
      * future rules_test() caller serialized by rules_engine.c's evaluation
      * mutex -- see rules_engine.c) -- same "big local off a small task
@@ -119,55 +78,79 @@ static bool resolve_plant(const char *name, uint8_t capability, uint8_t field,
         set_why(why, whylen, "no plant \"%s\"", name);
         return false;
     }
-    if (!snap.p[idx].mac_valid) {
+
+    if (capability >= CAPABILITY_COUNT || !snap.p[idx].cap_bound[capability]) {
         ref_not_ready(out);
-        set_why(why, whylen, "plant \"%s\" has no probe", name);
+        if (why && whylen) {
+            snprintf(why, whylen, "plant \"%s\" has no %s bound", name, rules_cap_name(capability));
+        }
+        return false;
+    }
+    uint8_t plant_id = snap.p[idx].id;
+
+    static registry_t reg;
+    data_core_snapshot(&reg);
+
+    float value; uint32_t age_s;
+    if (!plants_cap_value(plant_id, capability, &reg, &value, &age_s)) {
+        ref_not_ready(out);
+        if (why && whylen) snprintf(why, whylen, "device never heard");
         return false;
     }
 
-    static legacy_registry_t reg;   /* M2-SHIM */
-    data_core_snapshot_legacy(&reg);   /* M2-SHIM */
-    int ridx = legacy_registry_find(&reg, snap.p[idx].mac);   /* M2-SHIM */
-    if (ridx < 0) {
-        ref_not_ready(out);
-        if (why && whylen) snprintf(why, whylen, "probe never heard");
-        return false;
-    }
-    return resolve_from_entry(&reg.sensors[ridx], capability, field, now_uptime_s,
-                              "plant", name, out, why, whylen);
+    out->ready = true;
+    out->age_s = age_s;
+    out->value = (field == 1) ? (float)age_s : value;
+    return true;
 }
 
-/* device("<id>") kind: id is either a sensor display name
- * (app_config_get_sensor_name over every live registry mac) or a literal
- * "AA:BB:CC:DD:EE:FF" mac (spec §1 grammar / brief step 2). */
+/* device("<id>") kind: id is either a sensor display name (app_config's
+ * mac-keyed name store, checked against every live BLE device in the
+ * snapshot -- the only kind that store can name) or a device-id string
+ * device_id_parse() accepts: the canonical "kind:HEX" form (capability.h
+ * Sec.2), or M1's legacy bare "AA:BB:CC:DD:EE:FF" colon-mac literal, which
+ * device_id_parse() itself maps onto DEV_KIND_BLE -- exactly what an
+ * unmodified M1 device() ref (always BLE, the only kind that existed then)
+ * needs to keep resolving unchanged. */
 static bool resolve_device(const char *id, uint8_t capability, uint8_t field,
                            uint32_t now_uptime_s, psvm_ref_val_t *out, char *why, size_t whylen)
 {
-    static legacy_registry_t reg;   /* M2-SHIM */
-    data_core_snapshot_legacy(&reg);   /* M2-SHIM */
+    static registry_t reg;
+    data_core_snapshot(&reg);
 
-    int ridx = -1;
+    device_id_t dev = {0};
+    bool have_dev = false;
     char nm[33];
-    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
-        if (!reg.sensors[i].in_use) continue;
-        if (app_config_get_sensor_name(reg.sensors[i].mac, nm) && strcmp(nm, id) == 0) {
-            ridx = i;
-            break;
+    for (int i = 0; i < REGISTRY_MAX_DEVICES && !have_dev; i++) {
+        const device_entry_t *e = &reg.devices[i];
+        if (!e->in_use || e->id.kind != DEV_KIND_BLE) continue;
+        if (app_config_get_sensor_name(e->id.addr, nm) && strcmp(nm, id) == 0) {
+            dev = e->id;
+            have_dev = true;
         }
     }
-    if (ridx < 0) {
-        uint8_t mac[6];
-        if (parse_mac_literal(id, mac)) {
-            ridx = legacy_registry_find(&reg, mac);   /* M2-SHIM */
-        }
-    }
-    if (ridx < 0) {
+    if (!have_dev) have_dev = device_id_parse(id, &dev);
+
+    int ridx = have_dev ? registry_find(&reg, &dev) : -1;
+    if (ridx < 0 || capability >= CAPABILITY_COUNT) {
         ref_not_ready(out);
         set_why(why, whylen, "device \"%s\" never heard", id);
         return false;
     }
-    return resolve_from_entry(&reg.sensors[ridx], capability, field, now_uptime_s,
-                              "device", id, out, why, whylen);
+
+    const cap_slot_t *slot = &reg.devices[ridx].caps[capability];
+    if (!slot->valid) {
+        ref_not_ready(out);
+        if (why && whylen) {
+            snprintf(why, whylen, "device \"%s\" %s never reported", id, rules_cap_name(capability));
+        }
+        return false;
+    }
+
+    out->ready = true;
+    out->age_s = (now_uptime_s >= slot->updated_s) ? (now_uptime_s - slot->updated_s) : 0;
+    out->value = (field == 1) ? (float)out->age_s : capability_decode(capability, slot->raw);
+    return true;
 }
 
 bool rules_resolve(const psvm_prog_t *prog, uint16_t ref_idx, psvm_ref_val_t *out,

@@ -66,6 +66,13 @@ bool data_fmt_apply(const char *storage_base)
     esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "data_fmt: nvs_open failed (%s); cannot check data format this boot", esp_err_to_name(err));
+        /* A durably-FUTURE marker from an earlier boot plus a failed
+         * nvs_open() THIS boot must not silently read back as "safe": with
+         * s_data_safe defaulting true, plants_init()/sampler_start() would
+         * run against newer-format on-disk data main.c never actually
+         * verified this boot. Fail closed instead -- same as the real
+         * DATA_FMT_FUTURE branch below. */
+        s_data_safe = false;
         return false;
     }
 

@@ -2,9 +2,9 @@
 #include "app_config.h"
 #include "wifi_manager.h"
 #include "data_core.h"
-#include "sensors_json.h"
+#include "devices_json.h"
+#include "capability.h"
 #include "storage.h"
-#include "storage_compat.h"   /* M2-SHIM */
 #include "timekeeper.h"
 #include "plants.h"
 #include "claim.h"
@@ -33,15 +33,27 @@
 static const char *TAG = "api_v1";
 #define FW_VERSION "2.0.0-dev"
 
-/* Shared by sensors_get() and plants_get() below (final M8 review, L5):
- * each used to hold its own private `static registry_t` + `static
- * plants_table_t` pair (~2.25KB combined, doubled for no reason). Safe to
- * share one file-static pair between them: esp_http_server invokes exactly
- * one registered handler at a time on the single httpd task (this is why
- * each was `static` -- too big for that task's stack -- in the first
- * place), so there is never a concurrent writer to race. */
-static legacy_registry_t s_api_reg_snap;   /* M2-SHIM */
+/* Shared by devices_get()/sensors_get()/plants_get()/plants_bind_post()
+ * below (final M8 review, L5, carried forward by Task 6): each used to hold
+ * its own private `static registry_t` + `static plants_table_t` pair
+ * (~2.25KB combined, doubled for no reason). Safe to share one file-static
+ * pair between them: esp_http_server invokes exactly one registered
+ * handler at a time on the single httpd task (this is why each is
+ * `static` -- too big for that task's stack -- in the first place), so
+ * there is never a concurrent writer to race. */
+static registry_t s_api_reg_snap;
 static plants_table_t s_api_plant_snap;
+
+/* M2-SHIM (registry_compat.h): the ONE remaining use in this file, forced
+ * by plants_adopt_from_registry()'s own still-V1-shaped signature
+ * (plants.h) -- that header belongs to an earlier task and isn't touched
+ * here (RULING-1, task-6-report.md's Deviations section). A second static
+ * rather than reusing s_api_reg_snap above: the two types aren't
+ * interchangeable (legacy_registry_t is a decoded mibeacon_t view,
+ * registry_t is the real per-capability one), and plants_get() needs BOTH
+ * live at once -- this one just for the adopt-sweep call, s_api_reg_snap
+ * right after for the real bindings/values the response actually renders. */
+static legacy_registry_t s_api_plants_adopt_snap;   /* M2-SHIM */
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -150,10 +162,31 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "paired", paired);
     cJSON_AddBoolToObject(root, "pair_failed", swarm_store_pair_failed());
     size_t fs_total = 0, fs_used = 0;
+    bool fs_warn = false;
     if (esp_littlefs_info("storage", &fs_total, &fs_used) == ESP_OK) {
         cJSON_AddNumberToObject(root, "fs_total", fs_total);
         cJSON_AddNumberToObject(root, "fs_used", fs_used);
+        /* Storage-pressure ruling (task-6-brief.md): neither chip's
+         * partition can hold full history for all 16 plants, and
+         * storage_append() failure degrades silently. Cheap by design --
+         * no new scans, just thresholding the fs_total/fs_used this
+         * handler already fetches -- with a one-shot ESP_LOGW the first
+         * time usage crosses 85%, so it shows up in the log once rather
+         * than on every poll of this endpoint, plus a fs_warn bool Task 8
+         * renders as a UI warning. */
+        if (fs_total > 0) {
+            fs_warn = ((uint64_t)fs_used * 100 / fs_total) >= 85;
+            static bool s_storage_warn_logged = false;
+            if (fs_warn && !s_storage_warn_logged) {
+                ESP_LOGW(TAG, "storage: %u/%u bytes used (%.0f%%) -- history writes may start "
+                              "failing soon; oldest data goes first (ring buffer)",
+                         (unsigned)fs_used, (unsigned)fs_total,
+                         (double)fs_used * 100.0 / (double)fs_total);
+                s_storage_warn_logged = true;
+            }
+        }
     }
+    cJSON_AddBoolToObject(root, "fs_warn", fs_warn);
     cJSON_AddNumberToObject(root, "heap_free", esp_get_free_heap_size());
     const esp_partition_t *running = esp_ota_get_running_partition();
     if (running) cJSON_AddStringToObject(root, "partition", running->label);
@@ -271,32 +304,48 @@ static esp_err_t wifi_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* GET /api/v1/sensors -- demoted (M8 Task 6, spec §4) to the probe pool:
- * radio diagnostics only (mac/battery/rssi/via/last_seen_s), plus which
- * plant (if any) each mac is currently assigned to. Per-sensor history and
- * rename are gone -- a sensor is just a probe now; plants are the primary
- * entity (see plants_get() below). Unauthenticated, like every GET here.
+/* GET /api/v1/devices -- the device+capability surface (Task 6, spec
+ * §6/§7): every physical device across radios, each with its live
+ * capability readings (device_json(), devices_json.h) and which plants (if
+ * any) currently bind it. Unauthenticated, like every GET here.
  *
  * plants_snapshot() is safe to call even when plants_init() never ran (see
  * its own doc comment) -- a pair-failed-portal NODE's webserver hits this
- * route too, and gets an all-unassigned probe pool rather than a crash. */
-static esp_err_t sensors_get(httpd_req_t *req)
+ * route too, and gets an all-unbound device list rather than a crash.
+ *
+ * `deprecated` also drives the GET /api/v1/sensors alias right below: same
+ * body, plus a top-level "deprecated":true (task-6 brief: kept for one
+ * milestone since it's what M1's own tooling calls). */
+static cJSON *devices_root(bool deprecated)
 {
     /* s_api_reg_snap/s_api_plant_snap: too big for the httpd task stack;
-     * shared with plants_get() below, see their declaration comment (L5). */
-    data_core_snapshot_legacy(&s_api_reg_snap);   /* M2-SHIM */
+     * shared across this file's handlers, see their declaration comment (L5). */
+    data_core_snapshot(&s_api_reg_snap);
     plants_snapshot(&s_api_plant_snap);
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
     cJSON *root = cJSON_CreateObject();
-    cJSON *arr = cJSON_AddArrayToObject(root, "sensors");
-    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
-        if (!s_api_reg_snap.sensors[i].in_use) continue;
-        int pidx = plants_table_find_mac(&s_api_plant_snap, s_api_reg_snap.sensors[i].mac);
-        uint8_t plant_id = pidx >= 0 ? s_api_plant_snap.p[pidx].id : 0;
-        cJSON_AddItemToArray(arr, probe_json(&s_api_reg_snap.sensors[i], plant_id, now_uptime_s));
+    cJSON *arr = cJSON_AddArrayToObject(root, "devices");
+    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
+        if (!s_api_reg_snap.devices[i].in_use) continue;
+        cJSON_AddItemToArray(arr, device_json(&s_api_reg_snap.devices[i], &s_api_plant_snap, now_uptime_s));
     }
-    return send_json(req, root);
+    if (deprecated) cJSON_AddBoolToObject(root, "deprecated", true);
+    return root;
+}
+
+static esp_err_t devices_get(httpd_req_t *req)
+{
+    return send_json(req, devices_root(false));
+}
+
+/* GET /api/v1/sensors -- deprecated alias of GET /api/v1/devices, see
+ * devices_root()'s comment above. Per-sensor history and rename routes are
+ * gone (spec §4/§6) -- only POST /api/v1/sensors/{mac} (rename, still mac-keyed)
+ * survives below, unchanged. */
+static esp_err_t sensors_get(httpd_req_t *req)
+{
+    return send_json(req, devices_root(true));
 }
 
 /* Parse 12 uppercase/lowercase hex chars into mac[6]; returns false on malformed input. */
@@ -324,38 +373,6 @@ static bool resolve_shim(void *rctx, uint16_t boot_id, uint32_t rel_s, uint32_t 
     return timekeeper_resolve(boot_id, rel_s, epoch);
 }
 
-typedef struct {
-    httpd_req_t *req;
-    bool first;
-    bool failed;
-} hist_ctx_t;
-
-/* Once c->failed is set we just return without sending further chunks; we
- * don't abort the underlying storage_query scan early, but that scan is
- * bounded (<=STORAGE_RAW_CAP == 2880 records) so letting it run to
- * completion costs at most a bounded, harmless amount of wasted work. */
-static void hist_row(void *vctx, uint32_t epoch, const storage_rec_v1_t *rec)   /* M2-SHIM */
-{
-    hist_ctx_t *c = vctx;
-    if (c->failed) return;
-    char line[128];
-    int n = snprintf(line, sizeof(line), "%s[%lu,", c->first ? "" : ",", (unsigned long)epoch);
-    c->first = false;
-    #define APPEND_NUM(cond, fmt, val) \
-        n += (cond) ? snprintf(line + n, sizeof(line) - n, fmt, val) : snprintf(line + n, sizeof(line) - n, "null")
-    APPEND_NUM(rec->temp_dc != STORAGE_TEMP_NONE, "%.1f", rec->temp_dc / 10.0);
-    n += snprintf(line + n, sizeof(line) - n, ",");
-    APPEND_NUM(rec->moisture_pct != STORAGE_U8_NONE, "%u", rec->moisture_pct);
-    n += snprintf(line + n, sizeof(line) - n, ",");
-    APPEND_NUM(rec->lux != STORAGE_LUX_NONE, "%lu", (unsigned long)rec->lux);
-    n += snprintf(line + n, sizeof(line) - n, ",");
-    APPEND_NUM(rec->conductivity_us != STORAGE_U16_NONE, "%u", rec->conductivity_us);
-    n += snprintf(line + n, sizeof(line) - n, "]");
-    #undef APPEND_NUM
-    if (n >= (int)sizeof(line) || httpd_resp_sendstr_chunk(c->req, line) != ESP_OK)
-        c->failed = true;
-}
-
 /* Parses a decimal plant id from the start of s: one or more ASCII digits,
  * stopping at '/', '?' or the string's end; must start with a nonzero digit
  * and fit in a uint8_t (plant ids are 1-based, plants_table.h). 0 doubles as
@@ -373,7 +390,9 @@ static void hist_row(void *vctx, uint32_t epoch, const storage_rec_v1_t *rec)   
  * *p would land on '?', neither '/' nor NUL, and the old strict check
  * rejected that outright. Every caller below must in turn treat a
  * *tail_out starting with '?' the same as an empty/absent suffix -- see
- * plants_history_get()/plants_post_dispatch()/plants_delete_delete(). */
+ * plants_post_dispatch()/plants_delete_delete() (history_get() below also
+ * calls this, but against a query-parameter VALUE, which can't itself
+ * contain '/' or '?', so that '?'-handling is moot there). */
 static uint8_t parse_plant_id(const char *s, const char **tail_out)
 {
     if (*s < '1' || *s > '9') return 0;   /* must start with a nonzero digit */
@@ -397,121 +416,242 @@ static uint8_t parse_plant_id(const char *s, const char **tail_out)
  * crash.
  *
  * Also drives the auto-create sweep (final M8 review, M3): with the old
- * sensor<->plant API bridge gone (DoS rule, see plants_history_get()'s
- * comment above) and MQTT off by default, the sampler's periodic tick used
- * to be the ONLY driver of plant auto-creation -- a fresh hub could show
- * "No plants yet" for up to CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN minutes even
+ * sensor<->plant API bridge gone (DoS rule, see history_get()'s comment
+ * below) and MQTT off by default, the sampler's periodic tick used to be
+ * the ONLY driver of plant auto-creation -- a fresh hub could show "No
+ * plants yet" for up to CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN minutes even
  * with a probe already reporting. plants_adopt_from_registry() is safe to
- * call from here specifically because `s_api_reg_snap` below is itself a
- * registry SNAPSHOT (data_core_snapshot()), never anything request-supplied
- * -- the DoS rule stays airtight: an unauthenticated caller still can't seed
- * a plant from data it controls, it can only nudge an already-live sensor's
- * plant into existing sooner. httpd task context; sanctioned lazy driver
- * per plants_adopt_from_registry()'s own doc comment in plants.h. */
+ * call from here specifically because `s_api_plants_adopt_snap` below is
+ * itself a registry SNAPSHOT (data_core_snapshot_legacy()), never anything
+ * request-supplied -- the DoS rule stays airtight: an unauthenticated
+ * caller still can't seed a plant from data it controls, it can only nudge
+ * an already-live sensor's plant into existing sooner. httpd task context;
+ * sanctioned lazy driver per plants_adopt_from_registry()'s own doc comment
+ * in plants.h. */
 static esp_err_t plants_get(httpd_req_t *req)
 {
-    /* s_api_plant_snap/s_api_reg_snap: too big for the httpd task stack;
-     * shared with sensors_get() above, see their declaration comment (L5). */
-    data_core_snapshot_legacy(&s_api_reg_snap);   /* M2-SHIM */
+    /* s_api_plants_adopt_snap: M2-SHIM, see its declaration comment (L5) --
+     * forced by plants_adopt_from_registry()'s own still-V1-shaped
+     * signature, the one shim call site this task could not remove. */
+    data_core_snapshot_legacy(&s_api_plants_adopt_snap);   /* M2-SHIM */
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
-    plants_adopt_from_registry(&s_api_reg_snap, now_uptime_s,
+    plants_adopt_from_registry(&s_api_plants_adopt_snap, now_uptime_s,   /* M2-SHIM */
                                 CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN * 60);
 
     /* Re-snapshot AFTER the sweep above (not reusing an earlier one) so a
      * plant it just created shows up in THIS response, not the next poll --
-     * the whole point of M3's latency fix. */
+     * the whole point of M3's latency fix. s_api_reg_snap/s_api_plant_snap:
+     * too big for the httpd task stack; shared across this file's handlers,
+     * see s_api_reg_snap's declaration comment (L5). */
     plants_snapshot(&s_api_plant_snap);
-    uint32_t now_epoch = timekeeper_now();
+    data_core_snapshot(&s_api_reg_snap);
 
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(root, "plants");
     for (int i = 0; i < PLANTS_MAX; i++) {
         if (!s_api_plant_snap.p[i].in_use) continue;
-        cJSON_AddItemToArray(arr, plant_json(&s_api_plant_snap.p[i], &s_api_reg_snap, now_uptime_s, now_epoch));
+        cJSON_AddItemToArray(arr, plant_json(&s_api_plant_snap.p[i], &s_api_reg_snap));
     }
     return send_json(req, root);
 }
 
-/* GET /api/v1/plants/{id}/history?tier=&from=&to= -- replaces the old
- * /api/v1/sensors/{MAC12}/history bridge (M8 Task 3's interim wiring,
- * carried through Task 5); moved verbatim (resolve_shim/hist_ctx_t/hist_row
- * above are unchanged, just re-keyed here from a resolved mac to the URL's
- * own id) rather than duplicated, since storage.c's rings have been
- * plant-id keyed since Task 3 -- this is the non-bridged form.
+/* Once c->failed is set we just return without sending further chunks; we
+ * don't abort the underlying storage_query scan early, but that scan is
+ * bounded (<=STORAGE_RAW_CAP == 2880 records) so letting it run to
+ * completion costs at most a bounded, harmless amount of wasted work.
  *
- * Deliberately does NOT auto-create. This is an open, unauthenticated GET,
- * and the Task 3 review's BINDING finding is that plants_resolve_or_create()
- * must never be driven by a request-supplied identifier: an attacker could
- * otherwise exhaust the 16-slot plant table for free by GETting
- * /api/v1/plants/{1..255}/history for ids nobody ever created (the exact
- * hole the old mac-keyed bridge in history_get carried, and why this Task
- * removes that route rather than reworking it in place). An id the table
- * doesn't currently hold -- never assigned, or a plant that was since
- * deleted (ids are never reused, plants_table.h) -- just 404s, same answer
- * an unknown mac gave under the old bridge. */
-static esp_err_t plants_history_get(httpd_req_t *req)
+ * c->map is the SAME history_map_t pointer this file's history_get() below
+ * passes as storage_query()'s own map_out -- storage.h's doc comment on
+ * storage_query() guarantees map_out is filled from the ring file's header
+ * before the first row() call, so by the time this ever runs, c->map
+ * already holds this plant's real column layout for the requested tier. */
+typedef struct {
+    httpd_req_t  *req;
+    bool          first;
+    bool          failed;
+    uint8_t       cap_id;
+    history_map_t map;
+} api_hist_ctx_t;
+
+static void api_hist_row(void *vctx, uint32_t epoch, const storage_rec_t *rec)
 {
-    const char *tail = req->uri + strlen("/api/v1/plants/");
-    const char *suffix = NULL;
-    uint8_t id = parse_plant_id(tail, &suffix);
-    /* CRITICAL fix (review): req->uri retains the query string in this
-     * IDF, so "/api/v1/plants/3/history?tier=hourly" left suffix as
-     * "/history?tier=hourly" -- a bare strcmp() against "/history" 404'd
-     * every request that actually used tier/from/to, leaving the query
-     * parsing below unreachable in practice. Match the "/history" prefix
-     * and require whatever follows it to be either nothing or a query
-     * string, not an exact-string match. */
-    if (id == 0 || suffix == NULL || strncmp(suffix, "/history", 8) != 0 ||
-        (suffix[8] != '\0' && suffix[8] != '?')) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
-        return ESP_OK;
-    }
+    api_hist_ctx_t *c = vctx;
+    if (c->failed) return;
+    int col = history_map_col(&c->map, c->cap_id);
+    if (col < 0) return;   /* this plant never historised the requested capability */
 
-    plants_table_t table;
-    plants_snapshot(&table);
-    if (plants_table_find_id(&table, id) < 0) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
-        return ESP_OK;
+    char line[48];
+    int n;
+    if (rec->col[col] == CAP_VALUE_NONE) {
+        n = snprintf(line, sizeof(line), "%s[%lu,null]", c->first ? "" : ",", (unsigned long)epoch);
+    } else {
+        n = snprintf(line, sizeof(line), "%s[%lu,%.4f]", c->first ? "" : ",",
+                     (unsigned long)epoch, (double)capability_decode(c->cap_id, rec->col[col]));
     }
+    c->first = false;
+    if (n >= (int)sizeof(line) || httpd_resp_sendstr_chunk(c->req, line) != ESP_OK)
+        c->failed = true;
+}
 
+/* GET /api/v1/history?plant=<id>&cap=<id>&range=day|week|month -- one
+ * capability's time series for one plant (spec §7 "History tab"), replacing
+ * the old GET /api/v1/plants/{id}/history?tier=&from=&to= route (Task 3/5's
+ * interim per-tier form): the M2 UI selects a capability, not a raw/hourly
+ * tier directly -- `range` now picks BOTH the tier and the window (day ->
+ * raw/24h; week/month -> hourly/7d or 30d -- the raw tier's shorter C5
+ * retention, spec §3's chip-aware Kconfig table, can't cover a month).
+ *
+ * Deliberately does NOT auto-create (same DoS-prevention rule the old route
+ * documented, see plants_get()'s comment above): an unknown/deleted plant
+ * id just 404s rather than being seeded from a request-supplied id.
+ *
+ * "available" is every capability this plant's ring file for the chosen
+ * tier has EVER historised (its column map, storage.h's history_map_t) --
+ * not just its currently-bound capabilities: a plant that used to have a
+ * capability bound (since cleared or re-pointed) keeps that column's
+ * history, and the UI's capability selector should still offer it. */
+static esp_err_t history_get(httpd_req_t *req)
+{
     char query[96] = "", val[16];
     httpd_req_get_url_query_str(req, query, sizeof(query));
+
+    if (httpd_query_key_value(query, "plant", val, sizeof(val)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing plant");
+        return ESP_OK;
+    }
+    const char *tail = NULL;
+    uint8_t plant_id = parse_plant_id(val, &tail);
+    if (plant_id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad plant id");
+        return ESP_OK;
+    }
+    plants_table_t table;
+    plants_snapshot(&table);
+    if (plants_table_find_id(&table, plant_id) < 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown plant");
+        return ESP_OK;
+    }
+
+    if (httpd_query_key_value(query, "cap", val, sizeof(val)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing cap");
+        return ESP_OK;
+    }
+    char *endptr = NULL;
+    unsigned long cap_ul = strtoul(val, &endptr, 10);
+    if (endptr == val || *endptr != '\0' || cap_ul >= CAPABILITY_COUNT) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad cap");
+        return ESP_OK;
+    }
+    uint8_t cap_id = (uint8_t)cap_ul;
+
     storage_tier_t tier = STORAGE_TIER_RAW;
-    if (httpd_query_key_value(query, "tier", val, sizeof(val)) == ESP_OK && strcmp(val, "hourly") == 0)
-        tier = STORAGE_TIER_HOURLY;
+    uint32_t window_s = 86400;
+    const char *range = "day";
+    if (httpd_query_key_value(query, "range", val, sizeof(val)) == ESP_OK) {
+        if (strcmp(val, "day") == 0) { tier = STORAGE_TIER_RAW; window_s = 86400; range = "day"; }
+        else if (strcmp(val, "week") == 0) { tier = STORAGE_TIER_HOURLY; window_s = 7UL * 86400; range = "week"; }
+        else if (strcmp(val, "month") == 0) { tier = STORAGE_TIER_HOURLY; window_s = 30UL * 86400; range = "month"; }
+        else {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad range");
+            return ESP_OK;
+        }
+    }
 
-    uint32_t now = timekeeper_now();
-    uint32_t to = now, from = now > 86400 ? now - 86400 : 0;
-    if (httpd_query_key_value(query, "to", val, sizeof(val)) == ESP_OK) to = (uint32_t)strtoul(val, NULL, 10);
-    if (httpd_query_key_value(query, "from", val, sizeof(val)) == ESP_OK) from = (uint32_t)strtoul(val, NULL, 10);
-
-    httpd_resp_set_type(req, "application/json");
     bool synced = timekeeper_synced();
-    char head[64];
-    snprintf(head, sizeof(head), "{\"tier\":\"%s\",\"synced\":%s,\"points\":[",
+    uint32_t now = timekeeper_now(), to = 0, from = 0;
+    if (synced) { to = now; from = now > window_s ? now - window_s : 0; }
+
+    const capability_t *cap = capability_get(cap_id);
+    httpd_resp_set_type(req, "application/json");
+    char head[160];
+    snprintf(head, sizeof(head),
+             "{\"plant\":%u,\"cap\":%u,\"unit\":\"%s\",\"range\":\"%s\",\"tier\":\"%s\",\"synced\":%s,\"points\":[",
+             plant_id, cap_id, cap ? cap->unit : "", range,
              tier == STORAGE_TIER_RAW ? "raw" : "hourly", synced ? "true" : "false");
     httpd_resp_sendstr_chunk(req, head);
 
-    if (synced) {
-        hist_ctx_t ctx = { .req = req, .first = true, .failed = false };
-        storage_query_v1("/storage", id, tier, from, to, resolve_shim, NULL, hist_row, &ctx);   /* M2-SHIM */
-        /* A chunk send already failed (client/socket gone) -- don't send the
-         * trailing chunks over a dead connection, and return non-OK so
-         * esp_http_server closes the session instead of believing it's
-         * still alive. */
-        if (ctx.failed) return ESP_FAIL;
+    /* Called unconditionally (even when !synced, with an empty [0,0)
+     * window that no real record's epoch can land in): storage_query()
+     * fills ctx.map from the ring file's header regardless of whether any
+     * row resolves an epoch, so this is the one call that gets both the
+     * points AND "available" below, synced or not. */
+    api_hist_ctx_t ctx = { .req = req, .first = true, .failed = false, .cap_id = cap_id };
+    history_map_init(&ctx.map);
+    storage_query("/storage", plant_id, tier, from, to, resolve_shim, NULL, api_hist_row, &ctx, &ctx.map);
+    /* A chunk send already failed (client/socket gone) -- don't send the
+     * trailing chunks over a dead connection, and return non-OK so
+     * esp_http_server closes the session instead of believing it's still
+     * alive. */
+    if (ctx.failed) return ESP_FAIL;
+
+    cJSON *avail = cJSON_CreateArray();
+    for (int i = 0; i < HISTORY_COLS; i++) {
+        if (ctx.map.cap[i] != CAP_NONE) cJSON_AddItemToArray(avail, cJSON_CreateNumber(ctx.map.cap[i]));
     }
-    httpd_resp_sendstr_chunk(req, "]}");
+    char *avail_str = cJSON_PrintUnformatted(avail);
+    cJSON_Delete(avail);
+    httpd_resp_sendstr_chunk(req, "],\"available\":");
+    httpd_resp_sendstr_chunk(req, avail_str ? avail_str : "[]");
+    free(avail_str);
+    httpd_resp_sendstr_chunk(req, "}");
     httpd_resp_sendstr_chunk(req, NULL);   /* end chunked response */
     return ESP_OK;
 }
 
-/* POST /api/v1/plants {} -- pre-create an empty, probe-less plant (e.g.
- * before its physical sensor even exists yet -- plants_create() never
- * takes a mac, only plants_assign()/the .../probe route below does). No
- * body fields are read (the spec's contract is a literal `{}`); nothing to
- * validate, mirroring nodes_pair_post's body-ignoring POST above. 409
+/* GET /api/v1/capabilities -- capability.h's build-time table as JSON (spec
+ * §6: "every downstream surface ... reads metadata from this table" -- the
+ * UI is one of those surfaces, rendering unit/precision per capability
+ * rather than hardcoding metric names). Static data, no snapshot needed. */
+static esp_err_t capabilities_get(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "capabilities");
+    for (uint8_t i = 0; i < CAPABILITY_COUNT; i++) {
+        const capability_t *c = capability_get(i);
+        if (!c) continue;
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "id", c->id);
+        cJSON_AddStringToObject(o, "name", c->name);
+        cJSON_AddStringToObject(o, "unit", c->unit);
+        cJSON_AddNumberToObject(o, "precision", c->precision);
+        if (c->ha_device_class) cJSON_AddStringToObject(o, "ha_device_class", c->ha_device_class);
+        else cJSON_AddNullToObject(o, "ha_device_class");
+        cJSON_AddItemToArray(arr, o);
+    }
+    return send_json(req, root);
+}
+
+/* GET /api/v1/notice / POST /api/v1/notice/dismiss -- the clean-start
+ * notice (spec §5): data_fmt_apply() (app_config.h re-exports data_fmt.h)
+ * latches this in NVS on a first-V2-boot wipe; the UI shows it once until
+ * dismissed. */
+static esp_err_t notice_get(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "pending", data_fmt_notice_pending());
+    if (data_fmt_notice_pending()) {
+        cJSON_AddStringToObject(root, "message",
+            "Plant and history data did not carry over from the previous firmware version. "
+            "WiFi, claim, pairing and rules were preserved.");
+    }
+    return send_json(req, root);
+}
+
+static esp_err_t notice_dismiss_post(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+    data_fmt_dismiss_notice();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* POST /api/v1/plants {} -- pre-create an empty, bindingless plant (e.g.
+ * before its physical device even exists yet -- plants_create() never
+ * takes a binding, only the .../bind route below does). No body fields are
+ * read (the spec's contract is a literal `{}`); nothing to validate,
+ * mirroring nodes_pair_post's body-ignoring POST above. 409
  * {"error":"plant table full"} when all 16 (PLANTS_MAX) slots are taken. */
 static esp_err_t plants_create_post(httpd_req_t *req)
 {
@@ -584,27 +724,44 @@ static esp_err_t plants_rename_post(httpd_req_t *req, uint8_t id)
     return ESP_OK;
 }
 
-/* POST /api/v1/plants/{id}/probe {"mac":"MAC12"|null} -- assign, move, or
- * unassign id's probe (plants_table_assign()'s semantics, plants_table.h:
- * a mac currently assigned elsewhere is MOVED here, not duplicated; a plant
- * that already has a probe has it REPLACED; mac == NULL unassigns).
+/* POST /api/v1/plants/{id}/bind {"cap":<id>|null,"device":"<id-string>"|null}
+ * -- per-capability binding (spec §4/§7), replacing V1's single-probe
+ * "/probe" route (task-6 brief step 2: removed in favour of this one).
+ * Four body shapes:
+ *   cap given, device given -> bind that ONE capability to that device
+ *     (plants_bind_cap()); rebinding an already-bound capability replaces
+ *     its device outright.
+ *   cap given, device: null -> clear that ONE capability's binding
+ *     (plants_bind_cap(..., NULL)).
+ *   cap: null, device given -> bind-WHOLE-device: every capability
+ *     `device` currently reports (plants_bind_device()), spec §4's
+ *     one-click V1-parity flow.
+ *   cap: null, device: null -> 400: plants.h has no "unbind every
+ *     capability of this device" primitive, so there is nothing to do.
+ * A device id that isn't well-formed (device_id_parse() rejects it) is 400
+ * regardless of which branch it would have taken. 404 unknown plant.
  *
- * Unlike plants_resolve_or_create() (NEVER fed a request-supplied mac --
- * see plants_history_get()'s comment above and the Task 3 review's binding
+ * Unlike plants_resolve_or_create() (NEVER fed a request-supplied device
+ * id -- see history_get()'s comment above and the Task 3 review's binding
  * table-exhaustion finding it cites), this endpoint deliberately DOES
- * accept any well-formed mac from the request body, including one the
- * radio has never heard: that's the whole point of being able to
- * pre-assign a replacement probe before it has ever transmitted a reading
- * (see sensors_json.c's plant_json(), "pending" probe branch). This is
- * safe specifically because the route is authenticated (checked once by
- * plants_post_dispatch() before this is ever reached) -- an attacker can't
- * hit it for free the way an open GET could -- and it can't even grow the
- * plant table: plants_table_assign() only ever (re)points an EXISTING
- * plant's mac field, it never creates a plant. 404 unknown plant, 400 bad
- * mac. */
-static esp_err_t plants_probe_post(httpd_req_t *req, uint8_t id)
+ * accept any well-formed device id from the request body, including one
+ * the radio has never heard: that's the whole point of being able to
+ * pre-bind a replacement device before it has ever transmitted a reading.
+ * This is safe specifically because the route is authenticated (checked
+ * once by plants_post_dispatch() before this is ever reached) -- an
+ * attacker can't hit it for free the way an open GET could -- and neither
+ * plants_bind_cap() nor plants_bind_device() ever CREATES a plant, only
+ * (re)points bindings on an existing one. */
+static esp_err_t plants_bind_post(httpd_req_t *req, uint8_t id)
 {
-    char body[64];
+    plants_table_t table;
+    plants_snapshot(&table);
+    if (plants_table_find_id(&table, id) < 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown plant");
+        return ESP_OK;
+    }
+
+    char body[96];
     if (req->content_len == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
         return ESP_OK;
@@ -627,31 +784,52 @@ static esp_err_t plants_probe_post(httpd_req_t *req, uint8_t id)
     body[received] = '\0';
 
     cJSON *json = cJSON_Parse(body);
-    const cJSON *mac_j = cJSON_GetObjectItem(json, "mac");
-    uint8_t mac[6];
-    const uint8_t *mac_ptr = NULL;
-    bool ok_body;
-    if (mac_j != NULL && cJSON_IsNull(mac_j)) {
-        ok_body = true;   /* mac_ptr stays NULL: unassign */
-    } else if (mac_j != NULL && cJSON_IsString(mac_j) && parse_mac12(mac_j->valuestring, mac)) {
-        mac_ptr = mac;
-        ok_body = true;
-    } else {
-        ok_body = false;
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
+        return ESP_OK;
+    }
+    const cJSON *cap_j = cJSON_GetObjectItem(json, "cap");
+    const cJSON *dev_j = cJSON_GetObjectItem(json, "device");
+    bool cap_null = (!cap_j || cJSON_IsNull(cap_j));
+    bool dev_null = (!dev_j || cJSON_IsNull(dev_j));
+
+    uint8_t cap_id = 0;
+    if (!cap_null) {
+        if (!cJSON_IsNumber(cap_j) || cap_j->valuedouble < 0 || cap_j->valuedouble >= CAPABILITY_COUNT) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad cap");
+            return ESP_OK;
+        }
+        cap_id = (uint8_t)cap_j->valuedouble;
+    }
+
+    device_id_t dev = {0};
+    if (!dev_null) {
+        if (!cJSON_IsString(dev_j) || !device_id_parse(dev_j->valuestring, &dev)) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+            return ESP_OK;
+        }
     }
     cJSON_Delete(json);
-    if (!ok_body) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
+
+    bool ok;
+    if (!cap_null && !dev_null) {
+        ok = plants_bind_cap(id, cap_id, &dev);
+    } else if (!cap_null) {   /* dev_null */
+        ok = plants_bind_cap(id, cap_id, NULL);
+    } else if (!dev_null) {   /* cap_null */
+        /* s_api_reg_snap: too big for the httpd task stack; shared across
+         * this file's handlers, see its declaration comment (L5). */
+        data_core_snapshot(&s_api_reg_snap);
+        ok = plants_bind_device(id, &dev, &s_api_reg_snap) > 0;
+    } else {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "cap and device both null");
         return ESP_OK;
     }
 
-    esp_err_t err = plants_assign(id, mac_ptr);
-    if (err == ESP_ERR_NOT_FOUND) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown plant");
-        return ESP_OK;
-    }
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad mac");
+    if (!ok) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bind failed");
         return ESP_OK;
     }
     httpd_resp_set_type(req, "application/json");
@@ -659,27 +837,26 @@ static esp_err_t plants_probe_post(httpd_req_t *req, uint8_t id)
     return ESP_OK;
 }
 
-/* POST /api/v1/plants/{id}[/probe] -- rename or assign a probe, both under
- * the SAME registered wildcard route ("/api/v1/plants/" + wildcard), for
- * the exact ESP-IDF wildcard-registration reason node_post_dispatch's own
- * long comment above explains in full: only one wildcard template can ever be
- * registered per method under a given prefix -- a second, more specific
- * one would be rejected outright at registration time, since the existing
- * wildcard already "covers" it. Unlike nodes, there's no separate reserved
- * exact-path route competing for this prefix (no "/api/v1/plants/pair"
- * equivalent needing to win over the wildcard the way nodes_pair_post's
- * "/api/v1/nodes/pair" does) -- every POST under "/api/v1/plants/" is
- * either a bare id (rename) or an id + "/probe" (assign), both parsed and
- * dispatched right here. Auth is checked once here, not in either
- * sub-handler, mirroring node_post_dispatch's own single top-of-function
- * check.
+/* POST /api/v1/plants/{id}[/bind] -- rename or bind a capability, both
+ * under the SAME registered wildcard route ("/api/v1/plants/" + wildcard),
+ * for the exact ESP-IDF wildcard-registration reason node_post_dispatch's
+ * own long comment above explains in full: only one wildcard template can
+ * ever be registered per method under a given prefix -- a second, more
+ * specific one would be rejected outright at registration time, since the
+ * existing wildcard already "covers" it. Unlike nodes, there's no separate
+ * reserved exact-path route competing for this prefix (no
+ * "/api/v1/plants/pair" equivalent needing to win over the wildcard the
+ * way nodes_pair_post's "/api/v1/nodes/pair" does) -- every POST under
+ * "/api/v1/plants/" is either a bare id (rename) or an id + "/bind", both
+ * parsed and dispatched right here. Auth is checked once here, not in
+ * either sub-handler, mirroring node_post_dispatch's own single
+ * top-of-function check.
  *
  * Suffix matching tolerates a trailing query string ('?...') on either
- * branch, same fix as plants_history_get() above -- req->uri keeps it, so
- * "/3/probe?x=y" or "/3?x=y" must not be treated as an unrecognised suffix.
- * A real-world POST is unlikely to carry a query string, but being
- * consistent here costs nothing and avoids the exact trap that made the
- * history route's tier/from/to parsing unreachable. */
+ * branch, same fix as history_get()'s query parsing needed -- req->uri
+ * keeps it, so "/3/bind?x=y" or "/3?x=y" must not be treated as an
+ * unrecognised suffix. A real-world POST is unlikely to carry a query
+ * string, but being consistent here costs nothing. */
 static esp_err_t plants_post_dispatch(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
@@ -691,8 +868,8 @@ static esp_err_t plants_post_dispatch(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad id");
         return ESP_OK;
     }
-    if (strncmp(suffix, "/probe", 6) == 0 && (suffix[6] == '\0' || suffix[6] == '?'))
-        return plants_probe_post(req, id);
+    if (strncmp(suffix, "/bind", 5) == 0 && (suffix[5] == '\0' || suffix[5] == '?'))
+        return plants_bind_post(req, id);
     if (suffix[0] == '\0' || suffix[0] == '?') return plants_rename_post(req, id);
     httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
     return ESP_OK;
@@ -2023,35 +2200,49 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &scan));
     httpd_uri_t wifi = { .uri = "/api/v1/wifi", .method = HTTP_POST, .handler = wifi_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi));
-    /* Demoted probe pool (M8 Task 6, spec §4) -- diagnostics only; no
-     * per-sensor history or rename routes anymore (removed, see
-     * plants_history_get()'s comment for why the history route in
-     * particular isn't just re-registered under this prefix). */
+    /* Devices: the device+capability surface (Task 6, spec §6/§7).
+     * "/api/v1/sensors" (GET) stays registered as the deprecated alias
+     * task-6 brief calls for; its POST (rename, still mac-keyed) is
+     * unchanged. No per-sensor history route anymore -- devices' time
+     * series live under the plant they're bound to (GET /api/v1/history
+     * below), same as V1's demoted probe pool. */
+    httpd_uri_t devices = { .uri = "/api/v1/devices", .method = HTTP_GET, .handler = devices_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &devices));
+    httpd_uri_t caps = { .uri = "/api/v1/capabilities", .method = HTTP_GET, .handler = capabilities_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &caps));
     httpd_uri_t sensors_rn = { .uri = "/api/v1/sensors/*", .method = HTTP_POST, .handler = sensors_rename_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensors_rn));
     httpd_uri_t sensors = { .uri = "/api/v1/sensors", .method = HTTP_GET, .handler = sensors_get };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sensors));
 
-    /* Plants: the primary surface (M8 Task 6, spec §4). "/api/v1/plants"
+    /* Plants: the primary surface (Task 6, spec §4/§7). "/api/v1/plants"
      * (exact) and its wildcarded "/api/v1/plants/" + "*" form are distinct
      * URI templates to ESP-IDF's matcher -- same non-collision already
      * relied on above for exact "/api/v1/nodes" vs its own wildcarded form
      * -- so registration order between them doesn't matter; each wildcard
-     * method (GET/POST/DELETE) gets its own single dispatch point below,
-     * same pattern as the nodes routes' three separate wildcard
-     * handlers. */
+     * method (POST/DELETE) gets its own single dispatch point below, same
+     * pattern as the nodes routes' three separate wildcard handlers. No
+     * wildcarded GET anymore -- per-plant history moved to the exact
+     * "/api/v1/history" route below (spec §7's capability-driven history
+     * tab, not a raw/hourly tier pass-through). */
     httpd_uri_t plants = { .uri = "/api/v1/plants", .method = HTTP_GET, .handler = plants_get };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &plants));
     httpd_uri_t plants_create = { .uri = "/api/v1/plants", .method = HTTP_POST, .handler = plants_create_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &plants_create));
-    httpd_uri_t plants_history = { .uri = "/api/v1/plants/*", .method = HTTP_GET, .handler = plants_history_get };
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &plants_history));
-    /* Handles rename ("/{id}") and probe assign ("/{id}/probe") -- both
+    /* Handles rename ("/{id}") and capability bind ("/{id}/bind") -- both
      * under this one route, per plants_post_dispatch()'s comment. */
     httpd_uri_t plants_post = { .uri = "/api/v1/plants/*", .method = HTTP_POST, .handler = plants_post_dispatch };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &plants_post));
     httpd_uri_t plants_del = { .uri = "/api/v1/plants/*", .method = HTTP_DELETE, .handler = plants_delete_delete };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &plants_del));
+    httpd_uri_t history = { .uri = "/api/v1/history", .method = HTTP_GET, .handler = history_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &history));
+
+    /* Clean-start notice (spec §5). */
+    httpd_uri_t notice_g = { .uri = "/api/v1/notice", .method = HTTP_GET, .handler = notice_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &notice_g));
+    httpd_uri_t notice_d = { .uri = "/api/v1/notice/dismiss", .method = HTTP_POST, .handler = notice_dismiss_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &notice_d));
 
     httpd_uri_t timep = { .uri = "/api/v1/time", .method = HTTP_POST, .handler = time_post };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &timep));

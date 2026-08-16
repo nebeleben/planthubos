@@ -1,6 +1,6 @@
 #include "sse.h"
 #include "data_core.h"
-#include "sensors_json.h"
+#include "devices_json.h"
 #include "event_log.h"
 #include "cJSON.h"
 #include "esp_log.h"
@@ -123,22 +123,38 @@ static esp_err_t events_json_get(httpd_req_t *req, uint32_t after)
 
 static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
+    /* mac is copied into the event queue by esp_event (see data_core.c's
+     * esp_event_post() calls); every current producer is BLE-kind, same as
+     * V1 -- data_core.h doesn't post a device_id_t here, so DEV_KIND_BLE is
+     * the only sound interpretation of a bare 6-byte mac payload. */
     const uint8_t *mac = data;
-    static legacy_registry_t snap;   /* M2-SHIM; only ever touched on the default event loop task */
     /* static: this handler only ever runs on the single default event-loop
-     * task, which has just a 2304 B stack -- keep the message buffer off it.
-     * 512, not 320: M5b's "via" attribution (sensor_json()) added a nested
-     * object carrying a 32-char sensor name plus, when relayed, a node's own
-     * up-to-24-char name (SWARM_NODE_NAME_LEN) and MAC/rssi -- worst case is
-     * now ~250 B of JSON before the "data: "/"\n\n" SSE framing, versus the
-     * ~120 B this 320 B figure was originally sized for. 512 keeps a real
-     * margin above that ~250 B worst case rather than trimming right up
-     * against it. */
-    static char buf[512];
-    data_core_snapshot_legacy(&snap);   /* M2-SHIM */
-    int idx = legacy_registry_find(&snap, mac);   /* M2-SHIM */
+     * task, which has just a 2304 B stack -- keep both the registry
+     * snapshot and the message buffer off it (same reasoning api_v1.c's
+     * s_api_reg_snap doc comment gives; only one instance of this handler
+     * ever runs at a time, so sharing is safe). registry_t is bigger than
+     * V1's legacy_registry_t shim it replaces (~2 KB vs ~0.9 KB) -- see
+     * task-6-report.md for the byte accounting. */
+    static registry_t snap;
+    /* device_json()'s device-shaped payload (Task 6, spec Sec.6/Sec.7) is
+     * bigger than V1's sensor_json() shape it replaces: a live BLE MiFlora
+     * can carry up to 6 valid capability slots (moisture/temp/lux/
+     * conductivity/battery + signal.rssi, data_core.c's
+     * data_core_submit_mibeacon() doc comment), each its own JSON object
+     * with a capability name/unit string -- worst case (longest names,
+     * 24-char via node name, 32-char sensor name) is comfortably under
+     * 900 B; 1024 keeps real margin above that without costing anything
+     * meaningful in static RAM. plant_ids is passed NULL (empty array) --
+     * this task is not worth a plants_table_t snapshot on this task's tiny
+     * stack, and the SSE push is a "something changed" nudge, not the
+     * plant-binding source of truth (GET /api/v1/plants is). */
+    static char buf[1024];
+    data_core_snapshot(&snap);
+    device_id_t devid = device_id_from_mac(DEV_KIND_BLE, mac);
+    int idx = registry_find(&snap, &devid);
     if (idx < 0) return;
-    cJSON *o = sensor_json(&snap.sensors[idx]);
+    uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    cJSON *o = device_json(&snap.devices[idx], NULL, now_uptime_s);
     char *json = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     if (!json) return;
