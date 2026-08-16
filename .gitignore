@@ -35,3 +35,4 @@ tests/host/test_unknown_capture
 tests/host/test_bthome
 tests/host/test_bindkey_core
 .DS_Store
+tests/host/test_uri_handler_budget

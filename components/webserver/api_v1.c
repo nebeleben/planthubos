@@ -2915,7 +2915,6 @@ static esp_err_t unknown_get(httpd_req_t *req)
      * allocation fails partway through -- see the oom handling at the
      * bottom of the loop. */
     httpd_resp_set_type(req, "application/json");
-    if (httpd_resp_sendstr_chunk(req, "{\"devices\":[") != ESP_OK) return ESP_FAIL;
 
     /* Whether anything has actually been written yet -- NOT the same as
      * "i > 0": the `if (d->n == 0) continue;` skip below means an earlier
@@ -2925,6 +2924,13 @@ static esp_err_t unknown_get(httpd_req_t *req)
     bool emitted = false;
     bool oom = false;
     size_t oom_at = 0;
+
+    /* Bytes pending in s_http_body -- see the coalescing comment in the loop.
+     * The opening literal starts the buffer rather than being its own write,
+     * so the common case is exactly one TCP write for the whole response. */
+    static const char open_lit[] = "{\"devices\":[";
+    size_t used = sizeof(open_lit) - 1;
+    memcpy(s_http_body, open_lit, used);
 
     for (size_t i = 0; i < n; i++) {
         const unknown_dev_t *d = &s_unknown_buf[i];
@@ -2973,11 +2979,41 @@ static esp_err_t unknown_get(httpd_req_t *req)
         cJSON_Delete(o);
         if (!body) { oom = true; oom_at = i; break; }
 
-        esp_err_t err = ESP_OK;
-        if (emitted) err = httpd_resp_sendstr_chunk(req, ",");
-        if (err == ESP_OK) err = httpd_resp_sendstr_chunk(req, body);
+        /* Coalesce into s_http_body rather than writing each device as its
+         * own chunk. Streaming per device fixed the allocation failure this
+         * endpoint used to die of, but replaced it with a latency failure:
+         * ~18 small TCP writes for a 1.2 KB body, and with WiFi power-save
+         * on (wifi:pm start) each one can wait out a DTIM cycle. Measured on
+         * the C3, per-device chunks took 1.3-5.6 s when they worked and timed
+         * out at 18 s when they didn't -- and a timeout wedges the socket
+         * pool for ~90 s, so the failures cascade.
+         *
+         * s_http_body is the request-scoped shared scratch buffer (see its
+         * declaration): this is a GET handler on the same single httpd task
+         * as the POST/PUT handlers that use it for request bodies, so it is
+         * free here, and using it costs no new static RAM on a target with
+         * ~1.4 KB of margin. The whole response fits in one write at 8 KB;
+         * the flush-when-full path exists so a future larger capture cannot
+         * silently overflow it.
+         *
+         * Peak HEAP allocation is unchanged -- still one small device object
+         * at a time, which is the property that fixed the original bug. */
+        size_t need = strlen(body) + (emitted ? 1 : 0);
+        if (used + need > sizeof(s_http_body)) {
+            if (used > 0 && httpd_resp_send_chunk(req, s_http_body, used) != ESP_OK) {
+                free(body);
+                return ESP_FAIL;   /* client/socket gone; don't keep writing to a dead connection */
+            }
+            used = 0;
+            /* A single device larger than the whole buffer cannot be split
+             * without emitting malformed JSON, so treat it as the same
+             * "cannot render this list" case as an allocation failure. */
+            if (need > sizeof(s_http_body)) { free(body); oom = true; oom_at = i; break; }
+        }
+        if (emitted) s_http_body[used++] = ',';
+        memcpy(s_http_body + used, body, need - (emitted ? 1 : 0));
+        used += need - (emitted ? 1 : 0);
         free(body);
-        if (err != ESP_OK) return ESP_FAIL;   /* client/socket gone; don't send trailing chunks over a dead connection, same convention history_get() uses */
         emitted = true;
     }
 
@@ -2992,7 +3028,15 @@ static esp_err_t unknown_get(httpd_req_t *req)
                  (unsigned)oom_at, (unsigned)n);
     }
 
-    if (httpd_resp_sendstr_chunk(req, "]}") != ESP_OK) return ESP_FAIL;
+    /* Close the array in the same buffer, so the common case leaves the
+     * handler having done exactly one TCP write. */
+    if (used + 2 > sizeof(s_http_body)) {
+        if (httpd_resp_send_chunk(req, s_http_body, used) != ESP_OK) return ESP_FAIL;
+        used = 0;
+    }
+    s_http_body[used++] = ']';
+    s_http_body[used++] = '}';
+    if (httpd_resp_send_chunk(req, s_http_body, used) != ESP_OK) return ESP_FAIL;
     httpd_resp_sendstr_chunk(req, NULL);   /* end chunked response */
     return ESP_OK;
 }
