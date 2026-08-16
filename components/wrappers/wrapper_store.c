@@ -48,15 +48,34 @@ static bool path_for(uint32_t id, const char *ext, char *buf, size_t buflen)
 /* Reads the whole file into buf (capacity buflen); rejects (returns false) a
  * file that turns out to be longer than buflen rather than silently
  * truncating it -- same "confirm the file isn't LONGER than expected"
- * pattern as rules_store.c's/plants.c's read_whole_file()/load_file(). */
+ * pattern as rules_store.c's/plants.c's read_whole_file()/load_file().
+ *
+ * On that "too long for buflen" failure specifically, *len_out is still set
+ * to the file's TRUE size (one extra fseek/ftell, cheap relative to the
+ * already-failed read) rather than left untouched -- M3 Task 5's
+ * wrapper_arena.c (the only caller that ever passes a `buflen` smaller than
+ * a blob might genuinely be) uses this to tell "would fit after evicting N
+ * bytes from the arena" from "will never fit at all, refuse without
+ * evicting anything" without a second stat() of its own. Every EXISTING
+ * caller of this helper (load_one()'s meta-file reads, just below) already
+ * discards len_out entirely on a false return, so this changes no observed
+ * behaviour for them. A genuine I/O failure (fopen itself failing) leaves
+ * *len_out untouched, same as before -- there is no "true size" to report
+ * for a file that couldn't even be opened. */
 static bool read_whole_file(const char *path, void *buf, size_t buflen, size_t *len_out)
 {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
     size_t n = fread(buf, 1, buflen, f);
     int extra = fgetc(f);
+    if (extra != EOF) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fclose(f);
+        if (len_out && sz > 0) *len_out = (size_t)sz;
+        return false;
+    }
     fclose(f);
-    if (extra != EOF) return false;
     if (len_out) *len_out = n;
     return true;
 }

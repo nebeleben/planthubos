@@ -8,6 +8,8 @@
 #include "swarm_store.h"
 #include "rules.h"
 #include "wrapper_index.h"
+#include "wrapper_arena.h"
+#include "wrapper_exec.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
@@ -54,6 +56,24 @@ static portMUX_TYPE s_adv_mux = portMUX_INITIALIZER_UNLOCKED;
  * (same reasoning as s_batt_tab needing one and this not: unlike s_batt_tab,
  * nothing outside the decoder task touches this table in M3 Task 2). */
 static wrapper_index_t s_wrapper_index;
+
+/* M3 Task 5 (spec §2 "device -> wrapper memo"): one byte per registry
+ * device, the id of the wrapper that last matched it -- so a repeat
+ * advertisement from a device already known to match a specific wrapper
+ * skips wrapper_index_lookup() entirely and goes straight to
+ * wrapper_arena_get()+wrapper_exec_run(). WRAPPER_MEMO_NONE (0xFF, outside
+ * WRAPPERS_MAX's 0..15 range) means "no memo recorded" -- NOT "confirmed no
+ * wrapper matches"; a device whose last advert genuinely matched nothing
+ * always re-runs a real lookup, which is cheap (an O(WRAPPERS_MAX) scan)
+ * and, unlike a positive match, has nothing worth caching per spec's own
+ * wording ("the wrapper id that LAST MATCHED"). Indexed by registry slot
+ * (data_core_find_index()), not by MAC -- see that function's own doc
+ * comment for why a registry index is stable for a device's lifetime.
+ * 16 * 1 B = 16 B static, exactly spec §7's budget line; same
+ * "adv_decoder_task is the only reader/writer, no lock" reasoning as
+ * s_wrapper_index just above. */
+#define WRAPPER_MEMO_NONE 0xFF
+static uint8_t s_wrapper_memo[REGISTRY_MAX_DEVICES];
 
 #define ADV_DECODER_TASK_STACK 3072
 /* Below the NimBLE host task (configMAX_PRIORITIES - 4, see
@@ -187,14 +207,7 @@ static void decode_adv_item(const adv_item_t *item)
      * contract is 0xFFFFFFFF for "this advert had none of that field" --
      * never 0, which is a real (if unlikely) UUID/company id. This runs for
      * every advert, MiFlora or not, since a non-MiFlora frame is exactly
-     * what a wrapper exists to decode.
-     *
-     * Wrapper EXECUTION is not part of this task (Task 5 adds the arena and
-     * the VM run) -- s_wrapper_index is only ever populated by
-     * wrapper_store_load_all() at boot, and nothing installs a wrapper
-     * before Task 7's API exists, so in practice this is always -1 today.
-     * The lookup and its log line are wired now so the matcher itself is
-     * exercised on real traffic ahead of Task 5 giving it something to do. */
+     * what a wrapper exists to decode. */
     uint32_t svc_uuid = 0xFFFFFFFFu;
     if (fields.svc_data_uuid16 && fields.svc_data_uuid16_len >= 2) {
         svc_uuid = (uint32_t)(fields.svc_data_uuid16[0] | (fields.svc_data_uuid16[1] << 8));
@@ -215,9 +228,66 @@ static void decode_adv_item(const adv_item_t *item)
         return;
     }
 
-    int wrapper_id = wrapper_index_lookup(&s_wrapper_index, svc_uuid, manu_id, item->mac);
+    /* M3 Task 5 (spec §2 "device -> wrapper memo"): a memoised match skips
+     * wrapper_index_lookup() entirely; a device the registry doesn't know
+     * about yet (ridx < 0) or with no memo recorded falls through to a real
+     * lookup, same as before this task. mac_disp is item->mac reversed into
+     * display/human byte order -- device_id_from_mac()'s and
+     * wrapper_exec_run()'s own contract, same reversal
+     * decode_bthome_item() does independently for its own MAC use (see its
+     * comment for why raw GAP order must never be used directly here). */
+    uint8_t mac_disp[6];
+    for (int i = 0; i < 6; i++) mac_disp[i] = item->mac[5 - i];
+    device_id_t wid = device_id_from_mac(DEV_KIND_BLE, mac_disp);
+    int ridx = data_core_find_index(&wid);
+    int wrapper_id = (ridx >= 0 && s_wrapper_memo[ridx] != WRAPPER_MEMO_NONE)
+                          ? s_wrapper_memo[ridx]
+                          : wrapper_index_lookup(&s_wrapper_index, svc_uuid, manu_id, item->mac);
     if (wrapper_id >= 0) {
-        ESP_LOGD(TAG, "wrapper %d matched (execution lands in a later M3 task)", wrapper_id);
+        /* Payload slice convention mirrors decode_bthome_item()'s own
+         * "hand the wrapper the bytes AFTER the matched AD structure's own
+         * header, not the raw multi-structure advert" -- service-data past
+         * its 2-byte UUID, manufacturer-data past its 2-byte company id.
+         * mac_prefix has no such header to skip, so it gets the raw AD blob
+         * as queued (item->payload/item->len). */
+        const uint8_t *payload = NULL;
+        uint8_t payload_len = 0;
+        switch (wrapper_index_kind_of(&s_wrapper_index, (uint16_t)wrapper_id)) {
+        case WMATCH_SERVICE:
+            if (fields.svc_data_uuid16 && fields.svc_data_uuid16_len >= 2) {
+                payload = fields.svc_data_uuid16 + 2;
+                payload_len = (uint8_t)(fields.svc_data_uuid16_len - 2);
+            }
+            break;
+        case WMATCH_MANUFACTURER:
+            if (fields.mfg_data && fields.mfg_data_len >= 2) {
+                payload = fields.mfg_data + 2;
+                payload_len = (uint8_t)(fields.mfg_data_len - 2);
+            }
+            break;
+        default:   /* WMATCH_MAC_PREFIX, or an id the memo outlived a reindex for */
+            payload = item->payload;
+            payload_len = item->len;
+            break;
+        }
+
+        bool wrote = wrapper_exec_run((uint16_t)wrapper_id, mac_disp, payload, payload_len);
+
+        /* Record the memo now that the device is guaranteed to be
+         * registered (a successful EMIT just created/touched its registry
+         * entry via data_core_submit_cap()) -- re-resolve rather than trust
+         * `ridx` from above, which is -1 on this device's very first
+         * advertisement. If the device STILL isn't registered (every EMIT
+         * was skipped as out-of-range, or the wrapper's `require` rejected
+         * this payload and emitted nothing), there is nothing to memoise
+         * yet; the next advertisement just repeats a real lookup, which is
+         * always correct, only not free. */
+        int midx = (ridx >= 0) ? ridx : data_core_find_index(&wid);
+        if (midx >= 0 && midx < REGISTRY_MAX_DEVICES) {
+            s_wrapper_memo[midx] = (uint8_t)wrapper_id;
+        }
+        if (wrote) rules_notify_value_update();
+        return;   /* a matched wrapper's key can never also be MiFlora's (distinct match kinds/keys) -- nothing further to dispatch */
     }
 
     /* Native MiFlora path -- unchanged behaviour from before this task,
@@ -290,6 +360,19 @@ static void adv_decoder_task(void *arg)
 uint32_t ble_collector_adv_dropped(void)
 {
     return adv_ring_dropped(&s_adv_ring);
+}
+
+/* See ble_collector.h's doc comment (M3 Task 5): rebuild the match index
+ * from flash, then throw away every cached bytecode blob and every
+ * device's memoised wrapper id -- the three things spec §2 says a wrapper
+ * install/delete must invalidate together, since any of those can change
+ * which wrapper id (if any) a given device's advertisement should now
+ * resolve to. */
+void ble_collector_wrapper_reindex(void)
+{
+    wrapper_store_load_all(&s_wrapper_index);
+    memset(s_wrapper_memo, WRAPPER_MEMO_NONE, sizeof(s_wrapper_memo));
+    wrapper_arena_evict_all();
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg)
@@ -407,6 +490,16 @@ esp_err_t ble_collector_start(void)
      * spec §7); the LittleFS scan itself is transient stack/heap, freed
      * before this returns. */
     wrapper_store_load_all(&s_wrapper_index);
+    /* M3 Task 5: wire the arena's loader to the real flash reader before
+     * anything can call wrapper_arena_get() (adv_decoder_task, once
+     * created, below), then reset it to empty. Static
+     * CONFIG_PLANTHUB_WRAPPER_ARENA bytes (2048 on esp32c3, 4096 on
+     * esp32c5, spec §7). s_wrapper_memo (16 B static) starts all
+     * WRAPPER_MEMO_NONE -- memset(0xFF), not the default zero-init, since
+     * 0 is itself a valid wrapper id. */
+    wrapper_arena_set_loader(wrapper_store_read_psbc);
+    wrapper_arena_init();
+    memset(s_wrapper_memo, WRAPPER_MEMO_NONE, sizeof(s_wrapper_memo));
     log_heap("before adv_decoder_task");
     if (xTaskCreate(adv_decoder_task, "ble_adv_decoder", ADV_DECODER_TASK_STACK,
                      NULL, ADV_DECODER_TASK_PRIO, NULL) != pdPASS) {

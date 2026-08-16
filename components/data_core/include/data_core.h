@@ -121,3 +121,21 @@ bool      data_core_submit_battery(const uint8_t mac[6], uint8_t pct);
  * (nothing created or modified either way) -- callers must not treat that
  * as "this reading is now stored". */
 bool      data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value);
+
+/* Registry slot index for id (0..REGISTRY_MAX_DEVICES-1), or -1 when the
+ * device is not (yet) registered. Never creates an entry -- a pure lookup,
+ * thread-safe via the same s_mutex every other accessor here uses, no
+ * REGISTRY_MAX_DEVICES-sized struct copy (unlike data_core_snapshot()).
+ * Added for M3 Task 5's wrapper dispatch memo (spec section 2 "device ->
+ * wrapper memo"): ble_collector.c keeps a fixed REGISTRY_MAX_DEVICES-sized
+ * "last matched wrapper id" table, keyed by this index rather than by MAC,
+ * so it can live as a flat array the same shape as the match index (16 * 1
+ * B, spec section 7's budget line) instead of its own MAC-keyed lookup
+ * structure. A device the registry doesn't know about yet (index -1, e.g.
+ * its very first advertisement) always falls through to a real match-index
+ * lookup -- exactly the desired behaviour, since there is nothing yet to
+ * memoise. Registry entries are never removed once created (registry.h has
+ * no delete), so an index, once valid, stays valid for the device's
+ * lifetime -- the memo table never needs to worry about a slot being
+ * silently reused by a different device. */
+int       data_core_find_index(const device_id_t *id);

@@ -107,6 +107,10 @@ $CC -Wall -Wextra -Werror -I../../components/wrappers/include \
     test_wrapper_index.c ../../components/wrappers/wrapper_index.c -o test_wrapper_index
 ./test_wrapper_index
 
+$CC -Wall -Wextra -Werror -I../../components/wrappers/include \
+    test_wrapper_arena.c ../../components/wrappers/wrapper_arena.c -o test_wrapper_arena
+./test_wrapper_arena
+
 # test_bthome links mbedtls's AES-CCM for the one encrypted vector the M3
 # Task 3 brief asks for; the plain-cc host harness has no ESP-IDF mbedtls
 # component to draw on, so this looks for a host mbedtls (Homebrew's, if

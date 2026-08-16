@@ -41,6 +41,18 @@ bool wrapper_index_remove(wrapper_index_t *ix, uint16_t id);
 int  wrapper_index_lookup(const wrapper_index_t *ix, uint32_t svc_uuid,
                           uint32_t manu_id, const uint8_t mac[6]);
 
+/* Returns the WMATCH_* kind of the entry with id, or 0xFF if id isn't
+ * indexed. Added for M3 Task 5 (wrapper execution): ble_collector.c's
+ * decode_adv_item() needs to know WHICH slice of the raw advertisement to
+ * hand a matched wrapper -- service-data after its 2-byte UUID,
+ * manufacturer-data after its 2-byte company id, or the raw AD blob for a
+ * mac_prefix match -- and wrapper_index_lookup() above only ever returns
+ * the winning id, not its kind, so this is a small, separate, deliberately
+ * non-breaking addition (an O(count) rescan of an id lookup() just
+ * resolved) rather than widening lookup()'s own signature and disturbing
+ * Task 2's already-reviewed contract/tests. */
+uint8_t wrapper_index_kind_of(const wrapper_index_t *ix, uint16_t id);
+
 /* ---------------- wrapper_store.c (LittleFS side) ----------------
  * One wrapper lives as three files under /storage/wrappers/, `<id>.wsrc`
  * (source text), `<id>.wbc` (bytecode) and `<id>.json` (meta: name, enabled,
@@ -60,7 +72,11 @@ int  wrapper_index_lookup(const wrapper_index_t *ix, uint32_t svc_uuid,
 void wrapper_store_load_all(wrapper_index_t *ix);
 
 /* Reads exactly one wrapper's bytecode into buf (capacity cap); *len_out is
- * set to the blob's length on success. False on any I/O/size problem. Not
- * yet called by anything in M3 Task 2 (wrapper execution is Task 5) but
- * lives here now so the arena's loader (Task 5) has a ready entry point. */
+ * set to the blob's length on success. False on any I/O/size problem -- EXCEPT
+ * that a "file is longer than cap" failure specifically still sets *len_out
+ * to the file's true size (wrapper_store.c's read_whole_file()), which M3
+ * Task 5's wrapper_arena.c relies on to distinguish "would fit after
+ * evicting" from "will never fit". This signature matches wrapper_arena.h's
+ * wrapper_loader_t exactly -- wired as the real loader in
+ * ble_collector.c's ble_collector_start() via wrapper_arena_set_loader(). */
 bool wrapper_store_read_psbc(uint16_t id, uint8_t *buf, size_t cap, size_t *len_out);

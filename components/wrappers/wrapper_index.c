@@ -88,3 +88,11 @@ int wrapper_index_lookup(const wrapper_index_t *ix, uint32_t svc_uuid,
     }
     return -1;
 }
+
+uint8_t wrapper_index_kind_of(const wrapper_index_t *ix, uint16_t id)
+{
+    for (uint8_t i = 0; i < ix->count; i++) {
+        if (ix->e[i].id == id) return ix->e[i].kind;
+    }
+    return 0xFF;
+}

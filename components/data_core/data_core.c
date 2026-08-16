@@ -238,3 +238,11 @@ bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
                    (void *)mac, 6, 0 /* don't block the calling task (adv_decoder_task for BTHome) */);
     return true;
 }
+
+int data_core_find_index(const device_id_t *id)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int idx = registry_find(&s_registry, id);
+    xSemaphoreGive(s_mutex);
+    return idx;
+}

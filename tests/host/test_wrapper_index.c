@@ -74,6 +74,12 @@ int main(void)
     assert(wrapper_index_add(&full, WMATCH_SERVICE, 0x9999, 200) == 0);
     assert(wrapper_index_lookup(&full, 0x9999, 0xFFFFFFFF, MAC_C) == 200);
 
+    /* wrapper_index_kind_of() -- M3 Task 5 addition */
+    assert(wrapper_index_kind_of(&ix, 10) == WMATCH_SERVICE);
+    assert(wrapper_index_kind_of(&ix, 12) == WMATCH_MAC_PREFIX);
+    assert(wrapper_index_kind_of(&ix, 30) == WMATCH_MANUFACTURER);
+    assert(wrapper_index_kind_of(&ix, 999) == 0xFF);
+
     printf("test_wrapper_index: OK\n");
     return 0;
 }
