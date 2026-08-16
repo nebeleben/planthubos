@@ -1848,8 +1848,10 @@ static rules_test_action_t s_rules_test_acts[16];   /* generous cap for a dry-ru
  * nested): rules_upsert_from_body() [POST/PUT /api/v1/rules[/{id}]],
  * wrapper_upsert_from_body() [POST/PUT /api/v1/wrappers[/{id}]],
  * wrappers_test_post() [POST /api/v1/wrappers/{id}/test, optional {hex?}
- * body]. Every bound check against this buffer below uses sizeof(...) on
- * the variable itself, never a macro, so the merge changes nothing there;
+ * body], wrappers_inline_test_post() [POST /api/v1/wrappers/test,
+ * {bytecode_b64, hex} body -- M4 spec section 5]. Every bound check against
+ * this buffer below uses sizeof(...) on the variable itself, never a macro,
+ * so the merge changes nothing there;
  * both original sizes were 8192 regardless (rules and wrappers reasoning is
  * identical): name?(<=48)+source(<=4096, JSON-escaped -- worst realistic
  * case around 1.5x for compiler-produced source, not the 2x pathological
@@ -1864,12 +1866,14 @@ static char s_http_body[HTTP_BODY_MAX];
  * identical for both original owners. */
 static char s_http_source[RULES_SRC_MAX + 1];
 
-/* Decoded-bytecode scratch, three owners: rules_upsert_from_body() [decodes
+/* Decoded-bytecode scratch, four owners: rules_upsert_from_body() [decodes
  * bytecode_b64 for a rule], wrapper_upsert_from_body() [same, for a
  * wrapper], wrappers_test_post() [reads an EXISTING wrapper's bytecode for
- * a dry run]. Each is a separate httpd handler invocation -- none ever runs
- * nested inside another -- and none stashes a pointer into this buffer
- * past its own httpd_resp_send*() call, so all three folding into one
+ * a dry run], wrappers_inline_test_post() [decodes a CANDIDATE wrapper's
+ * bytecode_b64 straight from the request body for M4's id-less dry run --
+ * spec section 5]. Each is a separate httpd handler invocation -- none ever
+ * runs nested inside another -- and none stashes a pointer into this buffer
+ * past its own httpd_resp_send*() call, so all four folding into one
  * buffer is safe. RULES_PSBC_MAX == WRAPPER_PSBC_MAX == 2048.
  *
  * wrappers_test_post()'s read is deliberately NOT the shared wrapper arena
@@ -2630,16 +2634,35 @@ static esp_err_t wrappers_delete_delete(httpd_req_t *req)
 #define WRAPPER_AD_TYPE_MANUFACTURER    0xFF
 
 /* Minimal raw BLE AD-structure scanner: walks a raw advertisement blob's
- * {len,type,data...} structures looking for `ad_type`, and returns its
- * first two data bytes as a little-endian u16 (the UUID/company-id
- * convention every AD structure of these two types uses). Deliberately
- * NOT NimBLE's ble_hs_adv_parse_fields() -- pulling the NimBLE host parser
- * into the httpd task for what is purely advisory, read-only bookkeeping
+ * {len,type,data...} structures looking for `ad_type`. Deliberately NOT
+ * NimBLE's ble_hs_adv_parse_fields() -- pulling the NimBLE host parser into
+ * the httpd task for what is purely advisory, read-only bookkeeping
  * (picking which captured sample to preview in a dry-run) is unnecessary
  * weight; the REAL match, which this never influences, still only ever
- * happens on the decoder task via wrapper_index_lookup(). */
-static bool wrapper_ad_find_u16(const uint8_t *adv, uint8_t len, uint8_t ad_type, uint16_t *out)
+ * happens on the decoder task via wrapper_index_lookup().
+ *
+ * On a match, `*out_id` (if non-NULL) gets the AD structure's own first two
+ * data bytes as a little-endian u16 (the UUID/company-id convention every
+ * AD structure of these two types uses), and `*out_payload`/`*out_len` (if
+ * non-NULL) get the slice AFTER those two bytes -- the exact bytes
+ * decode_adv_item() (ble_collector.c) hands a matching wrapper at runtime.
+ *
+ * LAST-WINS: if `ad_type` occurs more than once, every match overwrites the
+ * previous one, so the function returns the LAST occurrence, not the
+ * first. This mirrors NimBLE's own ble_hs_adv_parse_fields(), which
+ * overwrites fields.mfg_data/svc_data_uuid16 on every matching AD structure
+ * it walks with no already-set guard -- the same reasoning that made
+ * payload.js's browser-side scanner last-wins. A preview built on a
+ * first-wins scan could pick a different AD structure (and therefore a
+ * different id and a different payload slice) than production actually
+ * matches on, which is exactly the disagreement this function exists to
+ * avoid. Returns false, leaving all output params untouched, if `ad_type`
+ * never occurs. */
+static bool wrapper_ad_find_slice(const uint8_t *adv, uint8_t len, uint8_t ad_type,
+                                  uint16_t *out_id, const uint8_t **out_payload,
+                                  uint8_t *out_len)
 {
+    bool found = false;
     uint16_t i = 0;
     while ((uint16_t)(i + 1) < len) {
         uint8_t seg_len = adv[i];
@@ -2647,12 +2670,14 @@ static bool wrapper_ad_find_u16(const uint8_t *adv, uint8_t len, uint8_t ad_type
         if ((uint16_t)(i + 1 + seg_len) > len) break;
         uint8_t seg_type = adv[i + 1];
         if (seg_type == ad_type && seg_len >= 3) {
-            *out = (uint16_t)(adv[i + 2] | (adv[i + 3] << 8));
-            return true;
+            if (out_id)      *out_id      = (uint16_t)(adv[i + 2] | (adv[i + 3] << 8));
+            if (out_payload) *out_payload = &adv[i + 4];
+            if (out_len)     *out_len     = (uint8_t)(seg_len - 3);
+            found = true;
         }
         i = (uint16_t)(i + 1 + seg_len);
     }
-    return false;
+    return found;
 }
 
 /* True iff captured sample `s` (from unknown device `d`) would resolve to
@@ -2676,12 +2701,14 @@ static bool wrapper_sample_matches(const unknown_dev_t *d, const unknown_sample_
     switch (match_kind) {
     case WMATCH_SERVICE: {
         uint16_t uuid;
-        return wrapper_ad_find_u16(s->payload, s->len, WRAPPER_AD_TYPE_SERVICE_DATA_16, &uuid) &&
+        return wrapper_ad_find_slice(s->payload, s->len, WRAPPER_AD_TYPE_SERVICE_DATA_16,
+                                     &uuid, NULL, NULL) &&
                uuid == match_key;
     }
     case WMATCH_MANUFACTURER: {
         uint16_t mid;
-        return wrapper_ad_find_u16(s->payload, s->len, WRAPPER_AD_TYPE_MANUFACTURER, &mid) &&
+        return wrapper_ad_find_slice(s->payload, s->len, WRAPPER_AD_TYPE_MANUFACTURER,
+                                     &mid, NULL, NULL) &&
                mid == match_key;
     }
     case WMATCH_MAC_PREFIX: {
@@ -2694,8 +2721,29 @@ static bool wrapper_sample_matches(const unknown_dev_t *d, const unknown_sample_
 }
 
 /* Scans every captured unknown device's samples for the NEWEST one (by ts)
- * that would match (match_kind,match_key); copies it into out_payload
- * (capacity PSVM_PAYLOAD_MAX) and *out_len. False if none match. */
+ * that would match (match_kind,match_key); slices it exactly the way
+ * decode_adv_item() (ble_collector.c) would at runtime and copies that
+ * slice into out_payload (capacity PSVM_PAYLOAD_MAX) / *out_len. False if
+ * none match.
+ *
+ * The slice matters, not just the pick: `best->payload` is the RAW
+ * captured advertisement -- AD length byte, AD type byte and the 2-byte
+ * service UUID/company id all still in it. Production never hands a
+ * wrapper that whole blob for a service or manufacturer match; see
+ * decode_adv_item()'s own payload-slice comment (ble_collector.c) for the
+ * three cases this mirrors:
+ *   - WMATCH_SERVICE:      fields.svc_data_uuid16 + 2  (past the UUID)
+ *   - WMATCH_MANUFACTURER: fields.mfg_data + 2         (past the company id)
+ *   - WMATCH_MAC_PREFIX:   the raw AD blob, unsliced -- there is no header
+ *                          to skip; item->payload/item->len go straight to
+ *                          the wrapper.
+ * wrapper_ad_find_slice() re-finds the SAME (last-wins) AD structure
+ * wrapper_sample_matches() above already confirmed matches -- so failing to
+ * find it here would mean the two disagree, which should never happen, but
+ * is still handled as "no sample" (false) rather than by falling back to
+ * the raw advertisement: a decode of the wrong bytes looks exactly as
+ * plausible as a decode of the right ones, and would send an operator
+ * chasing the decode instead of whatever actually broke. */
 static bool wrapper_find_test_sample(uint8_t match_kind, uint32_t match_key,
                                      uint8_t *out_payload, uint8_t *out_len)
 {
@@ -2710,9 +2758,35 @@ static bool wrapper_find_test_sample(uint8_t match_kind, uint32_t match_key,
         }
     }
     if (!best) return false;
-    memcpy(out_payload, best->payload, best->len);
-    *out_len = best->len;
-    return true;
+
+    switch (match_kind) {
+    case WMATCH_SERVICE: {
+        const uint8_t *slice;
+        uint8_t slice_len;
+        if (!wrapper_ad_find_slice(best->payload, best->len, WRAPPER_AD_TYPE_SERVICE_DATA_16,
+                                   NULL, &slice, &slice_len)) {
+            return false;
+        }
+        memcpy(out_payload, slice, slice_len);
+        *out_len = slice_len;
+        return true;
+    }
+    case WMATCH_MANUFACTURER: {
+        const uint8_t *slice;
+        uint8_t slice_len;
+        if (!wrapper_ad_find_slice(best->payload, best->len, WRAPPER_AD_TYPE_MANUFACTURER,
+                                   NULL, &slice, &slice_len)) {
+            return false;
+        }
+        memcpy(out_payload, slice, slice_len);
+        *out_len = slice_len;
+        return true;
+    }
+    default:   /* WMATCH_MAC_PREFIX -- no header to skip, raw AD blob as queued */
+        memcpy(out_payload, best->payload, best->len);
+        *out_len = best->len;
+        return true;
+    }
 }
 
 /* Dry-run emit sink: captures {cap,value} pairs into a fixed local array
@@ -2734,36 +2808,53 @@ static void wrapper_test_emit_sink(void *ctx, uint8_t capability, float value)
     (*t->n)++;
 }
 
+/* Parses `hex` into `out_payload`/`out_len`, replying 400 through `req` and
+ * returning false on any format error (odd length, too long, a non-hex
+ * digit) -- otherwise true. Factored out of wrapper_run_and_reply() so a
+ * caller that still has flash/arena access ahead of it (wrappers_test_post()
+ * below, before its wrapper_store_read_psbc() call) can validate a
+ * caller-supplied hex FIRST: an invalid hex must always be reported as a
+ * hex error, never masked by an unrelated failure further down the same
+ * request. */
+static bool wrapper_parse_test_hex(httpd_req_t *req, const char *hex,
+                                   uint8_t *out_payload, uint8_t *out_len)
+{
+    size_t hexlen = strlen(hex);
+    if (hexlen % 2 != 0 || hexlen > (size_t)WRAPPER_TEST_HEX_MAX) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "hex must be an even-length hex string, up to 62 chars");
+        return false;
+    }
+    uint8_t len = (uint8_t)(hexlen / 2);
+    bool valid_hex = true;
+    for (uint8_t i = 0; i < len && valid_hex; i++) {
+        int hi = hexval(hex[i * 2]);
+        int lo = hexval(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) valid_hex = false;
+        else out_payload[i] = (uint8_t)((hi << 4) | lo);
+    }
+    if (!valid_hex) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "hex must contain only hex digits");
+        return false;
+    }
+    *out_len = len;
+    return true;
+}
+
 /* Validates a wrapper blob, runs it against one payload slice and replies.
  * Shared by both dry-run entry points -- the id-based one (which loads
  * bytecode from LittleFS) and M4's id-less one (which takes bytecode
  * inline, spec section 5) -- so the two cannot diverge in what they accept
  * or in how they report a failure. Writes nothing anywhere: no flash, no
- * registry, no arena. `psbc` points at s_http_psbc in both cases. */
+ * registry, no arena. `psbc` points at s_http_psbc in both cases. Takes an
+ * already-parsed payload/payload_len (see wrapper_parse_test_hex() above),
+ * not a raw hex string: both callers need their hex validated before other
+ * work happens (flash reads / oversized-body checks), so parsing has
+ * already happened by the time either reaches here. */
 static esp_err_t wrapper_run_and_reply(httpd_req_t *req, const uint8_t *psbc,
-                                       size_t psbc_len, const char *hex)
+                                       size_t psbc_len, const uint8_t *payload,
+                                       uint8_t payload_len)
 {
-    uint8_t payload[PSVM_PAYLOAD_MAX];
-    uint8_t payload_len = 0;
-    size_t hexlen = strlen(hex);
-    if (hexlen % 2 != 0 || hexlen > (size_t)WRAPPER_TEST_HEX_MAX) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "hex must be an even-length hex string, up to 62 chars");
-        return ESP_OK;
-    }
-    payload_len = (uint8_t)(hexlen / 2);
-    bool valid_hex = true;
-    for (uint8_t i = 0; i < payload_len && valid_hex; i++) {
-        int hi = hexval(hex[i * 2]);
-        int lo = hexval(hex[i * 2 + 1]);
-        if (hi < 0 || lo < 0) valid_hex = false;
-        else payload[i] = (uint8_t)((hi << 4) | lo);
-    }
-    if (!valid_hex) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "hex must contain only hex digits");
-        return ESP_OK;
-    }
-
     psvm_prog_t prog;
     psvm_err_t verr = psvm_validate(psbc, psbc_len, PSVM_DIALECT_WRAPPERS,
                                     CAPABILITY_COUNT - 1, 0, &prog);
@@ -2811,7 +2902,7 @@ static esp_err_t wrapper_run_and_reply(httpd_req_t *req, const uint8_t *psbc,
  * wrapper equivalent of M1's rule dry-run"). Auth checked by
  * wrappers_post_dispatch() before this is ever reached. Never touches the
  * registry, never touches the shared wrapper arena (see s_http_psbc's own
- * declaration comment, third owner) and never calls
+ * declaration comment, third of four owners) and never calls
  * ble_collector_wrapper_reindex_request() -- nothing about the installed
  * registry changes. */
 static esp_err_t wrappers_test_post(httpd_req_t *req, uint32_t id)
@@ -2880,6 +2971,17 @@ static esp_err_t wrappers_test_post(httpd_req_t *req, uint32_t id)
         hex_encode(payload, payload_len, hexbuf);
     }
 
+    /* Validate hexbuf's format BEFORE any flash access below -- same order
+     * this handler used before wrapper_run_and_reply() was factored out to
+     * be shared with M4's id-less endpoint. A caller who sent both a
+     * malformed hex AND happens to reference a wrapper whose bytecode is
+     * unreadable must be told about the hex, the thing actually wrong with
+     * their request -- not "bytecode unavailable", which names a problem
+     * that was never reached. */
+    uint8_t payload[PSVM_PAYLOAD_MAX];
+    uint8_t payload_len = 0;
+    if (!wrapper_parse_test_hex(req, hexbuf, payload, &payload_len)) return ESP_OK;
+
     size_t psbc_len = 0;
     if (!wrapper_store_read_psbc((uint16_t)id, s_http_psbc, sizeof(s_http_psbc), &psbc_len)) {
         cJSON *root = cJSON_CreateObject();
@@ -2889,7 +2991,7 @@ static esp_err_t wrappers_test_post(httpd_req_t *req, uint32_t id)
         return send_json(req, root);
     }
 
-    return wrapper_run_and_reply(req, s_http_psbc, psbc_len, hexbuf);
+    return wrapper_run_and_reply(req, s_http_psbc, psbc_len, payload, payload_len);
 }
 
 /* POST /api/v1/wrappers/test {bytecode_b64, hex} -- M4 spec section 5.
@@ -2963,7 +3065,11 @@ static esp_err_t wrappers_inline_test_post(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad base64");
         return ESP_OK;
     }
-    return wrapper_run_and_reply(req, s_http_psbc, psbc_len, hexbuf);
+
+    uint8_t payload[PSVM_PAYLOAD_MAX];
+    uint8_t payload_len = 0;
+    if (!wrapper_parse_test_hex(req, hexbuf, payload, &payload_len)) return ESP_OK;
+    return wrapper_run_and_reply(req, s_http_psbc, psbc_len, payload, payload_len);
 }
 
 /* POST /api/v1/wrappers/{id}/test -- the only POST sub-route wrappers have
