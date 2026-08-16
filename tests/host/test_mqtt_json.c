@@ -64,11 +64,11 @@ int main(void)
     assert(strstr(j, "\"via_device\":\"PlantHub-7814\"") != NULL);
     assert(strstr(j, "\"dev\":{\"ids\":[\"planthub_plant_7\"],\"name\":\"Palme\",") != NULL);
 
-    /* HA unit translation (Task 7 item 1): the table stores "C"/"lux", HA
-     * discovery emits "\u00b0C"/"lx". The table itself is untouched -- only
-     * the discovery path translates. */
+    /* HA unit translation (Triage item 9 fixwave): the table stores UTF-8
+     * "°C" directly (spec §1) and it passes through discovery unchanged --
+     * only "lux" -> "lx" is still translated. */
     assert(mqtt_json_discovery(j, sizeof j, "PlantHub-7814", 7, "Palme", CAP_AIR_TEMPERATURE));
-    assert(strstr(j, "\"unit_of_meas\":\"\\u00b0C\"") != NULL);
+    assert(strstr(j, "\"unit_of_meas\":\"\xc2\xb0" "C\"") != NULL);
     assert(strstr(j, "\"suggested_display_precision\":1") != NULL);
     assert(mqtt_json_discovery(j, sizeof j, "PlantHub-7814", 7, "Palme", CAP_LIGHT_ILLUMINANCE));
     assert(strstr(j, "\"unit_of_meas\":\"lx\"") != NULL);
@@ -80,7 +80,7 @@ int main(void)
     assert(strstr(j, "\"name\":\"Plant 7 soil.conductivity\"") != NULL);
     assert(strstr(j, "\"dev\":{\"ids\":[\"planthub_plant_7\"],\"name\":\"Plant 7\",") != NULL);
     assert(strstr(j, "dev_cla") == NULL);
-    assert(strstr(j, "\"unit_of_meas\":\"uS/cm\"") != NULL);
+    assert(strstr(j, "\"unit_of_meas\":\"\xc2\xb5" "S/cm\"") != NULL);
 
     assert(!mqtt_json_discovery(j, sizeof j, "h", 1, "", CAPABILITY_COUNT));
 
@@ -128,7 +128,7 @@ int main(void)
     assert(mqtt_json_device_discovery(j, sizeof j, "PlantHub-7814", "ble:A4C138001122",
                                        "Windowsill Probe", CAP_AIR_TEMPERATURE));
     assert(strstr(j, "\"name\":\"Windowsill Probe air.temperature\"") != NULL);
-    assert(strstr(j, "\"unit_of_meas\":\"\\u00b0C\"") != NULL);   /* HA unit translation applies here too */
+    assert(strstr(j, "\"unit_of_meas\":\"\xc2\xb0" "C\"") != NULL);   /* table's UTF-8 unit passes through unchanged */
 
     assert(!mqtt_json_device_discovery(j, sizeof j, "h", "ble:AA", "", CAPABILITY_COUNT));
 

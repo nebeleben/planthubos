@@ -17,7 +17,9 @@ enum {
 typedef struct {
     uint8_t     id;
     const char *name;            /* "soil.moisture" */
-    const char *unit;            /* "%", "C", "lux", "uS/cm", "hPa", "dBm" */
+    const char *unit;            /* "%", "°C", "lux", "µS/cm", "hPa", "dBm" -- UTF-8
+                                   * (spec §1's table), see capability.c's Triage
+                                   * item 9 doc comment */
     const char *ha_device_class; /* NULL when HA has none (e.g. conductivity) */
     const char *influx_field;    /* "moisture", "temp", ... (short, stable) */
     float       scale;           /* stored = round((value - offset) * scale) */

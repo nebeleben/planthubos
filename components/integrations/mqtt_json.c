@@ -119,17 +119,18 @@ static void json_escape(const char *src, char *dst, size_t dst_cap)
     dst[pos] = '\0';
 }
 
-/* HA's spelling for the capability table's unit string, for the two units
- * that differ (Task 7 brief, item 1): "C" -> "°C" (already JSON-escaped
- * -- see mqtt_json_discovery() below, which writes this straight into a
- * JSON string), "lux" -> "lx". Every other unit in the table (%, uS/cm,
- * hPa, dBm) is already what HA expects, unchanged. The capability table
- * itself keeps its own spellings ("C", "lux") because M1 bytecode and the
- * REST API contract read them directly -- this translation happens ONLY on
- * the discovery path. */
+/* HA's spelling for the capability table's unit string. Only "lux" -> "lx"
+ * remains here (Triage item 9 fixwave, controller ruling): the table used
+ * to store ASCII "C" and this function translated it to the JSON-escaped
+ * "°C" HA expects, but the table itself now stores UTF-8 "°C" directly
+ * (capability.c) -- writing that straight into a JSON string needs no
+ * escaping (°  isn't a JSON control/quote/backslash character), so that
+ * branch would now be permanently dead (table_unit is never the bare ASCII
+ * "C" any more) and has been removed rather than kept as a no-op. Every
+ * other unit in the table (%, µS/cm, hPa, dBm) is already what HA expects,
+ * unchanged. */
 static const char *ha_unit_json(const char *table_unit)
 {
-    if (strcmp(table_unit, "C") == 0) return "\\u00b0C";
     if (strcmp(table_unit, "lux") == 0) return "lx";
     return table_unit;
 }

@@ -619,11 +619,14 @@ table.kv td:first-child { color: var(--text-muted); }
 
 .tile h3 { margin: 0 0 0.7rem; font-size: 1rem; word-break: break-all; }
 .tile .readings { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem 0.9rem; }
+/* min-width: 0 (Triage item 6): a grid item defaults to min-width: auto,
+ * which is its content's intrinsic width -- inside a `1fr` track that lets
+ * one long token (a long capability label, or a value with no unit known
+ * yet, both possible per fmtCapParts()'s fallbacks in caps.js) push the
+ * whole tile wider instead of wrapping/eliding within its own cell. */
+.reading { min-width: 0; }
 .tile .val { font-size: 1.3rem; font-weight: 600; margin-right: 0.3rem; }
 .tile .unit { color: var(--text-muted); font-size: 0.8rem; }
-
-.probe-chip { margin: 0.7rem 0 0; color: var(--text-muted); font-size: 0.8rem; }
-.probe-chip.pending { font-style: italic; }
 
 .hist-controls { display: flex; gap: 0.6rem; margin-bottom: 1.1rem; flex-wrap: wrap; align-items: center; }
 

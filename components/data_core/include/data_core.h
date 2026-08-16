@@ -61,8 +61,9 @@ void data_core_submit_from(const mibeacon_t *m, const uint8_t via_node[6],
 void      data_core_snapshot(registry_t *out);
 
 /* Single-device lookup, for a caller that only needs one entry rather than
- * the full ~2KB registry_t (e.g. swarm.c's on_sensor_update(), which runs
- * on the default event-loop task's ~2304 B stack -- see that file). Copies
+ * the full ~2KB registry_t (e.g. swarm.c's and webserver/sse.c's own
+ * on_sensor_update(), both of which run on the default event-loop task's
+ * ~2304 B stack -- see those files). Copies
  * the live device_entry_t (~124 B) for *id into *out under s_mutex, the
  * same locking this file's other accessors use; bounded, allocation-free.
  * Returns false (*out untouched) when the device isn't in the registry. */

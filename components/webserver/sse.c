@@ -128,26 +128,25 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
      * V1 -- data_core.h doesn't post a device_id_t here, so DEV_KIND_BLE is
      * the only sound interpretation of a bare 6-byte mac payload. */
     const uint8_t *mac = data;
-    /* static: this handler only ever runs on the single default event-loop
-     * task, which has just a 2304 B stack -- keep the registry snapshot
-     * off it (same reasoning api_v1.c's s_api_reg_snap doc comment gives;
-     * only one instance of this handler ever runs at a time, so sharing is
-     * safe). registry_t is bigger than V1's legacy_registry_t shim it
-     * replaces (~2 KB vs ~0.9 KB) -- see task-6-report.md for the byte
-     * accounting. The message buffer below is heap, not static -- see its
-     * own comment. */
-    static registry_t snap;
-    /* plant_ids is passed NULL (empty array) -- this handler is not worth
-     * a plants_table_t snapshot on this task's tiny stack, and the SSE
-     * push is a "something changed" nudge, not the plant-binding source of
-     * truth (GET /api/v1/plants is; see task-6-report.md's contract
-     * notes). */
-    data_core_snapshot(&snap);
+    /* Single-device lookup via data_core_get_device() (M1/M2 fixwave), not a
+     * full registry_t snapshot + registry_find(): this handler only ever
+     * runs on the single default event-loop task, which has just a 2304 B
+     * stack, and only needs the one device this update is for. A
+     * device_entry_t out-param (~124 B, data_core_get_device()'s own doc
+     * comment) is small enough to be a plain stack local -- no static
+     * needed, and no ~2 KB registry_t (whole-table snapshot for a
+     * one-device lookup) held in .bss for this file's whole lifetime
+     * either. plant_ids is passed NULL (empty array) -- this handler is not
+     * worth a plants_table_t snapshot on this task's tiny stack, and the
+     * SSE push is a "something changed" nudge, not the plant-binding source
+     * of truth (GET /api/v1/plants is; see task-6-report.md's contract
+     * notes). The message buffer below is heap, not static -- see its own
+     * comment. */
     device_id_t devid = device_id_from_mac(DEV_KIND_BLE, mac);
-    int idx = registry_find(&snap, &devid);
-    if (idx < 0) return;
+    device_entry_t dev;
+    if (!data_core_get_device(&devid, &dev)) return;
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
-    cJSON *o = device_json(&snap.devices[idx], NULL, now_uptime_s);
+    cJSON *o = device_json(&dev, NULL, now_uptime_s);
     char *json = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     if (!json) return;

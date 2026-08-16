@@ -485,10 +485,16 @@ export function ConfigTab() {
                        onInput={(e) => setInflux((i) => ({ ...i, token: e.currentTarget.value }))} />
               </label>
               <p class="infobox">
-                Points land in this bucket as measurement <code>plant</code>, tagged{' '}
-                <code>plant=&lt;id&gt;</code>, with fields <code>temp</code>,{' '}
-                <code>moisture</code>, <code>lux</code>, <code>conductivity</code>,{' '}
-                <code>battery</code> and <code>name</code>.
+                Points land in this bucket as measurement <code>plant</code>
+                (tagged <code>plant=&lt;id&gt;</code>, one point per bound
+                capability) and measurement <code>device</code> (tagged{' '}
+                <code>device=&lt;id&gt;</code>, every known device whether
+                bound to a plant or not), with fields <code>moisture</code>,{' '}
+                <code>temp</code>, <code>lux</code>, <code>conductivity</code>,{' '}
+                <code>battery</code>, <code>humidity</code>,{' '}
+                <code>pressure</code> and <code>rssi</code> — whichever of
+                these each point currently reports. There is no{' '}
+                <code>name</code> field.
               </p>
             </fieldset>
 

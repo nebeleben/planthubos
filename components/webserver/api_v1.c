@@ -50,7 +50,7 @@ static plants_table_t s_api_plant_snap;
  * started. */
 extern void mqtt_pub_plant_deleted(uint8_t plant_id);
 extern void mqtt_pub_cap_unbound(uint8_t plant_id, uint8_t cap_id);
-extern void mqtt_pub_device_cap_bound(const device_id_t *dev, uint8_t cap_id);
+extern void mqtt_pub_device_cap_bound(const device_id_t *dev, uint8_t cap_id, uint8_t plant_id);
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 {
@@ -859,13 +859,13 @@ static esp_err_t plants_bind_post(httpd_req_t *req, uint8_t id)
      *     via the same `caps[cap].valid` test plants_bind_device() itself
      *     used. */
     if (unbind) mqtt_pub_cap_unbound(id, cap_id);
-    if (single_bind) mqtt_pub_device_cap_bound(&dev, cap_id);
+    if (single_bind) mqtt_pub_device_cap_bound(&dev, cap_id, id);
     if (whole_device_bind) {
         int ridx = registry_find(&s_api_reg_snap, &dev);
         if (ridx >= 0) {
             const device_entry_t *de = &s_api_reg_snap.devices[ridx];
             for (uint8_t c = 0; c < CAPABILITY_COUNT; c++) {
-                if (de->caps[c].valid) mqtt_pub_device_cap_bound(&dev, c);
+                if (de->caps[c].valid) mqtt_pub_device_cap_bound(&dev, c, id);
             }
         }
     }

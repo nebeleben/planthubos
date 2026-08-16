@@ -171,7 +171,10 @@ typedef enum {
 typedef struct {
     mqtt_pub_msg_type_t type;
     uint8_t              mac[6];       /* STATE_UPDATE only */
-    uint8_t               plant_id;     /* PLANT_DELETED, CAP_UNBOUND */
+    uint8_t               plant_id;     /* PLANT_DELETED, CAP_UNBOUND, DEVICE_CAP_BOUND (the plant
+                                          * cap_id was just bound to -- H2 fixwave: drives the plant-
+                                          * form discovery republish below, not just the device-form
+                                          * cleanup) */
     uint8_t               cap_id;       /* CAP_UNBOUND, DEVICE_CAP_BOUND */
     device_id_t            dev;          /* DEVICE_REMOVED, DEVICE_CAP_BOUND */
     /* EVENT only: heap copy made by mqtt_pub_event() (the caller's own json
@@ -671,6 +674,32 @@ static void mqtt_pub_task(void *arg)
 
         if (msg.type == MQTT_PUB_MSG_DEVICE_CAP_BOUND) {
             cleanup_device_cap_discovery(&msg.dev, msg.cap_id);
+            /* H2 fixwave (spec Sec.6: "a probe's entity migrates from the
+             * device form to the plant form when it is bound"): the cleanup
+             * above only removes the stale device-form entity. Without this,
+             * the plant-form entity for msg.cap_id never gets (re)published
+             * here -- publish_discovery()'s only other call site is gated on
+             * `!s_discovery_sent[slot] || name_changed`, which is already
+             * false for a plant that published discovery earlier this
+             * session, so the newly-bound capability would have no entity in
+             * EITHER form until a reconnect/reboot/rename. Republish this
+             * plant's whole discovery set immediately (still solely from
+             * this task -- single-publisher discipline preserved) and
+             * refresh the same bookkeeping publish_all_discovery() would,
+             * so the periodic/state-triggered paths don't redundantly resend
+             * it. plants_snap is this task's own permanent stack copy (see
+             * mqtt_pub_task()'s doc comment); re-snapshotting it here is
+             * just a fresh read, not an extra allocation. */
+            plants_snapshot(&plants_snap);
+            int bound_slot = plants_table_find_id(&plants_snap, msg.plant_id);
+            if (bound_slot >= 0) {
+                const char *bound_name = plants_snap.p[bound_slot].name;
+                publish_discovery(msg.plant_id, bound_name);
+                s_discovery_sent[bound_slot] = true;
+                s_slot_plant_id[bound_slot] = msg.plant_id;
+                strncpy(s_slot_name[bound_slot], bound_name, PLANT_NAME_LEN);
+                s_slot_name[bound_slot][PLANT_NAME_LEN] = '\0';
+            }
             continue;
         }
 
@@ -726,8 +755,27 @@ static void mqtt_pub_task(void *arg)
 
 /* PLANTHUB_DATA_EVENT/DATA_EVENT_SENSOR_UPDATE handler -- default event
  * loop task. Callback discipline: queue-and-return only, see the file
- * header. Drop-oldest on a full queue (per the plan): the newest update
- * is kept rather than the stalest one already waiting. */
+ * header. Drop-HEAD on a full queue (per the plan; M4 fixwave correction --
+ * this used to be described as "the newest update is kept rather than the
+ * stalest one", which is only true when every item happens to be a
+ * STATE_UPDATE. xQueueReceive() always takes the queue's FRONT item, which
+ * on a busy queue can just as easily be a pending RESYNC_DISCOVERY/
+ * PLANT_DELETED/CAP_UNBOUND/DEVICE_REMOVED/DEVICE_CAP_BOUND control message
+ * as a stale sensor reading. Left as a plain FIFO head-drop rather than
+ * reworked to skip control messages: every other producer into this same
+ * queue (mqtt_pub_plant_deleted()/mqtt_pub_cap_unbound()/
+ * mqtt_pub_device_removed()/mqtt_pub_device_cap_bound(), all above) already
+ * documents its own send as best-effort/self-healing on a full queue --
+ * RESYNC_DISCOVERY re-derives the whole discovery set from scratch next
+ * reconnect, and the retained-cleanup messages' own comments already accept
+ * "a missed cleanup leaves a stale HA entity a little longer" -- so an
+ * occasional head-drop landing on one of them is within the tradeoff this
+ * file already makes elsewhere, not a new risk. If the dropped head is a
+ * MQTT_PUB_MSG_EVENT, its heap-allocated event_json (mqtt_pub_event()'s
+ * strdup) must still be freed here -- the two other paths that ever take an
+ * EVENT message off this queue (the normal publish/free after
+ * MQTT_PUB_MSG_EVENT above, and mqtt_pub_event()'s own xQueueSend-failed
+ * path) both already free it; this is the one spot that used to leak it. */
 static void data_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     (void)handler_args; (void)base; (void)event_id;
@@ -738,7 +786,9 @@ static void data_event_handler(void *handler_args, esp_event_base_t base, int32_
 
     if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
         mqtt_pub_msg_t discard;
-        (void)xQueueReceive(s_queue, &discard, 0);
+        if (xQueueReceive(s_queue, &discard, 0) == pdTRUE && discard.type == MQTT_PUB_MSG_EVENT) {
+            free(discard.event_json);
+        }
         (void)xQueueSend(s_queue, &msg, 0);
     }
 }
@@ -970,20 +1020,22 @@ void mqtt_pub_device_removed(const device_id_t *dev)
     }
 }
 
-/* dev's cap_id just became bound to a plant (api_v1.c's plants_bind_post(),
+/* dev's cap_id just became bound to plant_id (api_v1.c's plants_bind_post(),
  * the bind branch -- cap AND device both given) -- see
  * cleanup_device_cap_discovery()'s doc comment for what this clears and
- * why. NOT called on a plain rebind of an already-covered capability
- * (still covered, same cleanup would be a harmless no-op, but there is
- * nothing new to clear); api_v1.c calls this on every successful bind
- * regardless, since "was this capability already covered by some OTHER
- * plant before this call" isn't something plants_bind_cap()'s return
- * value tells the caller, and re-clearing an already-cleared/never-sent
- * topic is free. */
-void mqtt_pub_device_cap_bound(const device_id_t *dev, uint8_t cap_id)
+ * why, and mqtt_pub_task()'s MQTT_PUB_MSG_DEVICE_CAP_BOUND branch (H2
+ * fixwave) for the plant-form republish plant_id drives so the entity
+ * actually migrates rather than just disappearing from the device form.
+ * NOT called on a plain rebind of an already-covered capability (still
+ * covered, same cleanup would be a harmless no-op, but there is nothing new
+ * to clear); api_v1.c calls this on every successful bind regardless, since
+ * "was this capability already covered by some OTHER plant before this
+ * call" isn't something plants_bind_cap()'s return value tells the caller,
+ * and re-clearing an already-cleared/never-sent topic is free. */
+void mqtt_pub_device_cap_bound(const device_id_t *dev, uint8_t cap_id, uint8_t plant_id)
 {
     if (!s_client || !s_queue || !dev) return;
-    mqtt_pub_msg_t msg = { .type = MQTT_PUB_MSG_DEVICE_CAP_BOUND, .dev = *dev, .cap_id = cap_id };
+    mqtt_pub_msg_t msg = { .type = MQTT_PUB_MSG_DEVICE_CAP_BOUND, .dev = *dev, .cap_id = cap_id, .plant_id = plant_id };
     if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
         ESP_LOGW(TAG, "mqtt_pub queue full; dropping device cap %u bound cleanup", cap_id);
     }

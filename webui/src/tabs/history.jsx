@@ -123,7 +123,7 @@ export function HistoryTab() {
   return (
     <div class="panel">
       <div class="hist-controls">
-        <select value={plantId} onChange={(e) => setPlantId(e.currentTarget.value)}>
+        <select value={plantId} onChange={(e) => setPlantId(Number(e.currentTarget.value))}>
           {plants.map((p) => <option key={p.id} value={p.id}>{p.name || `Plant ${p.id}`}</option>)}
         </select>
         {caps && optionIds.length > 0 && (

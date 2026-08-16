@@ -223,11 +223,30 @@ static void sample_once(void)
              * shim doing the same): hourly_agg_add() below builds the
              * hourly record straight from `rec`'s column layout, so the two
              * tiers must already agree on what each column means before
-             * that happens. */
+             * that happens. M3 fixwave: this invariant used to be stated
+             * here but never enforced -- only the RAW return value was ever
+             * consulted, so an asymmetric failure inside create_fresh() on
+             * just one tier's column map (a fopen error or ENOSPC hitting
+             * one tier's file but not the other's, both ensure calls
+             * otherwise being identical) would permanently desync the two
+             * maps with nothing to catch it: RAW and HOURLY would silently
+             * assign the SAME cap_id to DIFFERENT column indices from that
+             * point on, and Week/Month views (which decode HOURLY records
+             * using RAW's column meanings, storage_col_for()'s own doc
+             * comment) would then decode one capability's stored values
+             * under another's label -- wrong, not missing, and with no log
+             * line anywhere to say so. Comparing both returned columns
+             * turns that silent mislabeling into a dropped sample plus a
+             * warning instead. */
             int col = storage_col_for(s_base, plant_id, STORAGE_TIER_RAW, cap_id);
-            (void)storage_col_for(s_base, plant_id, STORAGE_TIER_HOURLY, cap_id);
-            if (col < 0) {
+            int hourly_col = storage_col_for(s_base, plant_id, STORAGE_TIER_HOURLY, cap_id);
+            if (col < 0 || hourly_col < 0) {
                 ESP_LOGW(TAG, "plant %u: history column map full, dropping cap %u", plant_id, cap_id);
+                continue;
+            }
+            if (col != hourly_col) {
+                ESP_LOGE(TAG, "plant %u: cap %u column map diverged (raw=%d hourly=%d), dropping",
+                         plant_id, cap_id, col, hourly_col);
                 continue;
             }
 

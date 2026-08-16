@@ -61,11 +61,11 @@ bool mqtt_json_state(char *out, size_t cap, const mqtt_state_t *st);
 /* One HA discovery config for plant_id's cap_id (spec Sec.6). device_class,
  * unit_of_measurement and suggested_display_precision come straight from
  * the capability table (capability.h), EXCEPT unit_of_measurement: HA
- * expects its own spelling for a couple of units the table stores in the
- * REST/bytecode form ("C" -> "°C", "lux" -> "lx") -- see this file's
- * .c for ha_unit_of_measurement(). Every other unit (%, uS/cm, hPa, dBm)
- * passes through unchanged; the capability table itself is never touched
- * for this (M1 bytecode and the REST contract depend on its spellings).
+ * expects its own spelling for one unit the table stores differently
+ * ("lux" -> "lx") -- see this file's .c for ha_unit_json(). Every other
+ * unit (%, °C, µS/cm, hPa, dBm) passes through unchanged (Triage item 9
+ * fixwave: the table itself now stores UTF-8 °C/µS/cm directly, matching
+ * spec §1, so no translation is needed for those any more).
  *
  * plant_name "" falls back to "Plant <id>" (built inside this function).
  * The value_template addresses the field with bracket syntax

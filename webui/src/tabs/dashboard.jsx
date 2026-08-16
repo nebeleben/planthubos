@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
-import { loadCaps, capLabel } from '../lib/caps.js'
+import { loadCaps, capLabel, fmtCapParts } from '../lib/caps.js'
 
 // age_s on both a plant binding (GET /api/v1/plants) and a device capability
 // slot is already an AGE in seconds, computed hub-side -- same convention
@@ -29,9 +29,7 @@ function liveAge(ageS, elapsedS) {
 // binding for at all are omitted (spec §7: "missing capabilities are simply
 // absent").
 function Reading({ caps, binding, elapsedS }) {
-  const c = caps.get(binding.cap)
-  const valueText = binding.value == null ? '–' : binding.value.toFixed(c ? c.precision : 0)
-  const unit = c ? c.unit : ''
+  const { text: valueText, unit } = fmtCapParts(caps, binding.cap, binding.value)
   return (
     <div class="reading">
       <div class="hint">{capLabel(caps, binding.cap)}</div>

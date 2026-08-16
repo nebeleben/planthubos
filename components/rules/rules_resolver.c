@@ -43,6 +43,16 @@ static void set_why(char *why, size_t whylen, const char *fmt, const char *arg)
     snprintf(why, whylen, fmt, arg);
 }
 
+/* Shared registry_t snapshot scratch (M1/M2 fixwave): resolve_plant() and
+ * resolve_device() each used to declare their OWN `static registry_t reg`
+ * (~1984 B apiece, ~3968 B total in .bss). rules_resolve() below calls
+ * exactly one of the two per invocation (the r.kind == 0 ? plant : device
+ * branch) -- they are never simultaneously live -- and both already
+ * documented themselves as touched only from the caller's single
+ * evaluation-serialized task, so nothing about sharing one file-scope
+ * static changes that safety argument, only halves the static footprint. */
+static registry_t s_reg_snap;
+
 /* plant("<name>") kind: name -> plants table entry -> that capability's
  * binding -> registry value, via plants_cap_value() (plants.h), which does
  * the binding lookup + registry_find() + slot read in one call over a
@@ -88,11 +98,10 @@ static bool resolve_plant(const char *name, uint8_t capability, uint8_t field,
     }
     uint8_t plant_id = snap.p[idx].id;
 
-    static registry_t reg;
-    data_core_snapshot(&reg);
+    data_core_snapshot(&s_reg_snap);
 
     float value; uint32_t age_s;
-    if (!plants_cap_value(plant_id, capability, &reg, &value, &age_s)) {
+    if (!plants_cap_value(plant_id, capability, &s_reg_snap, &value, &age_s)) {
         ref_not_ready(out);
         if (why && whylen) snprintf(why, whylen, "device never heard");
         return false;
@@ -115,14 +124,13 @@ static bool resolve_plant(const char *name, uint8_t capability, uint8_t field,
 static bool resolve_device(const char *id, uint8_t capability, uint8_t field,
                            uint32_t now_uptime_s, psvm_ref_val_t *out, char *why, size_t whylen)
 {
-    static registry_t reg;
-    data_core_snapshot(&reg);
+    data_core_snapshot(&s_reg_snap);
 
     device_id_t dev = {0};
     bool have_dev = false;
     char nm[33];
     for (int i = 0; i < REGISTRY_MAX_DEVICES && !have_dev; i++) {
-        const device_entry_t *e = &reg.devices[i];
+        const device_entry_t *e = &s_reg_snap.devices[i];
         if (!e->in_use || e->id.kind != DEV_KIND_BLE) continue;
         if (app_config_get_sensor_name(e->id.addr, nm) && strcmp(nm, id) == 0) {
             dev = e->id;
@@ -131,14 +139,14 @@ static bool resolve_device(const char *id, uint8_t capability, uint8_t field,
     }
     if (!have_dev) have_dev = device_id_parse(id, &dev);
 
-    int ridx = have_dev ? registry_find(&reg, &dev) : -1;
+    int ridx = have_dev ? registry_find(&s_reg_snap, &dev) : -1;
     if (ridx < 0 || capability >= CAPABILITY_COUNT) {
         ref_not_ready(out);
         set_why(why, whylen, "device \"%s\" never heard", id);
         return false;
     }
 
-    const cap_slot_t *slot = &reg.devices[ridx].caps[capability];
+    const cap_slot_t *slot = &s_reg_snap.devices[ridx].caps[capability];
     if (!slot->valid) {
         ref_not_ready(out);
         if (why && whylen) {

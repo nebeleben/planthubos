@@ -8,6 +8,18 @@
  * the V1 spellings (moisture, temp, lux, conductivity, battery) so existing
  * dashboards keep working unchanged; the new capabilities (humidity,
  * pressure, rssi) follow the same short/stable-name convention.
+ *
+ * Triage item 9 fixwave (controller ruling): .unit is UTF-8, matching spec
+ * §1's table (°C, µS/cm) exactly rather than the ASCII "C"/"uS/cm" this file
+ * used to ship -- the REST API (devices_json.c, api_v1.c) and the webui
+ * (caps.js) both render this string directly, so the mismatch used to show
+ * up as "22.1C" in the UI where V1 showed "22.1 °C". This file is edited/
+ * saved as UTF-8 (standard for this codebase -- webui/src/lib/psc/caps.js
+ * already carries a literal "°C" the same way); a `const char *` string
+ * literal here is just its UTF-8 byte sequence, nothing narrows it. HA
+ * discovery's own unit translation (mqtt_json.c's ha_unit_json()) now only
+ * needs to handle "lux"->"lx" -- the "C"->"°C" case it used to JSON-escape
+ * by hand is gone because the table already carries °C.
  */
 static const capability_t CAP_TABLE[CAPABILITY_COUNT] = {
     [CAP_SOIL_MOISTURE] = {
@@ -16,7 +28,7 @@ static const capability_t CAP_TABLE[CAPABILITY_COUNT] = {
         .scale = 1.0f, .offset = 0.0f, .precision = 0,
     },
     [CAP_AIR_TEMPERATURE] = {
-        .id = CAP_AIR_TEMPERATURE, .name = "air.temperature", .unit = "C",
+        .id = CAP_AIR_TEMPERATURE, .name = "air.temperature", .unit = "°C",
         .ha_device_class = "temperature", .influx_field = "temp",
         .scale = 10.0f, .offset = 0.0f, .precision = 1,
     },
@@ -26,7 +38,7 @@ static const capability_t CAP_TABLE[CAPABILITY_COUNT] = {
         .scale = 1.0f / 16.0f, .offset = 0.0f, .precision = 0,
     },
     [CAP_SOIL_CONDUCTIVITY] = {
-        .id = CAP_SOIL_CONDUCTIVITY, .name = "soil.conductivity", .unit = "uS/cm",
+        .id = CAP_SOIL_CONDUCTIVITY, .name = "soil.conductivity", .unit = "µS/cm",
         .ha_device_class = NULL, .influx_field = "conductivity",
         .scale = 1.0f, .offset = 0.0f, .precision = 0,
     },
