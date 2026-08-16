@@ -1,7 +1,8 @@
 // The one place that speaks to an AI provider (M4 spec section 3). Two
 // request dialects, one return type: a string of model text. Callers deal
 // in prompts and get back text; nobody else in the codebase knows what an
-// Anthropic message looks like.
+// Anthropic message looks like. AiError.kind is one of: 'no-key', 'cors',
+// 'auth', 'rate-limit', 'http', 'shape', 'truncated', 'aborted'.
 import { getAiSettings } from './settings.js'
 
 const ANTHROPIC_VERSION = '2023-06-01'
@@ -73,6 +74,14 @@ function extractText(s, data) {
   return null
 }
 
+function isTruncated(s, data) {
+  if (s.kind === 'anthropic') {
+    return data?.stop_reason === 'max_tokens'
+  } else {
+    return data?.choices?.[0]?.finish_reason === 'length'
+  }
+}
+
 export async function aiComplete({ system, user, signal, settings }) {
   const s = settings || getAiSettings()
   if (!s.key || !s.key.trim()) {
@@ -112,6 +121,11 @@ export async function aiComplete({ system, user, signal, settings }) {
   if (!text) {
     throw new AiError('shape', 'The provider returned a response this app does not understand.',
                       JSON.stringify(data).slice(0, 500))
+  }
+  if (isTruncated(s, data)) {
+    throw new AiError('truncated',
+      'The response was cut off at the token limit. Narrow the prompt or raise max_tokens.',
+      text)
   }
   return text
 }

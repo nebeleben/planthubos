@@ -82,3 +82,35 @@ test('abort is reported as aborted, not as a network failure', async () => {
   await assert.rejects(() => aiComplete({ system: 'S', user: 'U', settings: ANTHROPIC }),
                        (e) => e.kind === 'aborted')
 })
+
+test('anthropic response truncated at max_tokens is reported as truncated', async () => {
+  stubFetch(() => ({ ok: true, status: 200,
+             json: async () => ({ stop_reason: 'max_tokens',
+                                  content: [{ type: 'text', text: 'partial' }] }) }))
+  await assert.rejects(() => aiComplete({ system: 'S', user: 'U', settings: ANTHROPIC }),
+                       (e) => e instanceof AiError && e.kind === 'truncated' && e.detail === 'partial')
+})
+
+test('openai response truncated at length is reported as truncated', async () => {
+  stubFetch(() => ({ ok: true, status: 200,
+             json: async () => ({ choices: [{ finish_reason: 'length',
+                                              message: { content: 'partial' } }] }) }))
+  await assert.rejects(() => aiComplete({ system: 'S', user: 'U', settings: OPENAI }),
+                       (e) => e instanceof AiError && e.kind === 'truncated' && e.detail === 'partial')
+})
+
+test('anthropic response with normal stop_reason resolves to text', async () => {
+  stubFetch(() => ({ ok: true, status: 200,
+             json: async () => ({ stop_reason: 'end_turn',
+                                  content: [{ type: 'text', text: 'complete' }] }) }))
+  const out = await aiComplete({ system: 'S', user: 'U', settings: ANTHROPIC })
+  assert.equal(out, 'complete')
+})
+
+test('openai response with normal finish_reason resolves to text', async () => {
+  stubFetch(() => ({ ok: true, status: 200,
+             json: async () => ({ choices: [{ finish_reason: 'stop',
+                                              message: { content: 'complete' } }] }) }))
+  const out = await aiComplete({ system: 'S', user: 'U', settings: OPENAI })
+  assert.equal(out, 'complete')
+})
