@@ -192,6 +192,18 @@ static void decode_bthome_item(const uint8_t *data, size_t len, const uint8_t ga
         return;
     }
 
+    /* M3 review fix 2: this device just decoded natively -- it no longer
+     * belongs in the unknown-device capture (spec section 5: "a device that
+     * later matches a wrapper is removed"; the same applies to a built-in
+     * decoder match, which is exactly as final). unknown_capture_add()'s
+     * only call site (decode_adv_item()'s no_match: label) is keyed by
+     * item->mac, the raw GAP/on-air order -- gap_mac here IS that same
+     * item->mac, unreversed, passed straight through from decode_adv_item()
+     * (see this function's own top comment); `mac` just above is the
+     * reversed display-order copy used for this device's identity/AES-CCM
+     * nonce and must NOT be used here, or the forget would silently miss. */
+    unknown_capture_forget(gap_mac);
+
     /* Each emit goes through data_core_submit_cap()'s own
      * capability_encode() + skip-on-CAP_VALUE_NONE discipline (M3 Task 3
      * brief: "the caller must SKIP the write in that case, never store the
@@ -326,6 +338,14 @@ static void decode_adv_item(const adv_item_t *item)
     mibeacon_t m;
     if (mibeacon_parse(fields.svc_data_uuid16 + 2, fields.svc_data_uuid16_len - 2, &m) != MIBEACON_OK) goto no_match;
     if (m.product_id != MIBEACON_PRODUCT_MIFLORA) goto no_match;
+
+    /* M3 review fix 2: same reasoning as decode_bthome_item()'s own forget
+     * call above -- this device just decoded natively as a MiFlora, so it
+     * no longer belongs in the unknown-device capture. item->mac is the
+     * exact same raw GAP-order MAC this function's own no_match: label below
+     * passes to unknown_capture_add(), so the two agree and this forget is
+     * never a silent no-op for a device that IS tracked. */
+    unknown_capture_forget(item->mac);
 
     /* Direct reception: no relaying node, just heard (age_s = 0). item->rssi
      * already has NimBLE's 127 "RSSI unavailable" sentinel (see ble_gap.h)
