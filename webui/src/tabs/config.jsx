@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import { getKey, setKey, authHeaders } from '../lib/auth.js'
+import { getAiSettings, setAiSettings, AI_DEFAULTS } from '../lib/ai/settings.js'
+import { aiComplete, AiError } from '../lib/ai/provider.js'
 
 function fmtBytes(n) {
   if (n == null) return '–'
@@ -35,6 +37,13 @@ export function ConfigTab() {
   const [hubName, setHubName] = useState('')
   const [nameMsg, setNameMsg] = useState('')
   const [fresetMsg, setFresetMsg] = useState('')
+
+  // AI assist (M4): browser-local only -- read once from localStorage via
+  // settings.js, written back the same way. Never touches the hub.
+  const [ai, setAi] = useState(() => getAiSettings())
+  const [aiMsg, setAiMsg] = useState('')
+  const [aiTestMsg, setAiTestMsg] = useState('')
+  const [aiTestDetail, setAiTestDetail] = useState('')
 
   // Every successful config save reboots the hub (the settings only apply
   // at boot). One shared countdown: tell the user, then pull the page back
@@ -272,6 +281,48 @@ export function ConfigTab() {
         setFresetMsg(msg)
       }
     } catch { setFresetMsg('hub not reachable') }
+    setBusy('')
+  }
+
+  function doSaveAi() {
+    setBusy('ai'); setAiMsg('')
+    // An empty key field means "clear it" -- setAiSettings treats null as
+    // remove, not the literal string "null" (that was a review-fixed bug).
+    setAiSettings({ kind: ai.kind, endpoint: ai.endpoint, model: ai.model, key: ai.key || null })
+    setAiMsg('Saved.')
+    setBusy('')
+  }
+
+  function doClearAiKey() {
+    setAiSettings({ key: null })
+    setAi((a) => ({ ...a, key: '' }))
+    setAiMsg('Key cleared.')
+  }
+
+  async function doTestAi() {
+    setBusy('ai-test'); setAiTestMsg(''); setAiTestDetail('')
+    try {
+      // Test whatever is currently typed, not the last-saved value -- the
+      // point of this button is to check a change before committing it.
+      await aiComplete({
+        system: 'You are a test.',
+        user: 'Reply with the single word: ok',
+        settings: {
+          kind: ai.kind,
+          endpoint: ai.endpoint || AI_DEFAULTS.endpoint,
+          model: ai.model || AI_DEFAULTS.model,
+          key: ai.key,
+        },
+      })
+      setAiTestMsg('Connection OK.')
+    } catch (err) {
+      if (err instanceof AiError) {
+        setAiTestMsg(err.message)
+        setAiTestDetail(err.detail || '')
+      } else {
+        setAiTestMsg('Unexpected error testing the connection.')
+      }
+    }
     setBusy('')
   }
 
@@ -556,6 +607,59 @@ export function ConfigTab() {
           </span>
         </p>
         {fresetMsg && <p class="hint">{fresetMsg}</p>}
+      </div>
+
+      <div class="panel">
+        <h2>AI assist</h2>
+        <p>
+          <label>
+            Provider
+            <select value={ai.kind} onChange={(e) => setAi((a) => ({ ...a, kind: e.currentTarget.value }))}>
+              <option value="anthropic">Anthropic (Claude)</option>
+              <option value="openai">OpenAI-compatible / local</option>
+            </select>
+          </label>
+        </p>
+        <p>
+          <label>
+            Endpoint
+            <input value={ai.endpoint} placeholder={AI_DEFAULTS.endpoint}
+                   onInput={(e) => setAi((a) => ({ ...a, endpoint: e.currentTarget.value }))} />
+          </label>
+        </p>
+        <p>
+          <label>
+            Model
+            <input value={ai.model} placeholder={AI_DEFAULTS.model}
+                   onInput={(e) => setAi((a) => ({ ...a, model: e.currentTarget.value }))} />
+          </label>
+        </p>
+        <label class="keyrow">
+          API key
+          <input type="password" value={ai.key} placeholder="paste your API key"
+                 onInput={(e) => setAi((a) => ({ ...a, key: e.currentTarget.value }))} />
+        </label>
+        <p class="hint">Stored in this browser only. Never sent to the hub.</p>
+        <p>
+          <button class="btn-primary" onClick={doSaveAi} disabled={busy === 'ai'}>
+            {busy === 'ai' ? 'Saving…' : 'Save AI settings'}
+          </button>
+          {' '}
+          <button onClick={doClearAiKey} disabled={busy !== '' || !ai.key}>Clear key</button>
+          {' '}
+          <button onClick={doTestAi} disabled={busy === 'ai-test'}>
+            {busy === 'ai-test' ? 'Testing…' : 'Test connection'}
+          </button>
+        </p>
+        {aiMsg && <p class="hint">{aiMsg}</p>}
+        {aiTestMsg && (
+          <p class="hint">
+            {aiTestMsg}
+            {aiTestDetail && (
+              <details><summary>Details</summary><pre>{aiTestDetail}</pre></details>
+            )}
+          </p>
+        )}
       </div>
     </div>
   )
