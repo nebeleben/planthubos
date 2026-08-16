@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build && node scripts/gzip-dist.mjs",
-    "test": "node --test src/lib/psc/tests/*.test.mjs"
+    "test": "node --test src/lib/psc/tests/*.test.mjs src/lib/ai/tests/*.test.mjs"
   },
   "dependencies": {
     "preact": "^10.22.0",
