@@ -1,8 +1,10 @@
 #include "data_core.h"
+#include "capability.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include <math.h>
 #include <string.h>
 
 #define MACSTR_FMT "%02X:%02X:%02X:%02X:%02X:%02X"
@@ -24,6 +26,69 @@ esp_err_t data_core_init(void)
 
 static uint32_t s_dropped_stale;
 
+/* Must be called with s_mutex held. The MiFlora -> capability adapter: runs
+ * registry_attribute() first (M5b arbitration), and writes capability
+ * values only when this reporter actually owns the frame -- the same
+ * "attribute first, then write values only if we own this frame" ordering
+ * V1's registry_update_from() followed. Returns 1 when values were written
+ * (post DATA_EVENT_SENSOR_UPDATE), 0 when this reporter lost the
+ * arbitration (nothing written, nothing to post), -1 when the registry is
+ * full and the device is unknown. */
+static int submit_locked(const mibeacon_t *m, const device_id_t *id,
+                          const uint8_t via_node[6], int8_t rssi, uint32_t ts_s)
+{
+    bool own = registry_attribute(&s_registry, id, m->frame_cnt, via_node, rssi, ts_s);
+    int idx = registry_find(&s_registry, id);
+    if (idx < 0) return -1;
+    if (!own) return 0;
+
+    if (m->has_temp) {
+        registry_set_cap(&s_registry, id, CAP_AIR_TEMPERATURE,
+                         capability_encode(CAP_AIR_TEMPERATURE, m->temp_dc / 10.0f), ts_s);
+    }
+    if (m->has_moisture) {
+        registry_set_cap(&s_registry, id, CAP_SOIL_MOISTURE,
+                         capability_encode(CAP_SOIL_MOISTURE, (float)m->moisture_pct), ts_s);
+    }
+    if (m->has_lux) {
+        registry_set_cap(&s_registry, id, CAP_LIGHT_ILLUMINANCE,
+                         capability_encode(CAP_LIGHT_ILLUMINANCE, (float)m->lux), ts_s);
+    }
+    if (m->has_conductivity) {
+        registry_set_cap(&s_registry, id, CAP_SOIL_CONDUCTIVITY,
+                         capability_encode(CAP_SOIL_CONDUCTIVITY, (float)m->conductivity_us), ts_s);
+    }
+    if (m->has_battery) {
+        registry_set_cap(&s_registry, id, CAP_BATTERY_LEVEL,
+                         capability_encode(CAP_BATTERY_LEVEL, (float)m->battery_pct), ts_s);
+    }
+    /* The winning reporter's own signal strength, always -- not gated on
+     * any has_* flag, since it describes the RADIO link, not a sensor
+     * reading the MiBeacon frame carried. */
+    registry_set_cap(&s_registry, id, CAP_SIGNAL_RSSI, capability_encode(CAP_SIGNAL_RSSI, (float)rssi), ts_s);
+    return 1;
+}
+
+void data_core_submit_mibeacon(const mibeacon_t *m, const uint8_t via_node[6], int8_t rssi)
+{
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    device_id_t id = device_id_from_mac(DEV_KIND_BLE, m->mac);
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int rc = submit_locked(m, &id, via_node, rssi, now_s);
+    xSemaphoreGive(s_mutex);
+
+    if (rc < 0) {
+        ESP_LOGW(TAG, "registry full, dropping " MACSTR_FMT, MAC_ARG(m->mac));
+        return;
+    }
+    if (rc == 1) {
+        /* mac is copied into the event queue by esp_event */
+        esp_event_post(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE,
+                       (void *)m->mac, 6, 0 /* don't block the caller's task */);
+    }
+}
+
 void data_core_submit_from(const mibeacon_t *m, const uint8_t via_node[6],
                             int8_t rssi, uint16_t age_s)
 {
@@ -38,23 +103,24 @@ void data_core_submit_from(const mibeacon_t *m, const uint8_t via_node[6],
     /* age_s back-dates the effective capture time; clamp rather than
      * underflow if a node ever reports an age older than our own uptime. */
     uint32_t effective_s = (age_s <= now_s) ? now_s - age_s : 0;
+    device_id_t id = device_id_from_mac(DEV_KIND_BLE, m->mac);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    int idx = registry_find(&s_registry, m->mac);
-    if (idx >= 0 && effective_s < s_registry.sensors[idx].last_seen_s) {
+    int idx = registry_find(&s_registry, &id);
+    if (idx >= 0 && effective_s < s_registry.devices[idx].last_seen_s) {
         /* A buffered reading arriving late must not regress the live view
          * behind a value we already have that is newer. This is a
          * "don't overwrite newer with older" guard only -- it does not
          * insert into an earlier history slot; see the age policy note in
          * data_core.h. */
-        uint32_t stored_s = s_registry.sensors[idx].last_seen_s;
+        uint32_t stored_s = s_registry.devices[idx].last_seen_s;
         xSemaphoreGive(s_mutex);
         ESP_LOGD(TAG, "dropping stale " MACSTR_FMT ": effective %us < last_seen %us (dropped_stale=%lu)",
                  MAC_ARG(m->mac), (unsigned)effective_s, (unsigned)stored_s,
                  (unsigned long)++s_dropped_stale);
         return;
     }
-    int rc = registry_update_from(&s_registry, m, effective_s, via_node, rssi);
+    int rc = submit_locked(m, &id, via_node, rssi, effective_s);
     xSemaphoreGive(s_mutex);
 
     if (rc < 0) {
@@ -68,11 +134,6 @@ void data_core_submit_from(const mibeacon_t *m, const uint8_t via_node[6],
     }
 }
 
-void data_core_submit(const mibeacon_t *m)
-{
-    data_core_submit_from(m, NULL, 0, 0);
-}
-
 void data_core_snapshot(registry_t *out)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -80,26 +141,92 @@ void data_core_snapshot(registry_t *out)
     xSemaphoreGive(s_mutex);
 }
 
+/* M2-SHIM: decodes one live device_entry_t into its V1 sensor_entry_t shape
+ * -- see registry_compat.h. Caller must hold s_mutex. */
+static void snapshot_legacy_one(sensor_entry_t *e, const device_entry_t *d)
+{
+    memset(e, 0, sizeof(*e));
+    e->in_use = true;
+    memcpy(e->mac, d->id.addr, 6);
+    e->last_seen_s = d->last_seen_s;
+    e->via_node_valid = d->via_node_valid;
+    memcpy(e->via_node, d->via_node, 6);
+    e->best_rssi = d->best_rssi;
+    e->attributed_s = d->attributed_s;
+
+    memcpy(e->latest.mac, e->mac, 6);
+    e->latest.product_id = MIBEACON_PRODUCT_MIFLORA;   /* the only kind V1's registry ever held */
+    e->latest.frame_cnt = d->last_frame_cnt;
+
+    if (d->caps[CAP_AIR_TEMPERATURE].valid) {
+        e->latest.has_temp = true;
+        e->latest.temp_dc = (int16_t)lroundf(
+            capability_decode(CAP_AIR_TEMPERATURE, d->caps[CAP_AIR_TEMPERATURE].raw) * 10.0f);
+    }
+    if (d->caps[CAP_SOIL_MOISTURE].valid) {
+        e->latest.has_moisture = true;
+        e->latest.moisture_pct = (uint8_t)lroundf(
+            capability_decode(CAP_SOIL_MOISTURE, d->caps[CAP_SOIL_MOISTURE].raw));
+    }
+    if (d->caps[CAP_LIGHT_ILLUMINANCE].valid) {
+        e->latest.has_lux = true;
+        e->latest.lux = (uint32_t)lroundf(
+            capability_decode(CAP_LIGHT_ILLUMINANCE, d->caps[CAP_LIGHT_ILLUMINANCE].raw));
+    }
+    if (d->caps[CAP_SOIL_CONDUCTIVITY].valid) {
+        e->latest.has_conductivity = true;
+        e->latest.conductivity_us = (uint16_t)lroundf(
+            capability_decode(CAP_SOIL_CONDUCTIVITY, d->caps[CAP_SOIL_CONDUCTIVITY].raw));
+    }
+    if (d->caps[CAP_BATTERY_LEVEL].valid) {
+        e->latest.has_battery = true;
+        e->latest.battery_pct = (uint8_t)lroundf(
+            capability_decode(CAP_BATTERY_LEVEL, d->caps[CAP_BATTERY_LEVEL].raw));
+    }
+}
+
+/* M2-SHIM: see registry_compat.h. Decodes directly out of the live
+ * s_registry under s_mutex -- deliberately NOT implemented as "take a full
+ * registry_t snapshot via data_core_snapshot(), then decode that" (which
+ * would be simpler) because several callers of this shim (webserver/sse.c,
+ * swarm.c's on_sensor_update()) run on the default event-loop task, which
+ * both files' own comments document as having only ~2304 bytes of stack; a
+ * second 2048-byte registry_t local on top of that call chain would risk
+ * overflowing it. Bounded, allocation-free -- same critical-section cost
+ * shape as data_core_snapshot()'s own memcpy. */
+void data_core_snapshot_legacy(legacy_registry_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    int oi = 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < REGISTRY_MAX_DEVICES && oi < REGISTRY_MAX_SENSORS; i++) {
+        const device_entry_t *d = &s_registry.devices[i];
+        if (!d->in_use || d->id.kind != DEV_KIND_BLE) continue;
+        snapshot_legacy_one(&out->sensors[oi], d);
+        oi++;
+    }
+    xSemaphoreGive(s_mutex);
+}
+
 void data_core_clear_node_attribution(const uint8_t node_mac[6])
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    int n = registry_clear_attribution(&s_registry, node_mac);
+    registry_clear_attribution(&s_registry, node_mac);
     xSemaphoreGive(s_mutex);
-    if (n > 0) {
-        ESP_LOGI(TAG, "cleared via-node attribution for " MACSTR_FMT " on %d sensor(s)",
-                 MAC_ARG(node_mac), n);
-    }
+    ESP_LOGI(TAG, "cleared via-node attribution for " MACSTR_FMT, MAC_ARG(node_mac));
 }
 
 bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)
 {
     uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    device_id_t id = device_id_from_mac(DEV_KIND_BLE, mac);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    int rc = registry_set_battery(&s_registry, mac, pct, now_s);
+    int idx = registry_set_cap(&s_registry, &id, CAP_BATTERY_LEVEL,
+                               capability_encode(CAP_BATTERY_LEVEL, (float)pct), now_s);
     xSemaphoreGive(s_mutex);
 
-    if (rc < 0) {
+    if (idx < 0) {
         ESP_LOGW(TAG, "registry full, dropping battery reading for " MACSTR_FMT, MAC_ARG(mac));
         return false;
     }

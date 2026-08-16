@@ -159,7 +159,7 @@ static void publish_discovery(uint8_t plant_id, const char *name)
 
 /* Publishes the retained state payload for one plant, qos 0. e is the
  * registry entry for the plant's currently-assigned probe. */
-static void publish_state(uint8_t plant_id, const sensor_entry_t *e)
+static void publish_state(uint8_t plant_id, const sensor_entry_t *e)   /* M2-SHIM: sensor_entry_t */
 {
     if (!s_client) return;
 
@@ -234,7 +234,7 @@ static void mqtt_pub_task(void *arg)
 {
     (void)arg;
     mqtt_pub_msg_t msg;
-    registry_t reg_snap;
+    legacy_registry_t reg_snap;   /* M2-SHIM */
     plants_table_t plants_snap;
 
     for (;;) {
@@ -262,8 +262,8 @@ static void mqtt_pub_task(void *arg)
         uint8_t plant_id = plants_resolve_or_create(msg.mac);
         if (plant_id == 0) continue;   /* plants table full; already logged once/mac/boot */
 
-        data_core_snapshot(&reg_snap);
-        int ridx = registry_find(&reg_snap, msg.mac);
+        data_core_snapshot_legacy(&reg_snap);   /* M2-SHIM */
+        int ridx = legacy_registry_find(&reg_snap, msg.mac);   /* M2-SHIM */
         if (ridx < 0) continue;   /* defensive: shouldn't happen, registry entries are never removed */
 
         plants_snapshot(&plants_snap);

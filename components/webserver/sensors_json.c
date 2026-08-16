@@ -106,14 +106,14 @@ cJSON *probe_json(const sensor_entry_t *e, uint8_t plant_id, uint32_t now_uptime
 
 /* ---------------- plant_json() -- GET /api/v1/plants ---------------- */
 
-cJSON *plant_json(const plant_entry_t *p, const registry_t *snap,
+cJSON *plant_json(const plant_entry_t *p, const legacy_registry_t *snap,   /* M2-SHIM */
                    uint32_t now_uptime_s, uint32_t now_epoch)
 {
     cJSON *o = cJSON_CreateObject();
     cJSON_AddNumberToObject(o, "id", p->id);
     cJSON_AddStringToObject(o, "name", p->name);   /* "" = unnamed; UI renders "Plant <id>" */
 
-    int idx = p->mac_valid ? registry_find(snap, p->mac) : -1;
+    int idx = p->mac_valid ? legacy_registry_find(snap, p->mac) : -1;   /* M2-SHIM */
     if (idx >= 0) {
         /* Live: assigned mac, currently in the registry (heard at least
          * once this boot). */

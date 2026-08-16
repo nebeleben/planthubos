@@ -39,7 +39,7 @@ static const char *TAG = "api_v1";
  * one registered handler at a time on the single httpd task (this is why
  * each was `static` -- too big for that task's stack -- in the first
  * place), so there is never a concurrent writer to race. */
-static registry_t s_api_reg_snap;
+static legacy_registry_t s_api_reg_snap;   /* M2-SHIM */
 static plants_table_t s_api_plant_snap;
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root)
@@ -283,7 +283,7 @@ static esp_err_t sensors_get(httpd_req_t *req)
 {
     /* s_api_reg_snap/s_api_plant_snap: too big for the httpd task stack;
      * shared with plants_get() below, see their declaration comment (L5). */
-    data_core_snapshot(&s_api_reg_snap);
+    data_core_snapshot_legacy(&s_api_reg_snap);   /* M2-SHIM */
     plants_snapshot(&s_api_plant_snap);
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
@@ -411,7 +411,7 @@ static esp_err_t plants_get(httpd_req_t *req)
 {
     /* s_api_plant_snap/s_api_reg_snap: too big for the httpd task stack;
      * shared with sensors_get() above, see their declaration comment (L5). */
-    data_core_snapshot(&s_api_reg_snap);
+    data_core_snapshot_legacy(&s_api_reg_snap);   /* M2-SHIM */
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
     plants_adopt_from_registry(&s_api_reg_snap, now_uptime_s,

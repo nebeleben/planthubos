@@ -2,6 +2,8 @@
 #include "esp_err.h"
 #include "esp_event.h"
 #include "registry.h"
+#include "mibeacon.h"
+#include "registry_compat.h"   /* M2-SHIM: v1-shaped read API, see that header */
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -15,13 +17,27 @@ enum { DATA_EVENT_SENSOR_UPDATE };
 
 esp_err_t data_core_init(void);
 
+/* The MiFlora -> capability adapter (M2): maps each has_* field of *m onto
+ * its capability slot via capability_encode() (temp -> CAP_AIR_TEMPERATURE,
+ * moisture -> CAP_SOIL_MOISTURE, lux -> CAP_LIGHT_ILLUMINANCE, conductivity
+ * -> CAP_SOIL_CONDUCTIVITY, battery -> CAP_BATTERY_LEVEL), plus
+ * CAP_SIGNAL_RSSI from rssi -- but only once registry_attribute() (M5b
+ * rules, registry.h) says this reporter actually owns the frame; a losing
+ * arbitration bid writes nothing, same as V1's duplicate-frame branch never
+ * called merge(). via_node/rssi mean exactly what they did pre-M2: NULL is
+ * a direct hub BLE reception, otherwise the relaying node's ESP-NOW MAC and
+ * its rssi reading of the sensor. Uses "now" (esp_timer uptime) as the
+ * capture time -- data_core_submit_from() below is the age-aware variant
+ * for a node's buffered/back-dated readings. */
+void data_core_submit_mibeacon(const mibeacon_t *m, const uint8_t via_node[6], int8_t rssi);
+
 /* via_node == NULL means the hub heard this on its own BLE radio; otherwise
  * it is the relaying node's ESP-NOW MAC. rssi is that source's signal
  * strength (0 if unknown/not applicable).
  *
  * age_s back-dates the effective last_seen_s to (now_s - age_s), for
  * readings a node buffered before it could forward them. A reading whose
- * effective time is older than the sensor's currently stored last_seen_s
+ * effective time is older than the device's currently stored last_seen_s
  * does not overwrite newer data -- but note this is a "don't regress the
  * live view" guard only. It does NOT insert into an earlier history slot:
  * the sampler writes 15-minute snapshots and the ring files require
@@ -34,30 +50,30 @@ esp_err_t data_core_init(void);
 void data_core_submit_from(const mibeacon_t *m, const uint8_t via_node[6],
                             int8_t rssi, uint16_t age_s);
 
-/* Wrapper kept for existing callers: a direct hub reception, no known rssi,
- * age_s = 0 (just heard). */
-void      data_core_submit(const mibeacon_t *m);
 void      data_core_snapshot(registry_t *out);
 
 /* Forgetting a node must fully forget it: clears via-node attribution (see
- * registry_clear_attribution()) for every sensor currently attributed to
+ * registry_clear_attribution()) for every device currently attributed to
  * node_mac, under the same mutex every other registry access here uses.
  * Called from the forget HTTP handler's task (api_v1.c), never from the
  * ESP-NOW receive callback -- registry_clear_attribution() itself is a
- * short, bounded, allocation-free scan, same as registry_update_from(), so
+ * short, bounded, allocation-free scan, same as registry_attribute(), so
  * this follows the exact locking pattern data_core_submit_from() and
  * data_core_snapshot() already use. */
 void      data_core_clear_node_attribution(const uint8_t node_mac[6]);
 
 /* A MiFlora battery poll result (battery_poll.c, M6): applies pct to mac's
- * registry entry (creating it if this is the sensor's first appearance)
- * via registry_set_battery(), NOT registry_update_from() -- see that
- * function's doc comment for why a battery read must bypass the frame_cnt
- * dedup path entirely rather than being wrapped in a synthetic mibeacon_t
- * and passed through data_core_submit_from(). Posts DATA_EVENT_SENSOR_UPDATE
- * on success, same as data_core_submit_from() does on a merge.
+ * CAP_BATTERY_LEVEL slot (creating the device if this is its first
+ * appearance) via registry_set_cap(), NOT registry_attribute() -- a GATT
+ * battery read has no frame_cnt of its own, so it must bypass the M5b
+ * frame_cnt dedup/arbitration path entirely rather than being wrapped in a
+ * synthetic frame and risk being read as a duplicate of frame_cnt 0. A
+ * battery poll result is new data by construction -- it was just read live
+ * over GATT -- so it is always applied. Posts DATA_EVENT_SENSOR_UPDATE on
+ * success, same as data_core_submit_from() does on a merge.
  * Returns false only when the registry is full and mac wasn't already
- * present -- callers must not advance their own success/backoff state
- * (e.g. a scheduler's last_ok_s) when this returns false, or a reading
- * that was actually dropped would wrongly stop being retried. */
+ * present (nothing is created or modified in that case) -- callers must not
+ * advance their own success/backoff state (e.g. a scheduler's last_ok_s)
+ * when this returns false, or a reading that was actually dropped would
+ * wrongly stop being retried. */
 bool      data_core_submit_battery(const uint8_t mac[6], uint8_t pct);

@@ -1003,9 +1003,9 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
 {
     (void)arg; (void)base; (void)id;
     const uint8_t *mac = data;
-    static registry_t snap;      /* event-loop task only */
-    data_core_snapshot(&snap);
-    int idx = registry_find(&snap, mac);
+    static legacy_registry_t snap;      /* M2-SHIM; event-loop task only */
+    data_core_snapshot_legacy(&snap);   /* M2-SHIM */
+    int idx = legacy_registry_find(&snap, mac);   /* M2-SHIM */
     if (idx < 0) return;
     const sensor_entry_t *se = &snap.sensors[idx];
     const mibeacon_t *m = &se->latest;

@@ -3,117 +3,124 @@
 
 void registry_init(registry_t *r) { memset(r, 0, sizeof(*r)); }
 
-int registry_find(const registry_t *r, const uint8_t mac[6])
+int registry_find(const registry_t *r, const device_id_t *id)
 {
-    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++)
-        if (r->sensors[i].in_use && memcmp(r->sensors[i].mac, mac, 6) == 0) return i;
+    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++)
+        if (r->devices[i].in_use && device_id_equal(&r->devices[i].id, id)) return i;
     return -1;
 }
 
 int registry_count(const registry_t *r)
 {
     int n = 0;
-    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) n += r->sensors[i].in_use;
+    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) n += r->devices[i].in_use;
     return n;
 }
 
-static void merge(mibeacon_t *dst, const mibeacon_t *src)
+/* Finds the device by id, or claims the first free slot and initialises it
+ * (in_use, id, every cap slot cleared to CAP_VALUE_NONE/invalid) when
+ * unknown. -1 when unknown and the table is full -- nothing is created or
+ * modified in that case. *created reports which path was taken (NULL if the
+ * caller doesn't need to know). */
+static int find_or_create(registry_t *r, const device_id_t *id, bool *created)
 {
-    dst->product_id = src->product_id;
-    dst->frame_cnt = src->frame_cnt;
-    if (src->has_temp)         { dst->temp_dc = src->temp_dc;                 dst->has_temp = true; }
-    if (src->has_moisture)     { dst->moisture_pct = src->moisture_pct;       dst->has_moisture = true; }
-    if (src->has_lux)          { dst->lux = src->lux;                         dst->has_lux = true; }
-    if (src->has_conductivity) { dst->conductivity_us = src->conductivity_us; dst->has_conductivity = true; }
-    if (src->has_battery)      { dst->battery_pct = src->battery_pct;         dst->has_battery = true; }
+    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
+        if (r->devices[i].in_use && device_id_equal(&r->devices[i].id, id)) {
+            if (created) *created = false;
+            return i;
+        }
+    }
+    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
+        if (r->devices[i].in_use) continue;
+        device_entry_t *d = &r->devices[i];
+        memset(d, 0, sizeof(*d));
+        d->in_use = true;
+        d->id = *id;
+        for (int c = 0; c < CAPABILITY_COUNT; c++) d->caps[c].raw = CAP_VALUE_NONE;
+        if (created) *created = true;
+        return i;
+    }
+    if (created) *created = false;
+    return -1;
 }
 
-static void set_attribution(sensor_entry_t *e, const uint8_t via_node[6], int8_t rssi, uint32_t now_s)
+int registry_set_cap(registry_t *r, const device_id_t *id, uint8_t cap_id,
+                      int16_t raw, uint32_t now_s)
+{
+    if (cap_id >= CAPABILITY_COUNT) return -1;
+    int idx = find_or_create(r, id, NULL);
+    if (idx < 0) return -1;
+    device_entry_t *d = &r->devices[idx];
+    d->last_seen_s = now_s;
+    d->caps[cap_id].raw = raw;
+    d->caps[cap_id].updated_s = now_s;
+    d->caps[cap_id].valid = (raw != CAP_VALUE_NONE);
+    return idx;
+}
+
+static void set_attribution(device_entry_t *d, const uint8_t via_node[6], int8_t rssi, uint32_t now_s)
 {
     if (via_node) {
-        e->via_node_valid = true;
-        memcpy(e->via_node, via_node, 6);
+        d->via_node_valid = true;
+        memcpy(d->via_node, via_node, 6);
     } else {
-        e->via_node_valid = false;
-        memset(e->via_node, 0, 6);
+        d->via_node_valid = false;
+        memset(d->via_node, 0, 6);
     }
-    e->best_rssi = rssi;
-    e->attributed_s = now_s;
+    d->best_rssi = rssi;
+    d->attributed_s = now_s;
 }
 
-int registry_update_from(registry_t *r, const mibeacon_t *m, uint32_t now_s,
-                          const uint8_t via_node[6], int8_t rssi)
+bool registry_attribute(registry_t *r, const device_id_t *id, uint32_t frame_cnt,
+                        const uint8_t via_node[6], int8_t rssi, uint32_t now_s)
 {
-    int idx = registry_find(r, m->mac);
-    if (idx < 0) {
-        for (int i = 0; i < REGISTRY_MAX_SENSORS && idx < 0; i++)
-            if (!r->sensors[i].in_use) idx = i;
-        if (idx < 0) return -1;
-        sensor_entry_t *e = &r->sensors[idx];
-        memset(e, 0, sizeof(*e));
-        e->in_use = true;
-        memcpy(e->mac, m->mac, 6);
-        merge(&e->latest, m);
-        e->last_seen_s = now_s;
-        set_attribution(e, via_node, rssi, now_s);
-        return 1;
+    bool created;
+    int idx = find_or_create(r, id, &created);
+    if (idx < 0) return false;
+    device_entry_t *d = &r->devices[idx];
+    d->last_seen_s = now_s;
+
+    if (created) {
+        /* Brand-new device: unconditionally attributed to whoever reported
+         * it first, exactly like V1's "new sensor" branch. */
+        d->last_frame_cnt = (uint8_t)frame_cnt;
+        set_attribution(d, via_node, rssi, now_s);
+        return true;
     }
-    sensor_entry_t *e = &r->sensors[idx];
-    e->last_seen_s = now_s;
-    if (e->latest.frame_cnt == m->frame_cnt) {
+
+    if (d->last_frame_cnt == (uint8_t)frame_cnt) {
         /* Duplicate frame: attribution can still hand off to a stronger
          * reporter -- or unconditionally to a direct reception, which
          * always outranks a relay -- without this being counted as new
          * data. Only a fresh frame_cnt (below) resets the contest. */
         if (via_node == NULL) {
-            set_attribution(e, NULL, rssi, now_s);
-        } else if (e->via_node_valid && rssi > e->best_rssi) {
+            set_attribution(d, NULL, rssi, now_s);
+            return true;
+        }
+        if (d->via_node_valid && rssi > d->best_rssi) {
             /* Only contest attribution against another node's rssi; if the
              * hub already attributed this frame to itself directly, that
              * stands regardless of what any node claims. */
-            set_attribution(e, via_node, rssi, now_s);
+            set_attribution(d, via_node, rssi, now_s);
+            return true;
         }
-        return 0;   /* repeated advertisement */
+        return false;   /* repeated advertisement, this reporter doesn't own it */
     }
-    merge(&e->latest, m);
-    set_attribution(e, via_node, rssi, now_s);
-    return 1;
+
+    /* New frame: the reporter of it unconditionally takes over. */
+    d->last_frame_cnt = (uint8_t)frame_cnt;
+    set_attribution(d, via_node, rssi, now_s);
+    return true;
 }
 
-int registry_update(registry_t *r, const mibeacon_t *m, uint32_t now_s)
+void registry_clear_attribution(registry_t *r, const uint8_t node_mac[6])
 {
-    return registry_update_from(r, m, now_s, NULL, 0);
-}
-
-int registry_set_battery(registry_t *r, const uint8_t mac[6], uint8_t pct, uint32_t now_s)
-{
-    int idx = registry_find(r, mac);
-    if (idx < 0) {
-        for (int i = 0; i < REGISTRY_MAX_SENSORS && idx < 0; i++)
-            if (!r->sensors[i].in_use) idx = i;
-        if (idx < 0) return -1;
-        memset(&r->sensors[idx], 0, sizeof(r->sensors[idx]));
-        r->sensors[idx].in_use = true;
-        memcpy(r->sensors[idx].mac, mac, 6);
+    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
+        device_entry_t *d = &r->devices[i];
+        if (!d->in_use || !d->via_node_valid) continue;
+        if (memcmp(d->via_node, node_mac, 6) != 0) continue;
+        d->via_node_valid = false;
+        memset(d->via_node, 0, 6);
+        d->best_rssi = 0;
     }
-    sensor_entry_t *e = &r->sensors[idx];
-    e->last_seen_s = now_s;
-    e->latest.has_battery = true;
-    e->latest.battery_pct = pct;
-    return 1;
-}
-
-int registry_clear_attribution(registry_t *r, const uint8_t node_mac[6])
-{
-    int n = 0;
-    for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {
-        sensor_entry_t *e = &r->sensors[i];
-        if (!e->in_use || !e->via_node_valid) continue;
-        if (memcmp(e->via_node, node_mac, 6) != 0) continue;
-        e->via_node_valid = false;
-        memset(e->via_node, 0, 6);
-        e->best_rssi = 0;
-        n++;
-    }
-    return n;
 }

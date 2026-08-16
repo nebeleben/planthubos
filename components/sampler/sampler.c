@@ -59,9 +59,9 @@ static storage_rec_t rec_from_entry(const sensor_entry_t *e, uint32_t rel_s)
 static void sample_once(void)
 {
     /* only touched on the sampler task */
-    static registry_t reg_snap;
+    static legacy_registry_t reg_snap;   /* M2-SHIM */
     static plants_table_t plant_snap;
-    data_core_snapshot(&reg_snap);
+    data_core_snapshot_legacy(&reg_snap);   /* M2-SHIM */
     plants_snapshot(&plant_snap);
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000000);
     uint32_t interval_s = CONFIG_PLANTHUB_SAMPLE_INTERVAL_MIN * 60;
@@ -91,7 +91,7 @@ static void sample_once(void)
         const plant_entry_t *p = &plant_snap.p[i];
         if (!p->in_use || !p->mac_valid) continue;
 
-        int ri = registry_find(&reg_snap, p->mac);
+        int ri = legacy_registry_find(&reg_snap, p->mac);   /* M2-SHIM */
         if (ri < 0) {
             /* Assigned to a probe this boot hasn't heard from yet -- there's
              * no registry entry to sample. Not a warning: this is routine

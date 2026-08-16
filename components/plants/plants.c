@@ -974,7 +974,7 @@ uint8_t plants_resolve_or_create(const uint8_t mac[6])
  * best, a stale answer (racing a concurrent assign/delete) at worst.
  * Bounded REGISTRY_MAX_SENSORS mutex-guarded lookups; no allocation, no
  * caller-stack table. */
-void plants_adopt_from_registry(const registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s)
+void plants_adopt_from_registry(const legacy_registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s)   /* M2-SHIM */
 {
     if (!reg) return;
     for (int i = 0; i < REGISTRY_MAX_SENSORS; i++) {

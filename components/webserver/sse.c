@@ -124,7 +124,7 @@ static esp_err_t events_json_get(httpd_req_t *req, uint32_t after)
 static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     const uint8_t *mac = data;
-    static registry_t snap;   /* only ever touched on the default event loop task */
+    static legacy_registry_t snap;   /* M2-SHIM; only ever touched on the default event loop task */
     /* static: this handler only ever runs on the single default event-loop
      * task, which has just a 2304 B stack -- keep the message buffer off it.
      * 512, not 320: M5b's "via" attribution (sensor_json()) added a nested
@@ -135,8 +135,8 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
      * margin above that ~250 B worst case rather than trimming right up
      * against it. */
     static char buf[512];
-    data_core_snapshot(&snap);
-    int idx = registry_find(&snap, mac);
+    data_core_snapshot_legacy(&snap);   /* M2-SHIM */
+    int idx = legacy_registry_find(&snap, mac);   /* M2-SHIM */
     if (idx < 0) return;
     cJSON *o = sensor_json(&snap.sensors[idx]);
     char *json = cJSON_PrintUnformatted(o);

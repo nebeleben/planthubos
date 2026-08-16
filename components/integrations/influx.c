@@ -59,8 +59,8 @@ static size_t build_batch(void)
     plants_table_t plants_snap;
     plants_snapshot(&plants_snap);
 
-    registry_t reg_snap;
-    data_core_snapshot(&reg_snap);
+    legacy_registry_t reg_snap;   /* M2-SHIM */
+    data_core_snapshot_legacy(&reg_snap);   /* M2-SHIM */
 
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
     uint32_t epoch_now = timekeeper_now();
@@ -70,7 +70,7 @@ static size_t build_batch(void)
         const plant_entry_t *pe = &plants_snap.p[i];
         if (!pe->in_use || !pe->mac_valid) continue;   /* assigned only */
 
-        int ridx = registry_find(&reg_snap, pe->mac);
+        int ridx = legacy_registry_find(&reg_snap, pe->mac);   /* M2-SHIM */
         if (ridx < 0) continue;   /* probe never reported to this hub */
 
         const sensor_entry_t *e = &reg_snap.sensors[ridx];

@@ -125,9 +125,9 @@ static bool resolve_plant(const char *name, uint8_t capability, uint8_t field,
         return false;
     }
 
-    static registry_t reg;
-    data_core_snapshot(&reg);
-    int ridx = registry_find(&reg, snap.p[idx].mac);
+    static legacy_registry_t reg;   /* M2-SHIM */
+    data_core_snapshot_legacy(&reg);   /* M2-SHIM */
+    int ridx = legacy_registry_find(&reg, snap.p[idx].mac);   /* M2-SHIM */
     if (ridx < 0) {
         ref_not_ready(out);
         if (why && whylen) snprintf(why, whylen, "probe never heard");
@@ -143,8 +143,8 @@ static bool resolve_plant(const char *name, uint8_t capability, uint8_t field,
 static bool resolve_device(const char *id, uint8_t capability, uint8_t field,
                            uint32_t now_uptime_s, psvm_ref_val_t *out, char *why, size_t whylen)
 {
-    static registry_t reg;
-    data_core_snapshot(&reg);
+    static legacy_registry_t reg;   /* M2-SHIM */
+    data_core_snapshot_legacy(&reg);   /* M2-SHIM */
 
     int ridx = -1;
     char nm[33];
@@ -158,7 +158,7 @@ static bool resolve_device(const char *id, uint8_t capability, uint8_t field,
     if (ridx < 0) {
         uint8_t mac[6];
         if (parse_mac_literal(id, mac)) {
-            ridx = registry_find(&reg, mac);
+            ridx = legacy_registry_find(&reg, mac);   /* M2-SHIM */
         }
     }
     if (ridx < 0) {

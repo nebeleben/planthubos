@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "plants_table.h"
-#include "registry.h"
+#include "registry_compat.h"   /* M2-SHIM: legacy_registry_t, see that header */
 
 /* LittleFS-backed plant registry: a single blob at <storage_base>/plants.bin
  * (M8 hardware bring-up fix -- this used to be an NVS blob keyed "plants" in
@@ -99,7 +99,7 @@ esp_err_t plants_delete(uint8_t id);                 /* also deletes P<id> ring 
  * nothing to pre-check a snapshot against. Safe to call from any task
  * context -- see plants_resolve_or_create()'s own TASK CONTEXT ONLY note,
  * which this inherits. */
-void plants_adopt_from_registry(const registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s);
+void plants_adopt_from_registry(const legacy_registry_t *reg, uint32_t now_uptime_s, uint32_t liveness_s);   /* M2-SHIM */
 
 /* Probe-less last values: the plant's last history record (ring tail),
  * read via storage_query() (storage.h) over the plant's own P<id>_raw.bin

@@ -1,6 +1,6 @@
 #pragma once
 #include "cJSON.h"
-#include "registry.h"
+#include "registry_compat.h"   /* M2-SHIM: sensor_entry_t/legacy_registry_t, see that header */
 #include "plants_table.h"
 
 /* M8 Task 6: plants are the primary surface now, so this file (kept under
@@ -59,5 +59,5 @@ cJSON *probe_json(const sensor_entry_t *e, uint8_t plant_id, uint32_t now_uptime
  * the plant has no assigned mac; present-with-nulled-diagnostics when a mac
  * is assigned but not yet live in the registry (the "pending" pre-assigned
  * case above); the live values otherwise. */
-cJSON *plant_json(const plant_entry_t *p, const registry_t *snap,
+cJSON *plant_json(const plant_entry_t *p, const legacy_registry_t *snap,   /* M2-SHIM */
                    uint32_t now_uptime_s, uint32_t now_epoch);

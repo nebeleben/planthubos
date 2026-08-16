@@ -14,8 +14,9 @@ $CC -Wall -Wextra -Werror -I../../components/mibeacon/include \
     test_mibeacon.c ../../components/mibeacon/mibeacon.c -o test_mibeacon
 ./test_mibeacon
 
-$CC -Wall -Wextra -Werror -I../../components/mibeacon/include -I../../components/data_core/include \
-    test_registry.c ../../components/data_core/registry.c ../../components/mibeacon/mibeacon.c -o test_registry
+$CC -Wall -Wextra -Werror -I../../components/capability/include -I../../components/data_core/include \
+    test_registry.c ../../components/data_core/registry.c ../../components/capability/capability.c \
+    ../../components/capability/device_id.c -o test_registry -lm
 ./test_registry
 
 $CC -Wall -Wextra -Werror -I../../components/timekeeper/include \
