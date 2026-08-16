@@ -22,8 +22,8 @@ test('spec section 3 Ruuvi example compiles', () => {
   // covered separately below, not via this golden.
   const src = `wrapper "ruuvi" match manufacturer 0x0499
 decode
-  emit air.temperature   i16_be(payload, 3) * 0.005
-  emit air.humidity      u16_be(payload, 5) * 0.0025`
+  emit air.temperature   i16_be(payload, 1) * 0.005
+  emit air.humidity      u16_be(payload, 3) * 0.0025`
   const r = compileWrapper(src)
   assert.equal(r.ok, true)
   assert.equal(r.name, 'ruuvi')
@@ -32,11 +32,11 @@ decode
   assert.deepEqual(new Set(r.capsUsed), new Set([1, 5])) // air.temperature, air.humidity
 
   const asm = disassemble(r.bytecode)
-  assert.match(asm, /LOAD_I16BE 3/)
+  assert.match(asm, /LOAD_I16BE 1/)
   // f32 round-trip (0.005 -> 0.004999999888241291 etc.), so match loosely.
   assert.match(asm, /PUSH_CONST .*0\.00499/)
   assert.match(asm, /EMIT air\.temperature/)
-  assert.match(asm, /LOAD_U16BE 5/)
+  assert.match(asm, /LOAD_U16BE 3/)
   assert.match(asm, /PUSH_CONST .*0\.00249/)
   assert.match(asm, /EMIT air\.humidity/)
   assert.match(asm, /HALT$/m)

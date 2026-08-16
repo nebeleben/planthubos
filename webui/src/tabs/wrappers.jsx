@@ -28,8 +28,10 @@ function fmtMatchKey(match) {
 // and shape as rules.jsx's own TEMPLATE.
 const TEMPLATE = `# wrapper "ruuvi" match manufacturer 0x0499
 # decode
-#   emit air.temperature   i16_be(payload, 3) * 0.005
-#   emit air.humidity      u16_be(payload, 5) * 0.0025
+#   payload starts after the match's own header (manufacturer: past the
+#   2-byte company id; service: past the 2-byte UUID; mac_prefix: raw advert)
+#   emit air.temperature   i16_be(payload, 1) * 0.005
+#   emit air.humidity      u16_be(payload, 3) * 0.0025
 `
 
 // POST /wrappers/<id>/test's response (spec §6, ruling: render exactly what
