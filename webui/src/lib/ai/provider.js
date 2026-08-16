@@ -6,7 +6,19 @@
 import { getAiSettings } from './settings.js'
 
 const ANTHROPIC_VERSION = '2023-06-01'
-const MAX_TOKENS = 2048
+
+// Raised from 2048 after the M4 hardware proof, where the very first real
+// generation came back `truncated`. The armchair reasoning for 2048 was
+// that a wrapper is well under 200 tokens, so it looked like ~10x headroom
+// -- but that counts only the code. What a current model actually returns
+// is reasoning and prose around the code block, and the cap applies to the
+// whole response, not to the part we keep. Measured, not guessed: 2048 was
+// not enough for a three-line wrapper from a six-byte payload.
+//
+// The `truncated` error kind is what made this legible instead of a
+// mysterious parse failure on half a program, so an overrun at this larger
+// figure still surfaces as itself rather than as bad model output.
+const MAX_TOKENS = 8192
 
 // `kind` is what the UI switches on to say something useful (spec section 6).
 // A generic "request failed" would send a user to check their WiFi when the
