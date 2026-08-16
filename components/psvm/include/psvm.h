@@ -54,6 +54,14 @@
 #define PSVM_PLAN_MAX_READS    4
 #define PSVM_PLAN_MAX_WRITES   2
 #define PSVM_PLAN_WRITE_MAX    8
+/* Enforce the concatenated buffer invariant: PSVM_PLAN_MAX_READS (4) slots of
+ * PSVM_PLAN_SLOT (16) bytes each must exactly fill PSVM_PAYLOAD_MAX (64). Task 3
+ * compiles slot offsets as compile-time constants in the browser's JavaScript
+ * version of these numbers; a silent mismatch between two independent copies
+ * would produce an out-of-bounds access in the last slot. This assertion makes
+ * it a compile failure instead. */
+_Static_assert(PSVM_PLAN_MAX_READS * PSVM_PLAN_SLOT == PSVM_PAYLOAD_MAX,
+               "concatenated GATT read buffer: PSVM_PLAN_MAX_READS * PSVM_PLAN_SLOT must equal PSVM_PAYLOAD_MAX");
 
 typedef enum { PSVM_OK = 0, PSVM_ERR_HEADER, PSVM_ERR_LIMITS, PSVM_ERR_TRUNCATED,
                PSVM_ERR_BADOP, PSVM_ERR_STACK, PSVM_ERR_STEPS, PSVM_ERR_DIV0,
