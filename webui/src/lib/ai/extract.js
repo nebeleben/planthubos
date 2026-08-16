@@ -16,7 +16,11 @@ export function extractSource(text) {
     // (```wrapper "x" match service 0x1234) must keep that line, since for
     // a wrapper it is the header and the single most load-bearing line.
     const firstLine = body.slice(0, nl)
-    if (/^[A-Za-z0-9_+-]*$/.test(firstLine)) body = body.slice(nl + 1)
+    // Judge the tag on its trimmed self (CRLF line endings leave a
+    // trailing \r on firstLine; a model may also pad with trailing
+    // spaces) but slice off the whole line, \r and all, once it passes.
+    const tagCandidate = firstLine.replace(/[ \t\r]+$/, '')
+    if (/^[A-Za-z0-9_+-]*$/.test(tagCandidate)) body = body.slice(nl + 1)
   }
   body = body.replace(/\s+$/, '')
   return body.length > 0 ? body : null

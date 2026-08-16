@@ -69,6 +69,30 @@ test('extracts a same-line fence, keeping the header line as code', () => {
   assert.equal(out, 'wrapper "x" match service 0x1234\ndecode\n  emit air.temperature u8(payload, 0)')
 })
 
+// Fix round 2: round 1's tag charset test (^[A-Za-z0-9_+-]*$) was applied
+// to the raw first line, so a CRLF-terminated tag line failed the test
+// (trailing \r isn't in the charset) and the tag was wrongly kept as
+// code. Judge the tag on its line-ending/whitespace-trimmed self.
+test('extracts a language-tagged fence with CRLF line endings', () => {
+  const out = extractSource('```js\r\nconsole.log(1)\r\n```')
+  assert.equal(out, 'console.log(1)')
+})
+
+// Fix round 2: same failure mode, trailing spaces after the tag instead
+// of a line ending.
+test('extracts a language-tagged fence with trailing whitespace after the tag', () => {
+  const out = extractSource('```js   \nconsole.log(1)\n```')
+  assert.equal(out, 'console.log(1)')
+})
+
+// Fix round 2: this info-string regex has moved twice now. Re-pin that
+// tightening the tag charset test can never again cost the same-line
+// wrapper header round 1 fixed.
+test('a same-line wrapper header still survives after the CRLF/whitespace fix', () => {
+  const out = extractSource('```wrapper "ruuvi" match manufacturer 0x0499\ndecode\n  emit air.temperature i16_be(payload, 1) * 0.005\n```')
+  assert.equal(out, 'wrapper "ruuvi" match manufacturer 0x0499\ndecode\n  emit air.temperature i16_be(payload, 1) * 0.005')
+})
+
 // Fix round 1: RULE_DIALECT says mode/cooldown/every "must appear in that
 // order" but does not claim each may appear only once -- parser.js only
 // rejects a clause going backward (idx < orderIdx), not a repeat. Pin
