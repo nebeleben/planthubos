@@ -6,6 +6,14 @@
 // nothing but jump-offset bookkeeping.
 
 import { CAPS } from './caps.js'
+import { PSError } from './lexer.js'
+
+// Mirrors PSVM_MAX_EMITS in components/psvm/include/psvm.h: the VM's emit
+// buffer is a fixed array (16 slots), not a growable one, so a wrapper
+// whose worst-case run pushes more EMITs than this compiles and installs
+// cleanly but then fails *every* run with PSVM_ERR_LIMITS. Caught here at
+// compile time instead, while the offending `emit` line is still visible.
+const PSVM_MAX_EMITS = 16
 
 export const OPCODES = {
   HALT_BOOL: 0x00,
@@ -339,12 +347,20 @@ export function emitWrapper(ast) {
   const ctx = { consts }
   const buf = new CodeBuf()
   const capsUsed = []
+  let emitCount = 0
 
   for (const stmt of ast.statements) {
     if (stmt.type === 'require') {
       emitWrapperExpr(stmt.expr, buf, ctx)
       buf.op(OPCODES.REQUIRE)
     } else if (stmt.type === 'emit') {
+      emitCount++
+      if (emitCount > PSVM_MAX_EMITS) {
+        throw new PSError(
+          `wrapper emits ${emitCount} capabilities, exceeding the hub's limit of ${PSVM_MAX_EMITS} (PSVM_MAX_EMITS)`,
+          stmt.line, stmt.col
+        )
+      }
       emitWrapperExpr(stmt.expr, buf, ctx)
       const capId = CAPS[stmt.capability].id
       buf.op(OPCODES.EMIT); buf.u8(capId)

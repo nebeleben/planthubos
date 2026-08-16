@@ -167,3 +167,29 @@ decode
   assert.match(asm, /AES_CCM/)
   assert.match(asm, /AES_CCM[\s\S]*LOAD_U8 4/)
 })
+
+// PSVM_MAX_EMITS (components/psvm/include/psvm.h) is 16: the VM's emit
+// buffer is a fixed array, not growable. A wrapper whose worst-case run
+// pushes more EMITs than that would install cleanly and then fail *every*
+// run with PSVM_ERR_LIMITS -- caught here at compile time instead. The two
+// tests below pin the exact boundary (16 ok, 17 not), not just "some smaller
+// number now fails".
+function nEmitsWrapper(n) {
+  const emits = Array.from({ length: n }, () => '  emit air.temperature u8(payload, 0)').join('\n')
+  return `wrapper "x" match manufacturer 0x0001\ndecode\n${emits}`
+}
+
+test('a 16-emit wrapper compiles (at the PSVM_MAX_EMITS boundary)', () => {
+  const r = compileWrapper(nEmitsWrapper(16))
+  assert.equal(r.ok, true)
+  const asm = disassemble(r.bytecode)
+  assert.equal((asm.match(/EMIT/g) || []).length, 16)
+})
+
+test('a 17-emit wrapper is a compile error naming PSVM_MAX_EMITS and the count', () => {
+  assertFails(nEmitsWrapper(17), /17.*16|16.*PSVM_MAX_EMITS/i)
+  const r = compileWrapper(nEmitsWrapper(17))
+  assert.match(r.errors[0].message, /17/)
+  assert.match(r.errors[0].message, /16/)
+  assert.match(r.errors[0].message, /PSVM_MAX_EMITS/)
+})
