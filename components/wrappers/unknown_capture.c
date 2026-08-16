@@ -15,6 +15,12 @@
  * at most once per advertisement and last_seen_s IS the recency signal) and
  * up to UNKNOWN_SAMPLES samples kept oldest-first/newest-last in s[].
  *
+ * Synchronization: the table and all helper functions are internally
+ * protected by a mutex (s_mux). All critical functions (unknown_capture_add(),
+ * unknown_capture_forget(), unknown_capture_list()) take the lock across
+ * their entire bodies, so callers never need to synchronise. This module is
+ * safe to call from any task.
+ *
  * Measured byte cost (host test prints this; also checked by the
  * _Static_assert below so a struct-layout change can't silently drift the
  * spec section 7 budget line without a compile failure calling it out):
@@ -24,14 +30,41 @@
  *                                     last_seen_s + 2*40 samples + 1 n
  *                                     + 3 tail pad, uint32_t/sample array
  *                                     both need 4-B alignment)
- *   s_tbl[8]                 = 768 B static -- the whole of this module's
- *                                     resident cost, close to spec section
- *                                     5's "~700 B" estimate (the gap is
- *                                     alignment padding the spec's own
- *                                     back-of-envelope 8*2*37 didn't count).
+ *   s_tbl[8]                 = 768 B static -- the table itself
+ *   StaticSemaphore_t s_mux  =  48 B static -- the mutex buffer (typical on
+ *                                     Xtensa/RISC-V targets)
+ *   Total                    = ~816 B static resident cost, close to spec
+ *                                     section 5's "~700 B" estimate plus
+ *                                     synchronisation overhead.
  */
 #include "unknown_capture.h"
 #include <string.h>
+
+#ifdef ESP_PLATFORM
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+static StaticSemaphore_t s_mux_buf;
+static SemaphoreHandle_t s_mux;
+
+static inline void cap_lock(void)
+{
+    if (s_mux) xSemaphoreTake(s_mux, portMAX_DELAY);
+}
+
+static inline void cap_unlock(void)
+{
+    if (s_mux) xSemaphoreGive(s_mux);
+}
+
+#else
+
+/* On host (non-ESP), cap_lock/cap_unlock are no-ops so this file
+ * compiles with plain cc and no ESP-IDF/FreeRTOS toolchain. */
+static inline void cap_lock(void) { }
+static inline void cap_unlock(void) { }
+
+#endif
 
 _Static_assert(sizeof(unknown_sample_t) == 40,
                "unknown_sample_t layout drifted from this file's documented 40 B");
@@ -42,8 +75,16 @@ static unknown_dev_t s_tbl[UNKNOWN_DEVICES];
 
 void unknown_capture_init(void)
 {
+#ifdef ESP_PLATFORM
+    if (!s_mux) {
+        s_mux = xSemaphoreCreateMutexStatic(&s_mux_buf);
+    }
+#endif
     memset(s_tbl, 0, sizeof(s_tbl));
 }
+
+/* Helpers below (find_by_mac, find_free, find_lru, push_sample) are
+ * lock-free and called only with s_mux already held by the caller. */
 
 static int find_by_mac(const uint8_t mac[6])
 {
@@ -100,6 +141,8 @@ static void push_sample(unknown_dev_t *d, const uint8_t *payload, uint8_t len,
 void unknown_capture_add(const uint8_t mac[6], const uint8_t *payload,
                           uint8_t len, int8_t rssi, uint32_t ts)
 {
+    cap_lock();
+
     if (len > ADV_PAYLOAD_MAX) len = ADV_PAYLOAD_MAX;
 
     int idx = find_by_mac(mac);
@@ -112,19 +155,29 @@ void unknown_capture_add(const uint8_t mac[6], const uint8_t *payload,
     }
     s_tbl[idx].last_seen_s = ts;
     push_sample(&s_tbl[idx], payload, len, rssi, ts);
+
+    cap_unlock();
 }
 
 void unknown_capture_forget(const uint8_t mac[6])
 {
+    cap_lock();
+
     int idx = find_by_mac(mac);
     if (idx >= 0) memset(&s_tbl[idx], 0, sizeof(s_tbl[idx]));   /* in_use = false, slot freed */
+
+    cap_unlock();
 }
 
 size_t unknown_capture_list(unknown_dev_t *out, size_t max)
 {
+    cap_lock();
+
     size_t n = 0;
     for (int i = 0; i < UNKNOWN_DEVICES && n < max; i++) {
         if (s_tbl[i].in_use) out[n++] = s_tbl[i];
     }
+
+    cap_unlock();
     return n;
 }

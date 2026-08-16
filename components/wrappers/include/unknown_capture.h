@@ -75,20 +75,18 @@ typedef struct {
 
 /* Resets the capture to empty. Called once at boot
  * (ble_collector.c's ble_collector_start(), alongside wrapper_arena_init()),
- * before the decoder task can run. */
+ * before the decoder task can run. Also creates the internal mutex. */
 void unknown_capture_init(void);
 
 /* Records one advertisement that matched nothing (spec section 5) --
  * ble_collector.c's decode_adv_item() calls this from every "nothing
  * dispatched this" exit on its no-match path (BTHome didn't claim it, no
- * wrapper's match key hit, and the native MiFlora check also missed), never
- * from the NimBLE callback (copy-and-queue only since Task 1 -- this always
- * runs on the decoder task). mac/payload/len/rssi/ts are the item's own
- * fields, unpacked at the call site (see this header's top comment on why
- * this takes primitives rather than an adv_item_t*); `len` is clamped to
- * ADV_PAYLOAD_MAX defensively (the queue's own producer already guarantees
- * this, but this module doesn't get to trust a caller it wasn't compiled
- * against).
+ * wrapper's match key hit, and the native MiFlora check also missed).
+ * mac/payload/len/rssi/ts are the item's own fields, unpacked at the call
+ * site (see this header's top comment on why this takes primitives rather
+ * than an adv_item_t*); `len` is clamped to ADV_PAYLOAD_MAX defensively
+ * (the queue's own producer already guarantees this, but this module doesn't
+ * get to trust a caller it wasn't compiled against).
  *
  * A first sighting of a MAC not already tracked creates a new device entry
  * (evicting the least-recently-seen tracked device first if all
@@ -100,7 +98,9 @@ void unknown_capture_init(void);
  * one appended as the newest -- so `s[]` is always ordered oldest-first,
  * newest-last, and only the SAMPLE is rotated, never the device itself
  * (spec section 5: "8 devices x 2 most-recent payloads"). Every call
- * (first sighting or not) updates last_seen_s, which is what eviction reads. */
+ * (first sighting or not) updates last_seen_s, which is what eviction reads.
+ *
+ * This function is internally synchronised and safe to call from any task. */
 void unknown_capture_add(const uint8_t mac[6], const uint8_t *payload,
                           uint8_t len, int8_t rssi, uint32_t ts);
 
@@ -116,11 +116,15 @@ void unknown_capture_add(const uint8_t mac[6], const uint8_t *payload,
  * doesn't need to -- the very next advertisement from a newly-matching
  * device reaches this call naturally). No-op (not an error) if mac isn't
  * currently tracked -- most calls here are exactly that, since most
- * matched devices were never unknown in the first place. */
+ * matched devices were never unknown in the first place.
+ *
+ * This function is internally synchronised and safe to call from any task. */
 void unknown_capture_forget(const uint8_t mac[6]);
 
 /* Copies up to `max` in-use tracked devices into out[], returns the count
  * actually copied. Order is internal table-slot order (not recency-sorted);
  * spec section 5's `GET /api/v1/unknown` (a later task) is free to sort its
- * JSON response however it likes -- this is just a snapshot read. */
+ * JSON response however it likes -- this is just a snapshot read.
+ *
+ * This function is internally synchronised and safe to call from any task. */
 size_t unknown_capture_list(unknown_dev_t *out, size_t max);
