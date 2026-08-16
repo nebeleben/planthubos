@@ -67,6 +67,15 @@ int main(void)
     assert(id_c == 3);
     assert(t.next_id == 4);
 
+    /* plants_table_assign() is still live behind the plants_assign()
+     * M2-SHIM (plants.h; Task 7 deletes it) -- minimal coverage: assigning
+     * a mac already assigned elsewhere moves it, and NULL unassigns. */
+    assert(plants_table_assign(&t, id_empty, MAC_C) == true);   /* moves MAC_C off id_c onto id_empty */
+    assert(plants_table_find_mac(&t, MAC_C) == plants_table_find_id(&t, id_empty));
+    assert(t.p[plants_table_find_id(&t, id_c)].mac_valid == false);
+    assert(plants_table_assign(&t, id_empty, NULL) == true);
+    assert(t.p[plants_table_find_id(&t, id_empty)].mac_valid == false);
+
     /* delete(2) retires: find_id(2) == -1, id 2 never reused */
     assert(plants_table_delete(&t, id_empty) == true);
     assert(plants_table_find_id(&t, id_empty) == -1);

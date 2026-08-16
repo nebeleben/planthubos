@@ -130,6 +130,20 @@ static SemaphoreHandle_t s_persist_mutex;
 static plants_table_t s_table;
 static const char *s_storage_base;   /* "/storage", or NULL: see plants_init() */
 
+/* Boot-time-only scratch, shared by load_file() and load_legacy_nvs_blob()
+ * (M2 Task 4 review): both read one plants_blob_t off disk/NVS, once,
+ * synchronously, strictly sequentially, all on the main task during
+ * plants_init() -- load_file() runs first and is done with its blob (either
+ * unpacked into s_table or discarded on failure) before
+ * plants_adopt_legacy_nvs() -> load_legacy_nvs_blob() ever runs, so there is
+ * no window where both need their own copy live at once. Sharing this one
+ * ~1954-byte static in place of two separate ones (each function's own doc
+ * comment used to justify its own copy on the same "post-mortem
+ * stack-safety fix" grounds) removes one buffer's worth of that history's
+ * growth -- see task-4-report.md's "Fix round" section. Do NOT reuse this
+ * for anything reachable outside plants_init()'s one-boot load sequence. */
+static plants_blob_t s_boot_blob_scratch;
+
 /* plants_last_values() RAM cache -- guarded by its own mutex, deliberately
  * separate from s_mutex/s_persist_mutex above: it is populated by a
  * storage_query() file scan (real I/O), which must never run while holding
@@ -302,12 +316,12 @@ static esp_err_t write_file(const plants_blob_t *blob)
 }
 
 /* Phase-2 persistence (see the locking invariant comment above): serialises
- * against other writers via s_persist_mutex, re-reads the CURRENT s_table
- * under a brief s_mutex hold (never held during the file write itself),
- * packs it into the on-disk mirror shape, then writes it. Callers must have
- * already completed their own RAM mutation under s_mutex and released it
- * BEFORE calling this -- it must never be called while still holding
- * s_mutex.
+ * against other writers via s_persist_mutex, packs the CURRENT s_table into
+ * the on-disk mirror shape under a brief s_mutex hold, then writes it (the
+ * file write itself happens AFTER s_mutex is released -- see below). Callers
+ * must have already completed their own RAM mutation under s_mutex and
+ * released it BEFORE calling this -- it must never be called while still
+ * holding s_mutex.
  *
  * storage_base == NULL (no filesystem -- see plants_init()) makes this a
  * no-op returning ESP_OK: plants are hub-only and the hub always has
@@ -316,39 +330,47 @@ static esp_err_t write_file(const plants_blob_t *blob)
  * write, and the RAM table remains the only copy for the rest of this
  * boot.
  *
- * snapshot/blob are `static`, not stack locals -- post-mortem stack-safety
- * fix: s_persist_mutex is held for this function's ENTIRE body (the take
- * above spans both the s_mutex snapshot copy AND write_file() below, not
- * just part of it), so exactly one task is ever inside this critical
- * section at a time, which is what makes two ~673/674-byte statics safe
- * despite persist_table() being reachable from FOUR different task
- * contexts (plants_resolve_or_create() off the sampler/BLE ingestion path,
- * plants_rename()/plants_assign()/plants_create()/plants_delete() off the
- * httpd task, plus MQTT-adjacent callers). Before this fix these were
- * plain stack locals totalling ~1.3KB in a function reachable from the
- * sampler task's 4096-byte stack under normal sampling load -- almost
- * certainly a contributing cause of the ORIGINAL M8 hardware incident's
- * crash (this file's top comment), independent of the NVS-GC blast radius
- * that motivated moving off NVS in the first place. Safe to keep as
- * `static` specifically BECAUSE persist_table() already serialises every
- * caller through s_persist_mutex for unrelated reasons (closing the same
- * two write-ordering gaps swarm_store.c's own comment documents) -- if
- * that mutex's scope ever narrows to exclude part of this function, these
- * must move back off `static` storage or gain their own lock. */
+ * `blob` is `static`, not a stack local -- post-mortem stack-safety fix:
+ * s_persist_mutex is held for this function's ENTIRE body, so exactly one
+ * task is ever inside this critical section at a time, which is what makes
+ * a ~1954-byte static safe despite persist_table() being reachable from
+ * FOUR different task contexts (plants_resolve_or_create() off the
+ * sampler/BLE ingestion path, plants_rename()/plants_assign()/
+ * plants_create()/plants_delete() off the httpd task, plus MQTT-adjacent
+ * callers). Before the original fix this was a plain stack local in a
+ * function reachable from the sampler task's 4096-byte stack under normal
+ * sampling load -- almost certainly a contributing cause of the ORIGINAL M8
+ * hardware incident's crash (this file's top comment), independent of the
+ * NVS-GC blast radius that motivated moving off NVS in the first place.
+ * Safe to keep as `static` specifically BECAUSE persist_table() already
+ * serialises every caller through s_persist_mutex for unrelated reasons
+ * (closing the same two write-ordering gaps swarm_store.c's own comment
+ * documents) -- if that mutex's scope ever narrows to exclude part of this
+ * function, this must move back off `static` storage or gain its own lock.
+ *
+ * M2 Task 4 review: this used to copy s_table into a second static
+ * `snapshot` under s_mutex, release s_mutex, THEN call pack_blob() on the
+ * copy -- solely so pack_blob() itself never ran while holding s_mutex.
+ * That copy is unnecessary: pack_blob() is a fixed O(PLANTS_MAX),
+ * allocation-free, no-I/O loop (see its own doc comment), exactly the kind
+ * of work the locking-invariant comment above already permits doing while
+ * s_mutex is held ("every hold is a short, bounded, allocation-free struct
+ * copy/mutation, never file I/O"). Packing s_table directly removes one
+ * ~1953-byte static (see task-4-report.md's "Fix round" section for the
+ * measured before/after) without changing what's protected: s_mutex still
+ * covers every touch of s_table, and the actual file write (write_file())
+ * still happens with s_mutex released, same as before. */
 static esp_err_t persist_table(void)
 {
     if (!s_storage_base) return ESP_OK;
 
     xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
 
-    static plants_table_t snapshot;
-    static plants_blob_t  blob;
+    static plants_blob_t blob;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    snapshot = s_table;
+    pack_blob(&s_table, &blob);
     xSemaphoreGive(s_mutex);
-
-    pack_blob(&snapshot, &blob);
 
     esp_err_t err = write_file(&blob);
     xSemaphoreGive(s_persist_mutex);
@@ -363,14 +385,18 @@ static esp_err_t persist_table(void)
  * relied on -- never fails boot. Returns true iff a valid blob was loaded.
  * Caller (plants_init()) guarantees s_storage_base is non-NULL.
  *
- * path/blob are `static`, not stack locals (post-mortem stack-safety fix --
- * see plants_init()'s top comment): load_file() only ever runs once,
+ * path is `static`, not a stack local (post-mortem stack-safety fix -- see
+ * plants_init()'s top comment): load_file() only ever runs once,
  * synchronously, from plants_init() on the main task, and has no other
  * caller -- there is no concurrency to protect against here, only stack
  * depth. This exact call chain (plants_init() -> load_file(), immediately
  * followed on a miss by plants_adopt_legacy_nvs() -> load_legacy_nvs_blob())
  * is where a hardware crash-loop hit a "Stack protection fault" on the main
- * task, right after this function's own "not readable" WARN below. */
+ * task, right after this function's own "not readable" WARN below. The blob
+ * itself is read into s_boot_blob_scratch (M2 Task 4 review: shared with
+ * load_legacy_nvs_blob(), see that static's own doc comment for why it's
+ * safe for the two to share one buffer) rather than a function-local
+ * static. */
 static bool load_file(plants_table_t *out)
 {
     static char path[128];
@@ -384,24 +410,24 @@ static bool load_file(plants_table_t *out)
         return false;
     }
 
-    static plants_blob_t blob;
-    size_t rlen = fread(&blob, 1, sizeof(blob), f);
+    plants_blob_t *blob = &s_boot_blob_scratch;
+    size_t rlen = fread(blob, 1, sizeof(*blob), f);
     int extra = fgetc(f);   /* confirm the file isn't LONGER than expected, too */
     fclose(f);
 
-    if (rlen != sizeof(blob) || extra != EOF) {
+    if (rlen != sizeof(*blob) || extra != EOF) {
         ESP_LOGW(TAG, "plants: %s has unrecognised size (read %d bytes, expected %d); starting "
-                      "with an empty plant table", path, (int)rlen, (int)sizeof(blob));
+                      "with an empty plant table", path, (int)rlen, (int)sizeof(*blob));
         return false;
     }
-    if (blob.format != PLANTS_BLOB_FORMAT) {
+    if (blob->format != PLANTS_BLOB_FORMAT) {
         ESP_LOGE(TAG, "plants: %s has unknown format byte %u (expected %u) -- DISCARDING it "
                       "rather than trusting an unrecognised layout; every plant is lost until "
-                      "re-created", path, blob.format, (unsigned)PLANTS_BLOB_FORMAT);
+                      "re-created", path, blob->format, (unsigned)PLANTS_BLOB_FORMAT);
         return false;
     }
 
-    unpack_blob(&blob, out);
+    unpack_blob(blob, out);
     return true;
 }
 
@@ -417,11 +443,15 @@ static bool load_file(plants_table_t *out)
  * plants no longer writes NVS once plants.bin exists. Same
  * reset-to-defaults-on-any-failure contract as load_file() above.
  *
- * blob is `static`, not a stack local -- same post-mortem stack-safety fix
- * as load_file() above, for the same reason: this function only ever runs
- * once, synchronously, from plants_adopt_legacy_nvs() (itself only called
- * from plants_init()), all on the main task. Returns true iff a valid blob
- * was loaded. */
+ * Reads into s_boot_blob_scratch, NOT a function-local static (M2 Task 4
+ * review) -- shared with load_file() above. Safe because plants_init()'s
+ * boot sequence only ever reaches this function AFTER load_file() has
+ * already returned (see plants_init() below: this is only called when
+ * load_file() returned false), so load_file()'s own use of the scratch
+ * buffer is finished -- unpacked into *out or discarded -- before this
+ * function's first write to it. Both calls are synchronous, on the main
+ * task, one-boot-only, with nothing else touching the scratch buffer in
+ * between. Returns true iff a valid blob was loaded. */
 static bool load_legacy_nvs_blob(nvs_handle_t h, plants_table_t *out)
 {
     size_t len = 0;
@@ -439,20 +469,20 @@ static bool load_legacy_nvs_blob(nvs_handle_t h, plants_table_t *out)
         return false;
     }
 
-    static plants_blob_t blob;
-    size_t rlen = sizeof(blob);
-    if (nvs_get_blob(h, KEY_PLANTS, &blob, &rlen) != ESP_OK || rlen != sizeof(blob)) {
+    plants_blob_t *blob = &s_boot_blob_scratch;
+    size_t rlen = sizeof(*blob);
+    if (nvs_get_blob(h, KEY_PLANTS, blob, &rlen) != ESP_OK || rlen != sizeof(*blob)) {
         ESP_LOGW(TAG, "plants: legacy NVS blob read failed at its expected length");
         return false;
     }
-    if (blob.format != PLANTS_BLOB_FORMAT) {
+    if (blob->format != PLANTS_BLOB_FORMAT) {
         ESP_LOGE(TAG, "plants: legacy NVS blob has unknown format byte %u (expected %u) -- "
                       "DISCARDING it rather than trusting an unrecognised layout",
-                 blob.format, (unsigned)PLANTS_BLOB_FORMAT);
+                 blob->format, (unsigned)PLANTS_BLOB_FORMAT);
         return false;
     }
 
-    unpack_blob(&blob, out);
+    unpack_blob(blob, out);
     return true;
 }
 
@@ -820,25 +850,33 @@ static void lv_cache_drop(uint8_t id)
  * execute comment above for the same reasoning applied to a different pair
  * of side effects.
  *
- * `legacy` below is `static`, not a stack local -- same post-mortem
- * stack-safety fix as this file's other init-path buffers: this function
- * only ever runs once, synchronously, from plants_init(). This exact
- * function was the innermost frame of the call chain a hardware
- * crash-loop hit a "Stack protection fault" in, on the main task -- see
- * plants_init()'s top comment. */
+ * M2 Task 4 review: this used to load into a separate `static
+ * plants_table_t legacy`, explicitly plants_table_init()'d first, then copy
+ * it into s_table on success (`s_table = legacy`). That copy -- and the
+ * ~1953-byte buffer behind it -- is unnecessary: plants_init() only calls
+ * this function when load_file() already returned false, and load_file()
+ * never partially writes *out on failure (see its own doc comment), so
+ * s_table is guaranteed to still hold the plants_table_init() defaults
+ * plants_init() set before either load attempt. load_legacy_nvs_blob()
+ * itself has the identical contract (only writes *out on success -- see its
+ * doc comment), so unpacking straight into s_table is safe: on success
+ * s_table gets the legacy contents (same as before); on failure s_table is
+ * simply left at the defaults it already holds, a no-op re-application, not
+ * a new write. This exact function was the innermost frame of the call
+ * chain a hardware crash-loop hit a "Stack protection fault" in, on the
+ * main task -- see plants_init()'s top comment -- so removing a buffer here
+ * keeps, rather than reopens, that fix: s_table was always `static` (it's
+ * the file-scope live table), so this isn't reintroducing a stack local. */
 static void plants_adopt_legacy_nvs(void)
 {
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
         return;  /* fresh "planthub" namespace: nothing to adopt */
     }
-    static plants_table_t legacy;
-    plants_table_init(&legacy);
-    bool have_legacy = load_legacy_nvs_blob(h, &legacy);
+    bool have_legacy = load_legacy_nvs_blob(h, &s_table);
     nvs_close(h);
     if (!have_legacy) return;
 
-    s_table = legacy;
     esp_err_t werr = persist_table();
     if (werr != ESP_OK) {
         ESP_LOGE(TAG, "plants: adopted a legacy NVS plant table but failed to write %s/%s (%s); "
@@ -903,7 +941,16 @@ static void plants_adopt_legacy_nvs(void)
  * (the sampler task's 4096-byte stack, under normal sampling load), not
  * just the NVS-GC blast radius that motivated this file's move off NVS in
  * the first place -- two independent contributing causes to the same
- * symptom, not one. */
+ * symptom, not one.
+ *
+ * Follow-up (M2 Task 4 review): per-plant size roughly tripled (capability
+ * bindings, plants_table.h), which made three of these `static` buffers
+ * -- persist_table()'s now-removed `snapshot`, and the now-shared
+ * load_file()/load_legacy_nvs_blob() blobs -- worth consolidating (see
+ * their own doc comments and task-4-report.md's "Fix round" section for the
+ * measured numbers). None of this reopens the bug this section describes:
+ * every buffer that was `static` before still is, just fewer of them --
+ * nothing moved back onto a task stack. */
 esp_err_t plants_init(const char *storage_base)
 {
     s_mutex = xSemaphoreCreateMutex();
