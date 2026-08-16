@@ -99,6 +99,19 @@ test('openai response truncated at length is reported as truncated', async () =>
                        (e) => e instanceof AiError && e.kind === 'truncated' && e.detail === 'partial')
 })
 
+// M4 fix wave finding 5: a response cut off before emitting any text
+// (stop_reason says max_tokens, but there's no text part at all -- e.g.
+// the model was still inside a tool-call-shaped or empty turn when the
+// limit hit) must report as 'truncated', not 'shape'. Shape is for a
+// response this app genuinely doesn't recognise; this is exactly the
+// truncation case spec section 6 exists to name correctly.
+test('a truncated response with no text at all is reported as truncated, not shape', async () => {
+  stubFetch(() => ({ ok: true, status: 200,
+             json: async () => ({ stop_reason: 'max_tokens', content: [] }) }))
+  await assert.rejects(() => aiComplete({ system: 'S', user: 'U', settings: ANTHROPIC }),
+                       (e) => e instanceof AiError && e.kind === 'truncated' && e.detail === '')
+})
+
 test('anthropic response with normal stop_reason resolves to text', async () => {
   stubFetch(() => ({ ok: true, status: 200,
              json: async () => ({ stop_reason: 'end_turn',

@@ -118,14 +118,19 @@ export async function aiComplete({ system, user, signal, settings }) {
 
   const data = await res.json().catch(() => null)
   const text = extractText(s, data)
-  if (!text) {
-    throw new AiError('shape', 'The provider returned a response this app does not understand.',
-                      JSON.stringify(data).slice(0, 500))
-  }
+  // Checked before the shape test: a response cut off before emitting any
+  // text (stop_reason/finish_reason says so, but there is no text part at
+  // all) is truncation, not an unrecognised shape -- spec section 6's
+  // truncation row exists precisely so this case reads as "hit the token
+  // limit", not as "this app doesn't understand the provider".
   if (isTruncated(s, data)) {
     throw new AiError('truncated',
       'The response was cut off at the token limit. Narrow the prompt or raise max_tokens.',
-      text)
+      text || '')
+  }
+  if (!text) {
+    throw new AiError('shape', 'The provider returned a response this app does not understand.',
+                      JSON.stringify(data).slice(0, 500))
   }
   return text
 }
