@@ -15,6 +15,23 @@ static const char *TAG = "data_core";
 static registry_t s_registry;
 static SemaphoreHandle_t s_mutex;
 
+/* Task 5 review FINDING 3: data_core_submit_cap()'s out-of-range WARN used
+ * to fire unthrottled on every single skip. Advertisements arrive several
+ * times a second and Task 7 is about to let arbitrary user-authored
+ * wrappers reach this path (unlike MiFlora's/BTHome's fixed native
+ * decoders, which rarely if ever emit an out-of-range value in practice) --
+ * one buggy wrapper's EMIT would otherwise become a permanent log firehose.
+ * One bit per (registry device, capability) -- CAPABILITY_COUNT (8) fits
+ * exactly one byte's worth of bits per device, so this is
+ * REGISTRY_MAX_DEVICES (16) bytes static, same budget class as M3's own
+ * wrapper memo -- records "already warned once for this device+capability
+ * combination since boot" (never cleared -- a capability that's
+ * persistently out of range only needs to be reported once, not once per
+ * boot-uptime-reset-adjacent event). The reviewer's suggested throttle:
+ * loud on the FIRST occurrence, silent after. */
+static uint8_t s_cap_warned[REGISTRY_MAX_DEVICES];
+_Static_assert(CAPABILITY_COUNT <= 8, "s_cap_warned's per-device bitmask needs one bit per capability id");
+
 esp_err_t data_core_init(void)
 {
     s_mutex = xSemaphoreCreateMutex();
@@ -216,10 +233,37 @@ bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
      * its comment and set_cap_or_warn()'s, both of which this mirrors. */
     int16_t raw = capability_encode(cap_id, value);
     if (raw == CAP_VALUE_NONE) {
-        const capability_t *c = capability_get(cap_id);
-        ESP_LOGW(TAG, "%s: value %.2f out of range, dropping reading for "
-                 MACSTR_FMT " (previous value kept)",
-                 c ? c->name : "?", (double)value, MAC_ARG(mac));
+        /* Throttle: look up (never create) the device's registry index and
+         * check/set its per-capability warn bit under s_mutex, same lock
+         * every other s_registry access here uses. A device not yet
+         * registered (idx < 0 -- e.g. this is its very first, already
+         * out-of-range, reading) has no slot to remember against, so it
+         * always logs loud; once the device exists, the bit makes every
+         * later repeat of the SAME capability's out-of-range skip silent.
+         * cap_id is only used to index the bitmask when it's a real
+         * capability (< CAPABILITY_COUNT) -- an invalid id (a malformed
+         * wrapper EMIT operand, since psvm.c never range-checks EMIT's
+         * capability byte at validate time) already reads as "unknown" via
+         * capability_get() below and always logs, unthrottled, rather than
+         * risk shifting a bitmask by an out-of-range amount. */
+        device_id_t id = device_id_from_mac(DEV_KIND_BLE, mac);
+        bool already_warned = false;
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        int idx = registry_find(&s_registry, &id);
+        if (idx >= 0 && cap_id < CAPABILITY_COUNT) {
+            uint8_t bit = (uint8_t)(1u << cap_id);
+            already_warned = (s_cap_warned[idx] & bit) != 0;
+            s_cap_warned[idx] |= bit;
+        }
+        xSemaphoreGive(s_mutex);
+
+        if (!already_warned) {
+            const capability_t *c = capability_get(cap_id);
+            ESP_LOGW(TAG, "%s: value %.2f out of range, dropping reading for "
+                     MACSTR_FMT " (previous value kept, further repeats for this "
+                     "device+capability suppressed)",
+                     c ? c->name : "?", (double)value, MAC_ARG(mac));
+        }
         return false;
     }
 

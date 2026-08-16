@@ -75,6 +75,27 @@ static wrapper_index_t s_wrapper_index;
 #define WRAPPER_MEMO_NONE 0xFF
 static uint8_t s_wrapper_memo[REGISTRY_MAX_DEVICES];
 
+/* Task 5 review FINDING 4/2: s_wrapper_index, the arena and s_wrapper_memo
+ * are all decoder-task-exclusive (see their own comments above) -- their
+ * invalidation ("wrapper install/delete", see do_wrapper_reindex() below)
+ * must therefore also run ONLY on the decoder task, never directly from
+ * whatever task calls ble_collector_wrapper_reindex_request() (Task 7's
+ * future httpd handler). Rather than add a mutex around the hot per-advert
+ * path (wrapper_arena_get()'s returned pointer is invalidated by ANY
+ * eviction from ANY caller -- see wrapper_arena.h's FINDING 2 doc comment --
+ * so a lock there would need to span the ENTIRE decode, not just the index
+ * touch), this is a plain "reindex requested" flag: any task may set it
+ * (ble_collector_wrapper_reindex_request()), and only adv_decoder_task ever
+ * clears it and performs the actual reindex, at a safe point between
+ * decodes (never mid-decode_adv_item()). A `volatile bool` is sufficient --
+ * one bit of information, no other state depends on its ordering relative
+ * to anything else, same "single aligned word, atomic enough on this
+ * target" reasoning ble_collector_adv_dropped()'s own comment already gives
+ * for its uint32_t. Worst-case latency to notice a request is one
+ * ADV_DECODER_POLL_MS tick (20 ms) -- fine: spec section 9's own words are
+ * "install takes effect on the next advertisement", not instantly. */
+static volatile bool s_wrapper_reindex_pending;
+
 #define ADV_DECODER_TASK_STACK 3072
 /* Below the NimBLE host task (configMAX_PRIORITIES - 4, see
  * nimble_port_freertos_init()/esp-idf's nimble_port_freertos.c) by a wide
@@ -336,10 +357,38 @@ static void decode_adv_item(const adv_item_t *item)
     xSemaphoreGive(s_batt_mutex);
 }
 
+/* See ble_collector.h's doc comment on ble_collector_wrapper_reindex_request()
+ * (M3 Task 5, review FINDING 4): rebuild the match index from flash, then
+ * throw away every cached bytecode blob and every device's memoised
+ * wrapper id -- the three things spec §2 says a wrapper install/delete
+ * must invalidate together, since any of those can change which wrapper id
+ * (if any) a given device's advertisement should now resolve to. STATIC and
+ * called ONLY from adv_decoder_task (below) -- never call this directly
+ * from another task; see s_wrapper_reindex_pending's own comment for why. */
+static void do_wrapper_reindex(void)
+{
+    wrapper_store_load_all(&s_wrapper_index);
+    memset(s_wrapper_memo, WRAPPER_MEMO_NONE, sizeof(s_wrapper_memo));
+    wrapper_arena_evict_all();
+}
+
 static void adv_decoder_task(void *arg)
 {
     (void)arg;
     for (;;) {
+        /* Checked every iteration -- both the "got an item" and "ring was
+         * empty" paths below -- so a pending reindex request is picked up
+         * promptly even during a burst of traffic, not just when the ring
+         * happens to run dry. Always at the TOP of the loop, never between
+         * popping an item and finishing decode_adv_item() for it, so a
+         * reindex can never run mid-decode (s_wrapper_reindex_pending's own
+         * comment; wrapper_arena.h's FINDING 2 doc comment on why that
+         * matters). */
+        if (s_wrapper_reindex_pending) {
+            s_wrapper_reindex_pending = false;
+            do_wrapper_reindex();
+        }
+
         adv_item_t item;
         portENTER_CRITICAL(&s_adv_mux);
         bool got = adv_ring_pop(&s_adv_ring, &item);
@@ -362,17 +411,15 @@ uint32_t ble_collector_adv_dropped(void)
     return adv_ring_dropped(&s_adv_ring);
 }
 
-/* See ble_collector.h's doc comment (M3 Task 5): rebuild the match index
- * from flash, then throw away every cached bytecode blob and every
- * device's memoised wrapper id -- the three things spec §2 says a wrapper
- * install/delete must invalidate together, since any of those can change
- * which wrapper id (if any) a given device's advertisement should now
- * resolve to. */
-void ble_collector_wrapper_reindex(void)
+/* See ble_collector.h's doc comment. Safe to call from ANY task (Task 7's
+ * future httpd handler is the intended caller) -- just sets a flag;
+ * adv_decoder_task itself performs the actual reindex (do_wrapper_reindex()
+ * above), at a safe point between decodes. Not yet called by anything in
+ * M3 Task 5 (no install/delete API exists yet); wired here now so Task 7
+ * only needs to call this one function. */
+void ble_collector_wrapper_reindex_request(void)
 {
-    wrapper_store_load_all(&s_wrapper_index);
-    memset(s_wrapper_memo, WRAPPER_MEMO_NONE, sizeof(s_wrapper_memo));
-    wrapper_arena_evict_all();
+    s_wrapper_reindex_pending = true;
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg)

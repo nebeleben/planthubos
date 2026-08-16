@@ -129,13 +129,26 @@ const uint8_t *wrapper_arena_get(uint16_t id, size_t *len_out)
             if (len_out) *len_out = need;
             return s_buf + e->offset;
         }
-        /* Miss. `need` (when the loader could report it) tells us whether
-         * evicting anything could ever help: a blob genuinely bigger than
-         * the WHOLE arena is refused immediately, with every currently
-         * resident entry left untouched -- "refused rather than evicting
-         * everything" (task-5-brief.md's own words for this exact case). */
-        if (need > (size_t)WRAPPER_ARENA_SIZE) return NULL;
-        if (s_count == 0) return NULL;   /* nothing left to evict; refuse (also covers "need unknown, non-capacity failure" -- see wrapper_arena.h) */
+        /* Miss. Only evict when the failure is KNOWN to be a capacity
+         * shortfall -- `need > 0` means the loader determined the blob's
+         * true size and it didn't fit `free_bytes` (wrapper_arena.h's
+         * wrapper_loader_t contract). `need == 0` means the loader could
+         * NOT determine a size at all -- a missing file, a corrupt entry,
+         * any non-capacity I/O failure (wrapper_store_read_psbc() leaves
+         * *len_out untouched, i.e. still its caller-supplied 0, in exactly
+         * that case) -- and evicting residents chasing a load that will
+         * fail identically no matter how much space exists would empty the
+         * whole arena for nothing: refuse immediately instead, touching
+         * nothing resident. This was FINDING 1 of the Task 5 review
+         * (reproduced against an earlier version of this function: one
+         * lookup of an unreadable id evicted all 5 resident blobs) --
+         * covered by test_wrapper_arena.c's "unreadable id" case. A blob
+         * genuinely bigger than the WHOLE arena (need known, need > SIZE)
+         * is refused the same way, for the same "don't evict pointlessly"
+         * reason -- task-5-brief.md's own "refused rather than evicting
+         * everything" wording for that case. */
+        if (need == 0 || need > (size_t)WRAPPER_ARENA_SIZE) return NULL;
+        if (s_count == 0) return NULL;   /* nothing left to evict; refuse */
         evict_index((uint8_t)find_lru());
     }
 }

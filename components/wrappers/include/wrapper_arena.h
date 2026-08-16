@@ -48,9 +48,17 @@
  * (wrapper_store_read_psbc()'s read_whole_file() does, cheaply, via one
  * extra ftell()) so wrapper_arena_get() can tell "would fit after evicting
  * N bytes" from "will never fit the whole arena, refuse without evicting
- * anything" -- see that function's own doc comment for the exact contract
- * and what happens when a loader can't/doesn't report it (*len_out left at
- * its caller-supplied 0). */
+ * anything" -- see that function's own doc comment for the exact contract.
+ *
+ * CONTRACT the caller (wrapper_arena_get()) relies on: *len_out must be left
+ * at the caller-supplied value it was passed in with (wrapper_arena_get()
+ * always passes 0) for any failure that is NOT a "doesn't fit in cap" size
+ * problem -- a missing file, a corrupt entry, any other I/O error. Reporting
+ * a nonzero *len_out on such a failure would make wrapper_arena_get() treat
+ * it as "might fit after evicting enough", which for a load that will fail
+ * identically no matter how much space exists means evicting every resident
+ * blob for nothing (Task 5 review FINDING 1, reproduced and fixed -- see
+ * wrapper_arena.c's own comment on the miss branch). */
 typedef bool (*wrapper_loader_t)(uint16_t id, uint8_t *buf, size_t cap, size_t *len_out);
 
 /* Must be called once, any time before the first wrapper_arena_get() (the
@@ -70,20 +78,43 @@ void wrapper_arena_init(void);
 
 /* Returns a pointer to wrapper `id`'s loaded bytecode blob (loading it via
  * the injected loader on a cache miss, evicting least-recently-used
- * resident blobs one at a time -- oldest last_used first -- only as far as
- * needed to make room), or NULL when the blob cannot fit (even after
- * evicting every other resident blob) or cannot be read at all. *len_out is
- * set to the blob's length on a hit. A resident blob's "last used" order is
- * bumped on every successful call that returns it, hit or fresh load alike,
- * so a genuinely idle wrapper (never re-matched) is the one evicted first
- * under pressure -- true LRU, not merely insertion order. */
+ * resident blobs one at a time -- oldest last_used first, and ONLY when the
+ * miss is a known capacity shortfall, never for a hard load failure, see
+ * wrapper_loader_t's contract above -- only as far as needed to make room),
+ * or NULL when the blob cannot fit (even after evicting every other
+ * resident blob) or cannot be read at all. *len_out is set to the blob's
+ * length on a hit. A resident blob's "last used" order is bumped on every
+ * successful call that returns it, hit or fresh load alike, so a genuinely
+ * idle wrapper (never re-matched) is the one evicted first under pressure --
+ * true LRU, not merely insertion order.
+ *
+ * POINTER LIFETIME (Task 5 review FINDING 2): the returned pointer is valid
+ * only until the NEXT call to wrapper_arena_get() from ANY thread/task --
+ * not just one that touches the same id. Eviction (evict_index(), internal)
+ * memmove()s the backing buffer to keep it compacted, which silently
+ * invalidates every previously returned pointer, not only the evicted
+ * entry's. This is safe today ONLY because a single caller -- ble_collector.c's
+ * decoder task -- is the arena's sole caller, and wrapper_exec_run() fetches
+ * exactly once per run and never re-enters the arena before it's done with
+ * that pointer. ANY new caller (e.g. a future httpd-task dry-run endpoint,
+ * spec section 6's `POST /wrappers/<id>/test`) MUST NOT call this from a
+ * different task while the decoder task might be mid-psvm_run() -- that is
+ * memory corruption, not merely a stale read. Do not add a mutex around this
+ * call to "fix" that: see ble_collector.h's wrapper-reindex request/perform
+ * split (Task 5 review FINDING 4) for the pattern this codebase uses
+ * instead -- keep the arena single-writer/single-caller (the decoder task),
+ * and marshal any other task's request through it rather than granting a
+ * second task direct access. */
 const uint8_t *wrapper_arena_get(uint16_t id, size_t *len_out);
 
 /* Empties the arena (every resident blob evicted, unconditionally) without
  * touching the installed loader. Called on wrapper install/delete (any
  * change that could make a previously loaded blob for some id stale or
- * outright wrong) -- see ble_collector.h's ble_collector_wrapper_reindex(),
- * which pairs this with rebuilding the match index and clearing the
+ * outright wrong) -- see ble_collector.h's doc comment on
+ * ble_collector_wrapper_reindex_request()/the decoder task's own reindex
+ * step, which pairs this with rebuilding the match index and clearing the
  * per-device memo, the three things spec section 2 says a wrapper
- * install/delete must invalidate together. */
+ * install/delete must invalidate together -- always from the decoder task
+ * itself, never called directly by another task (see wrapper_arena_get()'s
+ * own doc comment on why). */
 void wrapper_arena_evict_all(void);

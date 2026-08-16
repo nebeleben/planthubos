@@ -114,7 +114,12 @@ bool      data_core_submit_battery(const uint8_t mac[6], uint8_t pct);
  * capability's encodable range) -- same "never pass CAP_VALUE_NONE through
  * registry_set_cap()'s own clear-the-slot contract" discipline
  * set_cap_or_warn()/data_core_submit_battery() already use; the previous
- * stored value, if any, is left untouched, and a WARN is logged. Posts
+ * stored value, if any, is left untouched, and a WARN is logged ONCE per
+ * (device, capability) since boot -- further repeats of the same
+ * out-of-range skip are silent (Task 5 review FINDING 3: a wrapper's EMIT
+ * reaches this same path, and an unthrottled per-advert WARN from a single
+ * buggy user-authored wrapper would flood the log; data_core.c's own
+ * comment on s_cap_warned has the exact mechanism). Posts
  * DATA_EVENT_SENSOR_UPDATE on a successful write, same as
  * data_core_submit_battery(). Returns false when the write was skipped
  * (out-of-range value) or the registry is full and the device is unknown

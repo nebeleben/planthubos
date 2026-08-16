@@ -101,17 +101,34 @@ int main(void)
         const uint8_t *p = wrapper_arena_get(100, &len);
         assert(p == NULL);
     }
-    /* every previously resident entry is untouched -- no reload needed */
+
+    /* --- FINDING 1 (Task 5 review): a hard load failure (missing/corrupt
+     * blob -- the loader can't report a real size at all, unlike the
+     * oversize case above) must ALSO refuse immediately without evicting
+     * anything, not be treated as "might fit after evicting enough" and
+     * chase a doomed load until the arena is empty. id 999 isn't in
+     * FAKE_BLOBS -- fake_loader() returns false with len_out left
+     * untouched (still its caller-supplied 0), exactly matching
+     * wrapper_store_read_psbc()'s real contract for a missing/unreadable
+     * `.wbc` file. Reproduces the review's repro case: before the fix,
+     * this single call evicted all 5 resident blobs. */
+    {
+        int calls_before = g_loader_calls;
+        size_t len = 0xBEEF;
+        const uint8_t *p = wrapper_arena_get(999, &len);
+        assert(p == NULL);
+        assert(g_loader_calls == calls_before + 1);   /* loader was tried exactly once, not retried through evictions */
+    }
+
+    /* every previously resident entry is untouched by EITHER refusal above
+     * -- no reload needed. Probed in order 2,3,4,5,1, so this doubles as
+     * establishing the LRU order the eviction test below relies on: id2 is
+     * now least-recently-used, id1 most. */
     assert(!requires_reload(2));
     assert(!requires_reload(3));
     assert(!requires_reload(4));
     assert(!requires_reload(5));
     assert(!requires_reload(1));
-
-    /* re-establish LRU order after the requires_reload() probes above
-     * (each was itself a resident hit, so it also bumped recency) --
-     * probed in order 2,3,4,5,1, so that IS already the LRU order we want:
-     * id2 is least-recently-used, id1 most. */
 
     /* --- LRU eviction order is correct --- */
     /* used=1500/2048, free=548 -- id6 (600 B) doesn't fit without evicting

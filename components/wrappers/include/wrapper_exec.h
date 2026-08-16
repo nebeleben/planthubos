@@ -47,6 +47,16 @@
  *     a fractional leak) and with zero test coverage to catch it. See the
  *     Task 5 report's Deviations section. Native BTHome decryption
  *     (bthome.c) is completely unaffected by this and already works.
+ *     Review ruling: this "stays unwired" call is endorsed, but the failure
+ *     it causes must not be invisible -- a wrapper whose bytecode actually
+ *     calls aes_ccm_decrypt(...) gets an elevated, once-per-boot WARN
+ *     naming it and stating encryption is unsupported in this build
+ *     (wrapper_exec.c's warn_aes_ccm_unsupported_once()/code_uses_aes_ccm()),
+ *     distinguished from an ordinary out-of-range payload accessor (also
+ *     PSVM_ERR_REF, but expected background noise on a truncated/malformed
+ *     advert -- decode_bthome_item()'s own DEBUG-level precedent) by
+ *     scanning the validated instruction stream for the AES_CCM opcode
+ *     itself, since psvm_run()'s result alone can't tell the two apart.
  *
  * A wrapper that fails to load (arena refusal/miss) or fails validation (a
  * corrupt/tampered blob -- installed wrappers are validated at install time
