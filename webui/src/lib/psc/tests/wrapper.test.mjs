@@ -14,17 +14,22 @@ function assertFails(src, msgPattern) {
 }
 
 test('spec section 3 Ruuvi example compiles', () => {
+  // Spec §3's example is two lines as of the amendment that made `>>`
+  // bit-exact (the battery.level line was removed: it was wrong on three
+  // counts at once -- the non-bit-exact shift, a missing +1600 mV Ruuvi
+  // offset, and pct() being identity so the result could never pass
+  // capability_encode()'s 0-100% range check). `>>`'s own bit-exactness is
+  // covered separately below, not via this golden.
   const src = `wrapper "ruuvi" match manufacturer 0x0499
 decode
   emit air.temperature   i16_be(payload, 3) * 0.005
-  emit air.humidity      u16_be(payload, 5) * 0.0025
-  emit battery.level     pct(u16_be(payload, 13) >> 5)`
+  emit air.humidity      u16_be(payload, 5) * 0.0025`
   const r = compileWrapper(src)
   assert.equal(r.ok, true)
   assert.equal(r.name, 'ruuvi')
   assert.deepEqual(r.match, { kind: 1, key: 0x0499 })
-  assert.equal(r.capsUsed.length, 3)
-  assert.deepEqual(new Set(r.capsUsed), new Set([1, 5, 4])) // air.temperature, air.humidity, battery.level
+  assert.equal(r.capsUsed.length, 2)
+  assert.deepEqual(new Set(r.capsUsed), new Set([1, 5])) // air.temperature, air.humidity
 
   const asm = disassemble(r.bytecode)
   assert.match(asm, /LOAD_I16BE 3/)
@@ -34,12 +39,40 @@ decode
   assert.match(asm, /LOAD_U16BE 5/)
   assert.match(asm, /PUSH_CONST .*0\.00249/)
   assert.match(asm, /EMIT air\.humidity/)
-  assert.match(asm, /LOAD_U16BE 13/)
-  // `>> 5` compiles to DIV by 32 (no dedicated shift opcode in M1's table).
-  assert.match(asm, /PUSH_CONST .*32/)
-  assert.match(asm, /DIV/)
-  assert.match(asm, /EMIT battery\.level/)
   assert.match(asm, /HALT$/m)
+})
+
+test('`>>` compiles to a bit-exact DIV-then-FLOOR sequence (spec §3 as amended)', () => {
+  // No JS-side VM exists to execute this bytecode and check a runtime
+  // number, so the browser-compiler-side proof of bit-exactness is the
+  // codegen SHAPE itself: DIV by exactly 2^5=32 immediately followed by
+  // FLOOR (psvm.c's 0x6C). The actual numeric claim -- 0xAC36 (44086) >> 5
+  // is exactly 1377, not 1377.6875 -- is asserted on the C/VM side
+  // (tests/host/test_psvm.c), which is the only place bytecode actually
+  // runs.
+  const r = compileWrapper(
+    `wrapper "shift" match manufacturer 0x0001\ndecode\n  emit air.temperature u16_be(payload, 0) >> 5`
+  )
+  assert.equal(r.ok, true)
+  // Strip the "NNNN: " address prefix each disasm line carries so the
+  // mnemonic sequence is checked for exact, immediate adjacency (DIV
+  // directly followed by FLOOR, nothing else in between).
+  const mnemonics = disassemble(r.bytecode).split('\n').map((l) => l.replace(/^\d+: /, ''))
+  assert.deepEqual(mnemonics, [
+    'LOAD_U16BE 0',
+    'PUSH_CONST 0 ; 32',
+    'DIV',
+    'FLOOR',
+    'EMIT air.temperature',
+    'HALT',
+  ])
+})
+
+test('right-shift amount must be a literal, but the shifted value may be any expression', () => {
+  assertFails(
+    `wrapper "x" match manufacturer 0x0001\ndecode\n  emit air.temperature u8(payload, 0) >> u8(payload, 1)`,
+    /right-shift/i
+  )
 })
 
 test('match kinds map to wmatch_kind_t (service=0, manufacturer=1, mac_prefix=2)', () => {

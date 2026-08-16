@@ -398,13 +398,15 @@ class Parser {
     return left
   }
 
-  // `>>` (dialect-agnostic, but only the wrapper dialect's grammar ever
-  // produces it in practice -- spec §3's Ruuvi example, `u16_be(payload,
-  // 13) >> 5`). Right operand must be a compile-time integer literal in
-  // 0..31; codegen compiles `x >> n` to `x / 2^n` (spec §3: "pct(x) and
-  // plain arithmetic reuse M1's numeric ops" -- there is no dedicated
-  // shift opcode in the M3 opcode table, so this is DIV by a power of two,
-  // not a bit-exact integer shift; see codegen.js's own note on 'shr').
+  // `>>` (dialect-agnostic, but only the wrapper dialect's grammar produces
+  // it in practice -- extracting a sub-field from a payload accessor's
+  // result, e.g. `u16_be(payload, 13) >> 5`). Right operand must be a
+  // compile-time integer literal in 0..31. Spec §3 (as amended): `>>` is
+  // BIT-EXACT -- codegen compiles `x >> n` to `x / 2^n` followed by FLOOR
+  // (see codegen.js's 'shr' case and psvm.c's 0x6C), and a negative `x` at
+  // runtime is an error rather than a silently platform-dependent
+  // arithmetic shift. `bits(payload, i, lsb, width)` remains the clearer,
+  // preferred way to express a field extraction directly.
   parseShift() {
     let left = this.parseAdd()
     while (this.isPunct('>>')) {

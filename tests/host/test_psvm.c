@@ -91,6 +91,36 @@ static size_t build_w_payload_len(uint8_t *b) {
     return o + co;
 }
 
+/* LOAD_<op> offset; PUSH_CONST divisor; DIV; FLOOR; EMIT 0; HALT -- the
+ * exact codegen shape codegen.js's 'shr' case emits for `x >> n` (spec §3
+ * as amended: bit-exact, DIV by 2^n then FLOOR). */
+static size_t build_w_shift(uint8_t *b, uint8_t load_op, uint16_t offset, float divisor) {
+    uint8_t code[24]; size_t co = 0;
+    co = emit_op_u16(code, co, load_op, offset);
+    co = emit_op_u16(code, co, 0x01, 0);   /* PUSH_CONST 0 (divisor) */
+    co = emit_op(code, co, 0x13);          /* DIV */
+    co = emit_op(code, co, 0x6C);          /* FLOOR */
+    co = emit_op_u8(code, co, 0x69, 0);    /* EMIT 0 */
+    co = emit_op(code, co, 0xFF);
+    size_t o = emit_header_d(b, PSVM_DIALECT_WRAPPERS, 0, 1, 0, (uint16_t)co);
+    o = emit_f32(b, o, divisor);
+    memcpy(b + o, code, co);
+    return o + co;
+}
+
+/* PUSH_CONST(-5.0); FLOOR; EMIT 0; HALT -- FLOOR on a negative operand. */
+static size_t build_w_floor_neg(uint8_t *b) {
+    uint8_t code[16]; size_t co = 0;
+    co = emit_op_u16(code, co, 0x01, 0);   /* PUSH_CONST 0 (-5.0) */
+    co = emit_op(code, co, 0x6C);          /* FLOOR */
+    co = emit_op_u8(code, co, 0x69, 0);
+    co = emit_op(code, co, 0xFF);
+    size_t o = emit_header_d(b, PSVM_DIALECT_WRAPPERS, 0, 1, 0, (uint16_t)co);
+    o = emit_f32(b, o, -5.0f);
+    memcpy(b + o, code, co);
+    return o + co;
+}
+
 /* Program exercising "require after emit emits nothing" (spec §3):
  *   PUSH_CONST 1.0 ; EMIT 7            -- an emit BEFORE the require
  *   PUSH_CONST 0.0 ; PUSH_CONST 0.0 ; NE   -- false
@@ -687,6 +717,36 @@ int main(void) {
             psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
             assert(r2.err == PSVM_OK && ecap.count == 1 && ecap.items[0].value == 20.0f);
         }
+    }
+
+    /* `>>` is bit-exact (spec §3 as amended): DIV by 2^n then FLOOR must
+     * match a real integer right-shift exactly, not leave a fractional
+     * remainder. 0xAC36 = 44086; 44086 >> 5 = 1377 (44086 / 32 = 1377.6875,
+     * so without FLOOR this would wrongly be 1377.6875). Also: FLOOR on a
+     * negative operand is a runtime error (PSVM_ERR_TYPE -- the closest
+     * existing code: a negative input is a shape violation for an
+     * operation whose whole contract assumes a non-negative bit-derived
+     * integer, the same family as comparing two strings or using a bool
+     * where a number is expected). */
+    {
+        uint8_t payload[2] = { 0xAC, 0x36 }; /* u16_be(0) = 0xAC36 = 44086 */
+        psvm_wrapper_io_t wio = {0};
+        wio.payload.data = payload; wio.payload.len = 2;
+
+        uint8_t b2[64]; psvm_prog_t p2;
+        size_t l2 = build_w_shift(b2, 0x62 /* LOAD_U16BE */, 0, 32.0f);
+        assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
+        emit_cap_t ecap = {0};
+        wio.emit = emit_capture; wio.emit_ctx = &ecap;
+        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        assert(r2.err == PSVM_OK && ecap.count == 1);
+        assert(ecap.items[0].value == 1377.0f); /* exact, not 1377.6875 */
+
+        uint8_t b3[64]; psvm_prog_t p3;
+        size_t l3 = build_w_floor_neg(b3);
+        assert(psvm_validate(b3, l3, PSVM_DIALECT_WRAPPERS, 7, 0, &p3) == PSVM_OK);
+        r2 = psvm_run(&p3, NULL, &wio, NULL, NULL, true);
+        assert(r2.err == PSVM_ERR_TYPE);
     }
 
     /* Bounds: an offset at exactly `len` and one past it both PSVM_ERR_REF;

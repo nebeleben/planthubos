@@ -3,6 +3,7 @@
 #include "psvm.h"
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #define PSVM_HEADER_LEN 18u
 
@@ -464,6 +465,26 @@ psvm_result_t psvm_run(const psvm_prog_t *p, const psvm_ref_val_t *resolved,
                 res.err = PSVM_ERR_REF; goto done;
             }
             payload_len = (uint8_t)(off + out_len);
+            pc = (uint16_t)(pc + 1);
+            break;
+        }
+        case 0x6C: { /* FLOOR: pops num; negative is PSVM_ERR_TYPE (a shape
+                      * violation, not a value out of range -- FLOOR's whole
+                      * contract assumes a non-negative bit-derived integer,
+                      * same family of error as comparing two strings or
+                      * using a bool where a number is expected). Used by
+                      * `>>`'s codegen (x / 2^n then FLOOR) to make the
+                      * right-shift idiom bit-exact instead of leaving a
+                      * fractional remainder from the division; bits() is
+                      * still the recommended, always-bit-exact idiom for
+                      * extracting a sub-byte field directly. */
+            if (sp < 1) { res.err = PSVM_ERR_STACK; goto done; }
+            value_t v = stack[--sp];
+            if (v.tag != V_NUM) { res.err = PSVM_ERR_TYPE; goto done; }
+            if (v.f < 0.0f) { res.err = PSVM_ERR_TYPE; goto done; }
+            value_t out = { .tag = V_NUM, .f = floorf(v.f), .s = NULL, .slen = 0, .b = false };
+            if (sp >= PSVM_STACK) { res.err = PSVM_ERR_STACK; goto done; }
+            stack[sp++] = out;
             pc = (uint16_t)(pc + 1);
             break;
         }

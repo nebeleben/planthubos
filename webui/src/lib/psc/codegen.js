@@ -42,6 +42,11 @@ export const OPCODES = {
   EMIT: 0x69,
   REQUIRE: 0x6A,
   AES_CCM: 0x6B,
+  // FLOOR (0x6C, spec §3 as amended): pops a number, pushes floor(x);
+  // negative x is a runtime error (PSVM_ERR_TYPE). Used by `>>`'s codegen
+  // below so the shift idiom is bit-exact rather than leaving DIV's
+  // fractional remainder.
+  FLOOR: 0x6C,
   HALT: 0xFF,
 }
 
@@ -142,12 +147,17 @@ function emitExpr(node, buf, ctx) {
     case 'shr': {
       // `>>` shares the or/and/not/cmp/shift/add/mul/unary precedence chain
       // with the rules dialect (parser.js), but there is no dedicated shift
-      // opcode in M1's table -- x >> n compiles to x / 2^n (DIV), same as
-      // codegen.js's wrapper-dialect 'shr' case below.
+      // opcode in M1's table -- x >> n compiles to x / 2^n (DIV) then FLOOR
+      // (spec §3 as amended), matching a real bit-shift exactly rather than
+      // leaving DIV's fractional remainder: e.g. 44086 >> 5 must be 1377,
+      // not 1377.6875. bits() is still the recommended, always-bit-exact
+      // idiom for extracting a sub-byte field directly; see the
+      // wrapper-dialect 'shr' case below (identical codegen).
       emitExpr(node.operand, buf, ctx)
       const idx = ctx.consts.addNum(2 ** node.amount)
       buf.op(OPCODES.PUSH_CONST); buf.u16(idx)
       buf.op(OPCODES.DIV)
+      buf.op(OPCODES.FLOOR)
       return
     }
     case 'cmp':
@@ -269,10 +279,13 @@ function emitWrapperExpr(node, buf, ctx) {
       return
     }
     case 'shr': {
+      // Bit-exact: DIV then FLOOR (spec §3 as amended). bits() remains the
+      // recommended idiom for a sub-byte field extracted directly.
       emitWrapperExpr(node.operand, buf, ctx)
       const idx = ctx.consts.addNum(2 ** node.amount)
       buf.op(OPCODES.PUSH_CONST); buf.u16(idx)
       buf.op(OPCODES.DIV)
+      buf.op(OPCODES.FLOOR)
       return
     }
     case 'binop':

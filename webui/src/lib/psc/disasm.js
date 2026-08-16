@@ -155,6 +155,7 @@ export function disassemble(bytecode) {
       case OPCODES.PAYLOAD_LEN:
       case OPCODES.REQUIRE:
       case OPCODES.AES_CCM:
+      case OPCODES.FLOOR:
         lines.push(`${addr}: ${name}`)
         pc += 1
         break
