@@ -1803,25 +1803,92 @@ static esp_err_t factory_reset_post(httpd_req_t *req)
 /* Shared, static: too big for the 8KB httpd task stack, and (like
  * s_api_reg_snap/s_api_plant_snap above) safe to share because
  * esp_http_server only ever runs one registered handler at a time on this
- * one task. */
-static rule_info_t         s_rules_list_buf[RULES_MAX];
-static char                s_rules_source_buf[RULES_SRC_MAX + 1];
+ * one task.
+ *
+ * The four buffers right below (s_http_body/s_http_source/s_http_psbc/
+ * s_http_list) go one step further than a rules-only share: each is shared
+ * BETWEEN the rules API (this block) and the wrappers API further down this
+ * file (M1's rules routes and M3's wrappers routes each used to allocate a
+ * full private set of these, doubling ~16KB of static RAM for nothing --
+ * M3 hardware gate, ram-reclaim task). Same invariant as every other shared
+ * static in this file -- single-task sequential httpd dispatch means two
+ * handlers can never be mid-flight together -- PLUS a second condition
+ * specific to sharing ACROSS the rules/wrappers boundary: verified (below,
+ * per buffer) that no single handler invocation needs two of a buffer's
+ * aliases live at once, and that no pointer into any of these buffers is
+ * ever retained past its filling handler's httpd_resp_send*() call. Adding
+ * a new handler onto one of these: re-check both conditions against the
+ * owner list in that buffer's own comment, or give your handler a private
+ * buffer instead. */
 static rules_test_ref_t    s_rules_test_refs[PSVM_MAX_REFS];
 static rules_test_action_t s_rules_test_acts[16];   /* generous cap for a dry-run capture; extra actions beyond this are silently not captured (rules_engine.c's capture_sink), never a crash */
 
-/* POST/PUT body: name?(<=48)+source(<=4096, JSON-escaped -- worst realistic
+/* Request body scratch. Owners (each its own httpd handler invocation, never
+ * nested): rules_upsert_from_body() [POST/PUT /api/v1/rules[/{id}]],
+ * wrapper_upsert_from_body() [POST/PUT /api/v1/wrappers[/{id}]],
+ * wrappers_test_post() [POST /api/v1/wrappers/{id}/test, optional {hex?}
+ * body]. Every bound check against this buffer below uses sizeof(...) on
+ * the variable itself, never a macro, so the merge changes nothing there;
+ * both original sizes were 8192 regardless (rules and wrappers reasoning is
+ * identical): name?(<=48)+source(<=4096, JSON-escaped -- worst realistic
  * case around 1.5x for compiler-produced source, not the 2x pathological
- * worst case) + bytecode_b64 (<=~2732 chars for RULES_PSBC_MAX=2048 bytes)
- * + a few numeric/bool fields. 8192 is generous headroom over that. */
-#define RULES_BODY_MAX 8192
-static char    s_rules_body[RULES_BODY_MAX];
-static uint8_t s_rules_psbc[RULES_PSBC_MAX];
-/* base64 length of RULES_PSBC_MAX (2048) bytes: 4*ceil(2048/3), checked
- * BEFORE decoding (brief: "validate sizes BEFORE base64 decode") so a
- * wildly oversized bytecode_b64 is rejected without ever calling into
- * mbedtls; the decode call below is still bounds-checked against
- * sizeof(s_rules_psbc) regardless, as a second line of defense. */
+ * worst case) + bytecode_b64 (<=~2732 chars for a 2048-byte PSBC) + a few
+ * numeric/bool fields. 8192 is generous headroom over that. */
+#define HTTP_BODY_MAX 8192
+static char s_http_body[HTTP_BODY_MAX];
+
+/* Rule/wrapper source-text scratch. Owners: rules_get_one()
+ * [rules_get_source()], wrappers_get_one() [wrapper_store_get_source()].
+ * RULES_SRC_MAX == WRAPPER_SRC_MAX == 4096, so the +1 NUL headroom is
+ * identical for both original owners. */
+static char s_http_source[RULES_SRC_MAX + 1];
+
+/* Decoded-bytecode scratch, three owners: rules_upsert_from_body() [decodes
+ * bytecode_b64 for a rule], wrapper_upsert_from_body() [same, for a
+ * wrapper], wrappers_test_post() [reads an EXISTING wrapper's bytecode for
+ * a dry run]. Each is a separate httpd handler invocation -- none ever runs
+ * nested inside another -- and none stashes a pointer into this buffer
+ * past its own httpd_resp_send*() call, so all three folding into one
+ * buffer is safe. RULES_PSBC_MAX == WRAPPER_PSBC_MAX == 2048.
+ *
+ * wrappers_test_post()'s read is deliberately NOT the shared wrapper arena
+ * (wrapper_arena_get()): that pointer is decoder-task-exclusive
+ * (wrapper_arena.h's own doc comment names this exact endpoint as a caller
+ * that MUST NOT touch it from the httpd task). It reads straight off
+ * LittleFS via wrapper_store_read_psbc() instead into this SAME buffer --
+ * VFS/LittleFS's own internal locking already makes a concurrent read safe
+ * against the decoder task's writes, and a manual dry-run is rare enough
+ * that skipping the arena's cache costs nothing that matters. */
+static uint8_t s_http_psbc[RULES_PSBC_MAX];
+/* base64 length of a 2048-byte PSBC: 4*ceil(2048/3), checked BEFORE
+ * decoding (brief: "validate sizes BEFORE base64 decode") so a wildly
+ * oversized bytecode_b64 is rejected without ever calling into mbedtls; the
+ * decode call below is still bounds-checked against sizeof(s_http_psbc)
+ * regardless, as a second line of defense. Rules and wrappers land on the
+ * identical value (RULES_B64_MAX == WRAPPER_B64_MAX == 2732); kept as two
+ * separately-named macros (this one and WRAPPER_B64_MAX below) so each call
+ * site's intent stays local rather than reaching across the file. */
 #define RULES_B64_MAX 2732
+
+/* List/lookup scratch for rules_list()/wrapper_store_list() snapshots.
+ * Owners: rules_list_get(), rules_get_one(), rule_id_exists() [rules];
+ * wrappers_list_get(), wrappers_get_one(), wrapper_id_exists(),
+ * wrappers_test_post() [wrappers] -- see each function's body further down.
+ * A union, not a flat byte array: the two owners store different element
+ * types (rule_info_t vs wrapper_info_t), so a union lets each side keep
+ * reading/writing its OWN natural array type with no cast, while
+ * sizeof(union) is automatically the larger member (rules[RULES_MAX] ==
+ * 2112 B vs wrappers[WRAPPERS_MAX] == 1792 B) -- "the shared buffer takes
+ * the larger size" falls out for free. Critically, each member array is
+ * STILL fully sized for its own max (RULES_MAX=16 rule_info_t /
+ * WRAPPERS_MAX=16 wrapper_info_t independently), and every call site below
+ * bounds itself with its own RULES_MAX/WRAPPERS_MAX constant, never
+ * sizeof(s_http_list) -- so the size difference between the two owners can
+ * never turn into a buffer overflow for either. */
+static union {
+    rule_info_t    rules[RULES_MAX];
+    wrapper_info_t wrappers[WRAPPERS_MAX];
+} s_http_list;
 
 /* Parses a decimal rule id (u32, rules.h -- ids are 1-based monotonic,
  * never reused) from the start of s, stopping at '/', '?' or the string's
@@ -1928,11 +1995,11 @@ static cJSON *rule_status_json(const rule_info_t *r, uint32_t now_uptime_s)
 /* GET /api/v1/rules -- unauthenticated, like every GET in this file. */
 static esp_err_t rules_list_get(httpd_req_t *req)
 {
-    size_t n = rules_list(s_rules_list_buf, RULES_MAX);
+    size_t n = rules_list(s_http_list.rules, RULES_MAX);
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(root, "rules");
-    for (size_t i = 0; i < n; i++) cJSON_AddItemToArray(arr, rule_status_json(&s_rules_list_buf[i], now_uptime_s));
+    for (size_t i = 0; i < n; i++) cJSON_AddItemToArray(arr, rule_status_json(&s_http_list.rules[i], now_uptime_s));
     return send_json(req, root);
 }
 
@@ -1947,21 +2014,21 @@ static esp_err_t rules_get_one(httpd_req_t *req)
         return ESP_OK;
     }
 
-    size_t n = rules_list(s_rules_list_buf, RULES_MAX);
+    size_t n = rules_list(s_http_list.rules, RULES_MAX);
     const rule_info_t *found = NULL;
     for (size_t i = 0; i < n; i++) {
-        if (s_rules_list_buf[i].id == id) { found = &s_rules_list_buf[i]; break; }
+        if (s_http_list.rules[i].id == id) { found = &s_http_list.rules[i]; break; }
     }
     if (!found) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown rule");
         return ESP_OK;
     }
 
-    if (!rules_get_source(id, s_rules_source_buf, sizeof(s_rules_source_buf))) s_rules_source_buf[0] = '\0';
+    if (!rules_get_source(id, s_http_source, sizeof(s_http_source))) s_http_source[0] = '\0';
 
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
     cJSON *root = rule_status_json(found, now_uptime_s);
-    cJSON_AddStringToObject(root, "source", s_rules_source_buf);
+    cJSON_AddStringToObject(root, "source", s_http_source);
     return send_json(req, root);
 }
 
@@ -1972,8 +2039,8 @@ static esp_err_t rules_get_one(httpd_req_t *req)
  * delete: esp_http_server runs one handler at a time on this task. */
 static bool rule_id_exists(uint32_t id)
 {
-    size_t n = rules_list(s_rules_list_buf, RULES_MAX);
-    for (size_t i = 0; i < n; i++) if (s_rules_list_buf[i].id == id) return true;
+    size_t n = rules_list(s_http_list.rules, RULES_MAX);
+    for (size_t i = 0; i < n; i++) if (s_http_list.rules[i].id == id) return true;
     return false;
 }
 
@@ -2011,7 +2078,7 @@ static bool rules_upsert_from_body(httpd_req_t *req, uint32_t *id_inout)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
         return false;
     }
-    if (req->content_len > sizeof(s_rules_body) - 1) {
+    if (req->content_len > sizeof(s_http_body) - 1) {
         httpd_resp_set_status(req, "413 Payload Too Large");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
@@ -2019,16 +2086,16 @@ static bool rules_upsert_from_body(httpd_req_t *req, uint32_t *id_inout)
     }
     size_t received = 0;
     while (received < req->content_len) {
-        int r = httpd_req_recv(req, s_rules_body + received, req->content_len - received);
+        int r = httpd_req_recv(req, s_http_body + received, req->content_len - received);
         if (r <= 0) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
             return false;
         }
         received += (size_t)r;
     }
-    s_rules_body[received] = '\0';
+    s_http_body[received] = '\0';
 
-    cJSON *json = cJSON_Parse(s_rules_body);
+    cJSON *json = cJSON_Parse(s_http_body);
     if (!json) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
         return false;
@@ -2055,7 +2122,7 @@ static bool rules_upsert_from_body(httpd_req_t *req, uint32_t *id_inout)
         return false;
     }
     size_t psbc_len = 0;
-    int mbrc = mbedtls_base64_decode(s_rules_psbc, sizeof(s_rules_psbc), &psbc_len,
+    int mbrc = mbedtls_base64_decode(s_http_psbc, sizeof(s_http_psbc), &psbc_len,
                                       (const unsigned char *)b64_j->valuestring, b64len);
     if (mbrc != 0) {
         cJSON_Delete(json);
@@ -2079,7 +2146,7 @@ static bool rules_upsert_from_body(httpd_req_t *req, uint32_t *id_inout)
     uint32_t every_s = cJSON_IsNumber(every_j) ? (uint32_t)every_j->valuedouble : 0;
 
     char errbuf[80];
-    int err = rules_upsert(id_inout, name, source_j->valuestring, s_rules_psbc, psbc_len,
+    int err = rules_upsert(id_inout, name, source_j->valuestring, s_http_psbc, psbc_len,
                            enabled, mode, cooldown_s, every_s, errbuf, sizeof(errbuf));
     cJSON_Delete(json);
     if (err != ESP_OK) {
@@ -2242,35 +2309,21 @@ static esp_err_t rules_post_dispatch(httpd_req_t *req)
 /* ---- Wrappers + unknown-device discovery + bind-key HTTP API ----------
  * (Task 7, spec §6). Mirrors the rules block above's idioms verbatim
  * (route registration, api_auth_ok() gating, body-size limits, cJSON reply
- * helpers, the s_rules_*-shaped shared static buffers) -- the rules routes
- * are this task's own closest template, per the brief.
+ * helpers) -- the rules routes are this task's own closest template, per
+ * the brief. Its list/body/source/psbc scratch buffers are the SAME
+ * s_http_list/s_http_body/s_http_source/s_http_psbc statics the rules block
+ * above declares and documents (ram-reclaim task) -- see those declaration
+ * comments for the sharing invariant and the full owner list; nothing
+ * wrapper-specific is declared again here.
  */
 
-static wrapper_info_t s_wrappers_list_buf[WRAPPERS_MAX];
-static char           s_wrapper_source_buf[WRAPPER_SRC_MAX + 1];
-static unknown_dev_t  s_unknown_buf[UNKNOWN_DEVICES];
+static unknown_dev_t s_unknown_buf[UNKNOWN_DEVICES];
 
-/* POST/PUT body: name(<=48) + source(<=4096) + bytecode_b64 (<=~2732 chars
- * for WRAPPER_PSBC_MAX=2048 bytes) + a bool -- same sizing reasoning
- * RULES_BODY_MAX's comment gives. Also reused (generous headroom) for
- * POST /wrappers/{id}/test's tiny {hex?} body. */
-#define WRAPPER_BODY_MAX 8192
-static char    s_wrapper_body[WRAPPER_BODY_MAX];
-static uint8_t s_wrapper_psbc[WRAPPER_PSBC_MAX];
 /* base64 length of WRAPPER_PSBC_MAX (2048) bytes: 4*ceil(2048/3), checked
  * BEFORE decoding (brief: "validate base64 length bounds BEFORE decoding")
  * -- same two-line-of-defense reasoning RULES_B64_MAX's comment gives. */
 #define WRAPPER_B64_MAX 2732
 
-/* A dry-run's own scratch bytecode buffer -- deliberately NOT the shared
- * wrapper arena (wrapper_arena_get()): that pointer is decoder-task-
- * exclusive (wrapper_arena.h's own doc comment names this exact future
- * endpoint as a caller that MUST NOT touch it from the httpd task). This
- * reads straight off LittleFS via wrapper_store_read_psbc() instead --
- * VFS/LittleFS's own internal locking already makes a concurrent read safe
- * against the decoder task's writes, and a manual dry-run is rare enough
- * that skipping the arena's cache costs nothing that matters. */
-static uint8_t s_wrapper_test_psbc[WRAPPER_PSBC_MAX];
 #define WRAPPER_TEST_HEX_MAX (PSVM_PAYLOAD_MAX * 2)   /* 62: a full 31-byte advert */
 
 static int hexval(char c)
@@ -2342,10 +2395,10 @@ static cJSON *wrapper_status_json(const wrapper_info_t *w)
 /* GET /api/v1/wrappers -- unauthenticated, like every GET in this file. */
 static esp_err_t wrappers_list_get(httpd_req_t *req)
 {
-    size_t n = wrapper_store_list(s_wrappers_list_buf, WRAPPERS_MAX);
+    size_t n = wrapper_store_list(s_http_list.wrappers, WRAPPERS_MAX);
     cJSON *root = cJSON_CreateObject();
     cJSON *arr = cJSON_AddArrayToObject(root, "wrappers");
-    for (size_t i = 0; i < n; i++) cJSON_AddItemToArray(arr, wrapper_status_json(&s_wrappers_list_buf[i]));
+    for (size_t i = 0; i < n; i++) cJSON_AddItemToArray(arr, wrapper_status_json(&s_http_list.wrappers[i]));
     return send_json(req, root);
 }
 
@@ -2360,21 +2413,21 @@ static esp_err_t wrappers_get_one(httpd_req_t *req)
         return ESP_OK;
     }
 
-    size_t n = wrapper_store_list(s_wrappers_list_buf, WRAPPERS_MAX);
+    size_t n = wrapper_store_list(s_http_list.wrappers, WRAPPERS_MAX);
     const wrapper_info_t *found = NULL;
     for (size_t i = 0; i < n; i++) {
-        if (s_wrappers_list_buf[i].id == id) { found = &s_wrappers_list_buf[i]; break; }
+        if (s_http_list.wrappers[i].id == id) { found = &s_http_list.wrappers[i]; break; }
     }
     if (!found) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown wrapper");
         return ESP_OK;
     }
 
-    if (!wrapper_store_get_source((uint16_t)id, s_wrapper_source_buf, sizeof(s_wrapper_source_buf))) {
-        s_wrapper_source_buf[0] = '\0';
+    if (!wrapper_store_get_source((uint16_t)id, s_http_source, sizeof(s_http_source))) {
+        s_http_source[0] = '\0';
     }
     cJSON *root = wrapper_status_json(found);
-    cJSON_AddStringToObject(root, "source", s_wrapper_source_buf);
+    cJSON_AddStringToObject(root, "source", s_http_source);
     return send_json(req, root);
 }
 
@@ -2383,8 +2436,8 @@ static esp_err_t wrappers_get_one(httpd_req_t *req)
  * rule_id_exists() gives. */
 static bool wrapper_id_exists(uint32_t id)
 {
-    size_t n = wrapper_store_list(s_wrappers_list_buf, WRAPPERS_MAX);
-    for (size_t i = 0; i < n; i++) if (s_wrappers_list_buf[i].id == id) return true;
+    size_t n = wrapper_store_list(s_http_list.wrappers, WRAPPERS_MAX);
+    for (size_t i = 0; i < n; i++) if (s_http_list.wrappers[i].id == id) return true;
     return false;
 }
 
@@ -2425,7 +2478,7 @@ static bool wrapper_upsert_from_body(httpd_req_t *req, uint16_t *id_inout)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
         return false;
     }
-    if (req->content_len > sizeof(s_wrapper_body) - 1) {
+    if (req->content_len > sizeof(s_http_body) - 1) {
         httpd_resp_set_status(req, "413 Payload Too Large");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
@@ -2433,16 +2486,16 @@ static bool wrapper_upsert_from_body(httpd_req_t *req, uint16_t *id_inout)
     }
     size_t received = 0;
     while (received < req->content_len) {
-        int r = httpd_req_recv(req, s_wrapper_body + received, req->content_len - received);
+        int r = httpd_req_recv(req, s_http_body + received, req->content_len - received);
         if (r <= 0) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
             return false;
         }
         received += (size_t)r;
     }
-    s_wrapper_body[received] = '\0';
+    s_http_body[received] = '\0';
 
-    cJSON *json = cJSON_Parse(s_wrapper_body);
+    cJSON *json = cJSON_Parse(s_http_body);
     if (!json) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
         return false;
@@ -2467,7 +2520,7 @@ static bool wrapper_upsert_from_body(httpd_req_t *req, uint16_t *id_inout)
         return false;
     }
     size_t psbc_len = 0;
-    int mbrc = mbedtls_base64_decode(s_wrapper_psbc, sizeof(s_wrapper_psbc), &psbc_len,
+    int mbrc = mbedtls_base64_decode(s_http_psbc, sizeof(s_http_psbc), &psbc_len,
                                       (const unsigned char *)b64_j->valuestring, b64len);
     if (mbrc != 0) {
         cJSON_Delete(json);
@@ -2479,7 +2532,7 @@ static bool wrapper_upsert_from_body(httpd_req_t *req, uint16_t *id_inout)
 
     char errbuf[96];
     int err = wrapper_store_upsert(id_inout, name_j->valuestring, source_j->valuestring,
-                                   s_wrapper_psbc, psbc_len, enabled, errbuf, sizeof(errbuf));
+                                   s_http_psbc, psbc_len, enabled, errbuf, sizeof(errbuf));
     cJSON_Delete(json);
     if (err != ESP_OK) {
         send_wrapper_error(req, errbuf);
@@ -2661,16 +2714,16 @@ static void wrapper_test_emit_sink(void *ctx, uint8_t capability, float value)
 /* POST /api/v1/wrappers/{id}/test {hex?: "..."} -- dry-run (spec §6, "the
  * wrapper equivalent of M1's rule dry-run"). Auth checked by
  * wrappers_post_dispatch() before this is ever reached. Never touches the
- * registry, never touches the shared wrapper arena (see
- * s_wrapper_test_psbc's own comment) and never calls
+ * registry, never touches the shared wrapper arena (see s_http_psbc's own
+ * declaration comment, third owner) and never calls
  * ble_collector_wrapper_reindex_request() -- nothing about the installed
  * registry changes. */
 static esp_err_t wrappers_test_post(httpd_req_t *req, uint32_t id)
 {
-    size_t n = wrapper_store_list(s_wrappers_list_buf, WRAPPERS_MAX);
+    size_t n = wrapper_store_list(s_http_list.wrappers, WRAPPERS_MAX);
     const wrapper_info_t *w = NULL;
     for (size_t i = 0; i < n; i++) {
-        if (s_wrappers_list_buf[i].id == id) { w = &s_wrappers_list_buf[i]; break; }
+        if (s_http_list.wrappers[i].id == id) { w = &s_http_list.wrappers[i]; break; }
     }
     if (!w) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown wrapper");
@@ -2681,7 +2734,7 @@ static esp_err_t wrappers_test_post(httpd_req_t *req, uint32_t id)
     char hexbuf[WRAPPER_TEST_HEX_MAX + 1];
     hexbuf[0] = '\0';
     if (req->content_len > 0) {
-        if (req->content_len > sizeof(s_wrapper_body) - 1) {
+        if (req->content_len > sizeof(s_http_body) - 1) {
             httpd_resp_set_status(req, "413 Payload Too Large");
             httpd_resp_set_type(req, "application/json");
             httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
@@ -2689,15 +2742,15 @@ static esp_err_t wrappers_test_post(httpd_req_t *req, uint32_t id)
         }
         size_t received = 0;
         while (received < req->content_len) {
-            int r = httpd_req_recv(req, s_wrapper_body + received, req->content_len - received);
+            int r = httpd_req_recv(req, s_http_body + received, req->content_len - received);
             if (r <= 0) {
                 httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
                 return ESP_OK;
             }
             received += (size_t)r;
         }
-        s_wrapper_body[received] = '\0';
-        cJSON *json = cJSON_Parse(s_wrapper_body);
+        s_http_body[received] = '\0';
+        cJSON *json = cJSON_Parse(s_http_body);
         const cJSON *hex_j = json ? cJSON_GetObjectItem(json, "hex") : NULL;
         if (cJSON_IsString(hex_j)) {
             /* Reject an oversized hex string outright rather than letting
@@ -2743,7 +2796,7 @@ static esp_err_t wrappers_test_post(httpd_req_t *req, uint32_t id)
     }
 
     size_t psbc_len = 0;
-    if (!wrapper_store_read_psbc((uint16_t)id, s_wrapper_test_psbc, sizeof(s_wrapper_test_psbc), &psbc_len)) {
+    if (!wrapper_store_read_psbc((uint16_t)id, s_http_psbc, sizeof(s_http_psbc), &psbc_len)) {
         cJSON *root = cJSON_CreateObject();
         cJSON_AddBoolToObject(root, "ok", false);
         cJSON_AddArrayToObject(root, "emits");
@@ -2752,7 +2805,7 @@ static esp_err_t wrappers_test_post(httpd_req_t *req, uint32_t id)
     }
 
     psvm_prog_t prog;
-    psvm_err_t verr = psvm_validate(s_wrapper_test_psbc, psbc_len, PSVM_DIALECT_WRAPPERS,
+    psvm_err_t verr = psvm_validate(s_http_psbc, psbc_len, PSVM_DIALECT_WRAPPERS,
                                     CAPABILITY_COUNT - 1, 0, &prog);
     if (verr != PSVM_OK) {
         cJSON *root = cJSON_CreateObject();
