@@ -17,6 +17,10 @@
 #include "integr_config.h"
 #include "espnow_link.h"
 #include "rules.h"
+#include "wrapper_index.h"
+#include "unknown_capture.h"
+#include "bthome.h"
+#include "psvm.h"
 #include "cJSON.h"
 #include "mbedtls/base64.h"
 #include "esp_littlefs.h"
@@ -2235,6 +2239,734 @@ static esp_err_t rules_post_dispatch(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---- Wrappers + unknown-device discovery + bind-key HTTP API ----------
+ * (Task 7, spec §6). Mirrors the rules block above's idioms verbatim
+ * (route registration, api_auth_ok() gating, body-size limits, cJSON reply
+ * helpers, the s_rules_*-shaped shared static buffers) -- the rules routes
+ * are this task's own closest template, per the brief.
+ */
+
+static wrapper_info_t s_wrappers_list_buf[WRAPPERS_MAX];
+static char           s_wrapper_source_buf[WRAPPER_SRC_MAX + 1];
+static unknown_dev_t  s_unknown_buf[UNKNOWN_DEVICES];
+
+/* POST/PUT body: name(<=48) + source(<=4096) + bytecode_b64 (<=~2732 chars
+ * for WRAPPER_PSBC_MAX=2048 bytes) + a bool -- same sizing reasoning
+ * RULES_BODY_MAX's comment gives. Also reused (generous headroom) for
+ * POST /wrappers/{id}/test's tiny {hex?} body. */
+#define WRAPPER_BODY_MAX 8192
+static char    s_wrapper_body[WRAPPER_BODY_MAX];
+static uint8_t s_wrapper_psbc[WRAPPER_PSBC_MAX];
+/* base64 length of WRAPPER_PSBC_MAX (2048) bytes: 4*ceil(2048/3), checked
+ * BEFORE decoding (brief: "validate base64 length bounds BEFORE decoding")
+ * -- same two-line-of-defense reasoning RULES_B64_MAX's comment gives. */
+#define WRAPPER_B64_MAX 2732
+
+/* A dry-run's own scratch bytecode buffer -- deliberately NOT the shared
+ * wrapper arena (wrapper_arena_get()): that pointer is decoder-task-
+ * exclusive (wrapper_arena.h's own doc comment names this exact future
+ * endpoint as a caller that MUST NOT touch it from the httpd task). This
+ * reads straight off LittleFS via wrapper_store_read_psbc() instead --
+ * VFS/LittleFS's own internal locking already makes a concurrent read safe
+ * against the decoder task's writes, and a manual dry-run is rare enough
+ * that skipping the arena's cache costs nothing that matters. */
+static uint8_t s_wrapper_test_psbc[WRAPPER_PSBC_MAX];
+#define WRAPPER_TEST_HEX_MAX (PSVM_PAYLOAD_MAX * 2)   /* 62: a full 31-byte advert */
+
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void hex_encode(const uint8_t *data, size_t len, char *out)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2]     = digits[data[i] >> 4];
+        out[i * 2 + 1] = digits[data[i] & 0xF];
+    }
+    out[len * 2] = '\0';
+}
+
+/* Parses a decimal wrapper id (u16, wrapper_index.h -- ids are 1-based
+ * monotonic, never reused) from the start of s, stopping at '/', '?' or the
+ * string's end -- same contract as parse_rule_id() above, just bounded to
+ * 16 bits (wrapper_store_upsert()'s *id_inout is uint16_t*, not uint32_t*). */
+static uint32_t parse_wrapper_id(const char *s, const char **tail_out)
+{
+    if (*s < '1' || *s > '9') return 0;
+    uint64_t v = 0;
+    const char *p = s;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (uint64_t)(*p - '0');
+        if (v > 0xFFFFULL) return 0;
+        p++;
+    }
+    if (*p != '\0' && *p != '/' && *p != '?') return 0;
+    if (tail_out) *tail_out = p;
+    return (uint32_t)v;
+}
+
+static const char *wmatch_kind_str(uint8_t k)
+{
+    switch (k) {
+    case WMATCH_SERVICE:      return "service";
+    case WMATCH_MANUFACTURER: return "manufacturer";
+    case WMATCH_MAC_PREFIX:   return "mac_prefix";
+    }
+    return "?";
+}
+
+/* Shared by wrappers_list_get()/wrappers_get_one() -- the shape spec §6
+ * gives GET /api/v1/wrappers's list entries: {id,name,match:{kind,key},
+ * enabled,last_error,match_count}. GET /wrappers/{id} adds "source" on top
+ * of this, same "list shape + one extra field" pattern rule_status_json()
+ * uses for rules. */
+static cJSON *wrapper_status_json(const wrapper_info_t *w)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddNumberToObject(o, "id", w->id);
+    cJSON_AddStringToObject(o, "name", w->name);
+    cJSON *m = cJSON_AddObjectToObject(o, "match");
+    cJSON_AddStringToObject(m, "kind", wmatch_kind_str(w->match_kind));
+    cJSON_AddNumberToObject(m, "key", w->match_key);
+    cJSON_AddBoolToObject(o, "enabled", w->enabled);
+    cJSON_AddStringToObject(o, "last_error", w->last_error);
+    cJSON_AddNumberToObject(o, "match_count", w->match_count);
+    return o;
+}
+
+/* GET /api/v1/wrappers -- unauthenticated, like every GET in this file. */
+static esp_err_t wrappers_list_get(httpd_req_t *req)
+{
+    size_t n = wrapper_store_list(s_wrappers_list_buf, WRAPPERS_MAX);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "wrappers");
+    for (size_t i = 0; i < n; i++) cJSON_AddItemToArray(arr, wrapper_status_json(&s_wrappers_list_buf[i]));
+    return send_json(req, root);
+}
+
+/* GET /api/v1/wrappers/{id} -- meta + source (spec §6). Unauthenticated. */
+static esp_err_t wrappers_get_one(httpd_req_t *req)
+{
+    const char *tail = req->uri + strlen("/api/v1/wrappers/");
+    const char *suffix = NULL;
+    uint32_t id = parse_wrapper_id(tail, &suffix);
+    if (id == 0 || (suffix[0] != '\0' && suffix[0] != '?')) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+        return ESP_OK;
+    }
+
+    size_t n = wrapper_store_list(s_wrappers_list_buf, WRAPPERS_MAX);
+    const wrapper_info_t *found = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (s_wrappers_list_buf[i].id == id) { found = &s_wrappers_list_buf[i]; break; }
+    }
+    if (!found) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown wrapper");
+        return ESP_OK;
+    }
+
+    if (!wrapper_store_get_source((uint16_t)id, s_wrapper_source_buf, sizeof(s_wrapper_source_buf))) {
+        s_wrapper_source_buf[0] = '\0';
+    }
+    cJSON *root = wrapper_status_json(found);
+    cJSON_AddStringToObject(root, "source", s_wrapper_source_buf);
+    return send_json(req, root);
+}
+
+/* True iff id currently names a wrapper -- used by wrappers_update_put() to
+ * 404 before ever calling wrapper_store_upsert(), same reasoning
+ * rule_id_exists() gives. */
+static bool wrapper_id_exists(uint32_t id)
+{
+    size_t n = wrapper_store_list(s_wrappers_list_buf, WRAPPERS_MAX);
+    for (size_t i = 0; i < n; i++) if (s_wrappers_list_buf[i].id == id) return true;
+    return false;
+}
+
+/* Sends a 400 with a properly JSON-escaped {"error":"<errbuf>"} body -- same
+ * "not a hand-rolled snprintf" reasoning send_rules_error()'s comment
+ * gives (wrapper_store_upsert()'s own errbuf text can contain a literal
+ * '"', e.g. its name-validation message). */
+static void send_wrapper_error(httpd_req_t *req, const char *errbuf)
+{
+    httpd_resp_set_status(req, "400 Bad Request");
+    cJSON *eroot = cJSON_CreateObject();
+    cJSON_AddStringToObject(eroot, "error", errbuf);
+    char *ebody = cJSON_PrintUnformatted(eroot);
+    cJSON_Delete(eroot);
+    httpd_resp_set_type(req, "application/json");
+    if (ebody) {
+        httpd_resp_sendstr(req, ebody);
+        free(ebody);
+    } else {
+        httpd_resp_sendstr(req, "{\"error\":\"invalid wrapper\"}");
+    }
+}
+
+/* Shared by wrappers_create_post() (POST /api/v1/wrappers, *id_inout==0)
+ * and wrappers_update_put() (PUT /api/v1/wrappers/{id}, *id_inout already
+ * set to the URL's id): reads+validates the {name, source, bytecode_b64,
+ * enabled} body (spec §6) and calls wrapper_store_upsert(), which does
+ * every real validation (sizes, the mandatory match header parsed out of
+ * `source` itself, psvm_validate(dialect=2), the BTHome/MiFlora/duplicate
+ * match-key guards) -- this function's only job is body plumbing, same
+ * split rules_upsert_from_body()/rules_upsert() already use. Sends the
+ * 400/413 response itself and returns false on any failure -- caller has
+ * nothing left to do. Returns true (*id_inout holding the created/updated
+ * id, no response sent yet) on success. */
+static bool wrapper_upsert_from_body(httpd_req_t *req, uint16_t *id_inout)
+{
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no body");
+        return false;
+    }
+    if (req->content_len > sizeof(s_wrapper_body) - 1) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
+        return false;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, s_wrapper_body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return false;
+        }
+        received += (size_t)r;
+    }
+    s_wrapper_body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(s_wrapper_body);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return false;
+    }
+
+    const cJSON *name_j    = cJSON_GetObjectItem(json, "name");
+    const cJSON *source_j  = cJSON_GetObjectItem(json, "source");
+    const cJSON *b64_j     = cJSON_GetObjectItem(json, "bytecode_b64");
+    const cJSON *enabled_j = cJSON_GetObjectItem(json, "enabled");
+
+    if (!cJSON_IsString(name_j) || name_j->valuestring[0] == '\0' ||
+        !cJSON_IsString(source_j) || !cJSON_IsString(b64_j)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing name/source/bytecode_b64");
+        return false;
+    }
+
+    size_t b64len = strlen(b64_j->valuestring);
+    if (b64len == 0 || b64len > WRAPPER_B64_MAX) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bytecode_b64 too large");
+        return false;
+    }
+    size_t psbc_len = 0;
+    int mbrc = mbedtls_base64_decode(s_wrapper_psbc, sizeof(s_wrapper_psbc), &psbc_len,
+                                      (const unsigned char *)b64_j->valuestring, b64len);
+    if (mbrc != 0) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid base64");
+        return false;
+    }
+
+    bool enabled = cJSON_IsTrue(enabled_j);
+
+    char errbuf[96];
+    int err = wrapper_store_upsert(id_inout, name_j->valuestring, source_j->valuestring,
+                                   s_wrapper_psbc, psbc_len, enabled, errbuf, sizeof(errbuf));
+    cJSON_Delete(json);
+    if (err != ESP_OK) {
+        send_wrapper_error(req, errbuf);
+        return false;
+    }
+    return true;
+}
+
+/* POST /api/v1/wrappers -- create (auth). */
+static esp_err_t wrappers_create_post(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+    uint16_t id = 0;
+    if (!wrapper_upsert_from_body(req, &id)) return ESP_OK;
+    /* Marshal the reindex through the decoder task's request/perform split
+     * -- never call ble_collector's match index/arena/memo directly from
+     * this (httpd) task (wrapper_arena.h's FINDING 2, ble_collector.h's own
+     * doc comment on ble_collector_wrapper_reindex_request()). */
+    ble_collector_wrapper_reindex_request();
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddNumberToObject(root, "id", id);
+    return send_json(req, root);
+}
+
+/* PUT /api/v1/wrappers/{id} -- update (auth). Same body as POST. */
+static esp_err_t wrappers_update_put(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+    const char *tail = req->uri + strlen("/api/v1/wrappers/");
+    const char *suffix = NULL;
+    uint32_t id32 = parse_wrapper_id(tail, &suffix);
+    if (id32 == 0 || (suffix[0] != '\0' && suffix[0] != '?')) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad id");
+        return ESP_OK;
+    }
+    if (!wrapper_id_exists(id32)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown wrapper");
+        return ESP_OK;
+    }
+    uint16_t id = (uint16_t)id32;
+    if (!wrapper_upsert_from_body(req, &id)) return ESP_OK;
+    ble_collector_wrapper_reindex_request();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* DELETE /api/v1/wrappers/{id} -- auth. */
+static esp_err_t wrappers_delete_delete(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+    const char *tail = req->uri + strlen("/api/v1/wrappers/");
+    const char *suffix = NULL;
+    uint32_t id = parse_wrapper_id(tail, &suffix);
+    if (id == 0 || (suffix[0] != '\0' && suffix[0] != '?')) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad id");
+        return ESP_OK;
+    }
+    if (!wrapper_store_delete((uint16_t)id)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown wrapper");
+        return ESP_OK;
+    }
+    ble_collector_wrapper_reindex_request();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* AD structure types this file's own tiny scanner (below) looks for --
+ * same values ble_collector.c's NimBLE-side parse resolves fields.
+ * svc_data_uuid16/mfg_data from (Bluetooth Core Assigned Numbers). */
+#define WRAPPER_AD_TYPE_SERVICE_DATA_16 0x16
+#define WRAPPER_AD_TYPE_MANUFACTURER    0xFF
+
+/* Minimal raw BLE AD-structure scanner: walks a raw advertisement blob's
+ * {len,type,data...} structures looking for `ad_type`, and returns its
+ * first two data bytes as a little-endian u16 (the UUID/company-id
+ * convention every AD structure of these two types uses). Deliberately
+ * NOT NimBLE's ble_hs_adv_parse_fields() -- pulling the NimBLE host parser
+ * into the httpd task for what is purely advisory, read-only bookkeeping
+ * (picking which captured sample to preview in a dry-run) is unnecessary
+ * weight; the REAL match, which this never influences, still only ever
+ * happens on the decoder task via wrapper_index_lookup(). */
+static bool wrapper_ad_find_u16(const uint8_t *adv, uint8_t len, uint8_t ad_type, uint16_t *out)
+{
+    uint16_t i = 0;
+    while ((uint16_t)(i + 1) < len) {
+        uint8_t seg_len = adv[i];
+        if (seg_len == 0) break;
+        if ((uint16_t)(i + 1 + seg_len) > len) break;
+        uint8_t seg_type = adv[i + 1];
+        if (seg_type == ad_type && seg_len >= 3) {
+            *out = (uint16_t)(adv[i + 2] | (adv[i + 3] << 8));
+            return true;
+        }
+        i = (uint16_t)(i + 1 + seg_len);
+    }
+    return false;
+}
+
+/* True iff captured sample `s` (from unknown device `d`) would resolve to
+ * a wrapper declaring (match_kind,match_key) -- used only to pick which
+ * captured payload POST /wrappers/{id}/test previews when the caller
+ * supplies no `hex` of their own (spec §6: "runs against the supplied hex
+ * or the device's newest captured sample"). WMATCH_MAC_PREFIX compares
+ * against `d->mac`'s first 3 bytes UNREVERSED (raw GAP/wire order) --
+ * NOT display order -- because that is what ble_collector.c's
+ * decode_adv_item() actually passes to wrapper_index_lookup() at runtime
+ * (`item->mac`, never the `mac_disp` it computes alongside it for device
+ * identity); matching that exact convention here is what makes this
+ * preview agree with what the decoder task would really do, not a
+ * plausible-looking but wrong guess. unknown_capture.h's own top comment
+ * confirms `d->mac` is stored in that same raw order. */
+static bool wrapper_sample_matches(const unknown_dev_t *d, const unknown_sample_t *s,
+                                   uint8_t match_kind, uint32_t match_key)
+{
+    switch (match_kind) {
+    case WMATCH_SERVICE: {
+        uint16_t uuid;
+        return wrapper_ad_find_u16(s->payload, s->len, WRAPPER_AD_TYPE_SERVICE_DATA_16, &uuid) &&
+               uuid == match_key;
+    }
+    case WMATCH_MANUFACTURER: {
+        uint16_t mid;
+        return wrapper_ad_find_u16(s->payload, s->len, WRAPPER_AD_TYPE_MANUFACTURER, &mid) &&
+               mid == match_key;
+    }
+    case WMATCH_MAC_PREFIX: {
+        uint32_t mac_key = ((uint32_t)d->mac[0] << 16) | ((uint32_t)d->mac[1] << 8) | (uint32_t)d->mac[2];
+        return mac_key == match_key;
+    }
+    default:
+        return false;
+    }
+}
+
+/* Scans every captured unknown device's samples for the NEWEST one (by ts)
+ * that would match (match_kind,match_key); copies it into out_payload
+ * (capacity PSVM_PAYLOAD_MAX) and *out_len. False if none match. */
+static bool wrapper_find_test_sample(uint8_t match_kind, uint32_t match_key,
+                                     uint8_t *out_payload, uint8_t *out_len)
+{
+    size_t n = unknown_capture_list(s_unknown_buf, UNKNOWN_DEVICES);
+    const unknown_sample_t *best = NULL;
+    for (size_t i = 0; i < n; i++) {
+        const unknown_dev_t *d = &s_unknown_buf[i];
+        for (uint8_t j = 0; j < d->n; j++) {
+            const unknown_sample_t *s = &d->s[j];
+            if (!wrapper_sample_matches(d, s, match_kind, match_key)) continue;
+            if (!best || s->ts > best->ts) best = s;
+        }
+    }
+    if (!best) return false;
+    memcpy(out_payload, best->payload, best->len);
+    *out_len = best->len;
+    return true;
+}
+
+/* Dry-run emit sink: captures {cap,value} pairs into a fixed local array
+ * rather than data_core_submit_cap() -- spec §6: "returns the emitted
+ * capability values without touching the registry". Deliberately reports
+ * the VM's raw computed value, not what capability_encode()'s round-trip
+ * would clamp/skip it to: a dry run is exactly the place a user needs to
+ * see "the wrapper computed 137.4%", not have that silently vanish because
+ * it's out of a real sensor's plausible range. */
+typedef struct { uint8_t cap; float value; } wrapper_test_emit_t;
+typedef struct { wrapper_test_emit_t *emits; size_t *n; size_t max; } wrapper_test_ctx_t;
+
+static void wrapper_test_emit_sink(void *ctx, uint8_t capability, float value)
+{
+    wrapper_test_ctx_t *t = (wrapper_test_ctx_t *)ctx;
+    if (*t->n >= t->max) return;
+    t->emits[*t->n].cap = capability;
+    t->emits[*t->n].value = value;
+    (*t->n)++;
+}
+
+/* POST /api/v1/wrappers/{id}/test {hex?: "..."} -- dry-run (spec §6, "the
+ * wrapper equivalent of M1's rule dry-run"). Auth checked by
+ * wrappers_post_dispatch() before this is ever reached. Never touches the
+ * registry, never touches the shared wrapper arena (see
+ * s_wrapper_test_psbc's own comment) and never calls
+ * ble_collector_wrapper_reindex_request() -- nothing about the installed
+ * registry changes. */
+static esp_err_t wrappers_test_post(httpd_req_t *req, uint32_t id)
+{
+    size_t n = wrapper_store_list(s_wrappers_list_buf, WRAPPERS_MAX);
+    const wrapper_info_t *w = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (s_wrappers_list_buf[i].id == id) { w = &s_wrappers_list_buf[i]; break; }
+    }
+    if (!w) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown wrapper");
+        return ESP_OK;
+    }
+
+    /* Body is optional -- absent/empty means "use a captured sample". */
+    char hexbuf[WRAPPER_TEST_HEX_MAX + 1];
+    hexbuf[0] = '\0';
+    if (req->content_len > 0) {
+        if (req->content_len > sizeof(s_wrapper_body) - 1) {
+            httpd_resp_set_status(req, "413 Payload Too Large");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"error\":\"payload too large\"}");
+            return ESP_OK;
+        }
+        size_t received = 0;
+        while (received < req->content_len) {
+            int r = httpd_req_recv(req, s_wrapper_body + received, req->content_len - received);
+            if (r <= 0) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+                return ESP_OK;
+            }
+            received += (size_t)r;
+        }
+        s_wrapper_body[received] = '\0';
+        cJSON *json = cJSON_Parse(s_wrapper_body);
+        const cJSON *hex_j = json ? cJSON_GetObjectItem(json, "hex") : NULL;
+        if (cJSON_IsString(hex_j)) {
+            /* Reject an oversized hex string outright rather than letting
+             * strlcpy() silently truncate it into a shorter-but-still-valid
+             * payload -- that would run the dry-run against DIFFERENT bytes
+             * than the caller actually sent, with no error to explain why. */
+            if (strlen(hex_j->valuestring) > (size_t)WRAPPER_TEST_HEX_MAX) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                    "hex must be an even-length hex string, up to 62 chars");
+                return ESP_OK;
+            }
+            strlcpy(hexbuf, hex_j->valuestring, sizeof(hexbuf));
+        }
+        cJSON_Delete(json);
+    }
+
+    uint8_t payload[PSVM_PAYLOAD_MAX];
+    uint8_t payload_len = 0;
+    if (hexbuf[0] != '\0') {
+        size_t hexlen = strlen(hexbuf);
+        if (hexlen % 2 != 0 || hexlen > (size_t)WRAPPER_TEST_HEX_MAX) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "hex must be an even-length hex string, up to 62 chars");
+            return ESP_OK;
+        }
+        payload_len = (uint8_t)(hexlen / 2);
+        bool valid_hex = true;
+        for (uint8_t i = 0; i < payload_len && valid_hex; i++) {
+            int hi = hexval(hexbuf[i * 2]);
+            int lo = hexval(hexbuf[i * 2 + 1]);
+            if (hi < 0 || lo < 0) valid_hex = false;
+            else payload[i] = (uint8_t)((hi << 4) | lo);
+        }
+        if (!valid_hex) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "hex must contain only hex digits");
+            return ESP_OK;
+        }
+    } else if (!wrapper_find_test_sample(w->match_kind, w->match_key, payload, &payload_len)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "no hex supplied and no captured sample matches this wrapper yet");
+        return ESP_OK;
+    }
+
+    size_t psbc_len = 0;
+    if (!wrapper_store_read_psbc((uint16_t)id, s_wrapper_test_psbc, sizeof(s_wrapper_test_psbc), &psbc_len)) {
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddArrayToObject(root, "emits");
+        cJSON_AddStringToObject(root, "error", "bytecode unavailable");
+        return send_json(req, root);
+    }
+
+    psvm_prog_t prog;
+    psvm_err_t verr = psvm_validate(s_wrapper_test_psbc, psbc_len, PSVM_DIALECT_WRAPPERS,
+                                    CAPABILITY_COUNT - 1, 0, &prog);
+    if (verr != PSVM_OK) {
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddArrayToObject(root, "emits");
+        cJSON_AddStringToObject(root, "error", psvm_err_short(verr));
+        return send_json(req, root);
+    }
+
+    wrapper_test_emit_t emits[PSVM_MAX_EMITS];
+    size_t nemits = 0;
+    wrapper_test_ctx_t tctx = { .emits = emits, .n = &nemits, .max = PSVM_MAX_EMITS };
+    psvm_wrapper_io_t wio = {
+        .payload = { .data = payload, .len = payload_len },
+        .emit = wrapper_test_emit_sink,
+        .emit_ctx = &tctx,
+        /* AES_CCM stays unwired here too -- same "no wrapper-generic nonce
+         * scheme exists in this codebase" reasoning wrapper_exec.h's own
+         * top comment gives; a dry-run of a wrapper calling
+         * aes_ccm_decrypt(...) fails identically to a real run. */
+        .aes_ccm = NULL,
+        .aes_ccm_ctx = NULL,
+    };
+    psvm_result_t res = psvm_run(&prog, NULL, &wio, NULL, NULL, false);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", res.err == PSVM_OK);
+    cJSON *arr = cJSON_AddArrayToObject(root, "emits");
+    for (size_t i = 0; i < nemits; i++) {
+        const capability_t *cap = capability_get(emits[i].cap);
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "cap", emits[i].cap);
+        cJSON_AddStringToObject(o, "name", cap ? cap->name : "?");
+        cJSON_AddNumberToObject(o, "value", emits[i].value);
+        cJSON_AddStringToObject(o, "unit", cap ? cap->unit : "");
+        cJSON_AddItemToArray(arr, o);
+    }
+    if (res.err != PSVM_OK) cJSON_AddStringToObject(root, "error", psvm_err_short(res.err));
+    return send_json(req, root);
+}
+
+/* POST /api/v1/wrappers/{id}/test -- the only POST sub-route wrappers have
+ * (unlike rules, no "/enable": PUT already carries `enabled`). Same single
+ * wildcard-route-per-method-per-prefix reasoning rules_post_dispatch()'s
+ * comment gives. */
+static esp_err_t wrappers_post_dispatch(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/wrappers/");
+    const char *suffix = NULL;
+    uint32_t id = parse_wrapper_id(tail, &suffix);
+    if (id == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad id");
+        return ESP_OK;
+    }
+    if (strncmp(suffix, "/test", 5) == 0 && (suffix[5] == '\0' || suffix[5] == '?'))
+        return wrappers_test_post(req, id);
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+    return ESP_OK;
+}
+
+/* GET /api/v1/unknown -- unauthenticated (spec §5/§6). This exact shape is
+ * M4's input contract: {devices:[{id,rssi,last_seen_s,samples:[{hex,len,
+ * ts}]}]} -- do not vary it. */
+static esp_err_t unknown_get(httpd_req_t *req)
+{
+    size_t n = unknown_capture_list(s_unknown_buf, UNKNOWN_DEVICES);
+    uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "devices");
+    for (size_t i = 0; i < n; i++) {
+        const unknown_dev_t *d = &s_unknown_buf[i];
+        if (d->n == 0) continue;   /* defensive -- unknown_capture_add() never leaves a tracked device with zero samples, but this file doesn't get to assume that blindly across the component boundary */
+
+        /* unknown_capture stores the RAW GAP-order MAC exactly as the radio
+         * callback captured it (unknown_capture.h's own top comment: takes
+         * primitives straight off adv_item_t, never reversed) -- EVERY
+         * other MAC-bearing surface in this codebase (device_id_from_mac(),
+         * the wrapper-dispatch path's mac_disp, the Devices tab) uses
+         * REVERSED display order. Reversed here for the same reason
+         * decode_bthome_item()/decode_adv_item() reverse it: otherwise an
+         * operator can't correlate an unknown device with its own
+         * Devices-tab row, and M4's AI (this payload's actual consumer)
+         * would learn the wrong byte order for any mac_prefix match key it
+         * writes into a new wrapper. */
+        uint8_t disp[6];
+        for (int b = 0; b < 6; b++) disp[b] = d->mac[5 - b];
+        device_id_t did = device_id_from_mac(DEV_KIND_BLE, disp);
+        char idbuf[24];
+        device_id_format(&did, idbuf, sizeof(idbuf));
+
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "id", idbuf);
+        cJSON_AddNumberToObject(o, "rssi", d->s[d->n - 1].rssi);   /* newest sample's rssi (s[] is oldest-first, newest-last) */
+        cJSON_AddNumberToObject(o, "last_seen_s",
+                                (now_uptime_s >= d->last_seen_s) ? (now_uptime_s - d->last_seen_s) : 0);
+
+        cJSON *samples = cJSON_AddArrayToObject(o, "samples");
+        for (uint8_t j = 0; j < d->n; j++) {
+            const unknown_sample_t *s = &d->s[j];
+            char hex[2 * ADV_PAYLOAD_MAX + 1];
+            hex_encode(s->payload, s->len, hex);
+            cJSON *so = cJSON_CreateObject();
+            cJSON_AddStringToObject(so, "hex", hex);
+            cJSON_AddNumberToObject(so, "len", s->len);
+            cJSON_AddNumberToObject(so, "ts", s->ts);
+            cJSON_AddItemToArray(samples, so);
+        }
+        cJSON_AddItemToArray(arr, o);
+    }
+    return send_json(req, root);
+}
+
+/* POST /api/v1/devices/{id}/key {"key":"<32 hex chars>"|null} -- bind-key
+ * set/clear (spec §4, auth). Only sub-route "/api/v1/devices/*" (POST)
+ * has -- unlike plants/nodes/rules there is nothing else to dispatch on
+ * here, but this still goes through the same wildcard-route-plus-suffix-
+ * check shape as those for consistency and because "/api/v1/devices" (GET,
+ * exact) already owns the bare prefix.
+ *
+ * Keys are WRITE-ONLY (bthome.h's bindkey_get()/bindkey_has() contract,
+ * spec §4: "Keys are never returned by any GET") -- this handler only ever
+ * calls bindkey_set(), never bindkey_get(), and the 200 response never
+ * echoes key material back. */
+static esp_err_t devices_post_dispatch(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/devices/");
+    size_t taillen = strcspn(tail, "?");
+    static const char key_suffix[] = "/key";
+    size_t suflen = sizeof(key_suffix) - 1;
+    if (taillen <= suflen || strncmp(tail + taillen - suflen, key_suffix, suflen) != 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+        return ESP_OK;
+    }
+    size_t idlen = taillen - suflen;
+    char idbuf[40];
+    if (idlen == 0 || idlen >= sizeof(idbuf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+    memcpy(idbuf, tail, idlen);
+    idbuf[idlen] = '\0';
+
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+
+    char body[128];
+    if (req->content_len == 0 || req->content_len > sizeof(body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(body);
+    const cJSON *key_j = json ? cJSON_GetObjectItem(json, "key") : NULL;
+    if (!json || !key_j) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing key");
+        return ESP_OK;
+    }
+
+    char dev_id_str[24];
+    device_id_format(&dev, dev_id_str, sizeof(dev_id_str));
+
+    bool ok;
+    if (cJSON_IsNull(key_j)) {
+        ok = bindkey_set(dev_id_str, NULL);
+    } else if (cJSON_IsString(key_j) && strlen(key_j->valuestring) == 32) {
+        uint8_t keybytes[16];
+        bool valid_hex = true;
+        for (int i = 0; i < 16 && valid_hex; i++) {
+            int hi = hexval(key_j->valuestring[i * 2]);
+            int lo = hexval(key_j->valuestring[i * 2 + 1]);
+            if (hi < 0 || lo < 0) valid_hex = false;
+            else keybytes[i] = (uint8_t)((hi << 4) | lo);
+        }
+        if (!valid_hex) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "key must be 32 hex chars or null");
+            return ESP_OK;
+        }
+        ok = bindkey_set(dev_id_str, keybytes);
+    } else {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "key must be 32 hex chars or null");
+        return ESP_OK;
+    }
+    cJSON_Delete(json);
+
+    if (!ok) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to store key");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 void api_v1_register(httpd_handle_t server)
 {
     httpd_uri_t health = { .uri = "/api/v1/health", .method = HTTP_GET, .handler = health_get };
@@ -2340,4 +3072,30 @@ void api_v1_register(httpd_handle_t server)
      * per rules_post_dispatch()'s comment. */
     httpd_uri_t rules_post = { .uri = "/api/v1/rules/*", .method = HTTP_POST, .handler = rules_post_dispatch };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rules_post));
+
+    /* Wrappers + unknown-device discovery + bind-key (Task 7, spec §6). */
+    httpd_uri_t wrappers_g = { .uri = "/api/v1/wrappers", .method = HTTP_GET, .handler = wrappers_list_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wrappers_g));
+    httpd_uri_t wrappers_c = { .uri = "/api/v1/wrappers", .method = HTTP_POST, .handler = wrappers_create_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wrappers_c));
+    httpd_uri_t wrappers_get1 = { .uri = "/api/v1/wrappers/*", .method = HTTP_GET, .handler = wrappers_get_one };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wrappers_get1));
+    httpd_uri_t wrappers_put = { .uri = "/api/v1/wrappers/*", .method = HTTP_PUT, .handler = wrappers_update_put };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wrappers_put));
+    httpd_uri_t wrappers_del = { .uri = "/api/v1/wrappers/*", .method = HTTP_DELETE, .handler = wrappers_delete_delete };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wrappers_del));
+    /* Handles "/{id}/test" -- the only wrapper POST sub-route, per
+     * wrappers_post_dispatch()'s comment. */
+    httpd_uri_t wrappers_post = { .uri = "/api/v1/wrappers/*", .method = HTTP_POST, .handler = wrappers_post_dispatch };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wrappers_post));
+
+    httpd_uri_t unknown_g = { .uri = "/api/v1/unknown", .method = HTTP_GET, .handler = unknown_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &unknown_g));
+
+    /* Bind-key set/clear. "/api/v1/devices" (GET, exact) already owns the
+     * bare prefix -- this wildcard POST is a distinct URI template to
+     * ESP-IDF's matcher, same non-collision every other exact+wildcard pair
+     * in this file already relies on (e.g. "/api/v1/nodes" vs "/api/v1/nodes/*"). */
+    httpd_uri_t devices_post = { .uri = "/api/v1/devices/*", .method = HTTP_POST, .handler = devices_post_dispatch };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &devices_post));
 }

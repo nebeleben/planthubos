@@ -1,6 +1,7 @@
 /* wrapper_exec.c -- see wrapper_exec.h for the full contract. */
 #include "wrapper_exec.h"
 #include "wrapper_arena.h"
+#include "wrapper_index.h"
 #include "psvm.h"
 #include "capability.h"
 #include "data_core.h"
@@ -111,13 +112,45 @@ static void warn_aes_ccm_unsupported(uint16_t id)
              "and emit nothing; native BTHome decryption is unaffected", (unsigned)id);
 }
 
+/* Short human text for a psvm_err_t, for wrapper_store_note_error()'s
+ * last_error field (Task 7, spec §6's GET /api/v1/wrappers "last_error").
+ * Deliberately its own small copy rather than exporting wrapper_store.c's
+ * private psvm_err_str() -- same "psvm_err_t's value set is a fixed,
+ * spec'd contract" reasoning api_v1.c's own psvm_err_short() already gives
+ * for keeping a second, independent copy instead of a shared header. */
+static const char *wrapper_err_short(psvm_err_t e)
+{
+    switch (e) {
+    case PSVM_OK:            return "";
+    case PSVM_ERR_HEADER:    return "bad bytecode header";
+    case PSVM_ERR_LIMITS:    return "bytecode exceeds a hub limit";
+    case PSVM_ERR_TRUNCATED: return "bytecode truncated";
+    case PSVM_ERR_BADOP:     return "bad opcode";
+    case PSVM_ERR_STACK:     return "stack error";
+    case PSVM_ERR_STEPS:     return "step budget exceeded";
+    case PSVM_ERR_DIV0:      return "division by zero";
+    case PSVM_ERR_JUMP:      return "bad jump target";
+    case PSVM_ERR_TYPE:      return "type error";
+    case PSVM_ERR_REF:       return "bad reference";
+    default:                 return "vm error";
+    }
+}
+
 bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
                       const uint8_t *payload, uint8_t payload_len)
 {
+    /* Task 7 (controller RULING-3): "the only way a user can tell whether a
+     * hand-written wrapper is matching anything" -- bumped once per actual
+     * invocation, regardless of whether the run below ends up emitting
+     * anything, since "matching" is decided by the match-index lookup that
+     * already happened before this function was ever called. */
+    wrapper_store_note_match(id);
+
     size_t blob_len = 0;
     const uint8_t *blob = wrapper_arena_get(id, &blob_len);
     if (!blob) {
         ESP_LOGW(TAG, "wrapper %u: bytecode unavailable (arena miss/refusal), skipping", (unsigned)id);
+        wrapper_store_note_error(id, "bytecode unavailable (arena miss/refusal)");
         return false;
     }
 
@@ -126,6 +159,7 @@ bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
                                     CAPABILITY_COUNT - 1, 0, &prog);
     if (verr != PSVM_OK) {
         ESP_LOGW(TAG, "wrapper %u: bytecode failed validation (err=%d), skipping", (unsigned)id, (int)verr);
+        wrapper_store_note_error(id, wrapper_err_short(verr));
         return false;
     }
 
@@ -154,9 +188,19 @@ bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
          * already-warned FIRST (cheap) so the scan only ever runs once per
          * wrapper id, not on every single failed advert. */
         warn_aes_ccm_unsupported(id);
+        wrapper_store_note_error(id, "aes_ccm_decrypt unsupported in this build");
     } else if (res.err != PSVM_OK) {
         ESP_LOGD(TAG, "wrapper %u: run ended err=%d after %u step(s)",
                  (unsigned)id, (int)res.err, (unsigned)res.steps_used);
+        wrapper_store_note_error(id, wrapper_err_short(res.err));
+    } else {
+        /* PSVM_OK covers BOTH a clean HALT and a cleanly-rejected REQUIRE
+         * (psvm.h: "REQUIRE popping false ends the run at PSVM_OK... a
+         * failed require emits nothing") -- neither is an error, so clear
+         * any earlier last_error rather than leaving a stale one visible
+         * after the wrapper starts working again (e.g. a bind key gets set,
+         * or traffic shape changes). */
+        wrapper_store_note_error(id, NULL);
     }
     return ectx.wrote_any;
 }

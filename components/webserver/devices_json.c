@@ -3,6 +3,7 @@
 #include "swarm_store.h"
 #include "capability.h"
 #include "plants.h"
+#include "bthome.h"
 #include <stdio.h>
 
 /* now_uptime_s - last_seen_s, both esp_timer uptime seconds off the same
@@ -54,6 +55,13 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
     cJSON_AddStringToObject(o, "id", idbuf);
     cJSON_AddStringToObject(o, "kind", device_kind_str(e->id.kind));
     cJSON_AddNumberToObject(o, "last_seen_s", age_s(now_uptime_s, e->last_seen_s));
+    /* M3 Task 7 (spec §4): "Keys are never returned by any GET -- the API
+     * reports only has_key: true|false." bindkey_has() takes the SAME
+     * dev_id string device_id_format() just built (bindkey.c's own
+     * contract), so this is a cheap, well-defined check for every device
+     * kind -- not just BLE/BTHome -- even though only BLE devices can
+     * currently have a key set via POST /api/v1/devices/{id}/key. */
+    cJSON_AddBoolToObject(o, "has_key", bindkey_has(idbuf));
 
     if (e->via_node_valid) {
         char node_name[SWARM_NODE_NAME_LEN + 1];

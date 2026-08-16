@@ -80,3 +80,93 @@ void wrapper_store_load_all(wrapper_index_t *ix);
  * wrapper_loader_t exactly -- wired as the real loader in
  * ble_collector.c's ble_collector_start() via wrapper_arena_set_loader(). */
 bool wrapper_store_read_psbc(uint16_t id, uint8_t *buf, size_t cap, size_t *len_out);
+
+/* ---------------- Task 7: wrapper CRUD + metadata (spec §6 API) ----------
+ * Mirrors rules.h/rules_store.c's rule_info_t/rules_list()/rules_upsert()/
+ * rules_delete() shape closely: a resident RAM metadata table (g_wrappers,
+ * wrapper_store.c) that BOTH this task's httpd routes (api_v1.c: list/get/
+ * create/update/delete) and the decoder task (wrapper_exec.c, once per
+ * matched run -- wrapper_store_note_match()/note_error()) touch, so it is
+ * guarded by its own mutex -- same "rules_engine.c already takes
+ * g_rules_mutex briefly on every single rule evaluation" precedent already
+ * in this codebase (a short, bounded critical section on a small metadata
+ * table). This is NOT the match index/arena/device-memo triple
+ * ble_collector.h's reindex-request split protects -- that trio stays
+ * decoder-task-exclusive and untouched by any of this; a wrapper
+ * install/update/delete still MUST go through
+ * ble_collector_wrapper_reindex_request() afterwards (wrapper_store.c
+ * cannot call it directly itself -- requiring ble_collector from wrappers
+ * would be the exact component-dependency cycle this header's own
+ * unknown_capture.h sibling already rules out -- so api_v1.c, which already
+ * depends on ble_collector, is responsible for that call). */
+#define WRAPPER_NAME_MAX 48
+
+typedef struct {
+    uint16_t id;
+    char     name[WRAPPER_NAME_MAX + 1];
+    bool     enabled;
+    uint8_t  match_kind;      /* wmatch_kind_t */
+    uint32_t match_key;
+    uint32_t match_count;     /* diagnostic run counter -- see wrapper_store_note_match() */
+    char     last_error[48];  /* "" = none -- see wrapper_store_note_error() */
+} wrapper_info_t;
+
+/* Copies up to `max` in-use wrappers (enabled or not) into out[]; returns
+ * the count copied. Mutex-protected snapshot, safe to call from the httpd
+ * task. Order is internal table-slot order, same "caller sorts if it cares"
+ * convention unknown_capture_list() already uses. */
+size_t wrapper_store_list(wrapper_info_t *out, size_t max);
+
+/* Reads wrapper `id`'s source text into buf (capacity buflen), NUL-
+ * terminated on success. False if id is unknown or the file is missing/
+ * too large for buflen. Mirrors rules_get_source()'s contract exactly. */
+bool wrapper_store_get_source(uint16_t id, char *buf, size_t buflen);
+
+/* Create (*id_inout == 0) or update an existing wrapper. Validates name/
+ * source/bytecode size limits (WRAPPER_NAME_MAX/WRAPPER_SRC_MAX/
+ * WRAPPER_PSBC_MAX), parses the MANDATORY `wrapper "<name>" match
+ * <service|manufacturer|mac_prefix> <key>` header out of `source` itself --
+ * the wire body carries no separate match_kind/match_key field (spec §6),
+ * so this is the only place that information exists -- validates the
+ * bytecode via psvm_validate(dialect=2), and rejects:
+ *   - a match key that collides with BTHome's built-in service UUID
+ *     (0xFCD2) or MiFlora's native one (0xFE95): spec §4's "a user wrapper
+ *     declaring the same key is rejected at install time" shadowing guard.
+ *   - a (kind,key) pair already taken by any OTHER currently-tracked
+ *     wrapper (wrapper_index_add()'s own dedup, surfaced here as
+ *     ESP_ERR_INVALID_ARG/errbuf at install time rather than silently
+ *     failing to index at the next reindex).
+ * On success the three files (.wsrc/.wbc/.json) are written atomically and
+ * *id_inout holds the id. Caller (api_v1.c) MUST call
+ * ble_collector_wrapper_reindex_request() afterwards -- see this section's
+ * own top comment for why this file cannot do that itself. Returns ESP_OK /
+ * ESP_ERR_INVALID_ARG (reason in errbuf) / ESP_ERR_NO_MEM (table full,
+ * WRAPPERS_MAX reached, create only). */
+int wrapper_store_upsert(uint16_t *id_inout, const char *name, const char *source,
+                         const uint8_t *psbc, size_t psbc_len, bool enabled,
+                         char *errbuf, size_t errlen);
+
+/* Deletes wrapper `id` (meta+source+bytecode files, RAM slot). False if id
+ * is unknown. Same reindex-request obligation as wrapper_store_upsert()'s
+ * doc comment. */
+bool wrapper_store_delete(uint16_t id);
+
+/* Bumps wrapper `id`'s match_count by one -- called from wrapper_exec.c's
+ * wrapper_exec_run(), the decoder task, once per actual run (controller
+ * ruling: "the only way a user can tell whether a hand-written wrapper is
+ * matching anything"). Survives a reindex (wrapper_store_load_all() carries
+ * it over by id, see wrapper_store.c); resets only on reboot. No-op if id
+ * isn't currently tracked (defensive -- a stale race against a delete that
+ * landed between the match-index lookup and this call is possible in
+ * principle, even though wrapper_exec_run() is only ever invoked with an id
+ * the index just resolved). */
+void wrapper_store_note_match(uint16_t id);
+
+/* Sets (msg non-NULL and non-empty, truncated to this table's 48-byte
+ * field) or clears (msg NULL or "") wrapper `id`'s last_error -- called
+ * from wrapper_exec.c after every run attempt (cleared on a clean PSVM_OK
+ * run, set to a short description otherwise, including the arena-miss/
+ * validation-failure exits that return before psvm_run() is ever called).
+ * Same "survives a reindex, resets on reboot, no-op if id isn't tracked"
+ * contract as wrapper_store_note_match(). */
+void wrapper_store_note_error(uint16_t id, const char *msg);
