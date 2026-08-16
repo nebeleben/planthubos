@@ -21,13 +21,6 @@ typedef struct { int16_t raw; uint32_t updated_s; bool valid; } cap_slot_t;
 typedef struct {
     bool        in_use;
     device_id_t id;
-    uint32_t    last_seen_s;
-    cap_slot_t  caps[CAPABILITY_COUNT];
-    /* attribution (M5b rules, carried over verbatim) */
-    bool     via_node_valid;
-    uint8_t  via_node[6];
-    int8_t   best_rssi;
-    uint32_t attributed_s;
     /* M2 internal bookkeeping ONLY -- not part of the documented
      * per-capability model, no consumer should read this directly. Mirrors
      * mibeacon_t.frame_cnt's uint8_t width (the only producer of frame_cnt
@@ -35,8 +28,23 @@ typedef struct {
      * exact "a new frame_cnt always wins, a duplicate frame_cnt arbitrates
      * on rssi" rule without a second, separately-keyed lookup table. This is
      * the one field in this struct not given verbatim by the task brief --
-     * see task-2-report.md's Deviations section. */
+     * see task-2-report.md's Deviations section. Placed HERE deliberately
+     * (between `id`, which ends at offset 10, and `last_seen_s`, which needs
+     * 4-byte alignment and so starts at offset 12 regardless): this is
+     * already-dead alignment padding on every ABI this project targets, so
+     * the field is free -- appending it after `attributed_s` instead grew
+     * the struct's TRAILING padding by a real 4 bytes/device (124B->128B,
+     * registry_t 1984B->2048B for REGISTRY_MAX_DEVICES=16), caught in code
+     * review. The brief's eight named fields below keep their exact
+     * relative order. */
     uint8_t  last_frame_cnt;
+    uint32_t    last_seen_s;
+    cap_slot_t  caps[CAPABILITY_COUNT];
+    /* attribution (M5b rules, carried over verbatim) */
+    bool     via_node_valid;
+    uint8_t  via_node[6];
+    int8_t   best_rssi;
+    uint32_t attributed_s;
 } device_entry_t;
 
 typedef struct { device_entry_t devices[REGISTRY_MAX_DEVICES]; } registry_t;

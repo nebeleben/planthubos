@@ -26,6 +26,30 @@ esp_err_t data_core_init(void)
 
 static uint32_t s_dropped_stale;
 
+/* Must be called with s_mutex held. Encodes value into cap_id and writes it
+ * via registry_set_cap() -- UNLESS capability_encode() returns
+ * CAP_VALUE_NONE for an out-of-range value (e.g. MiFlora's uint16
+ * conductivity_us can exceed CAP_SOIL_CONDUCTIVITY's int16 ceiling), in
+ * which case the registry_set_cap() call is skipped entirely and a WARN is
+ * logged instead. This is deliberately NOT "pass CAP_VALUE_NONE through" --
+ * that is registry_set_cap()'s own, distinct "caller explicitly wants this
+ * slot cleared" contract (still exercised directly by callers that mean it,
+ * e.g. a device losing a capability outright), and reusing it here would
+ * silently ERASE a previously-good stored reading just because one later
+ * frame happened to carry a bad value, with no diagnostic. Skipping the
+ * call instead leaves whatever was already stored untouched. */
+static void set_cap_or_warn(const device_id_t *id, uint8_t cap_id, float value, uint32_t ts_s)
+{
+    int16_t raw = capability_encode(cap_id, value);
+    if (raw == CAP_VALUE_NONE) {
+        const capability_t *c = capability_get(cap_id);
+        ESP_LOGW(TAG, "%s: value %.2f out of range, dropping this reading (previous value kept)",
+                 c ? c->name : "?", (double)value);
+        return;
+    }
+    registry_set_cap(&s_registry, id, cap_id, raw, ts_s);
+}
+
 /* Must be called with s_mutex held. The MiFlora -> capability adapter: runs
  * registry_attribute() first (M5b arbitration), and writes capability
  * values only when this reporter actually owns the frame -- the same
@@ -42,30 +66,15 @@ static int submit_locked(const mibeacon_t *m, const device_id_t *id,
     if (idx < 0) return -1;
     if (!own) return 0;
 
-    if (m->has_temp) {
-        registry_set_cap(&s_registry, id, CAP_AIR_TEMPERATURE,
-                         capability_encode(CAP_AIR_TEMPERATURE, m->temp_dc / 10.0f), ts_s);
-    }
-    if (m->has_moisture) {
-        registry_set_cap(&s_registry, id, CAP_SOIL_MOISTURE,
-                         capability_encode(CAP_SOIL_MOISTURE, (float)m->moisture_pct), ts_s);
-    }
-    if (m->has_lux) {
-        registry_set_cap(&s_registry, id, CAP_LIGHT_ILLUMINANCE,
-                         capability_encode(CAP_LIGHT_ILLUMINANCE, (float)m->lux), ts_s);
-    }
-    if (m->has_conductivity) {
-        registry_set_cap(&s_registry, id, CAP_SOIL_CONDUCTIVITY,
-                         capability_encode(CAP_SOIL_CONDUCTIVITY, (float)m->conductivity_us), ts_s);
-    }
-    if (m->has_battery) {
-        registry_set_cap(&s_registry, id, CAP_BATTERY_LEVEL,
-                         capability_encode(CAP_BATTERY_LEVEL, (float)m->battery_pct), ts_s);
-    }
+    if (m->has_temp)         set_cap_or_warn(id, CAP_AIR_TEMPERATURE, m->temp_dc / 10.0f, ts_s);
+    if (m->has_moisture)     set_cap_or_warn(id, CAP_SOIL_MOISTURE, (float)m->moisture_pct, ts_s);
+    if (m->has_lux)          set_cap_or_warn(id, CAP_LIGHT_ILLUMINANCE, (float)m->lux, ts_s);
+    if (m->has_conductivity) set_cap_or_warn(id, CAP_SOIL_CONDUCTIVITY, (float)m->conductivity_us, ts_s);
+    if (m->has_battery)      set_cap_or_warn(id, CAP_BATTERY_LEVEL, (float)m->battery_pct, ts_s);
     /* The winning reporter's own signal strength, always -- not gated on
      * any has_* flag, since it describes the RADIO link, not a sensor
      * reading the MiBeacon frame carried. */
-    registry_set_cap(&s_registry, id, CAP_SIGNAL_RSSI, capability_encode(CAP_SIGNAL_RSSI, (float)rssi), ts_s);
+    set_cap_or_warn(id, CAP_SIGNAL_RSSI, (float)rssi, ts_s);
     return 1;
 }
 
@@ -218,12 +227,25 @@ void data_core_clear_node_attribution(const uint8_t node_mac[6])
 
 bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)
 {
+    /* capability_encode() is pure (no shared state), so this check happens
+     * before taking s_mutex. Same "skip the write, don't pass
+     * CAP_VALUE_NONE through" guard as set_cap_or_warn() above -- see its
+     * comment. pct is a uint8_t (0-100) and CAP_BATTERY_LEVEL's scale/offset
+     * give it an int16 ceiling, so this can never actually trigger today;
+     * checked anyway for the same reason every other capability write is
+     * checked, rather than leaving one submit path silently exempt. */
+    int16_t raw = capability_encode(CAP_BATTERY_LEVEL, (float)pct);
+    if (raw == CAP_VALUE_NONE) {
+        ESP_LOGW(TAG, "battery.level: value %u out of range, dropping reading for "
+                 MACSTR_FMT " (previous value kept)", (unsigned)pct, MAC_ARG(mac));
+        return false;
+    }
+
     uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
     device_id_t id = device_id_from_mac(DEV_KIND_BLE, mac);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    int idx = registry_set_cap(&s_registry, &id, CAP_BATTERY_LEVEL,
-                               capability_encode(CAP_BATTERY_LEVEL, (float)pct), now_s);
+    int idx = registry_set_cap(&s_registry, &id, CAP_BATTERY_LEVEL, raw, now_s);
     xSemaphoreGive(s_mutex);
 
     if (idx < 0) {

@@ -28,7 +28,15 @@ esp_err_t data_core_init(void);
  * a direct hub BLE reception, otherwise the relaying node's ESP-NOW MAC and
  * its rssi reading of the sensor. Uses "now" (esp_timer uptime) as the
  * capture time -- data_core_submit_from() below is the age-aware variant
- * for a node's buffered/back-dated readings. */
+ * for a node's buffered/back-dated readings.
+ *
+ * A per-field value capability_encode() can't represent (out of the
+ * capability's encodable range -- e.g. MiFlora's uint16 conductivity_us can
+ * exceed CAP_SOIL_CONDUCTIVITY's int16 ceiling) is logged (WARN) and that
+ * ONE field is skipped, leaving whatever was previously stored for it
+ * untouched; every other field in the same frame is still written. This is
+ * NOT the same thing as that capability's slot being cleared -- it never
+ * is, by an out-of-range reading. */
 void data_core_submit_mibeacon(const mibeacon_t *m, const uint8_t via_node[6], int8_t rssi);
 
 /* via_node == NULL means the hub heard this on its own BLE radio; otherwise
@@ -71,9 +79,14 @@ void      data_core_clear_node_attribution(const uint8_t node_mac[6]);
  * battery poll result is new data by construction -- it was just read live
  * over GATT -- so it is always applied. Posts DATA_EVENT_SENSOR_UPDATE on
  * success, same as data_core_submit_from() does on a merge.
- * Returns false only when the registry is full and mac wasn't already
- * present (nothing is created or modified in that case) -- callers must not
- * advance their own success/backoff state (e.g. a scheduler's last_ok_s)
- * when this returns false, or a reading that was actually dropped would
- * wrongly stop being retried. */
+ * Returns false when the registry is full and mac wasn't already present
+ * (nothing is created or modified in that case), OR when pct is out of
+ * CAP_BATTERY_LEVEL's encodable range (logged WARN, previous value kept if
+ * any -- see data_core_submit_mibeacon()'s doc comment for why this never
+ * overwrites with a cleared slot; not reachable in practice since pct is a
+ * uint8_t 0-100, well inside range, but checked for the same reason every
+ * other capability write is). Either way, callers must not advance their
+ * own success/backoff state (e.g. a scheduler's last_ok_s) when this
+ * returns false, or a reading that was actually dropped would wrongly stop
+ * being retried. */
 bool      data_core_submit_battery(const uint8_t mac[6], uint8_t pct);

@@ -142,6 +142,52 @@ int main(void)
      * had never been attributed at all */
     assert(registry_attribute(&rc, &c1, 2, nodeD, -45, 30) == true);
     assert(rc.devices[ic1].via_node_valid && memcmp(rc.devices[ic1].via_node, nodeD, 6) == 0);
+
+    /* --- out-of-range encode must not erase a previously-good value ---
+     *
+     * data_core.c's submit_locked()/data_core_submit_battery() guard every
+     * capability write: when capability_encode() returns CAP_VALUE_NONE for
+     * a value outside that capability's encodable range (e.g. MiFlora's
+     * uint16 conductivity_us, wire range 0-65535, can exceed
+     * CAP_SOIL_CONDUCTIVITY's int16 ceiling of 32767), the fix is to skip
+     * the registry_set_cap() call entirely rather than pass CAP_VALUE_NONE
+     * through -- registry_set_cap(..., CAP_VALUE_NONE, ...) is a distinct,
+     * deliberate "caller explicitly wants this slot cleared" contract (see
+     * the CAP_VALUE_NONE-clears-a-slot test above) that must keep working
+     * for callers that mean it. data_core.c itself isn't host-testable (it
+     * needs FreeRTOS/esp_event), so this exercises the real
+     * capability_encode() -- linked into this test binary already -- and
+     * asserts the registry-level invariant that guard relies on: a
+     * registry_set_cap() call that is never made cannot change stored
+     * state. */
+    registry_t rg;
+    registry_init(&rg);
+    device_id_t g1 = mk_id(DEV_KIND_BLE, 0x30);
+    assert(registry_set_cap(&rg, &g1, CAP_SOIL_CONDUCTIVITY, 5000, 10) >= 0);
+    int gidx = registry_find(&rg, &g1);
+    assert(gidx >= 0);
+    assert(rg.devices[gidx].caps[CAP_SOIL_CONDUCTIVITY].valid);
+    assert(rg.devices[gidx].caps[CAP_SOIL_CONDUCTIVITY].raw == 5000);
+
+    /* 40000 uS/cm is a legal MiFlora wire value (fits uint16) but exceeds
+     * CAP_SOIL_CONDUCTIVITY's int16/scale-1 ceiling of 32767. */
+    int16_t bad_raw = capability_encode(CAP_SOIL_CONDUCTIVITY, 40000.0f);
+    assert(bad_raw == CAP_VALUE_NONE);
+    if (bad_raw != CAP_VALUE_NONE) {
+        /* Unreachable given the assert above; written to mirror
+         * set_cap_or_warn()'s actual guard shape in data_core.c exactly. */
+        registry_set_cap(&rg, &g1, CAP_SOIL_CONDUCTIVITY, bad_raw, 20);
+    }
+    /* the guard skipped the call above -- the good value from t=10 survives */
+    assert(rg.devices[gidx].caps[CAP_SOIL_CONDUCTIVITY].valid);
+    assert(rg.devices[gidx].caps[CAP_SOIL_CONDUCTIVITY].raw == 5000);
+    assert(rg.devices[gidx].caps[CAP_SOIL_CONDUCTIVITY].updated_s == 10);
+
+    /* a deliberate clear (a real caller passing CAP_VALUE_NONE on purpose,
+     * e.g. a device that stopped reporting a capability) still works --
+     * this is registry_set_cap()'s own contract, untouched by the guard. */
+    assert(registry_set_cap(&rg, &g1, CAP_SOIL_CONDUCTIVITY, CAP_VALUE_NONE, 30) == gidx);
+    assert(!rg.devices[gidx].caps[CAP_SOIL_CONDUCTIVITY].valid);
     assert(rc.devices[ic1].best_rssi == -45);
 
     printf("test_registry: OK\n");
