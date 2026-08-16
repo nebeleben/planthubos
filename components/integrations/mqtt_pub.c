@@ -77,6 +77,29 @@ static const char *TAG = "mqtt_pub";
  * advertisement cycle (well under 30s in practice). */
 #define MQTT_PUB_MIN_INTERVAL_US ((int64_t)30 * 1000000)
 
+/* Discovery-burst pacing (M2 Task 7 hardware round 4): RESYNC_DISCOVERY can
+ * fire up to PLANTS_MAX*CAPABILITY_COUNT + REGISTRY_MAX_DEVICES*
+ * CAPABILITY_COUNT (16*8 + 16*8 = 256) individual esp_mqtt_client_publish()
+ * calls back-to-back on reconnect -- hardware round 3 fixed the CONNECT
+ * handshake, but the very next burst then exhausted esp-mqtt's outbox
+ * ("outbox_enqueue: Memory exhausted") because every one of those was QoS 1
+ * (V1's convention, confirmed by re-reading the pre-Task-7 file) and every
+ * QoS>0 publish sits in the outbox until PUBACK. Dropping discovery/HA
+ * publishes to QoS 0 (below) removes them from the outbox ENTIRELY --
+ * esp_mqtt_client_publish() only calls the outbox-enqueueing path when
+ * qos>0 (mqtt_client.c's mqtt_client_enqueue_publish()) -- which is the
+ * real fix; this delay is the belt-and-braces second lever the review
+ * asked for, keeping lwip's own send-side buffers shallow too even without
+ * the outbox in the picture. 20 ms keeps a realistic burst (a handful of
+ * plants/devices) imperceptible (tens of ms) while still bounding a
+ * pathological one (256 messages -> ~5.1 s) to something that ends on its
+ * own; see publish_discovery()/publish_device_discovery() for why this
+ * cannot stall state publishes indefinitely -- only for the duration of
+ * one (bounded, rare -- reconnect-only) burst, and mqtt_pub_task's own
+ * queue absorbs what arrives meanwhile (bounded, drop-oldest, same as
+ * every other momentary backlog this task already tolerates). */
+#define MQTT_DISCOVERY_PACE_MS 20
+
 #define TOPIC_BUF_SIZE      128
 #define STATE_JSON_BUF_SIZE 320   /* up to CAPABILITY_COUNT fields keyed by full capability name (M2 Task 7, up from V1's 256) */
 #define DISC_JSON_BUF_SIZE  1024  /* longer capability names + suggested_display_precision (M2 Task 7, up from V1's 640) */
@@ -161,6 +184,25 @@ typedef struct {
 static esp_mqtt_client_handle_t s_client;
 static QueueHandle_t            s_queue;      /* items: mqtt_pub_msg_t */
 static char                     s_hub[16];
+/* Tracked from mqtt_event_handler()'s CONNECTED/DISCONNECTED cases (esp-mqtt
+ * exposes no public "am I connected" query) -- M2 Task 7 hardware round 4:
+ * gates the QoS-0 publish paths below (publish_state()/publish_device_
+ * state()/publish_discovery()/publish_device_discovery()) so mqtt_pub_task
+ * stops calling esp_mqtt_client_publish() into a dead client the moment a
+ * disconnect is known, instead of discovering it per-call via esp-mqtt's own
+ * "Losing qos0 data when client not connected" (a QoS-0 publish while
+ * disconnected is unconditionally dropped -- no outbox, no retry -- so the
+ * call was always pure waste once disconnected; see esp_mqtt_client_publish()
+ * in mqtt_client.c). Deliberately NOT consulted by cleanup_plant()/
+ * cleanup_cap()/cleanup_device_cap_discovery() below -- those stay QoS 1,
+ * where a publish while disconnected is legitimately ENQUEUED in esp-mqtt's
+ * outbox for delivery on the next reconnect, not wasted. `volatile`: written
+ * on esp-mqtt's own task (mqtt_event_handler), read on mqtt_pub_task -- a
+ * plain flag read/write race is fine here (worst case one extra/skipped
+ * publish attempt around the exact moment of a state transition), so this
+ * doesn't need a mutex, just the compiler not caching a stale value across
+ * the loop iterations that read it. */
+static volatile bool s_mqtt_connected;
 
 /* Per-plants-table-slot state, indexed by the same slot plants_snapshot()'s
  * plants_table_t reports (plants_table_find_id() gives the index) -- sized
@@ -209,16 +251,32 @@ static char    s_slot_name[PLANTS_MAX][PLANT_NAME_LEN + 1]; /* last name discove
  * once start_mqtt() has already succeeded. */
 static bool (*s_device_disc_sent)[CAPABILITY_COUNT];
 
-/* Publishes one HA discovery config (retained, qos 1) per capability
- * CURRENTLY bound on plant_id (plants_bindings()) -- unlike V1's fixed
- * 5-metric loop, a plant may have any subset of CAPABILITY_COUNT bound, and
- * this only publishes for those, per the spec's "one entity per bound
- * capability". Unconditional per binding (not gated by whether the
+/* Publishes one HA discovery config (retained, **qos 0** -- see below) per
+ * capability CURRENTLY bound on plant_id (plants_bindings()) -- unlike V1's
+ * fixed 5-metric loop, a plant may have any subset of CAPABILITY_COUNT
+ * bound, and this only publishes for those, per the spec's "one entity per
+ * bound capability". Unconditional per binding (not gated by whether the
  * capability has a live value yet): a metric that only starts appearing
  * later would otherwise never get a discovery config, and HA tolerates a
  * config whose value template briefly yields nothing. name is the plant's
  * current display name or "" (mqtt_json.h's mqtt_json_discovery() supplies
- * the "Plant <id>" fallback). */
+ * the "Plant <id>" fallback).
+ *
+ * QoS 0, not V1's QoS 1 (hardware round 4, task-7-report.md): retained QoS 0
+ * is legitimate for HA discovery -- the broker keeps the config regardless
+ * of QoS, and this file already re-publishes the WHOLE discovery set on
+ * every reconnect (RESYNC_DISCOVERY) and whenever a plant's name changes,
+ * so QoS 1's "guaranteed, deduplicated, acked delivery" buys little here
+ * that isn't already covered by the periodic resync -- while its cost (every
+ * message sits in esp-mqtt's outbox until PUBACK) is exactly what exhausted
+ * the outbox during a reconnect's discovery burst. Gated on s_mqtt_connected
+ * (not just s_client) since a QoS-0 publish while disconnected is otherwise
+ * silently dropped for nothing -- see that flag's own comment -- and
+ * re-checked every iteration so a disconnect mid-burst stops the rest of it
+ * immediately rather than working through however many capabilities remain.
+ * Paced (MQTT_DISCOVERY_PACE_MS) between messages -- see that constant's
+ * comment for the full reasoning; this keeps mqtt_pub_task inside this call
+ * for at most tens of ms in the realistic case. */
 static void publish_discovery(uint8_t plant_id, const char *name)
 {
     if (!s_client) return;
@@ -229,6 +287,7 @@ static void publish_discovery(uint8_t plant_id, const char *name)
     char topic[TOPIC_BUF_SIZE];
     char json[DISC_JSON_BUF_SIZE];
     for (size_t i = 0; i < n; i++) {
+        if (!s_mqtt_connected) break;   /* disconnected mid-burst: stop, don't waste the rest */
         uint8_t cap_id = bindings[i].cap_id;
         if (!mqtt_topic_discovery(topic, sizeof(topic), plant_id, cap_id)) {
             ESP_LOGW(TAG, "discovery topic for plant %u/cap %u did not fit", plant_id, cap_id);
@@ -238,7 +297,8 @@ static void publish_discovery(uint8_t plant_id, const char *name)
             ESP_LOGW(TAG, "discovery payload for plant %u/cap %u did not fit", plant_id, cap_id);
             continue;
         }
-        esp_mqtt_client_publish(s_client, topic, json, 0, 1, 1);
+        esp_mqtt_client_publish(s_client, topic, json, 0, 0, 1);
+        vTaskDelay(pdMS_TO_TICKS(MQTT_DISCOVERY_PACE_MS));
     }
 }
 
@@ -250,7 +310,7 @@ static void publish_discovery(uint8_t plant_id, const char *name)
  * "nothing to say yet" case). */
 static void publish_state(uint8_t plant_id, const registry_t *reg)
 {
-    if (!s_client) return;
+    if (!s_client || !s_mqtt_connected) return;   /* QoS 0: a publish while disconnected is pure waste -- see s_mqtt_connected's comment */
 
     plant_binding_t bindings[CAPABILITY_COUNT];
     size_t n = plants_bindings(plant_id, bindings, CAPABILITY_COUNT);
@@ -289,7 +349,7 @@ static void publish_state(uint8_t plant_id, const registry_t *reg)
  * "nothing to say yet" contract as publish_state(). */
 static void publish_device_state(const device_entry_t *d)
 {
-    if (!s_client) return;
+    if (!s_client || !s_mqtt_connected) return;   /* QoS 0: a publish while disconnected is pure waste -- see s_mqtt_connected's comment */
 
     mqtt_state_t st = { 0 };
     bool any = false;
@@ -345,6 +405,19 @@ static bool cap_bound_by_plant(const plants_table_t *plants, const device_id_t *
  * gets its device-form entity cleared here (not just at the
  * DEVICE_CAP_BOUND site); one no longer covered (rebind moved it to a
  * different device, or unbound) but never sent gets published. */
+/* QoS 0 throughout (hardware round 4 -- same reasoning as publish_discovery()
+ * above, applied here too since this shares the same loop/burst shape: up to
+ * CAPABILITY_COUNT publishes per device, across up to REGISTRY_MAX_DEVICES
+ * devices in one RESYNC_DISCOVERY sweep). The "covered but stale bit"
+ * self-heal cleanup branch is itself just a backstop for
+ * cleanup_device_cap_discovery() (still QoS 1, single message, the
+ * AUTHORITATIVE cleanup at the actual bind-transition moment) -- if this
+ * opportunistic QoS-0 retry is ever lost, the stale bit stays stale and this
+ * function simply retries it again next time it runs for the device, so
+ * losing it costs nothing. Gated on s_mqtt_connected (re-checked every
+ * iteration, same as publish_discovery()) and paced
+ * (MQTT_DISCOVERY_PACE_MS) between every publish in the loop, both branches
+ * alike. */
 static void publish_device_discovery(const device_entry_t *d, int dev_slot, const plants_table_t *plants)
 {
     if (!s_client) return;
@@ -360,13 +433,15 @@ static void publish_device_discovery(const device_entry_t *d, int dev_slot, cons
     char topic[TOPIC_BUF_SIZE];
     char json[DISC_JSON_BUF_SIZE];
     for (uint8_t cap_id = 0; cap_id < CAPABILITY_COUNT; cap_id++) {
+        if (!s_mqtt_connected) break;   /* disconnected mid-burst: stop, don't waste the rest */
         if (!d->caps[cap_id].valid) continue;
 
         bool covered = cap_bound_by_plant(plants, &d->id, cap_id);
         if (covered) {
             if (s_device_disc_sent[dev_slot][cap_id]) {
                 if (mqtt_topic_device_discovery(topic, sizeof(topic), idstr, cap_id)) {
-                    esp_mqtt_client_publish(s_client, topic, MQTT_CLEANUP_PAYLOAD, 0, 1, 1);
+                    esp_mqtt_client_publish(s_client, topic, MQTT_CLEANUP_PAYLOAD, 0, 0, 1);
+                    vTaskDelay(pdMS_TO_TICKS(MQTT_DISCOVERY_PACE_MS));
                 }
                 s_device_disc_sent[dev_slot][cap_id] = false;
             }
@@ -382,8 +457,9 @@ static void publish_device_discovery(const device_entry_t *d, int dev_slot, cons
             ESP_LOGW(TAG, "device discovery payload for %s/cap %u did not fit", idstr, cap_id);
             continue;
         }
-        esp_mqtt_client_publish(s_client, topic, json, 0, 1, 1);
+        esp_mqtt_client_publish(s_client, topic, json, 0, 0, 1);
         s_device_disc_sent[dev_slot][cap_id] = true;
+        vTaskDelay(pdMS_TO_TICKS(MQTT_DISCOVERY_PACE_MS));
     }
 }
 
@@ -561,7 +637,11 @@ static void mqtt_pub_task(void *arg)
         }
 
         if (msg.type == MQTT_PUB_MSG_EVENT) {
-            if (s_client) {
+            /* QoS 0 (V1's own convention, unchanged) -- same "pure waste
+             * while disconnected" reasoning as the state/discovery paths
+             * (s_mqtt_connected's comment); this one is a single message
+             * per event, not a loop, but the gate costs nothing to add. */
+            if (s_client && s_mqtt_connected) {
                 char topic[TOPIC_BUF_SIZE];
                 int n = snprintf(topic, sizeof(topic), "planthub/%s/event", s_hub);
                 if (n > 0 && (size_t)n < sizeof(topic)) {
@@ -671,6 +751,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "connected to broker");
+        s_mqtt_connected = true;   /* set before RESYNC_DISCOVERY is enqueued below, so mqtt_pub_task sees it true from the start of that burst */
         char topic[TOPIC_BUF_SIZE];
         if (mqtt_topic_avail(topic, sizeof(topic), s_hub)) {
             esp_mqtt_client_publish(event->client, topic, "online", 0, 1, 1);
@@ -703,6 +784,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     }
     case MQTT_EVENT_DISCONNECTED:
+        s_mqtt_connected = false;
         ESP_LOGW(TAG, "disconnected from broker; esp-mqtt will auto-reconnect");
         break;
     case MQTT_EVENT_ERROR:
