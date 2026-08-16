@@ -44,6 +44,7 @@ export function ConfigTab() {
   const [aiMsg, setAiMsg] = useState('')
   const [aiTestMsg, setAiTestMsg] = useState('')
   const [aiTestDetail, setAiTestDetail] = useState('')
+  const aiTestAbortRef = useRef(null)   // current in-flight aiComplete()'s AbortController, for the Cancel button
 
   // Every successful config save reboots the hub (the settings only apply
   // at boot). One shared countdown: tell the user, then pull the page back
@@ -299,14 +300,21 @@ export function ConfigTab() {
     setAiMsg('Key cleared.')
   }
 
+  // Cancellable like every other AI call in M4 (wrappers.jsx/rules.jsx's
+  // own Generate flows): an AbortController per attempt, stashed in a ref
+  // so the Cancel button below can interrupt a hanging request instead of
+  // leaving "Testing…" stuck until the page is reloaded.
   async function doTestAi() {
     setBusy('ai-test'); setAiTestMsg(''); setAiTestDetail('')
+    const controller = new AbortController()
+    aiTestAbortRef.current = controller
     try {
       // Test whatever is currently typed, not the last-saved value -- the
       // point of this button is to check a change before committing it.
       await aiComplete({
         system: 'You are a test.',
         user: 'Reply with the single word: ok',
+        signal: controller.signal,
         settings: {
           kind: ai.kind,
           // Same normalisation Save routes through on write (settings.js),
@@ -326,7 +334,12 @@ export function ConfigTab() {
         setAiTestMsg('Unexpected error testing the connection.')
       }
     }
+    aiTestAbortRef.current = null
     setBusy('')
+  }
+
+  function onCancelTestAi() {
+    if (aiTestAbortRef.current) aiTestAbortRef.current.abort()
   }
 
   if (error) return <p class="error">Hub not reachable.</p>
@@ -650,9 +663,12 @@ export function ConfigTab() {
           {' '}
           <button onClick={doClearAiKey} disabled={busy !== '' || !ai.key}>Clear key</button>
           {' '}
-          <button onClick={doTestAi} disabled={busy === 'ai-test'}>
-            {busy === 'ai-test' ? 'Testing…' : 'Test connection'}
-          </button>
+          {busy === 'ai-test' ? (
+            <button type="button" onClick={onCancelTestAi}>Cancel</button>
+          ) : (
+            <button onClick={doTestAi}>Test connection</button>
+          )}
+          {busy === 'ai-test' && <span class="hint"> Testing…</span>}
         </p>
         {aiMsg && <p class="hint">{aiMsg}</p>}
         {aiTestMsg && (
