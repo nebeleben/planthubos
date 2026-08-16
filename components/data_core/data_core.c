@@ -21,16 +21,43 @@ static SemaphoreHandle_t s_mutex;
  * wrappers reach this path (unlike MiFlora's/BTHome's fixed native
  * decoders, which rarely if ever emit an out-of-range value in practice) --
  * one buggy wrapper's EMIT would otherwise become a permanent log firehose.
- * One bit per (registry device, capability) -- CAPABILITY_COUNT (8) fits
- * exactly one byte's worth of bits per device, so this is
- * REGISTRY_MAX_DEVICES (16) bytes static, same budget class as M3's own
- * wrapper memo -- records "already warned once for this device+capability
- * combination since boot" (never cleared -- a capability that's
- * persistently out of range only needs to be reported once, not once per
- * boot-uptime-reset-adjacent event). The reviewer's suggested throttle:
- * loud on the FIRST occurrence, silent after. */
-static uint8_t s_cap_warned[REGISTRY_MAX_DEVICES];
-_Static_assert(CAPABILITY_COUNT <= 8, "s_cap_warned's per-device bitmask needs one bit per capability id");
+ * One bit per (registry device, capability), plus ONE extra bit per device
+ * for "an out-of-range EMIT named a capability id that doesn't even exist"
+ * -- round 2 of the review found this second case (an EMIT capability byte
+ * >= CAPABILITY_COUNT) bypassed the original uint8_t bitmask entirely, since
+ * an invalid id has no valid `1 << cap_id` slot and the guard just skipped
+ * the whole throttle, logging forever. psvm_validate() now rejects that
+ * bytecode at INSTALL time (psvm.c's validate_emit_caps(), same review
+ * round) -- this bitmask bit is defence in depth for data_core_submit_cap()
+ * itself, which is a public function and must not be floodable regardless
+ * of who calls it or whether every caller goes through validation first.
+ * CAPABILITY_COUNT (8) real-capability bits + 1 more fits a uint16_t with
+ * seven bits to spare; REGISTRY_MAX_DEVICES (16) * 2 B = 32 B static, still
+ * the same small budget class as M3's own wrapper memo. Never cleared -- a
+ * capability that's persistently out of range only needs reporting once,
+ * not once per boot-uptime-reset-adjacent event. The reviewer's throttle
+ * policy throughout: loud on the FIRST occurrence, silent after. */
+static uint16_t s_cap_warned[REGISTRY_MAX_DEVICES];
+_Static_assert(CAPABILITY_COUNT <= 15, "s_cap_warned needs CAPABILITY_COUNT real-capability bits plus one 'invalid capability id' bit, all within a uint16_t");
+#define CAP_WARN_INVALID_ID_BIT ((uint16_t)(1u << CAPABILITY_COUNT))
+
+/* Bypass B (Task 5 review round 2): a wrapper whose EMITs are ALL
+ * out-of-range for a given MAC leaves that device permanently unregistered
+ * (registry_set_cap() only creates a slot on the SUCCESS branch -- see its
+ * own doc comment) -- s_cap_warned above is keyed by registry index, so a
+ * device that never registers has no slot to throttle against, and would
+ * log unthrottled forever otherwise. Rather than a second, MAC-keyed
+ * tracking structure (real RAM/complexity for a case that, unlike a
+ * mis-scaled-but-otherwise-working wrapper, means NOTHING from that device
+ * is usable at all), this is a single, global, once-per-boot line naming
+ * the first offending MAC/capability/value -- enough to point an operator
+ * at the problem (which device, which capability) without growing state
+ * per bad device. A wrapper this broken needs fixing regardless of how
+ * many devices trip it, so "the first one, once" carries the actionable
+ * information; further occurrences (from the same or a different
+ * never-registers device) are dropped at DEBUG, not WARN, so this can never
+ * itself become the firehose. */
+static bool s_unregistered_cap_warned;
 
 esp_err_t data_core_init(void)
 {
@@ -233,36 +260,53 @@ bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
      * its comment and set_cap_or_warn()'s, both of which this mirrors. */
     int16_t raw = capability_encode(cap_id, value);
     if (raw == CAP_VALUE_NONE) {
-        /* Throttle: look up (never create) the device's registry index and
-         * check/set its per-capability warn bit under s_mutex, same lock
-         * every other s_registry access here uses. A device not yet
-         * registered (idx < 0 -- e.g. this is its very first, already
-         * out-of-range, reading) has no slot to remember against, so it
-         * always logs loud; once the device exists, the bit makes every
-         * later repeat of the SAME capability's out-of-range skip silent.
-         * cap_id is only used to index the bitmask when it's a real
-         * capability (< CAPABILITY_COUNT) -- an invalid id (a malformed
-         * wrapper EMIT operand, since psvm.c never range-checks EMIT's
-         * capability byte at validate time) already reads as "unknown" via
-         * capability_get() below and always logs, unthrottled, rather than
-         * risk shifting a bitmask by an out-of-range amount. */
+        /* Throttle (Task 5 review FINDING 3, both bypasses closed in round
+         * 2): look up (never create) the device's registry index under
+         * s_mutex, same lock every other s_registry access here uses.
+         * Three cases:
+         *   - idx >= 0, cap_id valid: the ordinary per-(device,capability)
+         *     bit, as before.
+         *   - idx >= 0, cap_id invalid (>= CAPABILITY_COUNT -- shouldn't
+         *     reach here at all once every wrapper's EMIT operand is
+         *     validated at install time, psvm.c's validate_emit_caps(), but
+         *     this function is public and must not assume its caller
+         *     validated anything): the shared CAP_WARN_INVALID_ID_BIT for
+         *     this device, so a garbage capability id can't bypass the
+         *     bitmask by having no slot of its own.
+         *   - idx < 0 (device never successfully registered -- Bypass B):
+         *     no per-device slot exists to throttle against at all, so this
+         *     falls back to s_unregistered_cap_warned, a single global
+         *     once-per-boot line (see its own doc comment above). */
         device_id_t id = device_id_from_mac(DEV_KIND_BLE, mac);
         bool already_warned = false;
+        bool unregistered = false;
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         int idx = registry_find(&s_registry, &id);
-        if (idx >= 0 && cap_id < CAPABILITY_COUNT) {
-            uint8_t bit = (uint8_t)(1u << cap_id);
+        if (idx >= 0) {
+            uint16_t bit = (cap_id < CAPABILITY_COUNT) ? (uint16_t)(1u << cap_id) : CAP_WARN_INVALID_ID_BIT;
             already_warned = (s_cap_warned[idx] & bit) != 0;
             s_cap_warned[idx] |= bit;
+        } else {
+            unregistered = true;
+            already_warned = s_unregistered_cap_warned;
+            s_unregistered_cap_warned = true;
         }
         xSemaphoreGive(s_mutex);
 
         if (!already_warned) {
             const capability_t *c = capability_get(cap_id);
-            ESP_LOGW(TAG, "%s: value %.2f out of range, dropping reading for "
-                     MACSTR_FMT " (previous value kept, further repeats for this "
-                     "device+capability suppressed)",
-                     c ? c->name : "?", (double)value, MAC_ARG(mac));
+            if (unregistered) {
+                ESP_LOGW(TAG, "%s: value %.2f out of range for " MACSTR_FMT
+                         ", which has no successful reading yet (per-device suppression "
+                         "doesn't apply until it registers) -- further such skips from ANY "
+                         "never-registered device are suppressed for the rest of this boot",
+                         c ? c->name : "?", (double)value, MAC_ARG(mac));
+            } else {
+                ESP_LOGW(TAG, "%s: value %.2f out of range, dropping reading for "
+                         MACSTR_FMT " (previous value kept, further repeats for this "
+                         "device+capability suppressed)",
+                         c ? c->name : "?", (double)value, MAC_ARG(mac));
+            }
         }
         return false;
     }

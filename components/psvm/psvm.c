@@ -78,6 +78,67 @@ static void const_entry(const psvm_prog_t *p, uint16_t idx, uint8_t *tag_out,
     }
 }
 
+/* Scans a (already length-bounded) code section for EMIT (0x69, wrapper
+ * dialect) instructions and range-checks each one's inline capability-id
+ * operand against caps_max -- the same bound the ref table's own capability
+ * field is checked against just above, for the OTHER place a capability id
+ * appears in a blob. Added on M3 Task 5 review (round 2): previously only
+ * the ref table was checked, so a wrapper naming a nonexistent capability
+ * in an EMIT installed cleanly and then failed identically, silently, at
+ * every single run forever -- letting it fail at RUN time instead of
+ * catching it here, at INSTALL time, is strictly worse for the wrapper's
+ * author (no feedback at all) and opened a way to bypass
+ * data_core_submit_cap()'s per-(device,capability) warn throttle (an
+ * invalid cap_id has no valid bitmask slot to remember against).
+ *
+ * Walks the stream using each opcode's own operand width -- the exact
+ * widths psvm_run()'s interpreter switch below uses for the SAME code
+ * region -- so an operand byte is never mistaken for an opcode. This is a
+ * second place those widths are now spelled out (psvm_run()'s switch is the
+ * other); both live in this one file, which is the authority on the M3
+ * wrapper opcode set (spec section 3), so keeping them in sync is a local,
+ * contained concern, not a cross-file duplication risk. An opcode this
+ * table doesn't recognise, or a truncated final instruction, just stops the
+ * scan -- this function's only job is the EMIT check; a genuinely malformed
+ * or unknown opcode is still caught exactly as before, by psvm_run()'s own
+ * PSVM_ERR_BADOP at run time (this does not become a second, stricter
+ * bytecode verifier). Applies regardless of `dialect`: EMIT is a
+ * wrapper-only opcode in practice (a rules-dialect compiler never emits it),
+ * so this is a no-op scan for rules bytecode either way, but nothing here
+ * or in psvm_run() itself actually gates opcode interpretation by dialect,
+ * so checking unconditionally costs nothing and closes the loophole
+ * regardless of how it might be reached. */
+static psvm_err_t validate_emit_caps(const uint8_t *code, uint16_t code_len, uint8_t caps_max) {
+    uint16_t pc = 0;
+    while (pc < code_len) {
+        uint8_t op = code[pc];
+        uint16_t width;
+        switch (op) {
+        case 0x01: case 0x02: case 0x40: case 0x41:
+        case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66:
+            width = 3; break;
+        case 0x67:
+            width = 5; break;
+        case 0x50: case 0x51:
+            width = 2; break;
+        case 0x69:
+            if ((size_t)pc + 2 > code_len) return PSVM_OK;   /* truncated -- psvm_run() catches it */
+            if (code[pc + 1] > caps_max) return PSVM_ERR_REF;
+            width = 2;
+            break;
+        case 0x00: case 0x10: case 0x11: case 0x12: case 0x13:
+        case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25:
+        case 0x30: case 0x31: case 0x32:
+        case 0x68: case 0x6A: case 0x6B: case 0x6C: case 0xFF:
+            width = 1; break;
+        default:
+            return PSVM_OK;   /* unrecognised opcode -- not this pass's job */
+        }
+        pc = (uint16_t)(pc + width);
+    }
+    return PSVM_OK;
+}
+
 psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
                          uint8_t caps_max, uint32_t builtins_impl, psvm_prog_t *out) {
     if (len < PSVM_HEADER_LEN) return PSVM_ERR_TRUNCATED;
@@ -119,6 +180,9 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
 
     size_t code_off = offset;
     if (code_off + (size_t)code_len > len) return PSVM_ERR_TRUNCATED;
+
+    psvm_err_t emit_err = validate_emit_caps(blob + code_off, code_len, caps_max);
+    if (emit_err != PSVM_OK) return emit_err;
 
     if (out) {
         out->blob = blob;

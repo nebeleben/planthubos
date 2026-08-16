@@ -113,7 +113,14 @@ typedef struct {
  * vice versa (spec section 3's "the hub rejects unknown dialects... exactly
  * as it does for rules"). caps_max = highest capability id this firmware
  * knows; builtins_impl = bitmap of implemented CALL_BUILTIN ids (rules
- * dialect only -- pass 0 for wrappers, which never use CALL_BUILTIN). */
+ * dialect only -- pass 0 for wrappers, which never use CALL_BUILTIN).
+ *
+ * caps_max also bounds EVERY capability id a validated blob can reference,
+ * not just the ref table's: EMIT's (0x69, wrapper dialect) inline
+ * capability-id operand is range-checked the same way (added M3 Task 5
+ * review round 2) -- a wrapper naming a nonexistent capability is
+ * PSVM_ERR_REF at validate time, not a silent, permanent, every-run runtime
+ * failure. */
 psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
                          uint8_t caps_max, uint32_t builtins_impl, psvm_prog_t *out);
 

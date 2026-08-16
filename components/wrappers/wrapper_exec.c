@@ -81,20 +81,31 @@ static bool code_uses_aes_ccm(const psvm_prog_t *p)
     return false;
 }
 
-/* One bit per wrapper id (WRAPPERS_MAX <= 16, so a uint16_t always
- * suffices) -- "already logged the elevated AES_CCM-unsupported warning for
- * this id since boot". Without this, a genuinely encryption-using wrapper
- * would re-log its WARN on every single advertisement it matches (the exact
- * firehose shape review FINDING 3 flagged for data_core.c's own skip
- * warning) -- loud once, silent after, same policy. */
+/* One bit per wrapper id -- "already logged the elevated
+ * AES_CCM-unsupported warning for this id since boot". Without this, a
+ * genuinely encryption-using wrapper would re-log its WARN on every single
+ * advertisement it matches (the exact firehose shape review FINDING 3
+ * flagged for data_core.c's own skip warning) -- loud once, silent after,
+ * same policy. */
 static uint16_t s_aes_ccm_warned;
+_Static_assert(WRAPPERS_MAX <= 16, "s_aes_ccm_warned's per-wrapper bitmask needs one bit per wrapper id, all within a uint16_t");
 
-static void warn_aes_ccm_unsupported_once(uint16_t id)
+/* Cheap pre-check, deliberately separate from the function that actually
+ * warns+marks below -- checked BEFORE code_uses_aes_ccm()'s scan runs (Task
+ * 5 review round 2 nit), so a wrapper that's already been warned once
+ * doesn't pay for re-scanning its bytecode on every subsequent failed
+ * advert for the rest of the boot. Out-of-range ids (defensive; never
+ * happens in practice, ids are always < WRAPPERS_MAX) read as "already
+ * warned" -- nothing to warn about for an id with no bit to track it. */
+static bool aes_ccm_already_warned(uint16_t id)
 {
-    if (id >= WRAPPERS_MAX) return;   /* defensive; ids are always < WRAPPERS_MAX */
-    uint16_t bit = (uint16_t)(1u << id);
-    if (s_aes_ccm_warned & bit) return;
-    s_aes_ccm_warned |= bit;
+    if (id >= WRAPPERS_MAX) return true;
+    return (s_aes_ccm_warned & (uint16_t)(1u << id)) != 0;
+}
+
+static void warn_aes_ccm_unsupported(uint16_t id)
+{
+    if (id < WRAPPERS_MAX) s_aes_ccm_warned |= (uint16_t)(1u << id);
     ESP_LOGW(TAG, "wrapper %u uses aes_ccm_decrypt(), which this firmware build does not "
              "support (no AES-CCM callback wired) -- every run of this wrapper will fail "
              "and emit nothing; native BTHome decryption is unaffected", (unsigned)id);
@@ -137,10 +148,12 @@ bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
      * satisfied by simply calling psvm_run() normally -- that budget is
      * unconditional inside psvm_run() itself, not opt-in). */
     psvm_result_t res = psvm_run(&prog, NULL, &wio, NULL, NULL, false);
-    if (res.err == PSVM_ERR_REF && code_uses_aes_ccm(&prog)) {
+    if (res.err == PSVM_ERR_REF && !aes_ccm_already_warned(id) && code_uses_aes_ccm(&prog)) {
         /* Elevated per the Task 5 review ruling: this specific, structural,
-         * every-run-fails case must not be invisible at DEBUG. */
-        warn_aes_ccm_unsupported_once(id);
+         * every-run-fails case must not be invisible at DEBUG. Checked
+         * already-warned FIRST (cheap) so the scan only ever runs once per
+         * wrapper id, not on every single failed advert. */
+        warn_aes_ccm_unsupported(id);
     } else if (res.err != PSVM_OK) {
         ESP_LOGD(TAG, "wrapper %u: run ended err=%d after %u step(s)",
                  (unsigned)id, (int)res.err, (unsigned)res.steps_used);

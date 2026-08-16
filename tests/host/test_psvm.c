@@ -125,10 +125,14 @@ static size_t build_w_floor_neg(uint8_t *b) {
  *   PUSH_CONST 1.0 ; EMIT 7            -- an emit BEFORE the require
  *   PUSH_CONST 0.0 ; PUSH_CONST 0.0 ; NE   -- false
  *   REQUIRE                             -- pops false: ends the run here
- *   PUSH_CONST 1.0 ; EMIT 8 ; HALT      -- unreachable
+ *   PUSH_CONST 1.0 ; EMIT 6 ; HALT      -- unreachable
  * cond_true selects EQ instead of NE for the require expr's second operand
  * relationship, producing a require that PASSES (both the early emit and
- * the later one reach the sink) -- the positive control. */
+ * the later one reach the sink) -- the positive control. Second EMIT's
+ * capability is 6 (not 8, as an earlier version of this test used) -- every
+ * caller below validates with caps_max=7 (0..7 valid), and EMIT's operand
+ * is now range-checked at validate time too (Task 5 review round 2); 6 and
+ * 7 are still two distinct, in-range ids, which is all this test needs. */
 static size_t build_w_require(uint8_t *b, bool cond_true) {
     uint8_t code[32]; size_t co = 0;
     co = emit_op_u16(code, co, 0x01, 0);      /* PUSH_CONST 0 (1.0) */
@@ -138,7 +142,7 @@ static size_t build_w_require(uint8_t *b, bool cond_true) {
     co = emit_op(code, co, cond_true ? 0x24 : 0x25); /* EQ (true) or NE (false) */
     co = emit_op(code, co, 0x6A);             /* REQUIRE */
     co = emit_op_u16(code, co, 0x01, 0);      /* PUSH_CONST 0 (1.0) */
-    co = emit_op_u8(code, co, 0x69, 8);       /* EMIT cap=8 */
+    co = emit_op_u8(code, co, 0x69, 6);       /* EMIT cap=6 */
     co = emit_op(code, co, 0xFF);             /* HALT */
     size_t o = emit_header_d(b, PSVM_DIALECT_WRAPPERS, 0, 2, 0, (uint16_t)co);
     o = emit_f32(b, o, 1.0f); o = emit_f32(b, o, 0.0f);
@@ -807,7 +811,24 @@ int main(void) {
         r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
         assert(r2.err == PSVM_OK && ecap2.count == 2);
         assert(ecap2.items[0].cap == 7 && ecap2.items[0].value == 1.0f);
-        assert(ecap2.items[1].cap == 8 && ecap2.items[1].value == 1.0f);
+        assert(ecap2.items[1].cap == 6 && ecap2.items[1].value == 1.0f);
+    }
+
+    /* EMIT's inline capability operand is range-checked at validate time
+     * (Task 5 review round 2, "Bypass A"): PUSH_CONST 1.0; EMIT 99; HALT,
+     * validated with caps_max=7 (0..7 valid) -- 99 is out of range and must
+     * be rejected with the same error code the ref table's own capability
+     * field uses for the identical shape of problem. */
+    {
+        uint8_t code[16]; size_t co = 0;
+        co = emit_op_u16(code, co, 0x01, 0);    /* PUSH_CONST 0 (1.0) */
+        co = emit_op_u8(code, co, 0x69, 99);    /* EMIT cap=99 -- invalid */
+        co = emit_op(code, co, 0xFF);           /* HALT */
+        uint8_t b2[64]; psvm_prog_t p2;
+        size_t o = emit_header_d(b2, PSVM_DIALECT_WRAPPERS, 0, 1, 0, (uint16_t)co);
+        o = emit_f32(b2, o, 1.0f);
+        memcpy(b2 + o, code, co);
+        assert(psvm_validate(b2, o + co, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_ERR_REF);
     }
 
     /* AES_CCM: decrypts in place, subsequent accessors read plaintext, and

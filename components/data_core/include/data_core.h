@@ -119,7 +119,9 @@ bool      data_core_submit_battery(const uint8_t mac[6], uint8_t pct);
  * out-of-range skip are silent (Task 5 review FINDING 3: a wrapper's EMIT
  * reaches this same path, and an unthrottled per-advert WARN from a single
  * buggy user-authored wrapper would flood the log; data_core.c's own
- * comment on s_cap_warned has the exact mechanism). Posts
+ * comment on s_cap_warned has the exact mechanism, INCLUDING the two
+ * bypasses round 2 of that review found and closed: an invalid cap_id, and
+ * a device that never successfully registers at all). Posts
  * DATA_EVENT_SENSOR_UPDATE on a successful write, same as
  * data_core_submit_battery(). Returns false when the write was skipped
  * (out-of-range value) or the registry is full and the device is unknown
