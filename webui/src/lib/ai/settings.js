@@ -26,7 +26,10 @@ export const AI_DEFAULTS = {
 // request builders concatenate a path onto this, and "…:11434/" + "/v1/…"
 // is a 404 that looks like a wrong-endpoint error. Empty string and only-slashes
 // endpoints silently revert to the default on read (via the g() fallback).
-function normEndpoint(v) {
+// Exported so callers that need to preview a not-yet-saved endpoint (e.g. a
+// "Test connection" button) apply the exact same rule Save uses on write --
+// a second copy of this regex would be the same defect in slower motion.
+export function normEndpoint(v) {
   return String(v || '').trim().replace(/\/+$/, '')
 }
 

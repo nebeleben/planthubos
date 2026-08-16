@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import { getKey, setKey, authHeaders } from '../lib/auth.js'
-import { getAiSettings, setAiSettings, AI_DEFAULTS } from '../lib/ai/settings.js'
+import { getAiSettings, setAiSettings, normEndpoint, AI_DEFAULTS } from '../lib/ai/settings.js'
 import { aiComplete, AiError } from '../lib/ai/provider.js'
 
 function fmtBytes(n) {
@@ -309,7 +309,10 @@ export function ConfigTab() {
         user: 'Reply with the single word: ok',
         settings: {
           kind: ai.kind,
-          endpoint: ai.endpoint || AI_DEFAULTS.endpoint,
+          // Same normalisation Save routes through on write (settings.js),
+          // so Test checks the exact value that would actually be stored --
+          // not a doubled-slash URL that fails for a reason Save wouldn't hit.
+          endpoint: normEndpoint(ai.endpoint) || AI_DEFAULTS.endpoint,
           model: ai.model || AI_DEFAULTS.model,
           key: ai.key,
         },
@@ -639,7 +642,7 @@ export function ConfigTab() {
           <input type="password" value={ai.key} placeholder="paste your API key"
                  onInput={(e) => setAi((a) => ({ ...a, key: e.currentTarget.value }))} />
         </label>
-        <p class="hint">Stored in this browser only. Never sent to the hub.</p>
+        <p class="infobox">Stored in this browser only. Never sent to the hub.</p>
         <p>
           <button class="btn-primary" onClick={doSaveAi} disabled={busy === 'ai'}>
             {busy === 'ai' ? 'Saving…' : 'Save AI settings'}
