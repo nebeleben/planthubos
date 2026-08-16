@@ -58,23 +58,37 @@ static portMUX_TYPE s_adv_mux = portMUX_INITIALIZER_UNLOCKED;
  * nothing outside the decoder task touches this table in M3 Task 2). */
 static wrapper_index_t s_wrapper_index;
 
-/* M3 Task 5 (spec §2 "device -> wrapper memo"): one byte per registry
+/* M3 Task 5 (spec §2 "device -> wrapper memo"): one entry per registry
  * device, the id of the wrapper that last matched it -- so a repeat
  * advertisement from a device already known to match a specific wrapper
  * skips wrapper_index_lookup() entirely and goes straight to
- * wrapper_arena_get()+wrapper_exec_run(). WRAPPER_MEMO_NONE (0xFF, outside
- * WRAPPERS_MAX's 0..15 range) means "no memo recorded" -- NOT "confirmed no
- * wrapper matches"; a device whose last advert genuinely matched nothing
- * always re-runs a real lookup, which is cheap (an O(WRAPPERS_MAX) scan)
- * and, unlike a positive match, has nothing worth caching per spec's own
- * wording ("the wrapper id that LAST MATCHED"). Indexed by registry slot
- * (data_core_find_index()), not by MAC -- see that function's own doc
- * comment for why a registry index is stable for a device's lifetime.
- * 16 * 1 B = 16 B static, exactly spec §7's budget line; same
- * "adv_decoder_task is the only reader/writer, no lock" reasoning as
- * s_wrapper_index just above. */
-#define WRAPPER_MEMO_NONE 0xFF
-static uint8_t s_wrapper_memo[REGISTRY_MAX_DEVICES];
+ * wrapper_arena_get()+wrapper_exec_run(). WRAPPER_MEMO_NONE means "no memo
+ * recorded" -- NOT "confirmed no wrapper matches"; a device whose last
+ * advert genuinely matched nothing always re-runs a real lookup, which is
+ * cheap (an O(WRAPPERS_MAX) scan) and, unlike a positive match, has nothing
+ * worth caching per spec's own wording ("the wrapper id that LAST
+ * MATCHED"). Indexed by registry slot (data_core_find_index()), not by MAC
+ * -- see that function's own doc comment for why a registry index is
+ * stable for a device's lifetime.
+ *
+ * M3 review fix 4: this was originally uint8_t with WRAPPER_MEMO_NONE=0xFF,
+ * but wrapper ids are a monotonic, never-reused uint16_t counter
+ * (wrapper_store.c's s_wrapper_next_id) -- NOT a 0..WRAPPERS_MAX-1 slot
+ * index -- so a long-lived hub that has ever CREATED (not just currently
+ * has) 255 wrappers would see id 255 alias the sentinel and id 256 memoise
+ * as 0, silently feeding wrapper_exec_run() the wrong wrapper forever for
+ * that device (ble_collector.c's own dispatch just below). Widened to
+ * uint16_t -- matching wrapper_exec_run()'s own id type exactly, so the
+ * memo can represent every id that type can ever hold, not just a
+ * corner-case-prone subset -- rather than refusing to memoise past 254
+ * (which would need its own bookkeeping and just moves the same class of
+ * cliff from 255 to 65535 creations). Costs REGISTRY_MAX_DEVICES extra
+ * bytes (16 B, one per device: 16*2 B = 32 B vs the previous 16 B) against
+ * the C3's ~1.4 KB RAM margin over its spec floor -- about 1% of that
+ * margin, for correctness across the id type's entire real range instead
+ * of failing after ~255 wrapper creations. */
+#define WRAPPER_MEMO_NONE 0xFFFFu
+static uint16_t s_wrapper_memo[REGISTRY_MAX_DEVICES];
 
 /* Task 5 review FINDING 4/2: s_wrapper_index, the arena and s_wrapper_memo
  * are all decoder-task-exclusive (see their own comments above) -- their
@@ -334,7 +348,7 @@ static void decode_adv_item(const adv_item_t *item)
          * always correct, only not free. */
         int midx = (ridx >= 0) ? ridx : data_core_find_index(&wid);
         if (midx >= 0 && midx < REGISTRY_MAX_DEVICES) {
-            s_wrapper_memo[midx] = (uint8_t)wrapper_id;
+            s_wrapper_memo[midx] = (uint16_t)wrapper_id;
         }
         if (wrote) rules_notify_value_update();
         return;   /* a matched wrapper's key can never also be MiFlora's (distinct match kinds/keys) -- nothing further to dispatch */
@@ -590,9 +604,12 @@ esp_err_t ble_collector_start(void)
      * anything can call wrapper_arena_get() (adv_decoder_task, once
      * created, below), then reset it to empty. Static
      * CONFIG_PLANTHUB_WRAPPER_ARENA bytes (2048 on esp32c3, 4096 on
-     * esp32c5, spec §7). s_wrapper_memo (16 B static) starts all
-     * WRAPPER_MEMO_NONE -- memset(0xFF), not the default zero-init, since
-     * 0 is itself a valid wrapper id. */
+     * esp32c5, spec §7). s_wrapper_memo (32 B static, M3 review fix 4 --
+     * see its own declaration comment) starts all WRAPPER_MEMO_NONE --
+     * memset(0xFF) is still correct at the new uint16_t width (every byte
+     * of WRAPPER_MEMO_NONE=0xFFFFu is 0xFF, so filling byte-wise still
+     * leaves each element 0xFFFF), not the default zero-init, since 0 is
+     * itself a valid wrapper id. */
     wrapper_arena_set_loader(wrapper_store_read_psbc);
     wrapper_arena_init();
     memset(s_wrapper_memo, WRAPPER_MEMO_NONE, sizeof(s_wrapper_memo));
