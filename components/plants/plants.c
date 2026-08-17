@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -111,13 +112,63 @@ static const char *s_storage_base;   /* "/storage", or NULL: see plants_init() *
  * plants_init() -- load_file() runs first and is done with its blob (either
  * unpacked into s_table or discarded on failure) before
  * plants_adopt_legacy_nvs() -> load_legacy_nvs_blob() ever runs, so there is
- * no window where both need their own copy live at once. Sharing this one
- * ~1954-byte static in place of two separate ones (each function's own doc
+ * no window where both need their own copy live at once. Sharing ONE
+ * 2466-byte (sizeof(plants_blob_t)) buffer in place of two separate ones
+ * (each function's own doc
  * comment used to justify its own copy on the same "post-mortem
  * stack-safety fix" grounds) removes one buffer's worth of that history's
- * growth -- see task-4-report.md's "Fix round" section. Do NOT reuse this
- * for anything reachable outside plants_init()'s one-boot load sequence. */
-static plants_blob_t s_boot_blob_scratch;
+ * growth -- see task-4-report.md's "Fix round" section.
+ *
+ * M5b Task 2 fix round 1 (static-memory budget): heap, not `.bss`, and
+ * allocated fresh by boot_blob_scratch_acquire() at the TOP of
+ * plants_init()'s load sequence, freed by boot_blob_scratch_release()
+ * before that sequence returns -- never held across plants_init()'s return.
+ * This is not a reversal of the original stack-safety fix: the reasoning
+ * that made this a `static`/non-stack-local buffer (the crash-loop this
+ * file's top comment describes traced a "Stack protection fault" from a
+ * ~1954-byte STACK local reachable from the main task's boot-time stack
+ * depth) is unaffected by moving it off `.bss` onto the heap -- a
+ * heap-allocated buffer is not on any task's stack either, and
+ * plants_init() runs with tens of kB of heap free (measured ~76 kB at
+ * entry), far more than a permanent 2466-byte `.bss` reservation was
+ * costing every OTHER task's budget for the rest of the boot. Do NOT reuse
+ * this for anything reachable outside plants_init()'s one-boot load
+ * sequence, and do NOT let it outlive that sequence -- see
+ * boot_blob_scratch_release()'s own comment. */
+static plants_blob_t *s_boot_blob_scratch;
+
+/* Allocates s_boot_blob_scratch on first use within plants_init()'s one-boot
+ * load sequence (load_file(), then possibly load_legacy_nvs_blob()) and
+ * reuses it for the second call rather than allocating twice -- same
+ * "share one buffer, sequential, single task" contract the buffer's own doc
+ * comment describes, just now on the heap instead of `.bss`. Logs at ERROR
+ * and returns NULL on allocation failure; every caller treats NULL exactly
+ * like "file not readable"/"blob unrecognised" -- log-and-continue with an
+ * empty table, never a partial or garbage buffer. */
+static plants_blob_t *boot_blob_scratch_acquire(void)
+{
+    if (!s_boot_blob_scratch) {
+        s_boot_blob_scratch = malloc(sizeof(*s_boot_blob_scratch));
+        if (!s_boot_blob_scratch) {
+            ESP_LOGE(TAG, "plants: out of memory allocating the %d-byte boot blob scratch buffer",
+                     (int)sizeof(plants_blob_t));
+        }
+    }
+    return s_boot_blob_scratch;
+}
+
+/* Frees s_boot_blob_scratch and clears the pointer -- called once, at the
+ * end of plants_init()'s one-boot load sequence (after load_file() and,
+ * if it ran, load_legacy_nvs_blob() have both finished with it), so the
+ * buffer's heap cost is transient: allocated only for the handful of
+ * milliseconds this boot spends reading plants.bin/NVS, never held for the
+ * rest of the boot. Safe to call even if acquire() was never reached or
+ * failed (frees NULL, a no-op). */
+static void boot_blob_scratch_release(void)
+{
+    free(s_boot_blob_scratch);
+    s_boot_blob_scratch = NULL;
+}
 
 /* "plant table full" is logged at most once per distinct mac per boot,
  * mirroring battery_sched.h's small fixed-size in_use table -- otherwise a
@@ -229,23 +280,35 @@ static esp_err_t write_file(const plants_blob_t *blob)
  * write, and the RAM table remains the only copy for the rest of this
  * boot.
  *
- * `blob` is `static`, not a stack local -- post-mortem stack-safety fix:
- * s_persist_mutex is held for this function's ENTIRE body, so exactly one
- * task is ever inside this critical section at a time, which is what makes
- * a ~1954-byte static safe despite persist_table() being reachable from
- * FOUR different task contexts (plants_resolve_or_create() off the
- * sampler/BLE ingestion path, plants_rename()/plants_bind_cap()/
+ * `blob` is NOT a stack local -- post-mortem stack-safety fix: a
+ * ~2465-byte frame would be unsafe on the sampler task's 4096-byte stack
+ * (plants_resolve_or_create() calls this off that task), which was almost
+ * certainly a contributing cause of the ORIGINAL M8 hardware incident's
+ * crash (this file's top comment), independent of the NVS-GC blast radius
+ * that motivated moving off NVS in the first place. persist_table() is
+ * reachable from FOUR different task contexts (plants_resolve_or_create()
+ * off the sampler/BLE ingestion path, plants_rename()/plants_bind_cap()/
  * plants_create()/plants_delete() off the httpd task, plus MQTT-adjacent
- * callers). Before the original fix this was a plain stack local in a
- * function reachable from the sampler task's 4096-byte stack under normal
- * sampling load -- almost certainly a contributing cause of the ORIGINAL M8
- * hardware incident's crash (this file's top comment), independent of the
- * NVS-GC blast radius that motivated moving off NVS in the first place.
- * Safe to keep as `static` specifically BECAUSE persist_table() already
- * serialises every caller through s_persist_mutex for unrelated reasons
- * (closing the same two write-ordering gaps swarm_store.c's own comment
- * documents) -- if that mutex's scope ever narrows to exclude part of this
- * function, this must move back off `static` storage or gain its own lock.
+ * callers) -- s_persist_mutex is held for this function's ENTIRE body, so
+ * exactly one task is ever inside this critical section at a time, which
+ * is what used to make a ~1954-byte `static` safe here (a single shared
+ * `.bss` buffer, never contended).
+ *
+ * M5b Task 2 fix round 1 (static-memory budget): heap, not `.bss`, freed
+ * before every return below. The same single-owner-at-a-time reasoning
+ * that made `static` safe still makes a plain heap allocation safe -- it
+ * is not a stack local either way, and this function's callers already run
+ * with the same tens-of-kB-of-heap-free margin plants_init() does (this is
+ * a request/sensor-event-triggered save, not a boot-time-only path, but
+ * plants is a 16-slot table -- these calls are not hot enough to make
+ * repeated malloc/free churn a concern, unlike e.g. a per-sample hot path).
+ * Allocation failure logs at ERROR and returns ESP_FAIL -- the same
+ * failure write_file() itself returns for "couldn't open/write the file"
+ * -- WITHOUT calling write_file() at all: never write a partial/garbage
+ * blob, and the RAM table (s_table) remains the source of truth for the
+ * pending change until a later mutation's persist_table() call succeeds
+ * (same "RAM can run ahead of flash on a failed write" contract this
+ * function's callers already document for every OTHER failure mode).
  *
  * M2 Task 4 review: this used to copy s_table into a second static
  * `snapshot` under s_mutex, release s_mutex, THEN call pack_blob() on the
@@ -265,13 +328,21 @@ static esp_err_t persist_table(void)
 
     xSemaphoreTake(s_persist_mutex, portMAX_DELAY);
 
-    static plants_blob_t blob;
+    plants_blob_t *blob = malloc(sizeof(*blob));
+    if (!blob) {
+        ESP_LOGE(TAG, "plants: out of memory allocating the %d-byte persist blob; plants.bin "
+                      "was NOT written -- s_table still reflects the pending change and this "
+                      "will retry on the next mutation", (int)sizeof(*blob));
+        xSemaphoreGive(s_persist_mutex);
+        return ESP_FAIL;
+    }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    plants_blob_pack(&s_table, &blob);
+    plants_blob_pack(&s_table, blob);
     xSemaphoreGive(s_mutex);
 
-    esp_err_t err = write_file(&blob);
+    esp_err_t err = write_file(blob);
+    free(blob);
     xSemaphoreGive(s_persist_mutex);
     return err;
 }
@@ -292,10 +363,14 @@ static esp_err_t persist_table(void)
  * followed on a miss by plants_adopt_legacy_nvs() -> load_legacy_nvs_blob())
  * is where a hardware crash-loop hit a "Stack protection fault" on the main
  * task, right after this function's own "not readable" WARN below. The blob
- * itself is read into s_boot_blob_scratch (M2 Task 4 review: shared with
- * load_legacy_nvs_blob(), see that static's own doc comment for why it's
- * safe for the two to share one buffer) rather than a function-local
- * static. */
+ * itself is read into s_boot_blob_scratch (M2 Task 4 review, M5b Task 2 fix
+ * round 1: shared with load_legacy_nvs_blob(), see that buffer's own doc
+ * comment for why it's safe for the two to share one heap allocation)
+ * rather than a function-local static. On allocation failure, logs at
+ * ERROR and returns false -- the exact same "start with an empty plant
+ * table" contract every other failure path here already has; the caller
+ * (plants_init()) cannot tell an OOM apart from a missing/corrupt file,
+ * which is the correct answer either way. */
 static bool load_file(plants_table_t *out)
 {
     static char path[128];
@@ -313,7 +388,11 @@ static bool load_file(plants_table_t *out)
      * shorter file -- e.g. a format-2 blob, migratable below -- simply
      * makes fread() stop early (rlen < sizeof(*blob)), which is exactly
      * what plants_blob_load() dispatches on. */
-    plants_blob_t *blob = &s_boot_blob_scratch;
+    plants_blob_t *blob = boot_blob_scratch_acquire();
+    if (!blob) {
+        fclose(f);
+        return false;   /* OOM already logged by boot_blob_scratch_acquire() */
+    }
     size_t rlen = fread(blob, 1, sizeof(*blob), f);
     int extra = fgetc(f);   /* confirm the file isn't LONGER than expected, too */
     fclose(f);
@@ -344,14 +423,18 @@ static bool load_file(plants_table_t *out)
  * reset-to-defaults-on-any-failure contract as load_file() above.
  *
  * Reads into s_boot_blob_scratch, NOT a function-local static (M2 Task 4
- * review) -- shared with load_file() above. Safe because plants_init()'s
- * boot sequence only ever reaches this function AFTER load_file() has
- * already returned (see plants_init() below: this is only called when
- * load_file() returned false), so load_file()'s own use of the scratch
- * buffer is finished -- unpacked into *out or discarded -- before this
- * function's first write to it. Both calls are synchronous, on the main
- * task, one-boot-only, with nothing else touching the scratch buffer in
- * between. Returns true iff a valid blob was loaded. */
+ * review) -- shared with load_file() above (M5b Task 2 fix round 1: now a
+ * heap allocation, acquired via boot_blob_scratch_acquire() which reuses
+ * load_file()'s allocation if that call already made one). Safe because
+ * plants_init()'s boot sequence only ever reaches this function AFTER
+ * load_file() has already returned (see plants_init() below: this is only
+ * called when load_file() returned false), so load_file()'s own use of the
+ * scratch buffer is finished -- unpacked into *out or discarded -- before
+ * this function's first write to it. Both calls are synchronous, on the
+ * main task, one-boot-only, with nothing else touching the scratch buffer
+ * in between. Returns true iff a valid blob was loaded. Same OOM contract
+ * as load_file() above: allocation failure logs at ERROR and returns false,
+ * indistinguishable from (and treated identically to) "no legacy blob". */
 static bool load_legacy_nvs_blob(nvs_handle_t h, plants_table_t *out)
 {
     size_t len = 0;
@@ -372,7 +455,10 @@ static bool load_legacy_nvs_blob(nvs_handle_t h, plants_table_t *out)
         return false;
     }
 
-    plants_blob_t *blob = &s_boot_blob_scratch;   /* sized for the larger (current) format */
+    plants_blob_t *blob = boot_blob_scratch_acquire();   /* sized for the larger (current) format */
+    if (!blob) {
+        return false;   /* OOM already logged by boot_blob_scratch_acquire() */
+    }
     size_t rlen = len;
     if (nvs_get_blob(h, KEY_PLANTS, blob, &rlen) != ESP_OK || rlen != len) {
         ESP_LOGW(TAG, "plants: legacy NVS blob read failed at its expected length");
@@ -828,13 +914,34 @@ static void plants_adopt_legacy_nvs(void)
  * their own doc comments and task-4-report.md's "Fix round" section for the
  * measured numbers). None of this reopens the bug this section describes:
  * every buffer that was `static` before still is, just fewer of them --
- * nothing moved back onto a task stack. */
-/* M2 Task 4 hardware hotfix, round 4. main.c's boot heap trace measured
- * plants_init() costing 7956 B of heap that is never returned -- an amount
- * that nothing in this function's source obviously accounts for (three
- * mutexes are ~264 B; every plants_table_t/plants_blob_t buffer here is
- * file-scope .bss, not heap; and esp_littlefs frees each
- * vfs_littlefs_file_t on fclose()). Rather than guess, this splits the one
+ * nothing moved back onto a task stack.
+ *
+ * Follow-up (M5b Task 2 fix round 1): s_boot_blob_scratch and
+ * persist_table()'s blob moved OFF `.bss` onto transient heap allocations
+ * (malloc'd at the top of the operation, freed on every exit path -- see
+ * their own doc comments). This also does not reopen the bug this section
+ * describes: neither buffer became a stack local, before or after -- only
+ * their storage class BETWEEN calls changed, from a permanent `.bss`
+ * reservation (paid for the entire boot, whether or not a load/save was in
+ * progress) to a transient heap one (paid only while actually reading/
+ * writing plants.bin), which is what freed up their combined 4932 B
+ * (2 x sizeof(plants_blob_t), measured) from every other task's own `.bss`
+ * budget for the rest of the boot (see task-2-report.md's fix-round
+ * section). */
+/* M2 Task 4 hardware hotfix, round 4 (historical measurement -- at the time,
+ * EVERY plants_table_t/plants_blob_t buffer here was file-scope .bss, not
+ * heap; M5b Task 2 fix round 1 later moved s_boot_blob_scratch and
+ * persist_table()'s blob to a transient heap allocation each, freed before
+ * plants_init()/persist_table() returns -- see their own doc comments and
+ * the "Follow-up" note just above -- so that specific "not heap" claim no
+ * longer holds for those two, though it still explains this hotfix's own
+ * 7956 B measurement, taken before that change existed). main.c's boot heap
+ * trace measured plants_init() costing 7956 B of heap that is never
+ * returned -- an amount that nothing in this function's source obviously
+ * accounted for at the time (three mutexes are ~264 B; every
+ * plants_table_t/plants_blob_t buffer was still file-scope .bss then; and
+ * esp_littlefs frees each vfs_littlefs_file_t on fclose()). Rather than
+ * guess, this splits the one
  * measurement into three, so a single boot log says whether the cost is in
  * the mutexes, the plants.bin load (stdio/VFS/LittleFS first-open
  * allocations, which newlib and esp_littlefs both retain in per-process
@@ -876,6 +983,14 @@ esp_err_t plants_init(const char *storage_base)
         ESP_LOGW(TAG, "plants: no storage_base (littlefs unavailable) -- plant table is "
                       "RAM-only and will not survive a reboot");
     }
+
+    /* Both possible readers of the boot blob scratch buffer (load_file(),
+     * and load_legacy_nvs_blob() via plants_adopt_legacy_nvs()) have now
+     * either run and finished with it, or were never reached -- release it
+     * here so its heap cost is transient (this boot's load sequence only),
+     * never held for the rest of the boot. Safe even if it was never
+     * allocated (frees NULL). */
+    boot_blob_scratch_release();
 
     plants_log_heap("after table load");
 

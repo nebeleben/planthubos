@@ -70,6 +70,22 @@ typedef struct __attribute__((packed)) {
     plant_entry_blob_v2_t p[PLANTS_MAX];
 } plants_blob_v2_t;
 
+/* This layout describes bytes ALREADY ON USERS' DISKS (real plants.bin
+ * files written by every M2..M5a build) -- plants_blob_migrate_v2() below
+ * only reads it correctly if it matches exactly what those builds wrote.
+ * Unlike plant_entry_blob_t/plants_blob_t (format 3, still evolving),
+ * nothing may ever change plant_entry_blob_v2_t's field list, order, or
+ * types again. These sizes pin that promise: an unrelated change elsewhere
+ * (PLANT_NAME_LEN, device_id_t's width, ...) that would silently shift this
+ * struct's layout fails the build here instead of silently misreading a
+ * real hub's format-2 blob. 122 B/1954 B are the measured, externally
+ * confirmed sizes of the format-2 layout the M2/M5a "no migration branch"
+ * comment (see plants_blob.h's top comment) used to describe in prose. */
+_Static_assert(sizeof(plant_entry_blob_v2_t) == 122,
+               "format-2 entry layout is frozen: it describes bytes already on users' disks");
+_Static_assert(sizeof(plants_blob_v2_t) == 1954,
+               "format-2 blob layout is frozen: it describes bytes already on users' disks");
+
 /* Migrates one format-2 blob into a live table: copies id/name/mac and the
  * eight existing capability bindings verbatim. The new switch.state
  * capability (id 8) and both action slots come back unbound/ACTION_NONE --
