@@ -214,7 +214,9 @@ bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
      * hand-written wrapper is matching anything" -- bumped once per actual
      * invocation, regardless of whether the run below ends up emitting
      * anything, since "matching" is decided by the match-index lookup that
-     * already happened before this function was ever called. */
+     * already happened before this function was ever called. Callable only
+     * for a wrapper WITHOUT a connect plan (M5a gate fix round 2,
+     * ble_collector.c's decode_adv_item()) -- see wrapper_exec.h. */
     wrapper_store_note_match(id);
     return run_payload(id, mac, payload, payload_len);
 }
@@ -222,7 +224,21 @@ bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
 bool wrapper_exec_run_buffer(uint16_t id, const uint8_t mac[6],
                              const uint8_t *buf, uint8_t len)
 {
-    /* No wrapper_store_note_match() here -- see wrapper_exec.h. */
+    /* M5a gate fix round 2 (spec §2, amended 2026-08-17): THIS is now the
+     * sole invocation point for a connect wrapper's decode --
+     * decode_adv_item() no longer runs wrapper_exec_run() against an
+     * advertisement for a wrapper that declares a connect plan (the
+     * hardware gate found that exact bug: an empty advert payload handed to
+     * a decode addressing named GATT buffers, PSVM_ERR_REF on every single
+     * advertisement). So match_count for a connect wrapper now counts
+     * completed GATT reads -- the same "did my wrapper actually run" signal
+     * wrapper_exec_run()'s own bump gives an advert wrapper (Task 7,
+     * RULING-3), not "how many advertisements this device sent", which
+     * would say nothing about whether a read ever happened. Bumped
+     * regardless of whether the decode goes on to emit anything, same
+     * convention as wrapper_exec_run() above. See wrapper_exec.h for the
+     * full history of this decision. */
+    wrapper_store_note_match(id);
     return run_payload(id, mac, buf, len);
 }
 

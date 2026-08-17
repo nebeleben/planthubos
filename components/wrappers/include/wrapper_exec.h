@@ -66,7 +66,18 @@
  * Returns true iff at least one capability value was actually written (i.e.
  * data_core_submit_cap() returned true for at least one EMIT) -- callers
  * use this to decide whether to wake the rules engine, same convention as
- * ble_collector.c's decode_bthome_item()/wrote_any. */
+ * ble_collector.c's decode_bthome_item()/wrote_any.
+ *
+ * M5a gate fix round 2 (2026-08-17): callable ONLY for a wrapper that does
+ * NOT carry a connect plan. ble_collector.c's decode_adv_item() checks
+ * wrapper_exec_plan_get() before ever reaching a call to this function, and
+ * routes a plan-bearing wrapper to wrapper_exec_run_buffer() below instead,
+ * once a GATT read actually lands -- never here, never against an
+ * advertisement. The hardware gate is why: a connect wrapper's decode
+ * addresses named GATT buffers that an advertisement's payload slice
+ * doesn't contain, so running it here failed every single time at
+ * PSVM_ERR_REF ("bad reference"), reading past the end of an empty/
+ * unrelated slice. */
 bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
                       const uint8_t *payload, uint8_t payload_len);
 
@@ -78,14 +89,19 @@ bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
  * PSVM_PLAN_MAX_READS fixed 16-byte slots rather than one advert, which is
  * exactly what let M5a add a GATT path without touching the VM.
  *
- * The one deliberate difference from wrapper_exec_run() above: this does NOT
- * bump the wrapper's match counter. The advertisement that triggered this
- * connection already ran wrapper_exec_run() for the same wrapper moments
- * earlier and counted itself; counting again here would report two matches
- * per advertisement for a connect wrapper and make that counter -- whose
- * whole purpose is "is my hand-written wrapper matching anything at all"
- * (Task 7, RULING-3) -- mean something different depending on whether the
- * wrapper happens to carry a connect block.
+ * M5a gate fix round 2 (2026-08-17): THIS is the sole invocation point for a
+ * connect wrapper's decode, and so bumps the wrapper's match counter itself
+ * (wrapper_store_note_match()), exactly as wrapper_exec_run() above does for
+ * an advert wrapper. Earlier, decode_adv_item() also ran wrapper_exec_run()
+ * against the triggering advertisement for a connect wrapper, so THIS
+ * function deliberately did not bump the counter a second time -- but that
+ * advertisement-side run is exactly what the hardware gate found broken
+ * (see wrapper_exec_run()'s own updated comment) and it is gone.
+ * match_count for a connect wrapper therefore now counts completed GATT
+ * reads, not advertisement sightings -- the same "is my hand-written
+ * wrapper matching anything at all" signal (Task 7, RULING-3) an advert
+ * wrapper's counter gives, just keyed to the event that is actually
+ * meaningful for this class of wrapper.
  *
  * Returns true iff at least one capability value was actually written, same
  * convention as wrapper_exec_run(). */

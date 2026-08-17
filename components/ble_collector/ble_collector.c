@@ -365,8 +365,12 @@ static void decode_adv_item(const adv_item_t *item)
      * here and the advert falls through to unknown-capture exactly as
      * before this fix -- no installed wrapper's behaviour changes. Same
      * plan-presence query devices_json.c already uses to tell the two kinds
-     * apart on the API surface. */
-    bool matched_via_uuid16_list = false;
+     * apart on the API surface. Nothing below needs to remember that a
+     * match came from THIS loop rather than the lookup above: every
+     * candidate accepted here already carries a connect plan, and the
+     * dispatch below (has_plan) now routes every plan-bearing wrapper away
+     * from the advert-decode path regardless of how its id was found -- see
+     * that dispatch's own comment. */
     if (wrapper_id < 0 && fields.uuids16 && fields.num_uuids16 > 0) {
         uint8_t n = fields.num_uuids16;
         if (n > ADV_UUID16_SCAN_MAX) n = ADV_UUID16_SCAN_MAX;
@@ -376,7 +380,6 @@ static void decode_adv_item(const adv_item_t *item)
             if (cand >= 0 &&
                 wrapper_exec_plan_get((uint16_t)cand, NULL, 0, NULL) > 0) {
                 wrapper_id = cand;
-                matched_via_uuid16_list = true;
                 break;
             }
         }
@@ -391,6 +394,84 @@ static void decode_adv_item(const adv_item_t *item)
          * not do_wrapper_reindex(), is the natural place). */
         unknown_capture_forget(item->mac);
 
+        /* M5a gate fix round 2 (coordinator 2026-08-17): a matched wrapper
+         * either declares a `connect` block or it doesn't, and that decides
+         * EVERYTHING below -- resolved first, once, before any payload is
+         * built. A connect wrapper's decode addresses named GATT buffers
+         * that plainly don't exist on an advertisement: there has been no
+         * GATT read yet. The advertisement's only job for such a wrapper is
+         * "this device is awake, and may be due a read" -- the decode
+         * belongs solely to gatt_engine_service(), against the concatenated
+         * read buffer, once a read actually lands. Calling
+         * wrapper_exec_run() here for a connect wrapper is exactly the bug
+         * the hardware gate found: an empty/unrelated advert payload handed
+         * to a decode whose first accessor addresses offset 0 of a buffer
+         * that isn't there, so PSVM_ERR_REF ("bad reference") on every
+         * single advertisement.
+         *
+         * Cheap: an arena cache hit in the common case, the same cost this
+         * function's own UUID16-list fallback above already pays whenever
+         * the service-data lookup misses. */
+        uint32_t interval_s = 0;
+        bool has_plan = wrapper_exec_plan_get((uint16_t)wrapper_id, NULL, 0, &interval_s) > 0;
+
+        if (has_plan) {
+            /* No wrapper_exec_run() on this path, on purpose (see above):
+             * no payload slice is built, no decode runs, no last_error is
+             * written from here, and match_count does not move -- for a
+             * connect wrapper match_count now counts completed GATT reads
+             * (wrapper_exec_run_buffer(), see wrapper_exec.h), the same "did
+             * my wrapper actually run" signal wrapper_exec_run()'s bump
+             * gives an advert wrapper. So a device that is matched but not
+             * yet due a read does LITERALLY nothing else on this
+             * advertisement below.
+             *
+             * midx = ridx, not a re-resolve: nothing on THIS path can have
+             * just registered the device (no EMIT ran, unlike the
+             * advert-wrapper branch below), so ridx from above is still
+             * accurate. Recording the memo here only ever short-circuits
+             * the match-index lookup above for this device's NEXT
+             * advertisement -- no observable effect (no decode, no error,
+             * no counter, no registry write, no rules wake). */
+            int midx = ridx;
+            if (midx >= 0 && midx < REGISTRY_MAX_DEVICES) {
+                s_wrapper_memo[midx] = (uint16_t)wrapper_id;
+            }
+
+            /* M3 Task 6 (spec sections 3 and 5): if this wrapper carries a
+             * `connect` block, this advertisement is also the trigger for a
+             * GATT read. Connecting on an advertisement is the ONLY
+             * reliable moment for a battery sensor -- it is connectable for
+             * a short window after it advertises and asleep the rest of the
+             * time, so a periodic scheduler would spend most of its
+             * attempts talking to a sleeping device.
+             *
+             * Nothing here connects: gatt_engine_request() sets a request
+             * and returns, and the engine performs it on the NimBLE host
+             * task. Same request/perform split as do_wrapper_reindex()
+             * above, for the same reason -- a connection attempt is
+             * hundreds of milliseconds of radio work and this task must
+             * keep draining the advertisement ring. The plan/interval was
+             * already resolved above, so gatt_sched_due() is the only gate
+             * left. item->uptime_s is the uptime captured when gap_event
+             * received this advertisement -- the same clock
+             * gatt_sched_ok()/gatt_sched_fail() are stamped with. */
+            if (midx >= 0 && !gatt_engine_busy() &&
+                gatt_sched_due(midx, interval_s, item->uptime_s)) {
+                /* item->mac/item->addr_type: the RAW GAP address, which is
+                 * what gatt_engine_request() documents it wants (a
+                 * connection is addressed on-air, not in display order) --
+                 * NOT mac_disp. */
+                gatt_engine_request((uint16_t)wrapper_id, midx, item->mac, item->addr_type);
+            }
+            return;
+        }
+
+        /* Below here: an advert wrapper (no connect plan), M3/M4's exact
+         * semantics, untouched by M5a -- has_plan above is false for every
+         * such wrapper (it never had a plan to find), so this is the same
+         * code that always ran for it. */
+
         /* Payload slice convention mirrors decode_bthome_item()'s own
          * "hand the wrapper the bytes AFTER the matched AD structure's own
          * header, not the raw multi-structure advert" -- service-data past
@@ -401,21 +482,7 @@ static void decode_adv_item(const adv_item_t *item)
         uint8_t payload_len = 0;
         switch (wrapper_index_kind_of(&s_wrapper_index, (uint16_t)wrapper_id)) {
         case WMATCH_SERVICE:
-            /* M5a gate fix: a match resolved via the UUID16-list fallback
-             * above has, by construction, no service-data payload -- the
-             * whole reason the fallback exists is that this class of device
-             * broadcasts no service data at all. Keep payload/payload_len at
-             * their NULL/0 initialisers above rather than falling into the
-             * svc_data_uuid16 branch below, which would otherwise hand the
-             * wrapper whatever UNRELATED service-data AD structure this same
-             * advert happens to also carry (its UUID never matched
-             * svc_uuid -- that lookup already failed -- so it has nothing to
-             * do with the wrapper that matched). An honest empty slice, not
-             * a coincidentally-nonempty one: the wrapper's real payload for
-             * a connect match comes from GATT reads, decoded separately by
-             * gatt_engine_service() via wrapper_exec_run_buffer(). */
-            if (!matched_via_uuid16_list &&
-                fields.svc_data_uuid16 && fields.svc_data_uuid16_len >= 2) {
+            if (fields.svc_data_uuid16 && fields.svc_data_uuid16_len >= 2) {
                 payload = fields.svc_data_uuid16 + 2;
                 payload_len = (uint8_t)(fields.svc_data_uuid16_len - 2);
             }
@@ -448,37 +515,6 @@ static void decode_adv_item(const adv_item_t *item)
             s_wrapper_memo[midx] = (uint16_t)wrapper_id;
         }
         if (wrote) rules_notify_value_update();
-
-        /* M5a Task 6 (spec sections 3 and 5): if this wrapper carries a
-         * `connect` block, this advertisement is also the trigger for a GATT
-         * read. Connecting on an advertisement is the ONLY reliable moment
-         * for a battery sensor -- it is connectable for a short window after
-         * it advertises and asleep the rest of the time, so a periodic
-         * scheduler would spend most of its attempts talking to a sleeping
-         * device.
-         *
-         * Nothing here connects: gatt_engine_request() sets a request and
-         * returns, and the engine performs it on the NimBLE host task. Same
-         * request/perform split as do_wrapper_reindex() above, for the same
-         * reason -- a connection attempt is hundreds of milliseconds of radio
-         * work and this task must keep draining the advertisement ring.
-         *
-         * Order of the tests is deliberate: the two free ones (a registry
-         * index, and the engine being idle) come before the plan lookup,
-         * which resolves the wrapper's bytecode through the arena and
-         * validates it. gatt_sched_due() needs the plan's declared interval,
-         * so it must come last. item->uptime_s is the uptime captured when
-         * gap_event received this advertisement -- the same clock
-         * gatt_sched_ok()/gatt_sched_fail() are stamped with. */
-        uint32_t interval_s = 0;
-        if (midx >= 0 && !gatt_engine_busy() &&
-            wrapper_exec_plan_get((uint16_t)wrapper_id, NULL, 0, &interval_s) > 0 &&
-            gatt_sched_due(midx, interval_s, item->uptime_s)) {
-            /* item->mac/item->addr_type: the RAW GAP address, which is what
-             * gatt_engine_request() documents it wants (a connection is
-             * addressed on-air, not in display order) -- NOT mac_disp. */
-            gatt_engine_request((uint16_t)wrapper_id, midx, item->mac, item->addr_type);
-        }
         return;   /* a matched wrapper's key can never also be MiFlora's (distinct match kinds/keys) -- nothing further to dispatch */
     }
 
