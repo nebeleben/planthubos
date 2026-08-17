@@ -4,6 +4,11 @@
 #include "capability.h"
 #include "plants.h"
 #include "bthome.h"
+#include "data_core.h"
+#include "ble_collector.h"
+#include "wrapper_exec.h"
+#include "gatt_sched.h"
+#include "gatt_engine.h"
 #include <stdio.h>
 
 /* now_uptime_s - last_seen_s, both esp_timer uptime seconds off the same
@@ -104,6 +109,55 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
 
     cJSON *plant_ids = cJSON_AddArrayToObject(o, "plant_ids");
     if (plants) add_plant_ids(plant_ids, plants, &e->id);
+
+    /* M5a Task 7 (spec §5, amended): the GATT read-status surface --
+     * {interval_s, last_read_s, fails, last_error}, added ONLY for devices
+     * whose CURRENTLY matched wrapper declares a connect plan. An
+     * advertisement-only device (no wrapper matched yet, or its wrapper
+     * carries no plan) gets no "gatt" key at all, so nothing about the
+     * existing Devices tab shifts for a hub with no GATT sensors
+     * (task-7-brief.md's own words).
+     *
+     * The event-log write spec §5 originally required per attempt was cut
+     * in Task 6 (the decoder task's 3072B stack couldn't hold the LittleFS
+     * write chain plus the SSE hook's ~2KB frame without breaching the
+     * milestone's 9216B free-heap floor -- see task-6-report.md's Critical
+     * 2). That makes these four fields the ENTIRE visibility surface for a
+     * connect block that never succeeds -- there is nowhere else for it to
+     * show up -- which is why last_error rides along here rather than only
+     * being logged. */
+    int dev_idx = data_core_find_index(&e->id);
+    int wrapper_id = (dev_idx >= 0) ? ble_collector_wrapper_for_device(dev_idx) : -1;
+    uint32_t interval_s = 0;
+    if (wrapper_id >= 0 &&
+        wrapper_exec_plan_get((uint16_t)wrapper_id, NULL, 0, &interval_s) > 0) {
+        cJSON *g = cJSON_AddObjectToObject(o, "gatt");
+        cJSON_AddNumberToObject(g, "interval_s", interval_s);
+
+        /* gatt_sched_last_ok() returns 0 for "never succeeded" (its own doc
+         * comment) as well as for the theoretical, practically unreachable
+         * case of a success landing at uptime==0 -- a GATT read needs a
+         * scan hit, a connect and a discovery first, none of which can
+         * complete inside second 0 of boot. Rendered as JSON null (age_s
+         * unset), not a fabricated "0s ago" -- devices.jsx's existing
+         * fmtAge(null) => "never" path (already used for last_seen_s)
+         * picks this up with no new UI logic needed for the null case
+         * itself. */
+        uint32_t last_ok_s = gatt_sched_last_ok(dev_idx);
+        if (last_ok_s == 0) {
+            cJSON_AddNullToObject(g, "last_read_s");
+        } else {
+            cJSON_AddNumberToObject(g, "last_read_s", age_s(now_uptime_s, last_ok_s));
+        }
+
+        cJSON_AddNumberToObject(g, "fails", gatt_sched_fail_count(dev_idx));
+        /* "" when there is none (gatt_engine_last_error()'s own contract,
+         * never NULL) -- including the "read ok, decode emitted nothing"
+         * string Task 6 sets without clearing last_ok_s, so a device in
+         * that third state shows a stale last_read_s AND a last_error that
+         * explains why, rather than looking contradictory. */
+        cJSON_AddStringToObject(g, "last_error", gatt_engine_last_error(dev_idx));
+    }
 
     return o;
 }

@@ -543,6 +543,14 @@ void ble_collector_wrapper_reindex_request(void)
     s_wrapper_reindex_pending = true;
 }
 
+/* See ble_collector.h's doc comment. */
+int ble_collector_wrapper_for_device(int dev_idx)
+{
+    if (dev_idx < 0 || dev_idx >= REGISTRY_MAX_DEVICES) return -1;
+    uint16_t id = s_wrapper_memo[dev_idx];
+    return (id == WRAPPER_MEMO_NONE) ? -1 : (int)id;
+}
+
 static int gap_event(struct ble_gap_event *event, void *arg)
 {
     switch (event->type) {

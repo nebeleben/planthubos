@@ -145,6 +145,34 @@ function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed }) {
         <div class="node-card-row">
           <span class="hint">{d.via ? `via ${d.via}` : 'direct'} · {d.rssi} dBm</span>
         </div>
+        {/* M5a Task 7 (spec §5, amended): GATT read status. Present only for
+            devices whose matched wrapper declares a connect plan
+            (devices_json.c) -- an advertisement-only device gets no
+            `d.gatt` at all, so this row simply doesn't render for it. Since
+            the amended spec cut M5a's per-attempt event-log write, this row
+            is the ENTIRE visibility surface for a connect block that never
+            succeeds -- so a device with no successful read yet (last_read_s
+            null, fmtAge renders "never") gets `error` styling rather than
+            the muted `hint` a healthy device gets, matching the weight
+            wrappers.jsx's WrapperCard already gives its own last_error (M4
+            review: a security/reliability-relevant line must not be styled
+            as transient status). A radio-ok-but-decode-emitted-nothing
+            attempt (gatt_sched_attempt(), Task 6) leaves last_read_s at
+            whatever the last REAL success was -- not necessarily null, so
+            not necessarily red -- while last_error still explains the
+            current problem; the two are rendered as separate spans so a
+            stale-but-real timestamp next to an explanatory error reads as
+            "worked before, here's what's wrong now" rather than
+            contradicting itself. */}
+        {d.gatt && (
+          <div class="node-card-row">
+            <span class={`hint${d.gatt.last_read_s == null ? ' error' : ''}`}>
+              GATT · every {d.gatt.interval_s}s · last read {fmtAge(d.gatt.last_read_s)}
+              {d.gatt.fails > 0 ? ` · ${d.gatt.fails} failed attempt${d.gatt.fails === 1 ? '' : 's'}` : ''}
+            </span>
+            {d.gatt.last_error && <span class="error">{d.gatt.last_error}</span>}
+          </div>
+        )}
         {isBle && (
           <div class="node-card-row">
             <BindKeyField deviceId={d.id} hasKey={d.has_key} />

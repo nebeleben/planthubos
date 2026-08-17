@@ -37,3 +37,21 @@ uint32_t ble_collector_adv_dropped(void);
  * "fix" a direct call instead -- keep new callers (Task 7's dry-run
  * endpoint included) routed through this request flag. */
 void ble_collector_wrapper_reindex_request(void);
+
+/* M5a Task 7 (spec §5/§6): read-only access to the device -> wrapper memo
+ * (s_wrapper_memo, ble_collector.c) for GET /api/v1/devices' "gatt" object
+ * (devices_json.c) -- it needs to know which wrapper a device last matched
+ * so it can ask wrapper_exec_plan_get() whether that wrapper carries a
+ * connect plan at all. Returns the wrapper id, or -1 when dev_idx is out of
+ * range or has no memo recorded (WRAPPER_MEMO_NONE -- "no memo", NOT
+ * "confirmed no wrapper matches"; see s_wrapper_memo's own doc comment).
+ *
+ * Safe to call from the httpd task despite s_wrapper_memo being documented
+ * elsewhere on this page as decoder-task-exclusive: that comment is about
+ * WRITES (reindex must not race a in-flight decode touching the same
+ * table). This is a single read of one naturally-aligned uint16_t element,
+ * the same scalar-read-needs-no-lock reasoning ble_collector_adv_dropped()
+ * and gatt_sched.h's module comment already rely on for cross-task reads on
+ * this target -- worst case is a caller seeing last advertisement's match
+ * instead of the one just decoded, never a torn value. */
+int ble_collector_wrapper_for_device(int dev_idx);
