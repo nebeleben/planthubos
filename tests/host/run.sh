@@ -178,3 +178,7 @@ $CC -Wall -Wextra -Werror -I../../components/bthome/include \
 # top comment for the boot loop it exists to prevent.
 $CC -Wall -Wextra -Werror test_uri_handler_budget.c -o test_uri_handler_budget
 ./test_uri_handler_budget
+
+$CC -Wall -Wextra -Werror -I../../components/actions/include \
+    test_action.c ../../components/actions/action.c -o test_action
+./test_action
