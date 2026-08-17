@@ -1,6 +1,14 @@
 #include "gatt_fsm.h"
 #include <string.h>
 
+/* GE_WRITE_OK's handle is not compared against the currently-awaited
+ * write's uuid16 the way GE_READ_OK's is (see gatt_ev_t.handle's doc
+ * comment in the header): a same-state duplicate WRITE_OK could still
+ * misadvance write_idx, but nothing decoded depends on a write's response
+ * the way a read's slot does, so a wrong-value decode is not at stake
+ * here the way it is for reads. Left as a known asymmetry rather than
+ * silently "fixed" without it being asked for. */
+
 static uint16_t rd_u16(const uint8_t *p)
 {
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
@@ -168,6 +176,13 @@ gatt_act_t gatt_fsm_step(gatt_fsm_t *f, const gatt_ev_t *ev)
     case GS_READING:
         switch (ev->kind) {
         case GE_READ_OK: {
+            /* A completion for anything other than the read currently
+             * awaited -- a same-state duplicate of the read just
+             * finished, or a uuid16 this plan never named at all -- is
+             * ignored rather than mistaken for the next read's
+             * completion (see gatt_ev_t.handle's doc comment). */
+            if (ev->handle != f->read_uuid[f->read_idx]) return act(GA_NONE);
+
             uint8_t *slot = &f->buf[(size_t)f->read_idx * GATT_FSM_SLOT];
             memset(slot, 0, GATT_FSM_SLOT);
             uint8_t n = ev->len;
@@ -176,9 +191,20 @@ gatt_act_t gatt_fsm_step(gatt_fsm_t *f, const gatt_ev_t *ev)
             f->read_idx++;
             if (f->read_idx < f->read_count)
                 return act_read(f, f->read_idx);
-            f->state = GS_DONE;
+            f->state = GS_DECODING;
             return act_decode(f);
         }
+        case GE_DISCONNECTED:  return fail_report(f);
+        case GE_TIMEOUT:
+        case GE_ERROR:         return fail_disconnect(f);
+        default:                return act(GA_NONE);
+        }
+
+    case GS_DECODING:
+        switch (ev->kind) {
+        case GE_DECODED:
+            f->state = GS_DONE;
+            return act(GA_DISCONNECT);
         case GE_DISCONNECTED:  return fail_report(f);
         case GE_TIMEOUT:
         case GE_ERROR:         return fail_disconnect(f);

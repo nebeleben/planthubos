@@ -45,10 +45,16 @@ static void test_cold_path(void)
     assert(f.state == GS_READING);
     gatt_act_t decode = gatt_fsm_step(&f, &EV_READ(0x2A6F, "\x33\x44", 2));
     assert(decode.kind == GA_DECODE);
-    assert(f.state == GS_DONE);
+    assert(f.state == GS_DECODING);
     assert(decode.len == 32);          /* 2 reads x GATT_FSM_SLOT */
     assert(memcmp(decode.data, "\x11\x22", 2) == 0);
     assert(memcmp(decode.data + 16, "\x33\x44", 2) == 0);
+
+    /* Only the caller's GE_DECODED -- fed back once it has actually run
+     * the decode -- tears the connection down; that is what makes the
+     * success path emit GA_DISCONNECT the same as every failure path. */
+    assert(gatt_fsm_step(&f, &EV(GE_DECODED)).kind == GA_DISCONNECT);
+    assert(f.state == GS_DONE);
 
     assert(gatt_fsm_step(&f, &EV(GE_DISCONNECTED)).kind == GA_NONE);
     assert(f.state == GS_DONE);
@@ -94,12 +100,17 @@ static void test_short_read_zero_pads(void)
 
     gatt_act_t decode = gatt_fsm_step(&f, &EV_READ(0x2A6E, "\x11\x22", 2));
     assert(decode.kind == GA_DECODE);
+    assert(f.state == GS_DECODING);
     assert(decode.len == 16);
     assert(decode.data[0] == 0x11 && decode.data[1] == 0x22);
     for (int i = 2; i < 16; i++) assert(decode.data[i] == 0x00);
 }
 
-/* The deadline fires in every state and always ends in a disconnect. */
+/* The deadline fires in every state and always ends in a disconnect.
+ * Drives PLAN_2READ_1WRITE's cold path (2 reads, 1 write) up to but not
+ * including `target`, so GS_DECODING is reachable too -- both reads must
+ * actually land for that one, via the same EV_READ() uuids test_cold_path
+ * uses. */
 static void drive_to_state(gatt_fsm_t *f, gatt_state_t target)
 {
     gatt_fsm_init(f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE, false);
@@ -110,16 +121,23 @@ static void drive_to_state(gatt_fsm_t *f, gatt_state_t target)
     gatt_fsm_step(f, &EV(GE_DISCOVERED));
     if (target == GS_WRITING) return;
     gatt_fsm_step(f, &EV(GE_WRITE_OK));
-    /* target == GS_READING */
+    if (target == GS_READING) return;
+    gatt_fsm_step(f, &EV_READ(0x2A6E, "\x11\x22", 2));
+    gatt_fsm_step(f, &EV_READ(0x2A6F, "\x33\x44", 2));
+    /* target == GS_DECODING */
 }
+
+static const gatt_state_t OPEN_CONNECTION_STATES[] = {
+    GS_CONNECTING, GS_DISCOVERING, GS_WRITING, GS_READING, GS_DECODING,
+};
+#define N_OPEN_CONNECTION_STATES (sizeof OPEN_CONNECTION_STATES / sizeof OPEN_CONNECTION_STATES[0])
 
 static void test_timeout_in_each_state(void)
 {
-    const gatt_state_t states[] = { GS_CONNECTING, GS_DISCOVERING, GS_WRITING, GS_READING };
-    for (size_t i = 0; i < sizeof states / sizeof states[0]; i++) {
+    for (size_t i = 0; i < N_OPEN_CONNECTION_STATES; i++) {
         gatt_fsm_t f;
-        drive_to_state(&f, states[i]);
-        assert(f.state == states[i]);
+        drive_to_state(&f, OPEN_CONNECTION_STATES[i]);
+        assert(f.state == OPEN_CONNECTION_STATES[i]);
         gatt_act_t a = gatt_fsm_step(&f, &EV(GE_TIMEOUT));
         assert(a.kind == GA_DISCONNECT);
         assert(f.state == GS_FAILED);
@@ -133,11 +151,125 @@ static void test_timeout_in_each_state(void)
  * the link may still be open and the caller must actively close it). */
 static void test_unsolicited_disconnect(void)
 {
-    const gatt_state_t states[] = { GS_CONNECTING, GS_DISCOVERING, GS_WRITING, GS_READING };
-    for (size_t i = 0; i < sizeof states / sizeof states[0]; i++) {
+    for (size_t i = 0; i < N_OPEN_CONNECTION_STATES; i++) {
         gatt_fsm_t f;
-        drive_to_state(&f, states[i]);
-        assert(f.state == states[i]);
+        drive_to_state(&f, OPEN_CONNECTION_STATES[i]);
+        assert(f.state == OPEN_CONNECTION_STATES[i]);
+        gatt_act_t a = gatt_fsm_step(&f, &EV(GE_DISCONNECTED));
+        assert(a.kind == GA_REPORT_FAIL);
+        assert(f.state == GS_FAILED);
+    }
+}
+
+/* A READ_OK's handle must match the read currently expected -- a
+ * duplicate completion for the read that already finished, or one
+ * carrying a uuid16 this plan never named at all, is ignored rather than
+ * accepted for whichever read the FSM happens to be waiting on next. This
+ * is the check the coordinator's fix-round-1 ruling required move into
+ * this module itself (see gatt_ev_t.handle's doc comment): Task 6's
+ * adapter may filter using its own NimBLE callback context too, but it
+ * must not be the only layer that does, because it is the one layer a
+ * host test cannot reach. */
+static void test_read_ok_wrong_uuid_ignored(void)
+{
+    gatt_fsm_t f;
+    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE, false);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    gatt_fsm_step(&f, &EV(GE_DISCOVERED));
+    gatt_fsm_step(&f, &EV(GE_WRITE_OK));
+    assert(f.state == GS_READING);
+    assert(f.read_idx == 0);
+
+    /* Correct completion for read 0 (0x2A6E). */
+    assert(gatt_fsm_step(&f, &EV_READ(0x2A6E, "\x11\x22", 2)).kind == GA_READ);
+    assert(f.read_idx == 1);
+
+    /* Duplicate completion for the read that already finished (0x2A6E
+     * again, not the 0x2A6F now expected) -- ignored, does not advance. */
+    gatt_act_t dup = gatt_fsm_step(&f, &EV_READ(0x2A6E, "\xFF\xFF", 2));
+    assert(dup.kind == GA_NONE);
+    assert(f.state == GS_READING);
+    assert(f.read_idx == 1);
+
+    /* A completion carrying a uuid16 that isn't in this plan at all is
+     * equally ignored. */
+    gatt_act_t bogus = gatt_fsm_step(&f, &EV_READ(0x9999, "\xEE\xEE", 2));
+    assert(bogus.kind == GA_NONE);
+    assert(f.state == GS_READING);
+    assert(f.read_idx == 1);
+
+    /* The correct next read still completes normally afterwards -- the
+     * mismatches above corrupted neither read_idx nor the buffer. */
+    gatt_act_t decode = gatt_fsm_step(&f, &EV_READ(0x2A6F, "\x33\x44", 2));
+    assert(decode.kind == GA_DECODE);
+    assert(f.state == GS_DECODING);
+    assert(memcmp(decode.data, "\x11\x22", 2) == 0);       /* untouched by the 0x2A6E duplicate */
+    assert(memcmp(decode.data + 16, "\x33\x44", 2) == 0);
+}
+
+/* Every path from GS_CONNECTING to a terminal state must close the link
+ * exactly once (coordinator's fix-round-1 ruling): the success path used
+ * to be the exception, with zero GA_DISCONNECT actions and teardown left
+ * to the caller's own discretion. It no longer is. The one deliberate
+ * exception is an unsolicited disconnect, where the link is already down
+ * and GA_REPORT_FAIL substitutes for GA_DISCONNECT (kept as-is per the
+ * same ruling) -- so that path is checked separately, for exactly one
+ * GA_REPORT_FAIL and zero GA_DISCONNECT, rather than folded into the
+ * same assertion. */
+static void run_and_count(gatt_fsm_t *f, const gatt_ev_t *seq, size_t n,
+                           int *disconnects, int *reports)
+{
+    *disconnects = 0;
+    *reports = 0;
+    for (size_t i = 0; i < n; i++) {
+        gatt_act_t a = gatt_fsm_step(f, &seq[i]);
+        if (a.kind == GA_DISCONNECT)  (*disconnects)++;
+        if (a.kind == GA_REPORT_FAIL) (*reports)++;
+    }
+}
+
+static void test_exactly_one_disconnect_per_terminal_path(void)
+{
+    gatt_fsm_t f;
+    int nd, nr;
+
+    /* success */
+    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE, false);
+    gatt_ev_t success_seq[] = {
+        EV(GE_START), EV(GE_CONNECTED), EV(GE_DISCOVERED), EV(GE_WRITE_OK),
+        EV_READ(0x2A6E, "\x11\x22", 2), EV_READ(0x2A6F, "\x33\x44", 2), EV(GE_DECODED),
+    };
+    run_and_count(&f, success_seq, sizeof success_seq / sizeof success_seq[0], &nd, &nr);
+    assert(nd == 1 && nr == 0);
+    assert(f.state == GS_DONE);
+
+    /* read error (warm cache -- straight to GS_READING) */
+    gatt_fsm_init(&f, PLAN_1READ, sizeof PLAN_1READ, true);
+    gatt_ev_t read_err_seq[] = { EV(GE_START), EV(GE_CONNECTED), EV(GE_ERROR) };
+    run_and_count(&f, read_err_seq, sizeof read_err_seq / sizeof read_err_seq[0], &nd, &nr);
+    assert(nd == 1 && nr == 0);
+    assert(f.state == GS_FAILED);
+
+    /* write error */
+    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE, false);
+    gatt_ev_t write_err_seq[] = { EV(GE_START), EV(GE_CONNECTED), EV(GE_DISCOVERED), EV(GE_ERROR) };
+    run_and_count(&f, write_err_seq, sizeof write_err_seq / sizeof write_err_seq[0], &nd, &nr);
+    assert(nd == 1 && nr == 0);
+    assert(f.state == GS_FAILED);
+
+    /* timeout in each open-connection state, GS_DECODING included */
+    for (size_t i = 0; i < N_OPEN_CONNECTION_STATES; i++) {
+        drive_to_state(&f, OPEN_CONNECTION_STATES[i]);
+        gatt_act_t a = gatt_fsm_step(&f, &EV(GE_TIMEOUT));
+        assert(a.kind == GA_DISCONNECT);
+        assert(f.state == GS_FAILED);
+    }
+
+    /* unsolicited disconnect: the deliberate exception -- zero
+     * GA_DISCONNECT, one GA_REPORT_FAIL, in every open-connection state. */
+    for (size_t i = 0; i < N_OPEN_CONNECTION_STATES; i++) {
+        drive_to_state(&f, OPEN_CONNECTION_STATES[i]);
         gatt_act_t a = gatt_fsm_step(&f, &EV(GE_DISCONNECTED));
         assert(a.kind == GA_REPORT_FAIL);
         assert(f.state == GS_FAILED);
@@ -174,6 +306,8 @@ static void test_unexpected_event_ignored(void)
      * one of a kind that used to matter. */
     gatt_fsm_step(&f, &EV_READ(0x2A6E, "\x11\x22", 2));
     gatt_fsm_step(&f, &EV_READ(0x2A6F, "\x33\x44", 2));
+    assert(f.state == GS_DECODING);
+    gatt_fsm_step(&f, &EV(GE_DECODED));
     assert(f.state == GS_DONE);
     assert(gatt_fsm_step(&f, &EV(GE_READ_OK)).kind == GA_NONE);
     assert(f.state == GS_DONE);
@@ -188,6 +322,8 @@ int main(void)
     test_timeout_in_each_state();
     test_unsolicited_disconnect();
     test_unexpected_event_ignored();
+    test_read_ok_wrong_uuid_ignored();
+    test_exactly_one_disconnect_per_terminal_path();
 
     printf("test_gatt_fsm: OK\n");
     return 0;
