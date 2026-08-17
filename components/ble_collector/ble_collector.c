@@ -92,16 +92,33 @@ static wrapper_index_t s_wrapper_index;
 #define WRAPPER_MEMO_NONE 0xFFFFu
 static uint16_t s_wrapper_memo[REGISTRY_MAX_DEVICES];
 
-/* Task 5 review FINDING 4/2: s_wrapper_index, the arena and s_wrapper_memo
- * are all decoder-task-exclusive (see their own comments above) -- their
- * invalidation ("wrapper install/delete", see do_wrapper_reindex() below)
- * must therefore also run ONLY on the decoder task, never directly from
- * whatever task calls ble_collector_wrapper_reindex_request() (Task 7's
- * future httpd handler). Rather than add a mutex around the hot per-advert
- * path (wrapper_arena_get()'s returned pointer is invalidated by ANY
- * eviction from ANY caller -- see wrapper_arena.h's FINDING 2 doc comment --
- * so a lock there would need to span the ENTIRE decode, not just the index
- * touch), this is a plain "reindex requested" flag: any task may set it
+/* Task 5 review FINDING 4/2, corrected by M5a Task 7 fix round 1: s_wrapper_index
+ * and the arena are decoder-task-exclusive, full stop -- no reader anywhere
+ * else. s_wrapper_memo is NOT exclusive any more: it is single-writer,
+ * multi-reader, the same shape Task 6's review made gatt_sched.h,
+ * gatt_engine.h and battery_poll.c say about their own cross-task tables
+ * (that review even named this file's future httpd reader in advance). The
+ * SOLE WRITER stays adv_decoder_task -- the only task that ever stores a
+ * match (decode_adv_item(), below) or reindexes (do_wrapper_reindex(),
+ * which bulk-memset()s the whole table on install/edit/delete). The
+ * READERS are adv_decoder_task itself (the per-advertisement memo check)
+ * and, since M5a Task 7, the httpd task via ble_collector_wrapper_for_device()
+ * (ble_collector.h) -- GET /api/v1/devices' "gatt" object calls it to learn
+ * which wrapper's plan to consult for a device. A stale claim of exclusivity
+ * here is exactly the defect class Task 6's review caught in the
+ * neighbouring headers; left uncorrected it would tell the next reader a
+ * check is unnecessary, which is worse than no comment at all.
+ *
+ * That second reader is not why invalidation still runs ONLY on the
+ * decoder task, though -- it is because a caller that reindexed directly,
+ * from a different task, while the decoder task might be mid-psvm_run()
+ * over a pointer into the SAME arena these three tables gate together,
+ * would be memory corruption, not merely a stale read (wrapper_arena.h's
+ * FINDING 2 doc comment: wrapper_arena_get()'s returned pointer is
+ * invalidated by ANY eviction from ANY caller, so a lock here would need to
+ * span the ENTIRE decode, not just the index touch -- rejected for the same
+ * reason a mutex around the hot per-advert path always is). So this is a
+ * plain "reindex requested" flag instead: any task may set it
  * (ble_collector_wrapper_reindex_request()), and only adv_decoder_task ever
  * clears it and performs the actual reindex, at a safe point between
  * decodes (never mid-decode_adv_item()). A `volatile bool` is sufficient --
@@ -479,6 +496,9 @@ no_match:
 static void do_wrapper_reindex(void)
 {
     wrapper_store_load_all(&s_wrapper_index);
+    /* Bulk memset(), not a per-element atomic store -- see
+     * ble_collector_wrapper_for_device()'s doc comment (ble_collector.h)
+     * for what that means for a concurrent httpd read. */
     memset(s_wrapper_memo, WRAPPER_MEMO_NONE, sizeof(s_wrapper_memo));
     wrapper_arena_evict_all();
 }
