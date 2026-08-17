@@ -10,8 +10,9 @@
  * correctness rests on the hardware gate rather than on a suite.
  *
  * Nothing in this file makes a decision gatt_fsm.c could have made. The
- * places where it genuinely had to (the ATT-handle/uuid16 mapping, which
- * discovered characteristics are worth caching, what counts as a
+ * places where it genuinely had to (the ATT-handle/uuid16 mapping -- now a
+ * server-side read-by-UUID resolution on every connection, not a cache,
+ * per the M5a hardware gate's own finding -- what counts as a
  * "successful" attempt, and which task each half of the work runs on) are
  * called out in gatt_engine.c's own comments at the exact point they are
  * made, because those are precisely what the hardware gate has to probe.
@@ -98,8 +99,8 @@ void gatt_engine_set_scan_resume(gatt_scan_resume_fn_t fn);
  * connection owner (battery_poll.c's MiFlora battery poll) currently holds
  * the radio. CONFIG_BT_NIMBLE_MAX_CONNECTIONS is 1 and the two schedulers
  * are independent, so without this a poll and a GATT read can collide: the
- * loser's ble_gap_connect() fails and this engine would record a failure, a
- * backoff and a handle-cache drop against a device that did nothing wrong.
+ * loser's ble_gap_connect() fails and this engine would record a failure
+ * and a backoff against a device that did nothing wrong.
  * Checked immediately before connecting. Optional: a NULL hook means "no
  * other owner exists", which is the correct answer on a build where battery
  * polling is not running. */

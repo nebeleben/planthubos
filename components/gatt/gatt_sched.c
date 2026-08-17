@@ -1,25 +1,6 @@
 #include "gatt_sched.h"
 #include <string.h>
 
-/* {u16 uuid16, u16 handle}, 4 B, no padding (both members are 2-B aligned).
- * GATT_SCHED_MAX_DEVICES x GATT_CACHE_MAX_ENTRIES x 4 B = 16 x 4 x 4 =
- * 256 B, exactly this task's brief. */
-typedef struct {
-    uint16_t uuid16;
-    uint16_t handle;
-} gatt_cache_entry_t;
-
-typedef struct {
-    gatt_cache_entry_t e[GATT_CACHE_MAX_ENTRIES];
-} gatt_cache_dev_t;
-
-_Static_assert(sizeof(gatt_cache_entry_t) == 4,
-               "gatt_cache_entry_t layout drifted from this file's documented 4 B");
-_Static_assert(sizeof(gatt_cache_dev_t) == GATT_CACHE_MAX_ENTRIES * 4,
-               "gatt_cache_dev_t layout drifted from this file's documented 16 B/device");
-
-static gatt_cache_dev_t s_cache[GATT_SCHED_MAX_DEVICES];
-
 /* {u32 last_ok_s, u32 last_attempt_s, u8 fails, u8 has_ok, u8 attempted,
  * u8 pad} = 12 B/device, 192 B total for GATT_SCHED_MAX_DEVICES (16) --
  * fix round 1's controller ruling on this task: the original brief's
@@ -65,49 +46,6 @@ static gatt_sched_entry_t s_sched[GATT_SCHED_MAX_DEVICES];
 static bool dev_idx_valid(int dev_idx)
 {
     return dev_idx >= 0 && dev_idx < GATT_SCHED_MAX_DEVICES;
-}
-
-/* -------------------------- handle cache -------------------------- */
-
-uint16_t gatt_cache_lookup(int dev_idx, uint16_t uuid16)
-{
-    if (!dev_idx_valid(dev_idx)) return 0;
-
-    const gatt_cache_dev_t *d = &s_cache[dev_idx];
-    for (int i = 0; i < GATT_CACHE_MAX_ENTRIES; i++) {
-        if (d->e[i].handle != 0 && d->e[i].uuid16 == uuid16) return d->e[i].handle;
-    }
-    return 0;
-}
-
-void gatt_cache_store(int dev_idx, uint16_t uuid16, uint16_t handle)
-{
-    if (!dev_idx_valid(dev_idx)) return;
-
-    gatt_cache_dev_t *d = &s_cache[dev_idx];
-    int free_slot = -1;
-    for (int i = 0; i < GATT_CACHE_MAX_ENTRIES; i++) {
-        if (d->e[i].handle != 0 && d->e[i].uuid16 == uuid16) {
-            d->e[i].handle = handle;   /* re-discovery: overwrite in place */
-            return;
-        }
-        if (d->e[i].handle == 0 && free_slot < 0) free_slot = i;
-    }
-    if (free_slot < 0) return;   /* full of 4 DISTINCT uuid16s: refuse, don't evict */
-
-    d->e[free_slot].uuid16 = uuid16;
-    d->e[free_slot].handle = handle;
-}
-
-void gatt_cache_drop(int dev_idx)
-{
-    if (!dev_idx_valid(dev_idx)) return;
-    memset(&s_cache[dev_idx], 0, sizeof(s_cache[dev_idx]));
-}
-
-void gatt_cache_reset(void)
-{
-    memset(s_cache, 0, sizeof(s_cache));
 }
 
 /* --------------------------- read scheduler --------------------------- */

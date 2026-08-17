@@ -6,11 +6,10 @@ static uint16_t rd_u16(const uint8_t *p)
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
 }
 
-void gatt_fsm_init(gatt_fsm_t *f, const uint8_t *plan, size_t plan_len, bool have_handles)
+void gatt_fsm_init(gatt_fsm_t *f, const uint8_t *plan, size_t plan_len)
 {
     memset(f, 0, sizeof(*f));
     f->state = GS_IDLE;
-    f->have_handles = have_handles;
 
     size_t off = 0;
     uint8_t read_count = 0, write_count = 0;
@@ -81,13 +80,14 @@ static gatt_act_t act_decode(const gatt_fsm_t *f)
     return a;
 }
 
-/* Common continuation once the connection has usable handles, whether
- * because discovery just finished (GS_DISCOVERING + GE_DISCOVERED) or
- * because the caller's warm cache made discovery unnecessary in the first
- * place (GS_CONNECTING + GE_CONNECTED with have_handles). A plan always
- * has at least one read (psvm.h's on-blob layout caps read_count at
- * 1..GATT_FSM_MAX_READS), so falling through to GS_READING here always has
- * a first read to issue. */
+/* Common continuation once the connection is up (GS_CONNECTING +
+ * GE_CONNECTED): every read and write is addressed by uuid16, resolved by
+ * the caller's server-side UUID lookup on THIS connection, so there is no
+ * discovery step to wait for first (removed during the M5a hardware gate
+ * -- see gatt_fsm_init()'s doc comment). A plan always has at least one
+ * read (psvm.h's on-blob layout caps read_count at 1..GATT_FSM_MAX_READS),
+ * so falling through to GS_READING here always has a first read to
+ * issue. */
 static gatt_act_t begin_writes_or_reads(gatt_fsm_t *f)
 {
     if (f->write_count > 0) {
@@ -129,25 +129,11 @@ gatt_act_t gatt_fsm_step(gatt_fsm_t *f, const gatt_ev_t *ev)
 
     case GS_CONNECTING:
         switch (ev->kind) {
-        case GE_CONNECTED:
-            if (!f->have_handles) {
-                f->state = GS_DISCOVERING;
-                return act(GA_DISCOVER);
-            }
-            return begin_writes_or_reads(f);
+        case GE_CONNECTED:     return begin_writes_or_reads(f);
         case GE_DISCONNECTED: return fail_report(f);
         case GE_TIMEOUT:
         case GE_ERROR:        return fail_disconnect(f);
         default:               return act(GA_NONE);
-        }
-
-    case GS_DISCOVERING:
-        switch (ev->kind) {
-        case GE_DISCOVERED:    return begin_writes_or_reads(f);
-        case GE_DISCONNECTED:  return fail_report(f);
-        case GE_TIMEOUT:
-        case GE_ERROR:         return fail_disconnect(f);
-        default:                return act(GA_NONE);
         }
 
     case GS_WRITING:

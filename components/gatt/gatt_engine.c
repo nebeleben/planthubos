@@ -53,7 +53,7 @@ static const char *TAG = "gatt_engine";
  * CONFIG_BT_NIMBLE_MAX_CONN_REATTEMPT = 3: when a master link breaks with
  * BLE_ERR_CONN_ESTABLISHMENT, ble_hs_hci_evt.c aborts our GATT procedure,
  * DELETES the connection (so no BLE_GAP_EVENT_DISCONNECT ever reaches us --
- * we see only the aborted read/discovery callback) and re-issues
+ * we see only the aborted read/write callback) and re-issues
  * ble_gap_connect() with a FRESH copy of this duration, not the remainder.
  * That reattempt is issued after our attempt has already ended, so it holds
  * the radio -- and blocks ble_gap_disc() with BLE_HS_EBUSY -- for up to
@@ -154,7 +154,6 @@ typedef enum { TP_IDLE, TP_ATTEMPT, TP_TEARDOWN, TP_SCAN_RETRY } timer_phase_t;
 static gatt_fsm_t s_fsm;
 static bool     s_active;          /* attempt open: set by on_start_req(), cleared by attempt_finish().
                                     * Also READ from adv_decoder_task via gatt_engine_busy(). */
-static bool     s_link_up;         /* did this attempt ever get a connection up (scopes the cache drop) */
 /* Did THIS attempt's ble_gap_connect() actually start a connect procedure?
  * ble_gap_conn_cancel() is process-global -- it cancels whatever connect is
  * outstanding, with no notion of whose it is -- so cancelling without this
@@ -170,7 +169,18 @@ static uint8_t  s_mac_disp[6];     /* display/human order -- what wrapper_exec_r
 static uint8_t  s_addr_type;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_pending_uuid16;  /* the characteristic the in-flight read/write is for */
-static uint16_t s_pending_handle;  /* ...and the ATT handle it resolved to */
+/* True once the in-flight read-by-UUID (a GA_READ, or the handle-resolve
+ * half of a GA_WRITE -- see write_resolve_cb()) has delivered its one
+ * matching attribute. NimBLE's read-by-UUID procedure fires its callback
+ * once per matching attribute (status 0) and once more with status
+ * BLE_HS_EDONE when the procedure completes; this guards against a second
+ * status-0 hit (a peer exposing more than one instance of the same
+ * characteristic, which M5a does not support) being mistaken for the
+ * genuine completion, exactly like battery_poll.c's own s_got_result. Reset
+ * at the start of every GA_READ/GA_WRITE in perform(). */
+static bool     s_uuid_op_got_result;
+static const uint8_t *s_pending_write_data;  /* GA_WRITE's payload -- points into s_plan */
+static uint8_t  s_pending_write_len;
 static uint8_t  s_plan[GATT_PLAN_MAX];
 static uint16_t s_plan_len;
 
@@ -348,27 +358,22 @@ static void attempt_finish(void)
         ESP_LOGD(TAG, "gatt read ok: dev=%d", s_dev_idx);
     } else if (radio_ok) {
         /* Third outcome (fix round 1): the radio behaved perfectly and the
-         * wrapper emitted nothing. Not a failure -- no backoff, no cache
-         * drop, the handles are demonstrably fine -- but NOT a successful
-         * read either: gatt_sched_attempt() moves the interval gate without
-         * advancing the last-successful-read timestamp section 8 renders,
-         * so a connect block contributing nothing stays visibly silent
-         * instead of looking freshly read. See gatt_sched.h. */
+         * wrapper emitted nothing. Not a failure -- no backoff, the reads
+         * are demonstrably fine -- but NOT a successful read either:
+         * gatt_sched_attempt() moves the interval gate without advancing
+         * the last-successful-read timestamp section 8 renders, so a
+         * connect block contributing nothing stays visibly silent instead
+         * of looking freshly read. See gatt_sched.h. */
         gatt_sched_attempt(s_dev_idx, now);
         ESP_LOGI(TAG, "gatt read ok but the wrapper emitted nothing: dev=%d wrapper=%u",
                  s_dev_idx, (unsigned)s_wrapper_id);
     } else {
         gatt_sched_fail(s_dev_idx, now);
-        /* Design spec section 4's rationale for dropping the cache is a
-         * STALE HANDLE after a device firmware update -- which is only
-         * possible if a handle was actually exercised. Scoped to failures
-         * that happened after the link came up (fix round 1): a connect
-         * that never landed, a refused connect and a deadline in
-         * GS_CONNECTING all leave the cached handles untouched and
-         * unimpeached, and dropping them there would cost a full
-         * rediscovery on the next attempt for exactly the flaky, sleepy
-         * devices that can least afford the extra radio time. */
-        if (s_link_up) gatt_cache_drop(s_dev_idx);
+        /* No handle cache to drop any more (removed during the M5a
+         * hardware gate: every read and write resolves its uuid16 fresh,
+         * server-side, on every connection -- see GA_READ/GA_WRITE in
+         * perform()), so a failed attempt here needs no extra cleanup
+         * beyond the backoff bookkeeping gatt_sched_fail() already did. */
         ESP_LOGW(TAG, "gatt read failed: dev=%d %s (consecutive failures: %u)",
                  s_dev_idx, s_err ? s_err : "unknown error",
                  (unsigned)gatt_sched_fail_count(s_dev_idx));
@@ -398,7 +403,6 @@ static void attempt_finish(void)
      * here without re-reading that amendment -- the stack cannot hold it. */
 
     s_active = false;
-    s_link_up = false;
     s_own_conn_proc = false;
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
@@ -408,10 +412,10 @@ static void attempt_finish(void)
 /* Defined below; declared here because perform() hands each of them to
  * NimBLE as the callback for the operation it issues. */
 static int gatt_gap_event(struct ble_gap_event *event, void *arg);
-static int disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
-                       const struct ble_gatt_chr *chr, void *arg);
 static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                    struct ble_gatt_attr *attr, void *arg);
+static int write_resolve_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                            struct ble_gatt_attr *attr, void *arg);
 static int write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                     struct ble_gatt_attr *attr, void *arg);
 
@@ -460,44 +464,54 @@ static bool perform(const gatt_act_t *a)
         return false;
     }
 
-    case GA_DISCOVER: {
-        int rc = ble_gattc_disc_all_chrs(s_conn_handle, 1, 0xffff, disc_chr_cb, NULL);
+    case GA_READ: {
+        /* The state machine names characteristics by uuid16 and never sees
+         * a handle (spec section 4, as amended during the M5a hardware
+         * gate: handles are never written into a wrapper NOR cached across
+         * a connection, and gatt_fsm.c holds itself to the same
+         * discipline). Resolved here by NimBLE's read-by-UUID procedure --
+         * an ATT Read By Type Request over the connection's whole handle
+         * range -- which the SERVER resolves against its own attribute
+         * table, so a shifted attribute table on the peer cannot mislead
+         * it the way a stale cached handle could (this is exactly the
+         * defect the hardware gate found: a cached handle that drifted
+         * onto a DIFFERENT attribute -- a declaration, always readable --
+         * "succeeded" with the wrong bytes). battery_poll.c's read_cb
+         * establishes this same shape for MiFlora's single battery
+         * characteristic; read_cb below follows it. */
+        s_pending_uuid16 = a->uuid16;
+        s_uuid_op_got_result = false;
+        int rc = ble_gattc_read_by_uuid(s_conn_handle, 1, 0xffff,
+                                        BLE_UUID16_DECLARE(a->uuid16), read_cb, NULL);
         if (rc != 0) {
-            ESP_LOGI(TAG, "disc_all_chrs refused: %d", rc);
-            s_err = "discovery refused";
+            ESP_LOGI(TAG, "read of 0x%04X refused: %d", (unsigned)a->uuid16, rc);
+            s_err = "read refused";
             return true;
         }
         return false;
     }
 
-    case GA_WRITE:
-    case GA_READ: {
-        /* The state machine names characteristics by uuid16 and never sees
-         * a handle (spec section 4: handles are never written into a
-         * wrapper, and gatt_fsm.c holds itself to the same discipline).
-         * Resolving uuid16 to an ATT handle is this layer's job. */
-        uint16_t h = gatt_cache_lookup(s_dev_idx, a->uuid16);
-        if (h == 0) {
-            ESP_LOGI(TAG, "no handle cached for uuid16 0x%04X", (unsigned)a->uuid16);
-            s_err = "characteristic not found";
-            return true;
-        }
+    case GA_WRITE: {
+        /* No handle to write to yet -- and, per GA_READ's comment above,
+         * nothing here may cache one across a connection. So a write is
+         * two ATT operations, not one: resolve the uuid16 to THIS
+         * connection's handle via the same server-side read-by-UUID
+         * procedure GA_READ uses (write_resolve_cb, below), then write to
+         * the handle it hands back -- which is safe to use immediately
+         * (the same connection, the same round trip's answer) even though
+         * it is never stored anywhere afterward. The plan's optional
+         * pre-read write is the ONLY write M5a performs; actuators and any
+         * other state-changing write are M5b (spec section 9). a->data
+         * points into s_plan, which outlives this call. */
         s_pending_uuid16 = a->uuid16;
-        s_pending_handle = h;
-        int rc;
-        if (a->kind == GA_READ) {
-            rc = ble_gattc_read(s_conn_handle, h, read_cb, NULL);
-        } else {
-            /* The plan's optional pre-read write is the ONLY write M5a
-             * performs; actuators and any other state-changing write are
-             * M5b (spec section 9). a->data points into s_plan, which
-             * outlives this call. */
-            rc = ble_gattc_write_flat(s_conn_handle, h, a->data, a->len, write_cb, NULL);
-        }
+        s_pending_write_data = a->data;
+        s_pending_write_len = a->len;
+        s_uuid_op_got_result = false;
+        int rc = ble_gattc_read_by_uuid(s_conn_handle, 1, 0xffff,
+                                        BLE_UUID16_DECLARE(a->uuid16), write_resolve_cb, NULL);
         if (rc != 0) {
-            ESP_LOGI(TAG, "%s of 0x%04X refused: %d",
-                     a->kind == GA_READ ? "read" : "write", (unsigned)a->uuid16, rc);
-            s_err = (a->kind == GA_READ) ? "read refused" : "write refused";
+            ESP_LOGI(TAG, "write resolve of 0x%04X refused: %d", (unsigned)a->uuid16, rc);
+            s_err = "write refused";
             return true;
         }
         return false;
@@ -670,7 +684,6 @@ static int gatt_gap_event(struct ble_gap_event *event, void *arg)
                 return 0;
             }
             s_conn_handle = event->connect.conn_handle;
-            s_link_up = true;
             engine_feed(GE_CONNECTED, 0, NULL, 0);
         } else {
             /* A connect failure, NimBLE's own connect timeout and the
@@ -744,43 +757,6 @@ static int gatt_gap_event(struct ble_gap_event *event, void *arg)
     }
 }
 
-/* True once every uuid16 this plan needs -- reads AND the optional
- * pre-read writes -- has a cached handle for this device. Used twice: to
- * decide whether discovery can be skipped entirely (spec section 4's warm
- * cache), and to decide whether a discovery that just finished actually
- * found what the plan asked for. */
-static bool have_all_handles(void)
-{
-    for (uint8_t i = 0; i < s_fsm.read_count; i++) {
-        if (gatt_cache_lookup(s_dev_idx, s_fsm.read_uuid[i]) == 0) return false;
-    }
-    for (uint8_t i = 0; i < s_fsm.write_count; i++) {
-        if (gatt_cache_lookup(s_dev_idx, s_fsm.write[i].uuid16) == 0) return false;
-    }
-    return true;
-}
-
-/* Does this plan actually name uuid16? Discovery enumerates EVERY
- * characteristic the peer exposes, while the cache holds exactly four
- * entries (gatt_sched.h's GATT_CACHE_MAX_ENTRIES, sized to the 4-read plan
- * cap) and refuses a fifth distinct uuid16 rather than evicting. Storing
- * indiscriminately would therefore fill the cache with the first four
- * characteristics the device happens to declare -- typically Device Name and
- * Appearance from the mandatory GAP service -- and then refuse the ones the
- * plan actually needs. Filtering here is not an optimisation; without it a
- * warm cache would be permanently wrong on any device with more than four
- * characteristics. */
-static bool plan_wants(uint16_t uuid16)
-{
-    for (uint8_t i = 0; i < s_fsm.read_count; i++) {
-        if (s_fsm.read_uuid[i] == uuid16) return true;
-    }
-    for (uint8_t i = 0; i < s_fsm.write_count; i++) {
-        if (s_fsm.write[i].uuid16 == uuid16) return true;
-    }
-    return false;
-}
-
 /* A completion from a connection this engine is no longer driving: an
  * attempt that was forced closed while one of its GATT procedures was still
  * outstanding can still deliver callbacks (typically an aborted-procedure
@@ -794,84 +770,104 @@ static bool stale_completion(uint16_t conn_handle)
     return !s_active || conn_handle != s_conn_handle;
 }
 
-static int disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
-                       const struct ble_gatt_chr *chr, void *arg)
-{
-    (void)arg;
-    if (stale_completion(conn_handle)) return 0;
-
-    if (error->status == 0 && chr != NULL) {
-        /* Only 16-bit UUIDs are addressable from a plan at all (spec
-         * section 2: characteristics are named by 16-bit UUID, which is what
-         * a datasheet gives and what survives a device firmware update), so
-         * a 128-bit characteristic is simply not this plan's business. */
-        if (chr->uuid.u.type == BLE_UUID_TYPE_16) {
-            uint16_t u = ble_uuid_u16(&chr->uuid.u);
-            if (plan_wants(u)) gatt_cache_store(s_dev_idx, u, chr->val_handle);
-        }
-        return 0;
-    }
-
-    if (error->status == BLE_HS_EDONE) {
-        if (!have_all_handles()) {
-            /* The device does not expose something the plan names. Failing
-             * here rather than letting GA_READ discover it means the
-             * attempt reports one honest reason instead of a per-read one,
-             * and the cache drop that attempt_finish() performs clears the
-             * partial results this discovery just stored. */
-            ESP_LOGI(TAG, "discovery finished without every characteristic the plan needs");
-            s_err = "characteristic not found";
-            engine_feed(GE_ERROR, 0, NULL, 0);
-            return 0;
-        }
-        engine_feed(GE_DISCOVERED, 0, NULL, 0);
-        return 0;
-    }
-
-    ESP_LOGI(TAG, "discovery failed: %d", error->status);
-    s_err = "discovery failed";
-    engine_feed(GE_ERROR, 0, NULL, 0);
-    return 0;
-}
-
+/* ble_gattc_read_by_uuid callback for GA_READ -- runs on the NimBLE host
+ * task. Fires once per matching attribute (status 0) and once more with
+ * status BLE_HS_EDONE when the procedure completes (attr NULL); M5a does
+ * not support a peer exposing more than one instance of a plan's
+ * characteristic, so s_uuid_op_got_result guards against a second status-0
+ * hit being treated as a second completion (mirrors battery_poll.c's
+ * read_cb, which establishes this exact shape for MiFlora's single battery
+ * characteristic). No ATT-handle identity check is needed here the way the
+ * old cached-handle path needed one: the SERVER matched this attribute
+ * against the uuid16 we asked for, so what comes back is authoritatively
+ * for that characteristic on THIS connection, whatever handle it happens to
+ * live at -- which is exactly what makes this immune to the handle drift
+ * that broke the cache (see gatt_fsm.h's gatt_fsm_init() doc comment). What
+ * goes into the event is s_pending_uuid16 (the uuid16 we asked for), for
+ * gatt_fsm.c's own identity check against the read it is currently
+ * awaiting (gatt_ev_t.handle's doc comment) -- never an ATT handle, because
+ * the state machine has never seen one. */
 static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                    struct ble_gatt_attr *attr, void *arg)
 {
     (void)arg;
     if (stale_completion(conn_handle)) return 0;
 
-    if (error->status != 0 || attr == NULL) {
-        ESP_LOGI(TAG, "read of 0x%04X failed: %d", (unsigned)s_pending_uuid16, error->status);
-        s_err = "read failed";
-        engine_feed(GE_ERROR, 0, NULL, 0);
-        return 0;
-    }
-    /* Adapter-layer identity filter, in the ATT handle space NimBLE speaks.
-     * gatt_fsm.c performs the authoritative check one layer up, in the
-     * uuid16 space the plan speaks (gatt_ev_t.handle's doc comment explains
-     * why that check has to live where a host test can reach it), and this
-     * is the defence-in-depth half it explicitly permits. The translation
-     * between the two spaces happens right here: what goes into the event
-     * is the uuid16 we asked for, never the ATT handle NimBLE answered
-     * with, because the state machine has never seen a handle in its life. */
-    if (attr->handle != s_pending_handle) {
-        ESP_LOGD(TAG, "read completion for handle %u, expected %u -- ignored",
-                 (unsigned)attr->handle, (unsigned)s_pending_handle);
+    if (error->status == 0 && attr != NULL) {
+        if (s_uuid_op_got_result) return 0;   /* a second instance of this uuid16 on the peer: first wins */
+        s_uuid_op_got_result = true;
+
+        uint8_t buf[GATT_FSM_SLOT];
+        uint16_t n = OS_MBUF_PKTLEN(attr->om);
+        if (n > GATT_FSM_SLOT) n = GATT_FSM_SLOT;   /* a longer value is truncated to its slot */
+        if (n > 0 && os_mbuf_copydata(attr->om, 0, n, buf) != 0) {
+            s_err = "read failed";
+            engine_feed(GE_ERROR, 0, NULL, 0);
+            return 0;
+        }
+        /* A short read zero-pads its slot inside gatt_fsm_step(), which
+         * re-zeroes the slot before copying -- no previous device's bytes
+         * can survive in a slot this attempt did not fill. */
+        engine_feed(GE_READ_OK, s_pending_uuid16, buf, (uint8_t)n);
         return 0;
     }
 
-    uint8_t buf[GATT_FSM_SLOT];
-    uint16_t n = OS_MBUF_PKTLEN(attr->om);
-    if (n > GATT_FSM_SLOT) n = GATT_FSM_SLOT;   /* a longer value is truncated to its slot */
-    if (n > 0 && os_mbuf_copydata(attr->om, 0, n, buf) != 0) {
-        s_err = "read failed";
-        engine_feed(GE_ERROR, 0, NULL, 0);
+    if (error->status == BLE_HS_EDONE) {
+        if (!s_uuid_op_got_result) {
+            ESP_LOGI(TAG, "read of 0x%04X: characteristic not found", (unsigned)s_pending_uuid16);
+            s_err = "characteristic not found";
+            engine_feed(GE_ERROR, 0, NULL, 0);
+        }
+        /* else: already delivered GE_READ_OK in the status==0 branch above. */
         return 0;
     }
-    /* A short read zero-pads its slot inside gatt_fsm_step(), which
-     * re-zeroes the slot before copying -- no previous device's bytes can
-     * survive in a slot this attempt did not fill. */
-    engine_feed(GE_READ_OK, s_pending_uuid16, buf, (uint8_t)n);
+
+    ESP_LOGI(TAG, "read of 0x%04X failed: %d", (unsigned)s_pending_uuid16, error->status);
+    s_err = "read failed";
+    engine_feed(GE_ERROR, 0, NULL, 0);
+    return 0;
+}
+
+/* ble_gattc_read_by_uuid callback for GA_WRITE's handle-resolve half (see
+ * perform()'s GA_WRITE case) -- the same procedure and the same
+ * once-per-attribute/once-EDONE shape as read_cb above, but the resolved
+ * attribute's handle is not this attempt's answer: it is what the actual
+ * write (issued from here, via write_cb below) is addressed to. Nothing
+ * about the resolved handle is stored anywhere past this function. */
+static int write_resolve_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                            struct ble_gatt_attr *attr, void *arg)
+{
+    (void)arg;
+    if (stale_completion(conn_handle)) return 0;
+
+    if (error->status == 0 && attr != NULL) {
+        if (s_uuid_op_got_result) return 0;   /* a second instance of this uuid16 on the peer: first wins */
+        s_uuid_op_got_result = true;
+
+        int rc = ble_gattc_write_flat(conn_handle, attr->handle, s_pending_write_data,
+                                      s_pending_write_len, write_cb, NULL);
+        if (rc != 0) {
+            ESP_LOGI(TAG, "write of 0x%04X refused: %d", (unsigned)s_pending_uuid16, rc);
+            s_err = "write refused";
+            engine_feed(GE_ERROR, 0, NULL, 0);
+        }
+        return 0;
+    }
+
+    if (error->status == BLE_HS_EDONE) {
+        if (!s_uuid_op_got_result) {
+            ESP_LOGI(TAG, "write of 0x%04X: characteristic not found", (unsigned)s_pending_uuid16);
+            s_err = "characteristic not found";
+            engine_feed(GE_ERROR, 0, NULL, 0);
+        }
+        /* else: the actual write is already in flight from the status==0
+         * branch above, and write_cb owns the event from here. */
+        return 0;
+    }
+
+    ESP_LOGI(TAG, "write resolve of 0x%04X failed: %d", (unsigned)s_pending_uuid16, error->status);
+    s_err = "write refused";
+    engine_feed(GE_ERROR, 0, NULL, 0);
     return 0;
 }
 
@@ -911,31 +907,21 @@ static void on_start_req(struct ble_npl_event *ev)
      * this design can make it. Dropping the request costs nothing: the
      * device will advertise again and gatt_sched_due() will still say yes.
      * Crucially it is dropped WITHOUT recording a failure -- the device did
-     * nothing wrong, and a backoff plus a cache drop here would punish it
-     * for the hub's own scheduling. */
+     * nothing wrong, and a backoff here would punish it for the hub's own
+     * scheduling. */
     if (s_conn_busy && s_conn_busy()) {
         ESP_LOGD(TAG, "another connection owner has the radio; dropping this request");
         return;
     }
 
-    /* Parsed twice, deliberately. gatt_fsm_init() is what knows the plan's
-     * on-blob layout, and have_all_handles() needs the parsed uuid16s to
-     * answer the question gatt_fsm_init() itself takes as an argument. The
-     * alternative -- a second plan parser here, in the one file no host test
-     * can reach -- is exactly the duplication spec section 4 and gatt_fsm.h
-     * spent their effort avoiding. Parsing a 36-byte section twice costs
-     * nothing and happens at most once per declared interval. */
-    gatt_fsm_init(&s_fsm, s_plan, s_plan_len, false);
+    gatt_fsm_init(&s_fsm, s_plan, s_plan_len);
     if (s_fsm.read_count == 0) {
         ESP_LOGW(TAG, "wrapper %u: connect plan declares no reads, nothing to do",
                  (unsigned)s_wrapper_id);
         return;   /* no radio touched, so nothing to unwind and no scan to resume */
     }
-    bool warm = have_all_handles();
-    gatt_fsm_init(&s_fsm, s_plan, s_plan_len, warm);
 
     s_active = true;
-    s_link_up = false;
     s_own_conn_proc = false;
     s_decode_wrote = false;
     s_err = "unknown error";
@@ -953,9 +939,9 @@ static void on_start_req(struct ble_npl_event *ev)
     }
     s_phase = TP_ATTEMPT;
 
-    ESP_LOGD(TAG, "gatt attempt: dev=%d wrapper=%u reads=%u writes=%u warm=%d",
+    ESP_LOGD(TAG, "gatt attempt: dev=%d wrapper=%u reads=%u writes=%u",
              s_dev_idx, (unsigned)s_wrapper_id, (unsigned)s_fsm.read_count,
-             (unsigned)s_fsm.write_count, (int)warm);
+             (unsigned)s_fsm.write_count);
     engine_feed(GE_START, 0, NULL, 0);
 }
 

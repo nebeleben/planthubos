@@ -40,17 +40,19 @@ static const uint8_t PLAN_2READ_2WRITE[] = {
     ((gatt_ev_t){ .kind = GE_READ_OK, .handle = (u), .data = (const uint8_t *)(d), .len = (l) })
 #define EV_WRITE(u) ((gatt_ev_t){ .kind = GE_WRITE_OK, .handle = (u), .data = NULL, .len = 0 })
 
-/* Cold cache: the full sequence, in order. */
-static void test_cold_path(void)
+/* The full sequence, in order. No discovery state (removed during the M5a
+ * hardware gate -- gatt_fsm_init() no longer takes a have_handles argument
+ * at all): GE_CONNECTED goes straight to writing/reading, because every
+ * read and write is now addressed by uuid16 on every connection instead of
+ * through a handle a discovery pass would have produced. */
+static void test_full_sequence(void)
 {
     gatt_fsm_t f;
-    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE, false);
+    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE);
 
     assert(gatt_fsm_step(&f, &EV(GE_START)).kind      == GA_CONNECT);
     assert(f.state == GS_CONNECTING);
-    assert(gatt_fsm_step(&f, &EV(GE_CONNECTED)).kind  == GA_DISCOVER);
-    assert(f.state == GS_DISCOVERING);
-    assert(gatt_fsm_step(&f, &EV(GE_DISCOVERED)).kind == GA_WRITE);
+    assert(gatt_fsm_step(&f, &EV(GE_CONNECTED)).kind  == GA_WRITE);
     assert(f.state == GS_WRITING);
     assert(gatt_fsm_step(&f, &EV_WRITE(0x2A00)).kind == GA_READ);
     assert(f.state == GS_READING);
@@ -73,11 +75,13 @@ static void test_cold_path(void)
     assert(f.state == GS_DONE);
 }
 
-/* Warm cache skips discovery entirely -- the whole point of the cache. */
-static void test_warm_cache_skips_discovery(void)
+/* A plan with no writes goes straight from GS_CONNECTING to GS_READING on
+ * GE_CONNECTED -- the counterpart to test_full_sequence's write-then-read
+ * path, and the shape every read-only connect wrapper actually uses. */
+static void test_connect_goes_straight_to_reading_with_no_writes(void)
 {
     gatt_fsm_t f;
-    gatt_fsm_init(&f, PLAN_1READ, sizeof PLAN_1READ, true);
+    gatt_fsm_init(&f, PLAN_1READ, sizeof PLAN_1READ);
     assert(gatt_fsm_step(&f, &EV(GE_START)).kind     == GA_CONNECT);
     gatt_act_t a = gatt_fsm_step(&f, &EV(GE_CONNECTED));
     assert(a.kind == GA_READ);
@@ -85,12 +89,12 @@ static void test_warm_cache_skips_discovery(void)
     assert(f.state == GS_READING);
 }
 
-/* A read failure must not decode, and must report so the caller can drop
- * the handle cache -- a stale handle is the likeliest cause. */
+/* A read failure must not decode, and must report so the caller can end
+ * the attempt. */
 static void test_read_error_fails_without_decoding(void)
 {
     gatt_fsm_t f;
-    gatt_fsm_init(&f, PLAN_1READ, sizeof PLAN_1READ, true);
+    gatt_fsm_init(&f, PLAN_1READ, sizeof PLAN_1READ);
     gatt_fsm_step(&f, &EV(GE_START));
     gatt_fsm_step(&f, &EV(GE_CONNECTED));
     gatt_act_t a = gatt_fsm_step(&f, &EV(GE_ERROR));
@@ -103,7 +107,7 @@ static void test_read_error_fails_without_decoding(void)
 static void test_short_read_zero_pads(void)
 {
     gatt_fsm_t f;
-    gatt_fsm_init(&f, PLAN_1READ, sizeof PLAN_1READ, true);
+    gatt_fsm_init(&f, PLAN_1READ, sizeof PLAN_1READ);
     /* Poison the slot the way a previous device's read could have left it,
      * to prove the zero-pad actively clears it rather than happening to
      * start clean. */
@@ -120,18 +124,16 @@ static void test_short_read_zero_pads(void)
 }
 
 /* The deadline fires in every state and always ends in a disconnect.
- * Drives PLAN_2READ_1WRITE's cold path (2 reads, 1 write) up to but not
- * including `target`, so GS_DECODING is reachable too -- both reads must
- * actually land for that one, via the same EV_READ() uuids test_cold_path
+ * Drives PLAN_2READ_1WRITE (2 reads, 1 write) up to but not including
+ * `target`, so GS_DECODING is reachable too -- both reads must actually
+ * land for that one, via the same EV_READ() uuids test_full_sequence
  * uses. */
 static void drive_to_state(gatt_fsm_t *f, gatt_state_t target)
 {
-    gatt_fsm_init(f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE, false);
+    gatt_fsm_init(f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE);
     gatt_fsm_step(f, &EV(GE_START));
     if (target == GS_CONNECTING) return;
     gatt_fsm_step(f, &EV(GE_CONNECTED));
-    if (target == GS_DISCOVERING) return;
-    gatt_fsm_step(f, &EV(GE_DISCOVERED));
     if (target == GS_WRITING) return;
     gatt_fsm_step(f, &EV_WRITE(0x2A00));
     if (target == GS_READING) return;
@@ -141,7 +143,7 @@ static void drive_to_state(gatt_fsm_t *f, gatt_state_t target)
 }
 
 static const gatt_state_t OPEN_CONNECTION_STATES[] = {
-    GS_CONNECTING, GS_DISCOVERING, GS_WRITING, GS_READING, GS_DECODING,
+    GS_CONNECTING, GS_WRITING, GS_READING, GS_DECODING,
 };
 #define N_OPEN_CONNECTION_STATES (sizeof OPEN_CONNECTION_STATES / sizeof OPEN_CONNECTION_STATES[0])
 
@@ -179,17 +181,16 @@ static void test_unsolicited_disconnect(void)
  * carrying a uuid16 this plan never named at all, is ignored rather than
  * accepted for whichever read the FSM happens to be waiting on next. This
  * is the check the coordinator's fix-round-1 ruling required move into
- * this module itself (see gatt_ev_t.handle's doc comment): Task 6's
- * adapter may filter using its own NimBLE callback context too, but it
- * must not be the only layer that does, because it is the one layer a
- * host test cannot reach. */
+ * this module itself (see gatt_ev_t.handle's doc comment): the adapter may
+ * filter using its own NimBLE callback context too, but it must not be the
+ * only layer that does, because it is the one layer a host test cannot
+ * reach. */
 static void test_read_ok_wrong_uuid_ignored(void)
 {
     gatt_fsm_t f;
-    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE, false);
+    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE);
     gatt_fsm_step(&f, &EV(GE_START));
     gatt_fsm_step(&f, &EV(GE_CONNECTED));
-    gatt_fsm_step(&f, &EV(GE_DISCOVERED));
     gatt_fsm_step(&f, &EV_WRITE(0x2A00));
     assert(f.state == GS_READING);
     assert(f.read_idx == 0);
@@ -233,10 +234,9 @@ static void test_read_ok_wrong_uuid_ignored(void)
 static void test_write_ok_wrong_uuid_ignored(void)
 {
     gatt_fsm_t f;
-    gatt_fsm_init(&f, PLAN_2READ_2WRITE, sizeof PLAN_2READ_2WRITE, false);
+    gatt_fsm_init(&f, PLAN_2READ_2WRITE, sizeof PLAN_2READ_2WRITE);
     gatt_fsm_step(&f, &EV(GE_START));
-    gatt_fsm_step(&f, &EV(GE_CONNECTED));
-    assert(gatt_fsm_step(&f, &EV(GE_DISCOVERED)).kind == GA_WRITE);
+    assert(gatt_fsm_step(&f, &EV(GE_CONNECTED)).kind == GA_WRITE);
     assert(f.state == GS_WRITING);
     assert(f.write_idx == 0);
 
@@ -301,25 +301,25 @@ static void test_exactly_one_disconnect_per_terminal_path(void)
     int nd, nr;
 
     /* success */
-    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE, false);
+    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE);
     gatt_ev_t success_seq[] = {
-        EV(GE_START), EV(GE_CONNECTED), EV(GE_DISCOVERED), EV_WRITE(0x2A00),
+        EV(GE_START), EV(GE_CONNECTED), EV_WRITE(0x2A00),
         EV_READ(0x2A6E, "\x11\x22", 2), EV_READ(0x2A6F, "\x33\x44", 2), EV(GE_DECODED),
     };
     run_and_count(&f, success_seq, sizeof success_seq / sizeof success_seq[0], &nd, &nr);
     assert(nd == 1 && nr == 0);
     assert(f.state == GS_DONE);
 
-    /* read error (warm cache -- straight to GS_READING) */
-    gatt_fsm_init(&f, PLAN_1READ, sizeof PLAN_1READ, true);
+    /* read error (no writes -- straight to GS_READING) */
+    gatt_fsm_init(&f, PLAN_1READ, sizeof PLAN_1READ);
     gatt_ev_t read_err_seq[] = { EV(GE_START), EV(GE_CONNECTED), EV(GE_ERROR) };
     run_and_count(&f, read_err_seq, sizeof read_err_seq / sizeof read_err_seq[0], &nd, &nr);
     assert(nd == 1 && nr == 0);
     assert(f.state == GS_FAILED);
 
     /* write error */
-    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE, false);
-    gatt_ev_t write_err_seq[] = { EV(GE_START), EV(GE_CONNECTED), EV(GE_DISCOVERED), EV(GE_ERROR) };
+    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE);
+    gatt_ev_t write_err_seq[] = { EV(GE_START), EV(GE_CONNECTED), EV(GE_ERROR) };
     run_and_count(&f, write_err_seq, sizeof write_err_seq / sizeof write_err_seq[0], &nd, &nr);
     assert(nd == 1 && nr == 0);
     assert(f.state == GS_FAILED);
@@ -350,7 +350,7 @@ static void test_unexpected_event_ignored(void)
     /* Nothing has started yet: a stray completion callback before GE_START
      * is inert. */
     gatt_fsm_t f;
-    gatt_fsm_init(&f, PLAN_1READ, sizeof PLAN_1READ, true);
+    gatt_fsm_init(&f, PLAN_1READ, sizeof PLAN_1READ);
     assert(gatt_fsm_step(&f, &EV(GE_READ_OK)).kind == GA_NONE);
     assert(f.state == GS_IDLE);
 
@@ -358,10 +358,9 @@ static void test_unexpected_event_ignored(void)
      * completed (state has moved on to GS_READING) must not be mistaken
      * for a read completion -- it does not match GS_READING's expected
      * event kind, so it is ignored and read_idx is untouched. */
-    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE, false);
+    gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE);
     gatt_fsm_step(&f, &EV(GE_START));
     gatt_fsm_step(&f, &EV(GE_CONNECTED));
-    gatt_fsm_step(&f, &EV(GE_DISCOVERED));
     gatt_fsm_step(&f, &EV_WRITE(0x2A00));
     assert(f.state == GS_READING);
     assert(gatt_fsm_step(&f, &EV(GE_WRITE_OK)).kind == GA_NONE);
@@ -381,8 +380,8 @@ static void test_unexpected_event_ignored(void)
 
 int main(void)
 {
-    test_cold_path();
-    test_warm_cache_skips_discovery();
+    test_full_sequence();
+    test_connect_goes_straight_to_reading_with_no_writes();
     test_read_error_fails_without_decoding();
     test_short_read_zero_pads();
     test_timeout_in_each_state();

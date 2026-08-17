@@ -1,41 +1,52 @@
 #pragma once
-/* gatt_sched.h -- the M5a GATT read path's handle cache and per-device read
- * scheduler (design spec docs/superpowers/specs/2026-08-17-planthub-v2-m5a-
- * gatt-read-design.md sections 4 and 5). Pure bookkeeping either side of
- * an actual connection attempt: which GATT handles a device resolved to
- * last time (section 4), and whether a device is due another read yet,
- * with backoff on consecutive failures (section 5). No ESP-IDF, no
- * NimBLE, no timers, no I/O and no time source of its own -- every
- * function here takes `now_s` as a parameter, exactly like gatt_fsm.h's
- * own discipline, because this module is provable on the host and the
- * radio adapter (a later task) is not.
+/* gatt_sched.h -- the M5a GATT read path's per-device read scheduler
+ * (design spec docs/superpowers/specs/2026-08-17-planthub-v2-m5a-
+ * gatt-read-design.md section 5). Pure bookkeeping either side of an
+ * actual connection attempt: whether a device is due another read yet,
+ * with backoff on consecutive failures. No ESP-IDF, no NimBLE, no timers,
+ * no I/O and no time source of its own -- every function here takes
+ * `now_s` as a parameter, exactly like gatt_fsm.h's own discipline,
+ * because this module is provable on the host and the radio adapter (a
+ * later task) is not.
  *
- * Both tables are static module state, keyed by registry slot index
+ * This used to also own a per-device GATT handle cache (design spec
+ * section 4, original wording), removed during the M5a hardware gate: the
+ * bench found a stale cached handle can point at a DIFFERENT attribute
+ * after the peer's attribute table shifts (a declaration, which is always
+ * readable) and the read then "succeeds" with the wrong bytes decoded as
+ * plausible garbage -- a failure section 5's own invalidation rule cannot
+ * catch, because the read never fails. Every read and write is now
+ * addressed by uuid16 on every connection instead (gatt_engine.c resolves
+ * it via NimBLE's read-by-UUID procedure, server-side, each time), so
+ * there is nothing left for a handle cache to do. See gatt_fsm.h's
+ * gatt_fsm_init() doc comment for the same story from the state machine's
+ * side.
+ *
+ * The table below is static module state, keyed by registry slot index
  * (dev_idx), not by a caller-owned struct -- same shape as
  * unknown_capture.c's s_tbl, chosen for the same reason: there is no
  * benefit to threading a struct pointer through every call when there is
- * exactly one of each table.
+ * exactly one of it.
  *
  * CONCURRENCY (corrected in Task 6 fix round 1; the original wording here
  * claimed a single TASK, which is no longer true and a false invariant is
- * worse than none). Every WRITER is still the NimBLE host task --
- * gatt_sched_ok()/fail()/attempt() and gatt_cache_store()/drop() are called
- * only from gatt_engine.c's callbacks and npl handlers, which all run
- * there. The READERS are spread: gatt_sched_due() is called from
- * adv_decoder_task (ble_collector.c's per-advertisement trigger), and Task
- * 7's httpd handler will call gatt_sched_last_ok()/fail_count() from a
- * third task. That single-writer/multi-reader shape needs no lock on this
- * target: every field read across a task boundary is a naturally-aligned
- * u32 or u8, so a reader can never see a torn value -- only, at worst, one
- * field of an attempt's bookkeeping updated a few instructions before
- * another, costing one mistimed due() decision on a device that is about to
- * be re-evaluated on its next advertisement anyway. Anything added here
- * that needed a multi-word invariant to hold across tasks would need a real
+ * worse than none). The WRITER is the NimBLE host task --
+ * gatt_sched_ok()/fail()/attempt() are called only from gatt_engine.c's
+ * callbacks and npl handlers, which all run there. The READERS are spread:
+ * gatt_sched_due() is called from adv_decoder_task (ble_collector.c's
+ * per-advertisement trigger), and Task 7's httpd handler calls
+ * gatt_sched_last_ok()/fail_count() from a third task. That
+ * single-writer/multi-reader shape needs no lock on this target: every
+ * field read across a task boundary is a naturally-aligned u32 or u8, so a
+ * reader can never see a torn value -- only, at worst, one field of an
+ * attempt's bookkeeping updated a few instructions before another, costing
+ * one mistimed due() decision on a device that is about to be
+ * re-evaluated on its next advertisement anyway. Anything added here that
+ * needed a multi-word invariant to hold across tasks would need a real
  * lock.
  *
- * gatt_cache_reset()/gatt_sched_reset() exist for host test isolation
- * between cases (and for a fresh boot) -- Task 6 does not call them
- * itself. */
+ * gatt_sched_reset() exists for host test isolation between cases (and for
+ * a fresh boot) -- Task 6 does not call it itself. */
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -49,52 +60,12 @@
  * it by hand -- nothing in the build enforces that automatically. */
 #define GATT_SCHED_MAX_DEVICES 16
 
-/* A plan declares at most 4 reads (psvm.h's PSVM_PLAN_MAX_READS / gatt_fsm.h's
- * GATT_FSM_MAX_READS) -- the cache is sized to exactly that, one slot per
- * possible read. A 5th distinct uuid16 for one device is a bug upstream
- * (a plan that never should have compiled), not a cache-eviction case --
- * gatt_cache_store() refuses it rather than silently dropping a handle a
- * plan still needs. */
-#define GATT_CACHE_MAX_ENTRIES 4
-
 /* Consecutive-failure backoff cap: the effective read interval never
  * exceeds this many times the plan's declared interval (design spec
  * section 5). Doubles per consecutive failure (1x, 2x, 4x, 8x, 8x, ...)
  * so a device that goes quiet stops costing radio time, but never drifts
  * to an interval so long a recovered device would look permanently dead. */
 #define GATT_SCHED_BACKOFF_CAP 8
-
-/* ---------------- handle cache (design spec section 4) ----------------
- * Handle value 0 means "not cached". Real ATT handles are assigned
- * starting at 1 (handle 0 is reserved by the GATT spec itself), so 0 is a
- * safe sentinel for "gatt_cache_lookup() found nothing" and for "this
- * cache slot is unused" -- gatt_cache_store() must never be called with
- * handle == 0 for a real characteristic. */
-
-/* Returns the cached ATT handle for (dev_idx, uuid16), or 0 if this
- * device has no cached handle for that characteristic (never discovered,
- * or dropped by gatt_cache_drop()). dev_idx outside
- * [0, GATT_SCHED_MAX_DEVICES) returns 0. */
-uint16_t gatt_cache_lookup(int dev_idx, uint16_t uuid16);
-
-/* Records that uuid16 resolved to handle for dev_idx (from discovery).
- * Overwrites an existing entry for the same uuid16. If dev_idx's cache
- * already holds GATT_CACHE_MAX_ENTRIES DISTINCT uuid16s and this is a
- * new one, the store is refused (no-op) -- see GATT_CACHE_MAX_ENTRIES'
- * doc comment above for why a 5th entry must never silently evict one of
- * the first four. dev_idx outside [0, GATT_SCHED_MAX_DEVICES) is a no-op. */
-void gatt_cache_store(int dev_idx, uint16_t uuid16, uint16_t handle);
-
-/* Clears every cached handle for dev_idx ONLY -- every other device's
- * cache is untouched. Called after a failed read (design spec section 4:
- * a failed read is exactly the event that should invalidate handles,
- * because a firmware update on the device is the thing that moves them).
- * dev_idx outside [0, GATT_SCHED_MAX_DEVICES) is a no-op. */
-void gatt_cache_drop(int dev_idx);
-
-/* Clears every device's cache. Test isolation / cold boot; Task 6 does
- * not call this itself. */
-void gatt_cache_reset(void);
 
 /* ---------------- read scheduler (design spec section 5) ---------------- */
 
@@ -158,9 +129,9 @@ void gatt_sched_fail(int dev_idx, uint32_t now_s);
  *     since the event-log entry was cut from M5a (see the amended section
  *     5), the last-successful-read timestamp and last_error ARE the whole
  *     visibility surface. Advancing it would hide the one thing left.
- *   - gatt_sched_fail() would back the device off and (in Task 6's adapter)
- *     drop its handle cache, punishing a device whose radio behaviour was
- *     faultless for a decision its wrapper's `require` made.
+ *   - gatt_sched_fail() would back the device off, punishing a device whose
+ *     radio behaviour was faultless for a decision its wrapper's `require`
+ *     made.
  *
  * So this advances last_attempt_s (the interval gate must move, or the hub
  * would reconnect on the very next advertisement forever) and marks
