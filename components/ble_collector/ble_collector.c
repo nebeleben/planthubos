@@ -33,6 +33,16 @@ static const char *TAG = "ble_collector";
 /* GAP scan units are 0.625 ms */
 #define SCAN_UNITS(ms) ((uint16_t)((ms) * 1000 / 625))
 
+/* M5a gate fix (spec §2, amended 2026-08-17): bounds the fallback walk over
+ * a connectable peripheral's advertised 16-bit Service Class UUID list
+ * (fields.uuids16, AD types 0x02/0x03) in decode_adv_item() below. A legacy
+ * advert is at most ADV_PAYLOAD_MAX=31 bytes total, so num_uuids16 can never
+ * exceed roughly 14 in the most degenerate case (the whole advert being one
+ * UUID16-list structure and nothing else); 8 is a cheap, generous cap for a
+ * per-advertisement scan on the decoder task -- order is the advertiser's
+ * choice, so the first ACCEPTED match wins, not the last. */
+#define ADV_UUID16_SCAN_MAX 8
+
 /* M3 §1 raw-advert pipeline: gap_event (NimBLE host task) copies the raw
  * advertisement into this ring and returns; adv_decoder_task drains it and
  * does the actual decode (parsing, MiBeacon today, wrapper/BTHome dispatch
@@ -333,6 +343,45 @@ static void decode_adv_item(const adv_item_t *item)
     int wrapper_id = (ridx >= 0 && s_wrapper_memo[ridx] != WRAPPER_MEMO_NONE)
                           ? s_wrapper_memo[ridx]
                           : wrapper_index_lookup(&s_wrapper_index, svc_uuid, manu_id, mac_disp);
+
+    /* M5a gate fix (spec §2, amended 2026-08-17): the service-data
+     * resolution above is right for M3's devices (BTHome, Xiaomi), which
+     * broadcast their readings in service data (AD type 0x16), but a
+     * connectable GATT peripheral -- the class of device M5a exists to
+     * serve -- carries no service data at all. It advertises its services in
+     * the 16-bit Service Class UUID list instead (AD types 0x02/0x03, which
+     * NimBLE parses into fields.uuids16/num_uuids16), so the lookup above,
+     * keyed only on service DATA, can never resolve one. Tried only when
+     * that lookup (or the memo standing in for it) found nothing, so this
+     * never overrides a real service-data/manufacturer/mac_prefix match.
+     *
+     * A wrapper's match key is registered ONCE, at install time, under a
+     * single wmatch_kind_t (wrapper_store_upsert()) -- there is no separate
+     * "advert" vs "connect" match kind, only WMATCH_SERVICE either way. So
+     * this fallback is deliberately gated on wrapper_exec_plan_get() finding
+     * a connect plan for the candidate id, NOT on how the id was found: that
+     * is what stops it from ever matching an M3/M4 advert wrapper. An advert
+     * wrapper carries no plan, so a UUID-list hit against one is rejected
+     * here and the advert falls through to unknown-capture exactly as
+     * before this fix -- no installed wrapper's behaviour changes. Same
+     * plan-presence query devices_json.c already uses to tell the two kinds
+     * apart on the API surface. */
+    bool matched_via_uuid16_list = false;
+    if (wrapper_id < 0 && fields.uuids16 && fields.num_uuids16 > 0) {
+        uint8_t n = fields.num_uuids16;
+        if (n > ADV_UUID16_SCAN_MAX) n = ADV_UUID16_SCAN_MAX;
+        for (uint8_t i = 0; i < n; i++) {
+            int cand = wrapper_index_lookup(&s_wrapper_index, fields.uuids16[i].value,
+                                            manu_id, mac_disp);
+            if (cand >= 0 &&
+                wrapper_exec_plan_get((uint16_t)cand, NULL, 0, NULL) > 0) {
+                wrapper_id = cand;
+                matched_via_uuid16_list = true;
+                break;
+            }
+        }
+    }
+
     if (wrapper_id >= 0) {
         /* M3 Task 6 (spec §5): this advert now resolves to a wrapper --
          * either it always did, or a wrapper install/reindex just made it
@@ -352,7 +401,21 @@ static void decode_adv_item(const adv_item_t *item)
         uint8_t payload_len = 0;
         switch (wrapper_index_kind_of(&s_wrapper_index, (uint16_t)wrapper_id)) {
         case WMATCH_SERVICE:
-            if (fields.svc_data_uuid16 && fields.svc_data_uuid16_len >= 2) {
+            /* M5a gate fix: a match resolved via the UUID16-list fallback
+             * above has, by construction, no service-data payload -- the
+             * whole reason the fallback exists is that this class of device
+             * broadcasts no service data at all. Keep payload/payload_len at
+             * their NULL/0 initialisers above rather than falling into the
+             * svc_data_uuid16 branch below, which would otherwise hand the
+             * wrapper whatever UNRELATED service-data AD structure this same
+             * advert happens to also carry (its UUID never matched
+             * svc_uuid -- that lookup already failed -- so it has nothing to
+             * do with the wrapper that matched). An honest empty slice, not
+             * a coincidentally-nonempty one: the wrapper's real payload for
+             * a connect match comes from GATT reads, decoded separately by
+             * gatt_engine_service() via wrapper_exec_run_buffer(). */
+            if (!matched_via_uuid16_list &&
+                fields.svc_data_uuid16 && fields.svc_data_uuid16_len >= 2) {
                 payload = fields.svc_data_uuid16 + 2;
                 payload_len = (uint8_t)(fields.svc_data_uuid16_len - 2);
             }
