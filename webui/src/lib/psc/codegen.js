@@ -7,6 +7,7 @@
 
 import { CAPS } from './caps.js'
 import { PSError } from './lexer.js'
+import { PSVM_FLAG_CONNECT_PLAN } from './plan-limits.js'
 
 // Mirrors PSVM_MAX_EMITS in components/psvm/include/psvm.h: the VM's emit
 // buffer is a fixed array (16 slots), not a growable one, so a wrapper
@@ -375,11 +376,18 @@ export function emitWrapper(ast) {
   }
   buf.op(OPCODES.HALT)
 
+  // M5a: a wrapper with a `connect` block sets PSVM_FLAG_CONNECT_PLAN and
+  // carries a trailing plan section after the code (Task 1's layout,
+  // validated by psvm_validate()). A wrapper with none is byte-identical to
+  // what this function produced before M5a -- flags stays 0, no trailing
+  // bytes -- which is the M3/M4 compatibility guarantee.
+  const hasConnect = !!ast.connect
+
   const w = new ByteWriter()
   w.raw([0x50, 0x53, 0x42, 0x43]) // "PSBC"
   w.u8(1) // fmt_ver
   w.u8(2) // dialect (wrappers)
-  w.u16(0) // flags — psvm.c rejects nonzero
+  w.u16(hasConnect ? PSVM_FLAG_CONNECT_PLAN : 0) // flags
   w.u32(0) // builtins — unused by this dialect
   w.u16(consts.entries.length)
   w.u16(0) // ref_count — always 0
@@ -391,5 +399,20 @@ export function emitWrapper(ast) {
   // no refs section
   w.raw(buf.bytes)
 
-  return { bytecode: w.toUint8Array(), capsUsed }
+  if (hasConnect) {
+    // read_count(u8) write_count(u8) interval_s(u32 LE)
+    //   read_count  x { uuid16(u16 LE) }
+    //   write_count x { uuid16(u16 LE) len(u8) data[len] }
+    w.u8(ast.connect.reads.length)
+    w.u8(ast.connect.writes.length)
+    w.u32(ast.connect.intervalS)
+    for (const r of ast.connect.reads) w.u16(r.uuid16)
+    for (const wr of ast.connect.writes) {
+      w.u16(wr.uuid16)
+      w.u8(wr.data.length)
+      w.raw(wr.data)
+    }
+  }
+
+  return { bytecode: w.toUint8Array(), capsUsed, plan: hasConnect ? ast.connect : null }
 }

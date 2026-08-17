@@ -193,3 +193,71 @@ test('a 17-emit wrapper is a compile error naming PSVM_MAX_EMITS and the count',
   assert.match(r.errors[0].message, /16/)
   assert.match(r.errors[0].message, /PSVM_MAX_EMITS/)
 })
+
+// ---- connect block (M5a spec section 2, task 3) ----
+
+test('connect block compiles and assigns slot offsets', () => {
+  const r = compileWrapper(`wrapper "acme env" match service 0x181A
+connect every 10min
+  write 2A00 = 01
+  read 2A6E as temp
+  read 2A6F as hum
+decode
+  emit air.temperature  i16_le(temp, 0) * 0.01
+  emit air.humidity     u16_le(hum, 0) * 0.01`)
+  assert.equal(r.ok, true)
+  assert.equal(r.plan.intervalS, 600)
+  assert.deepEqual(r.plan.reads.map(x => [x.name, x.uuid16, x.offset]),
+                   [['temp', 0x2A6E, 0], ['hum', 0x2A6F, 16]])
+  assert.deepEqual(r.plan.writes, [{ uuid16: 0x2A00, data: [0x01] }])
+  // the named buffer became a compile-time offset: hum reads at 16
+  assert.match(disassemble(r.bytecode), /LOAD_U16LE 16/)
+})
+
+test('a wrapper with no connect block is byte-identical to before', () => {
+  const src = `wrapper "ruuvi" match manufacturer 0x0499
+decode
+  emit air.temperature   i16_be(payload, 1) * 0.005`
+  const r = compileWrapper(src)
+  assert.equal(r.ok, true)
+  assert.equal(r.plan, null)
+  assert.equal(r.bytecode[6] | (r.bytecode[7] << 8), 0)   // flags still 0
+})
+
+test('decode may not reference an undeclared buffer', () => {
+  assertFails(`wrapper "x" match service 0x181A
+connect every 10min
+  read 2A6E as temp
+decode
+  emit air.humidity u16_le(hum, 0)`, /unknown buffer 'hum'/)
+})
+
+test('payload is not addressable in a connect wrapper', () => {
+  assertFails(`wrapper "x" match service 0x181A
+connect every 10min
+  read 2A6E as temp
+decode
+  emit air.temperature u8(payload, 0)`, /payload/)
+})
+
+test('duplicate buffer name is rejected', () => {
+  assertFails(`wrapper "x" match service 0x181A
+connect every 10min
+  read 2A6E as temp
+  read 2A6F as temp
+decode
+  emit air.temperature u8(temp, 0)`, /duplicate/)
+})
+
+test('caps are enforced at compile time', () => {
+  const reads = ['2A01','2A02','2A03','2A04','2A05'].map(u => `  read ${u} as b${u}`).join('\n')
+  assertFails(`wrapper "x" match service 0x181A\nconnect every 10min\n${reads}\ndecode\n  emit air.temperature u8(b2A01, 0)`, /at most 4 reads/)
+})
+
+test('an offset past a slot is a compile error, not a runtime surprise', () => {
+  assertFails(`wrapper "x" match service 0x181A
+connect every 10min
+  read 2A6E as temp
+decode
+  emit air.temperature u8(temp, 16)`, /outside/)
+})

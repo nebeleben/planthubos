@@ -20,6 +20,8 @@ const KEYWORDS = new Set([
   // Wrapper dialect (M3 spec section 3).
   'wrapper', 'match', 'decode', 'require', 'emit',
   'service', 'manufacturer', 'mac_prefix',
+  // connect block (M5a spec section 2).
+  'connect', 'read', 'write', 'as',
 ])
 
 const UNIT_CHAR = /[A-Za-z%°]/
@@ -29,7 +31,10 @@ const DIGIT = /[0-9]/
 const HEX_DIGIT = /[0-9A-Fa-f]/
 
 const TWO_CHAR_PUNCT = new Set(['<=', '>=', '==', '!=', '>>'])
-const ONE_CHAR_PUNCT = new Set(['(', ')', '.', ',', ';', '<', '>', '+', '-', '*', '/'])
+// '=' (connect block: `write <uuid16> = <hex>`, M5a spec section 2) is
+// checked one-char-at-a-time, but '==' above is matched first via the
+// two-char lookahead in readToken(), so this never swallows '=='.
+const ONE_CHAR_PUNCT = new Set(['(', ')', '.', ',', ';', '<', '>', '+', '-', '*', '/', '='])
 
 function unescape(s) {
   let out = ''
@@ -186,11 +191,43 @@ export function tokenize(source) {
     throw new PSError(`unexpected character '${c}'`, startLine, startCol)
   }
 
+  // connect block (M5a spec section 2): `read <uuid16> as <name>` and
+  // `write <uuid16> = <hex>` write BARE hex, no `0x` prefix -- the
+  // Bluetooth SIG's own convention for a 16-bit UUID/characteristic value.
+  // The general NUMBER lexer can't represent that: its digit run stops at
+  // the first non-digit character, so "2A6E" would come out as two
+  // malformed NUMBER-with-unit tokens ("2" unit "A", "6" unit "E"), and an
+  // all-digit UUID like "1809" would silently come out as decimal 1809
+  // instead of hex 0x1809. Rather than teach every numeric literal in the
+  // language to guess "is this hex", the tokenizer switches into hex mode
+  // for exactly one token, right after 'read', 'write' or '=' -- tokens
+  // that exist ONLY in this grammar position, so the switch can never
+  // misfire on anything that predates M5a.
+  function readHexRun(startLine, startCol) {
+    let s = ''
+    while (peek() !== undefined && HEX_DIGIT.test(peek())) s += advance()
+    return { type: 'HEX', raw: s, value: parseInt(s, 16), line: startLine, col: startCol }
+  }
+
+  function readHexToken() {
+    skipWhitespaceAndComments()
+    const startLine = line
+    const startCol = col
+    if (peek() !== undefined && HEX_DIGIT.test(peek())) return readHexRun(startLine, startCol)
+    // Not actually hex where hex was expected (e.g. a missing UUID) -- fall
+    // back to normal lexing so the parser reports a proper "expected a hex
+    // value, got '...'" error instead of the lexer failing silently.
+    return readToken()
+  }
+
   const tokens = []
+  let hexNext = false
   for (;;) {
-    const tok = readToken()
+    const tok = hexNext ? readHexToken() : readToken()
     tokens.push(tok)
     if (tok.type === 'EOF') break
+    hexNext = (tok.type === 'KEYWORD' && (tok.value === 'read' || tok.value === 'write')) ||
+              (tok.type === 'PUNCT' && tok.value === '=')
   }
   return tokens
 }

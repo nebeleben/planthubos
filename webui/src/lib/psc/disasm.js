@@ -4,6 +4,7 @@
 
 import { OPCODES } from './codegen.js'
 import { CAPS_BY_ID } from './caps.js'
+import { PSVM_FLAG_CONNECT_PLAN, PSVM_PLAN_SLOT } from './plan-limits.js'
 
 const OPNAME = Object.fromEntries(Object.entries(OPCODES).map(([k, v]) => [v, k]))
 const BUILTIN_NAME = { 0: 'log', 1: 'notify' }
@@ -165,5 +166,35 @@ export function disassemble(bytecode) {
         return lines.join('\n')
     }
   }
+
+  // M5a connect plan: a trailing section right after the code, present only
+  // when the header flag is set (Task 1's layout). Names aren't on the
+  // blob -- only the compiler's symbol table knew them -- so reads render
+  // as (uuid, slot offset) instead.
+  const flags = view.getUint16(6, true)
+  if (flags & PSVM_FLAG_CONNECT_PLAN) {
+    let po = codeStart + codeLen
+    const readCount = bytes[po]
+    const writeCount = bytes[po + 1]
+    const intervalS = view.getUint32(po + 2, true)
+    po += 6
+    const hex16 = (v) => `0x${v.toString(16).toUpperCase().padStart(4, '0')}`
+    lines.push(`-- connect: every ${intervalS}s, ${readCount} read(s), ${writeCount} write(s) --`)
+    for (let i = 0; i < readCount; i++) {
+      const uuid = view.getUint16(po, true)
+      lines.push(`READ ${hex16(uuid)} -> slot ${i} (offset ${i * PSVM_PLAN_SLOT})`)
+      po += 2
+    }
+    for (let i = 0; i < writeCount; i++) {
+      const uuid = view.getUint16(po, true)
+      const wlen = bytes[po + 2]
+      po += 3
+      const hex = Array.from(bytes.subarray(po, po + wlen))
+        .map((b) => b.toString(16).toUpperCase().padStart(2, '0')).join('')
+      lines.push(`WRITE ${hex16(uuid)} = ${hex}`)
+      po += wlen
+    }
+  }
+
   return lines.join('\n')
 }

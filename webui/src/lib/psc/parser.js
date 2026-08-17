@@ -3,6 +3,7 @@
 
 import { PSError } from './lexer.js'
 import { CAPS } from './caps.js'
+import { PSVM_PLAN_MAX_READS, PSVM_PLAN_MAX_WRITES, PSVM_PLAN_WRITE_MAX, PSVM_PLAN_SLOT } from './plan-limits.js'
 
 const DURATION_UNITS = { s: 1, sec: 1, m: 60, min: 60, h: 3600, hr: 3600 }
 const CMP_OPS = new Set(['<', '<=', '>', '>=', '==', '!='])
@@ -32,6 +33,11 @@ class Parser {
     this.tokens = tokens
     this.pos = 0
     this.dialect = dialect
+    // name -> compile-time slot offset (0/16/32/48), set only while parsing
+    // a wrapper's `decode` block that follows a `connect` block (M5a spec
+    // section 2). null means "no connect block": accessors address
+    // 'payload' exactly as M3 defined them, unchanged.
+    this.buffers = null
   }
 
   peek(offset = 0) {
@@ -98,10 +104,45 @@ class Parser {
     return this.advance()
   }
 
-  expectPayloadIdent() {
+  // A payload accessor's FIRST argument (wrapper dialect): 'payload' in a
+  // wrapper with no connect block (M3, unchanged); a declared buffer name
+  // in one that has a connect block, where 'payload' itself is not
+  // addressable (M5a spec section 2: named buffers replace it, and section
+  // 9 defers mixing advert and GATT bytes in the same wrapper). Returns
+  // {name, slotOffset} either way -- slotOffset is always 0 for 'payload'.
+  expectBufferIdent() {
     const t = this.peek()
-    if (t.type !== 'IDENT' || t.value !== 'payload') {
+    if (t.type !== 'IDENT') {
+      throw new PSError(`expected 'payload' or a declared buffer name, got '${describeToken(t)}'`, t.line, t.col)
+    }
+    if (this.buffers) {
+      if (t.value === 'payload') {
+        throw new PSError(
+          "'payload' is not addressable in a wrapper with a connect block (spec section 9 defers mixing advert and GATT bytes)",
+          t.line, t.col
+        )
+      }
+      if (!this.buffers.has(t.value)) {
+        throw new PSError(`unknown buffer '${t.value}'`, t.line, t.col)
+      }
+      this.advance()
+      return { name: t.value, slotOffset: this.buffers.get(t.value) }
+    }
+    if (t.value !== 'payload') {
       throw new PSError(`expected 'payload', got '${describeToken(t)}'`, t.line, t.col)
+    }
+    this.advance()
+    return { name: 'payload', slotOffset: 0 }
+  }
+
+  // A bare hex token (M5a spec section 2: `read <uuid16> as <name>` /
+  // `write <uuid16> = <hex>`), lexed by tokenize()'s hex mode right after
+  // 'read', 'write' or '='. Never a general expression -- same reasoning as
+  // expectIntLiteral: these values must be resolvable at compile time.
+  expectHex() {
+    const t = this.peek()
+    if (t.type !== 'HEX') {
+      throw new PSError(`expected a hex value, got '${describeToken(t)}'`, t.line, t.col)
     }
     return this.advance()
   }
@@ -194,6 +235,15 @@ class Parser {
       )
     }
 
+    // connect block (M5a spec section 2): optional, between the header and
+    // `decode`. Builds the name -> slot-offset table `decode` resolves
+    // buffer identifiers against (expectBufferIdent()).
+    let connect = null
+    if (this.isKeyword('connect')) {
+      connect = this.parseConnectBlock()
+      this.buffers = new Map(connect.reads.map((r) => [r.name, r.offset]))
+    }
+
     this.expectKeyword('decode')
     const statements = []
     while (this.peek().type !== 'EOF') {
@@ -204,7 +254,83 @@ class Parser {
       throw new PSError('decode block must contain at least one statement', t.line, t.col)
     }
 
-    return { name, match: { kind, key: keyTok.value }, statements }
+    return { name, match: { kind, key: keyTok.value }, connect, statements }
+  }
+
+  // `connect every <duration>` followed by `read`/`write` lines (M5a spec
+  // section 2). Reuses parseDuration() -- same grammar M1's rules `every`
+  // clause already uses -- rather than writing a second duration parser.
+  // Read offsets are assigned here, in declaration order, as index*16
+  // (PSVM_PLAN_SLOT): this compile-time table is the entire mechanism that
+  // lets `decode` address a named GATT buffer with the SAME accessor
+  // opcodes it already has for `payload`.
+  parseConnectBlock() {
+    this.expectKeyword('connect')
+    this.expectKeyword('every')
+    const intervalS = this.parseDuration('connect', 60, 86400)
+
+    const reads = []
+    const writes = []
+    const names = new Set()
+
+    while (this.isKeyword('read') || this.isKeyword('write')) {
+      if (this.isKeyword('write')) {
+        const wTok = this.advance()
+        const uuidTok = this.expectHex()
+        if (uuidTok.value > 0xFFFF) {
+          throw new PSError(`write UUID 0x${uuidTok.raw} out of range for a 16-bit UUID`, uuidTok.line, uuidTok.col)
+        }
+        this.expectPunct('=')
+        const dataTok = this.expectHex()
+        if (dataTok.raw.length === 0 || dataTok.raw.length % 2 !== 0) {
+          throw new PSError(
+            `write data must be a whole number of bytes (an even number of hex digits), got '${dataTok.raw}'`,
+            dataTok.line, dataTok.col
+          )
+        }
+        const data = []
+        for (let i = 0; i < dataTok.raw.length; i += 2) data.push(parseInt(dataTok.raw.slice(i, i + 2), 16))
+        if (data.length > PSVM_PLAN_WRITE_MAX) {
+          throw new PSError(
+            `write data must be at most ${PSVM_PLAN_WRITE_MAX} bytes (PSVM_PLAN_WRITE_MAX), got ${data.length}`,
+            dataTok.line, dataTok.col
+          )
+        }
+        if (writes.length >= PSVM_PLAN_MAX_WRITES) {
+          throw new PSError(
+            `connect block allows at most ${PSVM_PLAN_MAX_WRITES} writes (PSVM_PLAN_MAX_WRITES)`,
+            wTok.line, wTok.col
+          )
+        }
+        writes.push({ uuid16: uuidTok.value, data })
+      } else {
+        const rTok = this.advance()
+        const uuidTok = this.expectHex()
+        if (uuidTok.value > 0xFFFF) {
+          throw new PSError(`read UUID 0x${uuidTok.raw} out of range for a 16-bit UUID`, uuidTok.line, uuidTok.col)
+        }
+        this.expectKeyword('as')
+        const nameTok = this.expectIdent()
+        if (names.has(nameTok.value)) {
+          throw new PSError(`duplicate buffer name '${nameTok.value}'`, nameTok.line, nameTok.col)
+        }
+        if (reads.length >= PSVM_PLAN_MAX_READS) {
+          throw new PSError(
+            `connect block allows at most ${PSVM_PLAN_MAX_READS} reads (PSVM_PLAN_MAX_READS)`,
+            rTok.line, rTok.col
+          )
+        }
+        names.add(nameTok.value)
+        reads.push({ uuid16: uuidTok.value, name: nameTok.value, offset: reads.length * PSVM_PLAN_SLOT })
+      }
+    }
+
+    if (reads.length === 0) {
+      const t = this.peek()
+      throw new PSError('connect block must declare at least one read', t.line, t.col)
+    }
+
+    return { intervalS, reads, writes }
   }
 
   parseDecodeStmt() {
@@ -241,7 +367,7 @@ class Parser {
   parseDecryptStmt() {
     const t = this.advance() // 'aes_ccm_decrypt'
     this.expectPunct('(')
-    this.expectPayloadIdent()
+    this.expectBufferIdent()
     this.expectPunct(',')
     const offsetExpr = this.parseOr()
     this.expectPunct(',')
@@ -260,7 +386,7 @@ class Parser {
     const nameTok = this.advance()
     const name = nameTok.value
     this.expectPunct('(')
-    this.expectPayloadIdent()
+    const buf = this.expectBufferIdent()
     if (name === 'len') {
       this.expectPunct(')')
       return { type: 'plen', line: nameTok.line, col: nameTok.col }
@@ -280,6 +406,21 @@ class Parser {
         )
       }
       const need = Math.ceil((lsbTok.value + widthTok.value) / 8)
+      // Bound to the 16-byte slot at COMPILE time (brief: "the whole reason
+      // slots are fixed" -- a runtime bounds error would only say "out of
+      // range", with no hint which buffer, since the VM has no buffer names).
+      if (this.buffers) {
+        if (offTok.value + need > PSVM_PLAN_SLOT) {
+          throw new PSError(
+            `offset ${offTok.value} (width ${need}) is outside buffer '${buf.name}' (each connect-block slot is ${PSVM_PLAN_SLOT} bytes)`,
+            offTok.line, offTok.col
+          )
+        }
+        return {
+          type: 'bits', offset: buf.slotOffset + offTok.value, lsb: lsbTok.value, width: widthTok.value,
+          line: nameTok.line, col: nameTok.col,
+        }
+      }
       if (offTok.value + need > 31) {
         throw new PSError(
           `offset ${offTok.value} out of range for bits() (payload is at most 31 bytes)`,
@@ -293,6 +434,15 @@ class Parser {
     }
     this.expectPunct(')')
     const size = ACCESSOR_WIDTH[name]
+    if (this.buffers) {
+      if (offTok.value + size > PSVM_PLAN_SLOT) {
+        throw new PSError(
+          `offset ${offTok.value} (width ${size}) is outside buffer '${buf.name}' (each connect-block slot is ${PSVM_PLAN_SLOT} bytes)`,
+          offTok.line, offTok.col
+        )
+      }
+      return { type: 'load', accessor: name, offset: buf.slotOffset + offTok.value, line: nameTok.line, col: nameTok.col }
+    }
     if (offTok.value + size > 31) {
       throw new PSError(
         `offset ${offTok.value} out of range for ${name}() (payload is at most 31 bytes)`,
@@ -508,6 +658,7 @@ function describeToken(t) {
   if (t.type === 'EOF') return '<eof>'
   if (t.type === 'STRING') return '<string>'
   if (t.type === 'NUMBER') return String(t.value)
+  if (t.type === 'HEX') return `0x${t.raw}`
   return String(t.value)
 }
 
