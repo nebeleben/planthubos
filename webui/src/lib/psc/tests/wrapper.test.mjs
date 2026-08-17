@@ -264,6 +264,18 @@ decode
   assert.match(r.errors[0].message, /duplicate read of UUID/)
 })
 
+test('the same characteristic may not be written twice in one connect block', () => {
+  const r = compileWrapper(`wrapper "dupw" match service 0x181A
+connect every 10min
+  write 2A00 = 01
+  write 2A00 = 02
+  read 2A6E as t
+decode
+  emit air.temperature  i16_le(t, 0) * 0.01`)
+  assert.equal(r.ok, false)
+  assert.match(r.errors[0].message, /duplicate write to UUID/)
+})
+
 test('a wrapper with no connect block is byte-identical to before', () => {
   const src = `wrapper "ruuvi" match manufacturer 0x0499
 decode

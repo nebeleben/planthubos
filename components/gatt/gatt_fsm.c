@@ -10,6 +10,7 @@ void gatt_fsm_init(gatt_fsm_t *f, const uint8_t *plan, size_t plan_len)
 {
     memset(f, 0, sizeof(*f));
     f->state = GS_IDLE;
+    f->fail = GF_NONE;
 
     size_t off = 0;
     uint8_t read_count = 0, write_count = 0;
@@ -187,7 +188,10 @@ gatt_act_t gatt_fsm_step(gatt_fsm_t *f, const gatt_ev_t *ev)
              * spec section 4 exists to prevent, reached by a short
              * characteristic rather than by handle drift. Fail the attempt
              * instead, so it is visible as a failure. */
-            if (ev->len < f->read_min_len[f->read_idx]) return fail_disconnect(f);
+            if (ev->len < f->read_min_len[f->read_idx]) {
+                f->fail = GF_SHORT_READ;
+                return fail_disconnect(f);
+            }
 
             uint8_t *slot = &f->buf[(size_t)f->read_idx * GATT_FSM_SLOT];
             memset(slot, 0, GATT_FSM_SLOT);

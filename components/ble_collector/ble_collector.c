@@ -122,10 +122,12 @@ static uint16_t s_wrapper_memo[REGISTRY_MAX_DEVICES];
  * own scheduling decision, so memoising it costs one store and no extra
  * lookup. Single writer, naturally-aligned uint32_t elements: a concurrent
  * reader sees either the previous advertisement's value or this one, never
- * a torn one -- the same argument s_wrapper_memo's own doc comment makes,
- * and here there is no memset()-the-whole-table write shape to qualify it,
- * because a reindex leaves these entries alone and the next advertisement
- * refreshes them. */
+ * a torn one -- the same argument s_wrapper_memo's own doc comment makes.
+ * A reindex memset()s this table alongside that one, so the same
+ * byte-mixed-read caveat that comment records applies here too; the
+ * consequence is bounded the same way (every byte written is 0x00, so the
+ * mixed value is still a plausible interval at worst) and self-corrects on
+ * the next advertisement. */
 static uint32_t s_plan_interval_memo[REGISTRY_MAX_DEVICES];
 
 /* Task 5 review FINDING 4/2, corrected by M5a Task 7 fix round 1: s_wrapper_index
@@ -657,6 +659,15 @@ static void do_wrapper_reindex(void)
      * ble_collector_wrapper_for_device()'s doc comment (ble_collector.h)
      * for what that means for a concurrent httpd read. */
     memset(s_wrapper_memo, WRAPPER_MEMO_NONE, sizeof(s_wrapper_memo));
+    /* Cleared with the wrapper memo, not left to be refreshed. A device
+     * whose connect wrapper was just DELETED never matches again, so it
+     * never reaches either of the two writes below that would refresh this
+     * -- both sit inside the "a wrapper matched" branch. Leaving the old
+     * interval standing would keep /api/v1/devices reporting a "gatt"
+     * object, with a stale interval and a stale last_read/last_error, for a
+     * device that no longer has a plan at all. Zero is "no plan", which is
+     * also the correct answer while nothing has matched yet. */
+    memset(s_plan_interval_memo, 0, sizeof(s_plan_interval_memo));
     wrapper_arena_evict_all();
 }
 

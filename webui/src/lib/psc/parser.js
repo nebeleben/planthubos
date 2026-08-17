@@ -332,6 +332,17 @@ class Parser {
             dataTok.line, dataTok.col
           )
         }
+        // Same hazard the duplicate-read check below guards: gatt_fsm.c
+        // distinguishes write completions by uuid16 alone, so a stale
+        // GE_WRITE_OK for the first would be accepted as the second's, the
+        // second write would be skipped, and the reads would proceed
+        // against a peer that was never woken or configured.
+        if (writes.some((x) => x.uuid16 === uuidTok.value)) {
+          throw new PSError(
+            `duplicate write to UUID 0x${uuidTok.raw}: each characteristic may be written once per connect block`,
+            uuidTok.line, uuidTok.col
+          )
+        }
         if (writes.length >= PSVM_PLAN_MAX_WRITES) {
           throw new PSError(
             `connect block allows at most ${PSVM_PLAN_MAX_WRITES} writes (PSVM_PLAN_MAX_WRITES)`,

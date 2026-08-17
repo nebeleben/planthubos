@@ -95,8 +95,21 @@ typedef struct { gatt_act_kind_t kind; uint16_t uuid16; const uint8_t *data; uin
 #define GATT_FSM_WRITE_MAX  8
 #define GATT_FSM_SLOT       16
 
+/* Why a terminal failure needs a reason at all: the engine sets its own
+ * error string for every failure IT detects (connect refused, read failed,
+ * timed out), but a short read is detected HERE, inside the state machine,
+ * and the engine has no way to tell that apart from any other GA_DISCONNECT
+ * -- it would report the milestone's own "entire visibility surface" as
+ * "unknown error". This enum is the one fact the engine cannot otherwise
+ * recover. */
+typedef enum { GF_NONE, GF_SHORT_READ } gatt_fail_t;
+
 typedef struct {
     gatt_state_t state;
+    /* Why this attempt failed, when the state machine itself is what
+     * decided it. GF_NONE for every failure the engine detected and already
+     * has a better string for. */
+    gatt_fail_t  fail;
 
     uint8_t read_count;
     uint8_t write_count;
@@ -119,9 +132,11 @@ typedef struct {
 
     /* Concatenated read buffer, GATT_FSM_MAX_READS x GATT_FSM_SLOT bytes.
      * Zeroed whole at gatt_fsm_init() and re-zeroed per slot immediately
-     * before each read lands, so a short read zero-pads its slot and a
-     * failed or short read can never leave a previous device's bytes
-     * sitting in a slot it didn't write. GA_DECODE's action.data points
+     * before each read lands, so a read that is shorter than its slot but
+     * still at least read_min_len zero-pads the remainder, and a failed
+     * read can never leave a previous device's bytes sitting in a slot it
+     * didn't write. A read shorter than read_min_len does not land at all
+     * -- it fails the attempt (see read_min_len). GA_DECODE's action.data points
      * here; action.len is read_count * GATT_FSM_SLOT, the meaningful
      * prefix (any unused trailing slots, when read_count < the max, stay
      * zeroed but are not included in len). */

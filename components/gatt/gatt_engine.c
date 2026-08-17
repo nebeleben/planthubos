@@ -378,6 +378,13 @@ static void attempt_finish(void)
     bool radio_ok = (s_fsm.state == GS_DONE);
     uint32_t now = now_s();
 
+    /* The one failure the state machine detects rather than this file: a
+     * read shorter than the plan's min_len never reaches any callback that
+     * would have set s_err, so without this it lands in the API as
+     * "unknown error" -- useless on the four fields that are a connect
+     * block's entire visibility surface. */
+    if (!radio_ok && s_fsm.fail == GF_SHORT_READ) s_err = "read too short";
+
     if (radio_ok && s_decode_wrote) {
         gatt_sched_ok(s_dev_idx, now);
         ESP_LOGD(TAG, "gatt read ok: dev=%d", s_dev_idx);
@@ -394,10 +401,15 @@ static void attempt_finish(void)
                  s_dev_idx, (unsigned)s_wrapper_id);
     } else if (s_drop_without_failure) {
         /* Abandoned before the peer was ever contacted (see GA_CONNECT's
-         * EALREADY branch). Not this device's failure, so no backoff and no
-         * last_error -- but the interval gate still moves, so a losing race
-         * cannot spin on every advertisement. */
-        gatt_sched_attempt(s_dev_idx, now);
+         * EALREADY branch). Not this device's failure, so the scheduler is
+         * not touched AT ALL -- no backoff, no last_error, and the interval
+         * gate does not move. That last part matters: moving it would cost
+         * this device a full interval for a race it had no part in, and
+         * interval_s runs to 86400, so one lost race against the battery
+         * poller could silence a daily sensor for another day. This matches
+         * on_start_req()'s own pre-attempt drop, which likewise just waits
+         * for the next advertisement. The collision window is the poller's
+         * connect, so the retry costs at most a few advertisements. */
         ESP_LOGI(TAG, "gatt attempt dropped before contact: dev=%d (%s)",
                  s_dev_idx, s_err ? s_err : "unknown");
     } else {
