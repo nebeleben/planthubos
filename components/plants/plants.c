@@ -1,5 +1,6 @@
 #include "plants.h"
 #include "plants_migrate.h"
+#include "plants_blob.h"
 #include "capability.h"
 #include "storage.h"
 #include "app_config.h"
@@ -48,40 +49,14 @@ static const char *TAG = "plants";
 
 /* On-disk format of the plants.bin blob (identical layout to the old NVS
  * blob this replaces, including the legacy KEY_PLANTS blob the one-boot
- * migration in plants_init() reads). Bump this and add a migration branch
- * in load_file()/load_legacy_nvs_blob() below whenever plant_entry_t's shape
- * changes -- same reasoning as swarm_store.c's SWARM_STORE_FORMAT for the
- * node table. Deliberately NOT plants_table_t dumped raw: that struct's
- * `bool` fields and any compiler-inserted padding are not a stable on-disk
- * shape, so this mirror struct pins every field to an explicit width/order
- * instead.
- *
- * Format 2 (M2 Task 4): adds each plant's capability bindings (cap_bound[]/
- * cap_dev[], plants_table.h). No migration branch for format 1 -- per the
- * M2 device-model plan, this is a clean-start format change: a format-1
- * blob is already the wrong LENGTH (674B vs this format's 1954B, see
- * plant_entry_blob_t below) and gets discarded by load_file()'s existing
- * "unrecognised size" branch before the format byte is even checked, so
- * bumping this number is defense in depth, not the primary guard. An
- * upgrading hub starts with an empty plant table (logged) rather than a
- * silently-reinterpreted one -- see task-4-report.md. */
-#define PLANTS_BLOB_FORMAT 2
-
-typedef struct __attribute__((packed)) {
-    uint8_t id;
-    uint8_t in_use;      /* bool, packed as u8 */
-    uint8_t mac[6];
-    uint8_t mac_valid;   /* bool, packed as u8 */
-    char    name[PLANT_NAME_LEN + 1];
-    uint8_t     cap_bound[CAPABILITY_COUNT];   /* bool, packed as u8, indexed by cap_id */
-    device_id_t cap_dev[CAPABILITY_COUNT];     /* device_id_t is all-uint8_t: safe to embed directly */
-} plant_entry_blob_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t           format;
-    uint8_t           next_id;
-    plant_entry_blob_t p[PLANTS_MAX];
-} plants_blob_t;
+ * migration in plants_init() reads): PLANTS_BLOB_FORMAT, plant_entry_blob_t,
+ * plants_blob_t, and the format-version migration all now live in
+ * plants_blob.h/.c -- a PURE module, no ESP includes, host compilable, so
+ * tests/host/test_plants_migrate.c can exercise the real pack/unpack/migrate
+ * code directly instead of a reimplementation of it. See that header's own
+ * comment for the format-2 -> format-3 (M5b Task 2) migration this file's
+ * load_file()/load_legacy_nvs_blob() now perform via plants_blob_load()
+ * below, in place of the old "wrong length -> discard" branch alone. */
 
 /* ---------------- Locking invariant ----------------
  *
@@ -175,58 +150,6 @@ static void log_full_once(const uint8_t mac[6])
     if (free_slot >= 0) {
         s_full_logged[free_slot].used = true;
         memcpy(s_full_logged[free_slot].mac, mac, 6);
-    }
-}
-
-/* Packs a live plants_table_t into the on-disk mirror shape (shared by
- * persist_table() below), and the reverse for load_file()/
- * load_legacy_nvs_blob() -- both blob sources (plants.bin and the legacy NVS
- * key) use the exact same PLANTS_BLOB_FORMAT layout, so this pair is shared
- * between them rather than duplicated. */
-static void pack_blob(const plants_table_t *in, plants_blob_t *out)
-{
-    memset(out, 0, sizeof(*out));
-    out->format = PLANTS_BLOB_FORMAT;
-    out->next_id = in->next_id;
-    for (int i = 0; i < PLANTS_MAX; i++) {
-        out->p[i].id = in->p[i].id;
-        out->p[i].in_use = in->p[i].in_use ? 1 : 0;
-        memcpy(out->p[i].mac, in->p[i].mac, 6);
-        out->p[i].mac_valid = in->p[i].mac_valid ? 1 : 0;
-        memcpy(out->p[i].name, in->p[i].name, sizeof(out->p[i].name));
-        for (int c = 0; c < CAPABILITY_COUNT; c++) {
-            out->p[i].cap_bound[c] = in->p[i].cap_bound[c] ? 1 : 0;
-            out->p[i].cap_dev[c] = in->p[i].cap_dev[c];
-        }
-    }
-}
-
-/* Unpacks straight into *out -- deliberately NOT via an intermediate local
- * plants_table_t (a stack-overflow post-mortem fix: that local used to add
- * a second ~673-byte frame stacked directly on top of the caller's own
- * ~674-byte plants_blob_t local, and this function's two callers are both
- * on the plants_init() hot path where a hardware crash-loop traced a "Stack
- * protection fault" in this exact call chain, on the main task, right after
- * a plants.bin-missing WARN -- see plants_init()'s top comment and this
- * file's top-of-file comment for the full story). *out is always the
- * caller's real destination (s_table, or an init-only static -- see
- * load_file()/load_legacy_nvs_blob() below), never a value that needs to
- * survive being overwritten mid-loop, so writing straight through has no
- * correctness cost, only a stack-safety benefit. */
-static void unpack_blob(const plants_blob_t *blob, plants_table_t *out)
-{
-    out->next_id = blob->next_id;
-    for (int i = 0; i < PLANTS_MAX; i++) {
-        out->p[i].in_use = blob->p[i].in_use != 0;
-        out->p[i].id = blob->p[i].id;
-        out->p[i].mac_valid = blob->p[i].mac_valid != 0;
-        memcpy(out->p[i].mac, blob->p[i].mac, 6);
-        memcpy(out->p[i].name, blob->p[i].name, sizeof(out->p[i].name));
-        out->p[i].name[PLANT_NAME_LEN] = '\0';  /* defensive: guard against a corrupt non-terminated blob */
-        for (int c = 0; c < CAPABILITY_COUNT; c++) {
-            out->p[i].cap_bound[c] = blob->p[i].cap_bound[c] != 0;
-            out->p[i].cap_dev[c] = blob->p[i].cap_dev[c];
-        }
     }
 }
 
@@ -345,7 +268,7 @@ static esp_err_t persist_table(void)
     static plants_blob_t blob;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    pack_blob(&s_table, &blob);
+    plants_blob_pack(&s_table, &blob);
     xSemaphoreGive(s_mutex);
 
     esp_err_t err = write_file(&blob);
@@ -386,24 +309,25 @@ static bool load_file(plants_table_t *out)
         return false;
     }
 
+    /* s_boot_blob_scratch is sized for the CURRENT (largest) format; a
+     * shorter file -- e.g. a format-2 blob, migratable below -- simply
+     * makes fread() stop early (rlen < sizeof(*blob)), which is exactly
+     * what plants_blob_load() dispatches on. */
     plants_blob_t *blob = &s_boot_blob_scratch;
     size_t rlen = fread(blob, 1, sizeof(*blob), f);
     int extra = fgetc(f);   /* confirm the file isn't LONGER than expected, too */
     fclose(f);
 
-    if (rlen != sizeof(*blob) || extra != EOF) {
-        ESP_LOGW(TAG, "plants: %s has unrecognised size (read %d bytes, expected %d); starting "
-                      "with an empty plant table", path, (int)rlen, (int)sizeof(*blob));
+    if (extra != EOF) {
+        ESP_LOGW(TAG, "plants: %s is longer than any recognised blob size (read at least %d "
+                      "bytes); starting with an empty plant table", path, (int)rlen);
         return false;
     }
-    if (blob->format != PLANTS_BLOB_FORMAT) {
-        ESP_LOGE(TAG, "plants: %s has unknown format byte %u (expected %u) -- DISCARDING it "
-                      "rather than trusting an unrecognised layout; every plant is lost until "
-                      "re-created", path, blob->format, (unsigned)PLANTS_BLOB_FORMAT);
+    if (!plants_blob_load((const uint8_t *)blob, rlen, out)) {
+        ESP_LOGW(TAG, "plants: %s has an unrecognised size or format byte (read %d bytes); "
+                      "starting with an empty plant table", path, (int)rlen);
         return false;
     }
-
-    unpack_blob(blob, out);
     return true;
 }
 
@@ -439,26 +363,26 @@ static bool load_legacy_nvs_blob(nvs_handle_t h, plants_table_t *out)
         ESP_LOGW(TAG, "plants: legacy NVS blob length query failed: %s", esp_err_to_name(err));
         return false;
     }
-    if (len != sizeof(plants_blob_t)) {
-        ESP_LOGW(TAG, "plants: legacy NVS blob has unrecognised length %d (expected %d)",
-                 (int)len, (int)sizeof(plants_blob_t));
+    /* Same two recognised lengths as load_file()/plants_blob_load(): the
+     * current format, or a migratable format-2 blob -- a live rig that
+     * never got the LittleFS fix (this file's top comment) before this
+     * upgrade could still have a format-2 blob sitting in NVS. */
+    if (len != sizeof(plants_blob_t) && len != sizeof(plants_blob_v2_t)) {
+        ESP_LOGW(TAG, "plants: legacy NVS blob has unrecognised length %d", (int)len);
         return false;
     }
 
-    plants_blob_t *blob = &s_boot_blob_scratch;
-    size_t rlen = sizeof(*blob);
-    if (nvs_get_blob(h, KEY_PLANTS, blob, &rlen) != ESP_OK || rlen != sizeof(*blob)) {
+    plants_blob_t *blob = &s_boot_blob_scratch;   /* sized for the larger (current) format */
+    size_t rlen = len;
+    if (nvs_get_blob(h, KEY_PLANTS, blob, &rlen) != ESP_OK || rlen != len) {
         ESP_LOGW(TAG, "plants: legacy NVS blob read failed at its expected length");
         return false;
     }
-    if (blob->format != PLANTS_BLOB_FORMAT) {
-        ESP_LOGE(TAG, "plants: legacy NVS blob has unknown format byte %u (expected %u) -- "
-                      "DISCARDING it rather than trusting an unrecognised layout",
-                 blob->format, (unsigned)PLANTS_BLOB_FORMAT);
+    if (!plants_blob_load((const uint8_t *)blob, len, out)) {
+        ESP_LOGE(TAG, "plants: legacy NVS blob has an unrecognised format byte -- DISCARDING it "
+                      "rather than trusting an unrecognised layout");
         return false;
     }
-
-    unpack_blob(blob, out);
     return true;
 }
 

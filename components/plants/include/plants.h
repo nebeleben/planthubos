@@ -20,14 +20,19 @@
  * plants_init() that adopts an existing pre-fix NVS blob if plants.bin
  * doesn't exist yet -- steady state never writes NVS.
  *
- * The on-disk blob is an explicit packed mirror struct (format byte 2 +
- * next_id + 16 x {id, in_use:u8, mac[6], mac_valid:u8, name[33], cap_bound[8],
- * cap_dev[8]}), never a raw dump of plants_table_t -- the host struct's bool
- * fields and padding are not a stable on-disk shape across compilers/targets.
- * A wrong length or an unrecognised format byte is loudly logged and treated
- * as "start empty" -- this never fails boot. See plants.c's PLANTS_BLOB_FORMAT
- * comment for the format-1 -> format-2 (M2 Task 4) bump: no migration code,
- * a clean-start format change (task-4-report.md). */
+ * The on-disk blob is an explicit packed mirror struct (format byte 3 +
+ * next_id + 16 x {id, in_use:u8, mac[6], mac_valid:u8, name[33], cap_bound[9],
+ * cap_dev[9], act_bound[2], act_id[2], act_dev[2]}), never a raw dump of
+ * plants_table_t -- the host struct's bool fields and padding are not a
+ * stable on-disk shape across compilers/targets. A wrong length or an
+ * unrecognised format byte is loudly logged and treated as "start empty" --
+ * this never fails boot. See plants_blob.h (the pure, host-testable module
+ * that owns this layout and its format-version migration) for the format-1
+ * -> format-2 (M2 Task 4) clean start (no migration code -- task-4-report.md)
+ * versus the format-2 -> format-3 (M5b Task 2) REAL migration: an upgrading
+ * hub's existing plants and their capability bindings survive, with
+ * switch.state and both action slots coming back unbound rather than the
+ * whole table being discarded (task-2-report.md). */
 
 /* Init: loads <storage_base>/plants.bin (missing/bad -> empty table, logged;
  * if also absent, a one-boot check adopts a pre-fix NVS blob if one exists),

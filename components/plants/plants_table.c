@@ -5,6 +5,15 @@ void plants_table_init(plants_table_t *t)
 {
     memset(t, 0, sizeof(*t));
     t->next_id = 1;
+    /* act_bound[]==false already makes every slot read as unbound, but
+     * act_id[]'s memset-0 would otherwise read as ACT_SWITCH_ON (a real
+     * action id, not "none") -- pin it explicitly, same as
+     * plants_table_create()/plants_table_delete() below. */
+    for (int i = 0; i < PLANTS_MAX; i++) {
+        for (int s = 0; s < PLANT_ACTION_SLOTS; s++) {
+            t->p[i].act_id[s] = ACTION_NONE;
+        }
+    }
 }
 
 static int find_free_slot(const plants_table_t *t)
@@ -33,6 +42,9 @@ uint8_t plants_table_create(plants_table_t *t, const uint8_t *mac_or_null)
     e->in_use = true;
     e->id = t->next_id;
     e->name[0] = '\0';
+    for (int s = 0; s < PLANT_ACTION_SLOTS; s++) {
+        e->act_id[s] = ACTION_NONE;   /* see plants_table_init()'s comment */
+    }
     if (mac_or_null != NULL) {
         e->mac_valid = true;
         memcpy(e->mac, mac_or_null, 6);
@@ -120,6 +132,9 @@ bool plants_table_delete(plants_table_t *t, uint8_t id)
     }
     memset(&t->p[idx], 0, sizeof(t->p[idx]));   /* also drops every binding */
     t->p[idx].in_use = false;
+    for (int s = 0; s < PLANT_ACTION_SLOTS; s++) {
+        t->p[idx].act_id[s] = ACTION_NONE;   /* see plants_table_init()'s comment */
+    }
     return true;
 }
 
@@ -159,4 +174,34 @@ size_t plants_table_bindings(const plants_table_t *t, uint8_t id,
         }
     }
     return n;
+}
+
+bool plants_table_bind_action(plants_table_t *t, uint8_t plant_id, uint8_t slot,
+                              uint8_t action_id, const device_id_t *dev)
+{
+    if (!dev || slot >= PLANT_ACTION_SLOTS || action_id >= ACTION_COUNT) {
+        return false;
+    }
+    int idx = plants_table_find_id(t, plant_id);
+    if (idx < 0) {
+        return false;
+    }
+    t->p[idx].act_bound[slot] = true;
+    t->p[idx].act_id[slot] = action_id;
+    t->p[idx].act_dev[slot] = *dev;
+    return true;
+}
+
+int plants_table_action_slot(const plants_table_t *t, uint8_t plant_id, uint8_t action_id)
+{
+    int idx = plants_table_find_id(t, plant_id);
+    if (idx < 0) {
+        return -1;
+    }
+    for (uint8_t s = 0; s < PLANT_ACTION_SLOTS; s++) {
+        if (t->p[idx].act_bound[s] && t->p[idx].act_id[s] == action_id) {
+            return s;
+        }
+    }
+    return -1;
 }

@@ -12,6 +12,47 @@ static device_id_t dev_ble(const uint8_t mac[6])
     return device_id_from_mac(DEV_KIND_BLE, mac);
 }
 
+/* plants_table_create() takes an optional probe mac, not a name (unlike the
+ * brief's illustrative snippet) -- name it afterwards via
+ * plants_table_rename(), same two-step every other test in this file uses. */
+static uint8_t make_named_plant(plants_table_t *t, const char *name)
+{
+    uint8_t pid = plants_table_create(t, NULL);
+    assert(pid != 0);
+    assert(plants_table_rename(t, pid, name));
+    return pid;
+}
+
+static void test_bind_action(void)
+{
+    plants_table_t t; plants_table_init(&t);
+    uint8_t pid = make_named_plant(&t, "Ficus");
+    device_id_t dev = device_id_from_mac(DEV_KIND_BLE, (uint8_t[]){1,2,3,4,5,6});
+
+    assert(plants_table_bind_action(&t, pid, 0, ACT_IRRIGATION_OPEN, &dev));
+    assert(plants_table_action_slot(&t, pid, ACT_IRRIGATION_OPEN) == 0);
+    assert(plants_table_action_slot(&t, pid, ACT_PUMP_RUN) == -1);
+
+    /* Slot index is bounded by PLANT_ACTION_SLOTS (spec section 8: two slots
+     * per plant, because the hub supports four actor devices in total). */
+    assert(!plants_table_bind_action(&t, pid, PLANT_ACTION_SLOTS, ACT_SWITCH_ON, &dev));
+    assert(!plants_table_bind_action(&t, pid, 0, ACTION_COUNT, &dev));
+}
+
+/* Swapping the device keeps the plant's identity, exactly as capability
+ * bindings already do. */
+static void test_rebind_action_keeps_plant(void)
+{
+    plants_table_t t; plants_table_init(&t);
+    uint8_t pid = make_named_plant(&t, "Ficus");
+    device_id_t a = device_id_from_mac(DEV_KIND_BLE, (uint8_t[]){1,1,1,1,1,1});
+    device_id_t b = device_id_from_mac(DEV_KIND_BLE, (uint8_t[]){2,2,2,2,2,2});
+    assert(plants_table_bind_action(&t, pid, 0, ACT_IRRIGATION_OPEN, &a));
+    assert(plants_table_bind_action(&t, pid, 0, ACT_IRRIGATION_OPEN, &b));
+    assert(device_id_equal(&t.p[0].act_dev[0], &b));
+    assert(t.p[0].id == pid);
+}
+
 int main(void)
 {
     plants_table_t t;
@@ -187,6 +228,9 @@ int main(void)
     uint8_t id_d = plants_table_create(&t, NULL);
     assert(id_d != 0 && id_d != id_a);
     assert(plants_table_bindings(&t, id_d, out, CAPABILITY_COUNT) == 0);
+
+    test_bind_action();
+    test_rebind_action_keeps_plant();
 
     printf("test_plants_table: OK\n");
     return 0;

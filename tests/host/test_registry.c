@@ -190,6 +190,28 @@ int main(void)
     assert(!rg.devices[gidx].caps[CAP_SOIL_CONDUCTIVITY].valid);
     assert(rc.devices[ic1].best_rssi == -45);
 
+    /* switch.state is an ORDINARY capability so history, MQTT, HA and Influx
+     * render actor state with no new code (spec section 1.3). */
+    const capability_t *sw = capability_get(CAP_SWITCH_STATE);
+    assert(sw != NULL);
+    assert(strcmp(sw->name, "switch.state") == 0);
+    assert(sw->precision == 0);
+    assert(capability_encode(CAP_SWITCH_STATE, 0.0f) == 0);
+    assert(capability_encode(CAP_SWITCH_STATE, 1.0f) == 1);
+    /* Observed behaviour, not the ideal one: capability_encode()'s range
+     * check is generic (int16, gated on `offset` for the "physical quantity
+     * with a floor" capabilities -- see capability.c). switch.state has
+     * offset 0.0f, so it falls into the same wide zero-offset lane as
+     * air.temperature/signal.rssi and is NOT bounded to {0,1} here -- 2.0f
+     * and -1.0f both encode instead of failing safe. Per the brief: do not
+     * paper over this with a special case in capability_encode() (that
+     * would make one capability's range check bespoke); a switch.state of 2
+     * that gets silently stored is a real gap, asserted here rather than
+     * hidden, and left for whichever caller writes switch.state values
+     * (M5b's actuator write path) to range-check before calling encode. */
+    assert(capability_encode(CAP_SWITCH_STATE, 2.0f) == 2);
+    assert(capability_encode(CAP_SWITCH_STATE, -1.0f) == -1);
+
     printf("test_registry: OK\n");
     return 0;
 }

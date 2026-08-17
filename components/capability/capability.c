@@ -62,6 +62,11 @@ static const capability_t CAP_TABLE[CAPABILITY_COUNT] = {
         .ha_device_class = "signal_strength", .influx_field = "rssi",
         .scale = 1.0f, .offset = 0.0f, .precision = 0,
     },
+    [CAP_SWITCH_STATE] = {
+        .id = CAP_SWITCH_STATE, .name = "switch.state", .unit = "",
+        .ha_device_class = NULL, .influx_field = "switch",
+        .scale = 1.0f, .offset = 0.0f, .precision = 0,
+    },
 };
 
 const capability_t *capability_get(uint8_t id) {

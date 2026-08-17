@@ -66,12 +66,16 @@ $CC -Wall -Wextra -Werror -I../../components/swarm/include \
 ./test_batt_cycle
 
 $CC -Wall -Wextra -Werror -I../../components/plants/include -I../../components/capability/include \
+    -I../../components/actions/include \
     test_plants_table.c ../../components/plants/plants_table.c \
-    ../../components/capability/device_id.c -o test_plants_table
+    ../../components/capability/device_id.c ../../components/actions/action.c -o test_plants_table
 ./test_plants_table
 
 $CC -Wall -Wextra -Werror -I../../components/plants/include -I../../components/capability/include \
-    test_plants_migrate.c ../../components/plants/plants_migrate.c ../../components/plants/plants_table.c -o test_plants_migrate
+    -I../../components/actions/include \
+    test_plants_migrate.c ../../components/plants/plants_migrate.c ../../components/plants/plants_table.c \
+    ../../components/plants/plants_blob.c ../../components/capability/device_id.c \
+    ../../components/actions/action.c -o test_plants_migrate
 ./test_plants_migrate
 
 $CC -Wall -Wextra -Werror -I../../components/psvm/include \
@@ -103,7 +107,7 @@ $CC -Wall -Wextra -Werror -I../../components/capability/include \
 ./test_device_id
 
 $CC -Wall -Wextra -Werror -I../../components/app_config/include -I../../components/plants/include \
-    -I../../components/capability/include \
+    -I../../components/capability/include -I../../components/actions/include \
     test_data_fmt.c ../../components/app_config/data_fmt.c -o test_data_fmt
 ./test_data_fmt
 

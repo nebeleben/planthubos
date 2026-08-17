@@ -3,9 +3,16 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "capability.h"   /* CAPABILITY_COUNT, device_id_t */
+#include "action.h"       /* ACTION_COUNT, ACTION_NONE (M5b action slots) */
 
 #define PLANTS_MAX      16
 #define PLANT_NAME_LEN  32
+
+/* Two, not four (spec section 8). The budget did not close at four: 16
+ * plants x 4 slots x 10 B is 640 B against 1280 B of total headroom, and
+ * the hub supports four actor devices in TOTAL. A plant binding more than
+ * two actuators is not a V2 shape. */
+#define PLANT_ACTION_SLOTS 2
 
 /* M2: per-capability device bindings, indexed by cap_id (0..CAPABILITY_COUNT-1)
  * -- cap_bound[c] tells whether capability c is bound at all, cap_dev[c] is
@@ -31,6 +38,14 @@ typedef struct {
     uint8_t mac[6];
     bool        cap_bound[CAPABILITY_COUNT];
     device_id_t cap_dev[CAPABILITY_COUNT];
+    /* M5b: per-plant action slots, the actuator analogue of cap_bound[]/
+     * cap_dev[] above -- act_bound[s] tells whether slot s is bound at all,
+     * act_id[s] is which action.h action id (ACTION_NONE when unbound),
+     * act_dev[s] is which physical device it's bound to. See
+     * PLANT_ACTION_SLOTS above for why there are only two. */
+    bool        act_bound[PLANT_ACTION_SLOTS];
+    uint8_t     act_id[PLANT_ACTION_SLOTS];      /* ACTION_NONE when unbound */
+    device_id_t act_dev[PLANT_ACTION_SLOTS];
 } plant_entry_t;
 
 /* Produced (out-projection) shape for plants_table_bindings()/plants_bindings():
@@ -79,3 +94,16 @@ bool plants_table_bind_cap(plants_table_t *t, uint8_t id, uint8_t cap_id,
  * -- 0 for an unknown id or a plant with no bindings. */
 size_t plants_table_bindings(const plants_table_t *t, uint8_t id,
                              plant_binding_t *out, size_t max);
+
+/* Bind plant `plant_id`'s action slot `slot` to `action_id` on `dev`.
+ * Rebinding an already-bound slot replaces its action/device outright, same
+ * "no move-off side effect" contract as plants_table_bind_cap(). Returns
+ * false for an unknown plant id, slot >= PLANT_ACTION_SLOTS, action_id >=
+ * ACTION_COUNT, or dev == NULL (unlike plants_table_bind_cap(), a slot has
+ * no "clear" form here -- rebind it, or leave it as ACTION_NONE). */
+bool plants_table_bind_action(plants_table_t *t, uint8_t plant_id, uint8_t slot,
+                              uint8_t action_id, const device_id_t *dev);
+
+/* Which slot (0..PLANT_ACTION_SLOTS-1) plant `plant_id` has bound to
+ * `action_id`, or -1 if none does (including an unknown plant id). */
+int plants_table_action_slot(const plants_table_t *t, uint8_t plant_id, uint8_t action_id);

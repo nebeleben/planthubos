@@ -3,15 +3,19 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define CAPABILITY_COUNT 8
+#define CAPABILITY_COUNT 9
 #define CAP_NONE         0xFF          /* "no capability" marker (column maps) */
 #define CAP_VALUE_NONE   INT16_MIN     /* stored sentinel: no value */
 
-/* Frozen ids 0-4 (M1 bytecode references them numerically). */
+/* Frozen ids 0-4 (M1 bytecode references them numerically); 5-7 also frozen
+ * (M3/M4 bytecode). CAP_SWITCH_STATE (M5b) is appended at the end, never
+ * renumbered: an actuator's on/off state is an ORDINARY capability so
+ * history, MQTT, HA and Influx render it with no new code (spec section
+ * 1.3). */
 enum {
     CAP_SOIL_MOISTURE = 0, CAP_AIR_TEMPERATURE = 1, CAP_LIGHT_ILLUMINANCE = 2,
     CAP_SOIL_CONDUCTIVITY = 3, CAP_BATTERY_LEVEL = 4, CAP_AIR_HUMIDITY = 5,
-    CAP_AIR_PRESSURE = 6, CAP_SIGNAL_RSSI = 7,
+    CAP_AIR_PRESSURE = 6, CAP_SIGNAL_RSSI = 7, CAP_SWITCH_STATE = 8,
 };
 
 typedef struct {
