@@ -364,8 +364,20 @@ class Parser {
   // aes_ccm_decrypt(payload, <expr>, <expr>) -- offset/len may be any
   // expression (unlike the fixed-offset accessors), matching AES_CCM's
   // pop-two-operands-off-the-stack opcode shape (no immediate operand).
+  //
+  // The AES_CCM opcode has no buffer operand at all: it always decrypts in
+  // place against the VM's one physical working buffer, i.e. the
+  // advertisement payload. There is no way to scope it to a single 16-byte
+  // GATT slot, so it is rejected outright in a connect wrapper rather than
+  // silently doing something other than what a buffer name would suggest.
   parseDecryptStmt() {
     const t = this.advance() // 'aes_ccm_decrypt'
+    if (this.buffers) {
+      throw new PSError(
+        "aes_ccm_decrypt() operates on the advertisement payload and is not scoped to a named buffer, so it cannot be used in a wrapper with a connect block",
+        t.line, t.col
+      )
+    }
     this.expectPunct('(')
     this.expectBufferIdent()
     this.expectPunct(',')
@@ -388,6 +400,21 @@ class Parser {
     this.expectPunct('(')
     const buf = this.expectBufferIdent()
     if (name === 'len') {
+      // A named GATT buffer has no runtime length to report: slots are
+      // fixed-size and zero-padded (never "short"), and a read failure
+      // aborts the whole plan before decode ever runs -- so by the time
+      // len() would execute, every declared slot is exactly PSVM_PLAN_SLOT
+      // bytes. PAYLOAD_LEN also has no buffer operand: it reports the
+      // WHOLE 64-byte concatenated working buffer's length, not any one
+      // slot's, so `len(temp)` would silently compare against 64 rather
+      // than a length that means anything -- a guard that never passes and
+      // a wrapper that silently emits nothing. Reject at compile time.
+      if (this.buffers) {
+        throw new PSError(
+          `len(${buf.name}) is not available in a connect wrapper: a named GATT buffer has no runtime length -- each slot is fixed-size and zero-padded, and a failed read aborts the plan before decode runs, so a length check is neither knowable at compile time nor needed at runtime`,
+          nameTok.line, nameTok.col
+        )
+      }
       this.expectPunct(')')
       return { type: 'plen', line: nameTok.line, col: nameTok.col }
     }

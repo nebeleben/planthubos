@@ -261,3 +261,42 @@ connect every 10min
 decode
   emit air.temperature u8(temp, 16)`, /outside/)
 })
+
+// Fix round 1: len() and aes_ccm_decrypt() have no honest meaning scoped to
+// a named GATT buffer (PAYLOAD_LEN/AES_CCM have no buffer operand -- both
+// always act on the VM's one physical working buffer), and len() in
+// particular would silently compare against the whole 64-byte concatenated
+// buffer rather than any one slot's size, so a guard like
+// `require len(temp) == 6` would fail on every run with no visible error.
+// Reject both at compile time in a connect wrapper; both remain legal in an
+// advert wrapper exactly as M3 defined them.
+
+test('len() is a compile error in a connect wrapper (a named buffer has no runtime length)', () => {
+  assertFails(`wrapper "x" match service 0x181A
+connect every 10min
+  read 2A6E as temp
+decode
+  emit air.temperature len(temp)`, /len\(temp\)/)
+})
+
+test('aes_ccm_decrypt() is a compile error in a connect wrapper (not scoped to a named buffer)', () => {
+  assertFails(`wrapper "x" match service 0x181A
+connect every 10min
+  read 2A6E as temp
+decode
+  aes_ccm_decrypt(temp, 0, 6)
+  emit air.temperature u8(temp, 0)`, /aes_ccm_decrypt/)
+})
+
+test('len() and aes_ccm_decrypt() remain legal in an advert wrapper (no connect block)', () => {
+  const src = `wrapper "x" match manufacturer 0x0001
+decode
+  require len(payload) > 10
+  aes_ccm_decrypt(payload, 4, 6)
+  emit air.temperature u8(payload, 4)`
+  const r = compileWrapper(src)
+  assert.equal(r.ok, true)
+  const asm = disassemble(r.bytecode)
+  assert.match(asm, /PAYLOAD_LEN/)
+  assert.match(asm, /AES_CCM/)
+})
