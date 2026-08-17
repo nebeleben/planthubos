@@ -106,10 +106,10 @@ static void test_last_ok_survives_failures_and_due_anchors_on_attempt(void)
 
 /* A never-read device must report something a caller can tell apart from
  * "read at time zero" -- Task 7 renders "never" differently from "just
- * now". 0 is the "never" sentinel (gatt_sched_last_ok()'s doc comment:
- * a real completed GATT read cannot land on uptime 0), so any real
- * success is guaranteed to report a nonzero, distinguishable value --
- * exercised here at the smallest legitimate uptime, 1 second. */
+ * now". Backed by the internal explicit "has ever succeeded" flag (fix
+ * round 2), not by last_ok_s being nonzero -- exercised here at the
+ * smallest legitimate post-boot uptime, 1 second; test_ok_at_time_zero_
+ * is_recorded_and_distinct_from_never below covers now_s == 0 itself. */
 static void test_last_ok_never_is_distinct_from_time_zero(void)
 {
     gatt_sched_reset();
@@ -122,6 +122,63 @@ static void test_last_ok_never_is_distinct_from_time_zero(void)
     assert(gatt_sched_last_ok(5) != 0);          /* distinguishable from "never" */
 }
 
+/* Fix round 2 (controller ruling): now_s == 0 is a real, reachable value
+ * -- an immediate NimBLE rejection needs no radio round-trip, and uptime
+ * is 1-second resolution, so the first second after boot is a real
+ * window, not a theoretical one. Before this fix, gatt_sched_due()
+ * inferred "never attempted" from last_attempt_s == 0, so a failure
+ * landing exactly at t=0 was silently exempted from backoff -- this is
+ * the reviewer's exact repro: a first contact that fails at t=0 must
+ * still open a real backed-off window, not be treated as if nothing
+ * happened. */
+static void test_fail_at_time_zero_backs_off(void)
+{
+    gatt_sched_reset();
+    gatt_sched_fail(6, 0);
+    assert(gatt_sched_fail_count(6) == 1);
+
+    /* declared interval 100 s; 1 fail -> scale 2x = 200 s window, anchored
+     * on the attempt at t=0 -- NOT treated as "never attempted", which
+     * would have short-circuited gatt_sched_due() to true here. */
+    assert(gatt_sched_due(6, 100, 50) == false);
+    assert(gatt_sched_due(6, 100, 199) == false);
+    assert(gatt_sched_due(6, 100, 200) == true);
+}
+
+/* Same fix round 2 concern, success side (the reviewer flagged
+ * gatt_sched_ok(dev, 0) as the same theoretical exposure): a success
+ * landing exactly on now_s == 0 must be recorded as a real event and
+ * stay distinguishable from a device that was never contacted at all.
+ * The distinguishing behaviour is gatt_sched_due(): a never-contacted
+ * device is due immediately even at now_s == 0, but once
+ * gatt_sched_ok(dev, 0) has actually happened, due() stops short-
+ * circuiting and instead honours the declared interval from that real
+ * attempt, exactly as it would for any other attempt timestamp. */
+static void test_ok_at_time_zero_is_recorded_and_distinct_from_never(void)
+{
+    gatt_sched_reset();
+    assert(gatt_sched_due(7, 600, 0) == true);   /* never contacted: due even at t=0 */
+
+    gatt_sched_ok(7, 0);
+    assert(gatt_sched_fail_count(7) == 0);
+    assert(gatt_sched_last_ok(7) == 0);          /* a real timestamp that happens to be 0 */
+
+    assert(gatt_sched_due(7, 600, 0) == false);      /* no longer "never contacted" */
+    assert(gatt_sched_due(7, 600, 599) == false);
+    assert(gatt_sched_due(7, 600, 600) == true);
+}
+
+/* A never-contacted device is due immediately, at any now_s -- including
+ * now_s == 0, which must not be mistaken for a past contact at t=0. */
+static void test_never_contacted_due_immediately(void)
+{
+    gatt_sched_reset();
+    assert(gatt_sched_due(8, 600, 0) == true);
+    assert(gatt_sched_due(8, 600, 999999) == true);
+    assert(gatt_sched_fail_count(8) == 0);
+    assert(gatt_sched_last_ok(8) == 0);
+}
+
 int main(void)
 {
     test_backoff_doubles_and_caps();
@@ -131,6 +188,9 @@ int main(void)
     test_due_boundaries();
     test_last_ok_survives_failures_and_due_anchors_on_attempt();
     test_last_ok_never_is_distinct_from_time_zero();
+    test_fail_at_time_zero_backs_off();
+    test_ok_at_time_zero_is_recorded_and_distinct_from_never();
+    test_never_contacted_due_immediately();
 
     printf("test_gatt_sched: OK\n");
     return 0;

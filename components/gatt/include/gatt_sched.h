@@ -83,8 +83,15 @@ void gatt_cache_reset(void);
 /* True if dev_idx is due another read at now_s, given the plan's declared
  * interval_s. A device that has never been ATTEMPTED (no gatt_sched_ok()
  * or gatt_sched_fail() call since the last gatt_sched_reset()) is due
- * immediately. Otherwise due = (now_s - <last ATTEMPT time>) >= interval_s
- * x min(2 ^ fail_count, GATT_SCHED_BACKOFF_CAP). Deliberately anchored on
+ * immediately -- this is tracked with an explicit internal "attempted"
+ * flag, NOT inferred from last_attempt_s being zero (fix round 2,
+ * controller ruling: now_s == 0 is a real, reachable value -- an
+ * immediate NimBLE rejection needs no radio round-trip, and uptime is
+ * 1-second resolution, so the first second after boot is a real window --
+ * so a zero TIMESTAMP can legitimately mean "attempted, at t=0", and
+ * inferring "never" from it would silently skip backoff on exactly that
+ * attempt). Otherwise due = (now_s - <last ATTEMPT time>) >= interval_s x
+ * min(2 ^ fail_count, GATT_SCHED_BACKOFF_CAP). Deliberately anchored on
  * the last attempt (gatt_sched_fail()'s last_attempt_s), NOT on
  * gatt_sched_last_ok()'s last SUCCESS -- anchoring on the last success
  * would make a failing device perpetually "past due", so it would retry
@@ -97,22 +104,29 @@ bool gatt_sched_due(int dev_idx, uint32_t interval_s, uint32_t now_s);
 /* Records a successful read at now_s: clears the failure count to 0 (one
  * success clears backoff completely -- deliberate, see this header's top
  * comment reference to design spec section 5), sets last_attempt_s (so
- * gatt_sched_due()'s backoff anchor advances too) AND sets last_ok_s (so
- * gatt_sched_last_ok() moves forward with it). dev_idx outside range is
- * a no-op. */
+ * gatt_sched_due()'s backoff anchor advances too), sets last_ok_s (so
+ * gatt_sched_last_ok() moves forward with it), and marks both internal
+ * "attempted" and "has ever succeeded" flags true -- explicitly, not by
+ * the timestamps becoming nonzero, because now_s == 0 is a real value a
+ * success can legitimately land on (fix round 2; see gatt_sched_due()'s
+ * doc comment for why the same argument applies here). dev_idx outside
+ * range is a no-op. */
 void gatt_sched_ok(int dev_idx, uint32_t now_s);
 
 /* Records a failed attempt at now_s: increments the failure count
  * (saturating at 255, never wrapping back to 0 -- a wrap would silently
  * reset backoff exactly like a success does, which a failure must never
- * do) and advances ONLY last_attempt_s, the timestamp gatt_sched_due()'s
- * backoff window is measured from. Deliberately does NOT touch last_ok_s
- * -- design spec section 5 requires a connect block that never succeeds
- * to stay visibly silent (the Devices tab renders the time of the last
- * SUCCESSFUL read, section 8); if a failure advanced last_ok_s too, a
- * device failing every attempt would show "last read: Ns ago" forever,
- * which hides exactly the silence section 5 exists to make loud.
- * dev_idx outside range is a no-op. */
+ * do), advances ONLY last_attempt_s (the timestamp gatt_sched_due()'s
+ * backoff window is measured from), and marks the internal "attempted"
+ * flag true -- even when now_s is 0 (fix round 2: a first contact that
+ * fails within the first second of uptime must still get a real backoff
+ * window, not be read back as "never attempted"). Deliberately does NOT
+ * touch last_ok_s or the "has ever succeeded" flag -- design spec section
+ * 5 requires a connect block that never succeeds to stay visibly silent
+ * (the Devices tab renders the time of the last SUCCESSFUL read, section
+ * 8); if a failure advanced last_ok_s too, a device failing every attempt
+ * would show "last read: Ns ago" forever, which hides exactly the silence
+ * section 5 exists to make loud. dev_idx outside range is a no-op. */
 void gatt_sched_fail(int dev_idx, uint32_t now_s);
 
 /* Current consecutive-failure count for dev_idx (0 = last attempt, if
@@ -126,12 +140,13 @@ uint8_t gatt_sched_fail_count(int dev_idx);
  * task-5-brief.md's pre-flight-scan addendum) so Task 7 can render "time
  * since last successful read" in the Devices tab without a second,
  * separately-updated copy of this timestamp -- see this header's module
- * comment. 0 is a safe "never" sentinel for the same reason handle 0 is
- * (this header's handle-cache section, above): now_s is uptime seconds,
- * and a GATT read cannot complete -- radio init, connect, optionally
- * discover, then the read itself all take real time -- at uptime 0, so a
- * real caller's first successful now_s is always > 0. dev_idx outside
- * range returns 0. */
+ * comment. "Never succeeded" is tracked with an explicit internal flag,
+ * NOT inferred from last_ok_s being zero (fix round 2: a real success can
+ * legitimately land on now_s == 0, exactly like gatt_sched_due()'s
+ * "attempted" flag above -- a zero RETURN VALUE from this function is
+ * therefore not itself proof of "never"; gatt_sched_due()'s behaviour,
+ * which uses the flag directly, is what actually distinguishes the two).
+ * dev_idx outside range returns 0. */
 uint32_t gatt_sched_last_ok(int dev_idx);
 
 /* Resets every device's failure count and both timestamps to zero (never
