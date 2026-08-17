@@ -1,14 +1,6 @@
 #include "gatt_fsm.h"
 #include <string.h>
 
-/* GE_WRITE_OK's handle is not compared against the currently-awaited
- * write's uuid16 the way GE_READ_OK's is (see gatt_ev_t.handle's doc
- * comment in the header): a same-state duplicate WRITE_OK could still
- * misadvance write_idx, but nothing decoded depends on a write's response
- * the way a read's slot does, so a wrong-value decode is not at stake
- * here the way it is for reads. Left as a known asymmetry rather than
- * silently "fixed" without it being asked for. */
-
 static uint16_t rd_u16(const uint8_t *p)
 {
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
@@ -161,6 +153,17 @@ gatt_act_t gatt_fsm_step(gatt_fsm_t *f, const gatt_ev_t *ev)
     case GS_WRITING:
         switch (ev->kind) {
         case GE_WRITE_OK:
+            /* Same identity check as GE_READ_OK below: a completion for
+             * anything other than the write currently awaited -- a
+             * same-state duplicate of the write just finished, or a
+             * uuid16 this plan never named -- is ignored rather than
+             * mistaken for the next write's completion (see
+             * gatt_ev_t.handle's doc comment). Skipping a real write
+             * silently is the same wrong-value hazard as skipping a real
+             * read: a device left unwoken or in its default mode still
+             * answers the reads that follow with plausible bytes. */
+            if (ev->handle != f->write[f->write_idx].uuid16) return act(GA_NONE);
+
             f->write_idx++;
             if (f->write_idx < f->write_count)
                 return act_write(f, f->write_idx);

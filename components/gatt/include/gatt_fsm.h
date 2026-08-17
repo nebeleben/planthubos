@@ -39,25 +39,28 @@ typedef enum { GS_IDLE, GS_CONNECTING, GS_DISCOVERING, GS_WRITING,
 typedef enum { GE_START, GE_CONNECTED, GE_DISCONNECTED, GE_DISCOVERED,
                GE_WRITE_OK, GE_READ_OK, GE_DECODED, GE_ERROR, GE_TIMEOUT } gatt_ev_kind_t;
 
-/* handle: which characteristic this completion is for (uuid16). On
- * GE_READ_OK this module DOES check it: it compares against the uuid16 the
- * currently-awaited read expects (from the plan) and ignores the event on
- * a mismatch, exactly as it ignores any other event that makes no sense
- * right now. This is deliberately checked here rather than left to the
- * adapter -- this pure module is the only part of M5a's GATT read path a
- * host test can reach, so a same-state duplicate (a second GE_READ_OK
- * arriving for the read that already completed, while still in
- * GS_READING waiting on the next one) has to be caught here or it isn't
- * provably caught at all: unlike a duplicate of the wrong EVENT KIND,
- * which the (state, event-kind) dispatch below already rejects on its
- * own, two READ_OKs in a row are the same kind in the same state, and
- * without this check the second one would be accepted as the next read's
- * completion and its bytes written into the wrong slot -- a decode that
- * succeeds and is silently wrong. Task 6's adapter may still filter using
- * its own NimBLE callback context too (defence in depth is fine); it must
- * not be the only layer that does. GE_WRITE_OK's handle is not currently
- * checked the same way -- see gatt_fsm.c's top comment for that
- * asymmetry. */
+/* handle: which characteristic this completion is for (uuid16). Both
+ * GE_READ_OK and GE_WRITE_OK are checked against it: each compares
+ * against the uuid16 the currently-awaited read or write expects (from
+ * the plan) and ignores the event on a mismatch, exactly as it ignores
+ * any other event that makes no sense right now. This is deliberately
+ * checked here rather than left to the adapter -- this pure module is
+ * the only part of M5a's GATT read path a host test can reach, so a
+ * same-state duplicate (a second completion of the SAME kind arriving
+ * for the read or write that already finished, while still in
+ * GS_READING/GS_WRITING waiting on the next one) has to be caught here or
+ * it isn't provably caught at all: unlike a duplicate of the wrong EVENT
+ * KIND, which the (state, event-kind) dispatch below already rejects on
+ * its own, two READ_OKs (or two WRITE_OKs) in a row are the same kind in
+ * the same state, and without this check the second one would be
+ * accepted as the next step's completion. For a read that means bytes
+ * written into the wrong slot -- a decode that succeeds and is silently
+ * wrong. For a write it means the real write is skipped or never
+ * confirmed while the sequence proceeds as though it landed -- the same
+ * hazard one event kind over: a device left unwoken or in its default
+ * mode still answers the reads that follow with plausible bytes. Task 6's
+ * adapter may still filter using its own NimBLE callback context too
+ * (defence in depth is fine); it must not be the only layer that does. */
 typedef struct { gatt_ev_kind_t kind; uint16_t handle; const uint8_t *data; uint8_t len; } gatt_ev_t;
 
 typedef enum { GA_NONE, GA_CONNECT, GA_DISCOVER, GA_WRITE, GA_READ,

@@ -23,9 +23,22 @@ static const uint8_t PLAN_1READ[] = {
     0x6E, 0x2A,                 /* read 0x2A6E */
 };
 
+/* Two writes, so a duplicate GE_WRITE_OK for write 0 can be delivered
+ * while write 1 is still outstanding (test_write_ok_wrong_uuid_ignored) --
+ * PLAN_2READ_1WRITE only has one write, which can't exercise that case. */
+static const uint8_t PLAN_2READ_2WRITE[] = {
+    2, 2,                       /* read_count=2, write_count=2 */
+    0x58, 0x02, 0x00, 0x00,     /* interval_s = 600 */
+    0x6E, 0x2A,                 /* read 0x2A6E */
+    0x6F, 0x2A,                 /* read 0x2A6F */
+    0x00, 0x2A, 1, 0x01,        /* write 0x2A00 = 01 */
+    0x01, 0x2A, 1, 0x02,        /* write 0x2A01 = 02 */
+};
+
 #define EV(k) ((gatt_ev_t){ .kind = (k), .handle = 0, .data = NULL, .len = 0 })
 #define EV_READ(u, d, l) \
     ((gatt_ev_t){ .kind = GE_READ_OK, .handle = (u), .data = (const uint8_t *)(d), .len = (l) })
+#define EV_WRITE(u) ((gatt_ev_t){ .kind = GE_WRITE_OK, .handle = (u), .data = NULL, .len = 0 })
 
 /* Cold cache: the full sequence, in order. */
 static void test_cold_path(void)
@@ -39,7 +52,7 @@ static void test_cold_path(void)
     assert(f.state == GS_DISCOVERING);
     assert(gatt_fsm_step(&f, &EV(GE_DISCOVERED)).kind == GA_WRITE);
     assert(f.state == GS_WRITING);
-    assert(gatt_fsm_step(&f, &EV(GE_WRITE_OK)).kind   == GA_READ);
+    assert(gatt_fsm_step(&f, &EV_WRITE(0x2A00)).kind == GA_READ);
     assert(f.state == GS_READING);
     assert(gatt_fsm_step(&f, &EV_READ(0x2A6E, "\x11\x22", 2)).kind == GA_READ);
     assert(f.state == GS_READING);
@@ -120,7 +133,7 @@ static void drive_to_state(gatt_fsm_t *f, gatt_state_t target)
     if (target == GS_DISCOVERING) return;
     gatt_fsm_step(f, &EV(GE_DISCOVERED));
     if (target == GS_WRITING) return;
-    gatt_fsm_step(f, &EV(GE_WRITE_OK));
+    gatt_fsm_step(f, &EV_WRITE(0x2A00));
     if (target == GS_READING) return;
     gatt_fsm_step(f, &EV_READ(0x2A6E, "\x11\x22", 2));
     gatt_fsm_step(f, &EV_READ(0x2A6F, "\x33\x44", 2));
@@ -177,7 +190,7 @@ static void test_read_ok_wrong_uuid_ignored(void)
     gatt_fsm_step(&f, &EV(GE_START));
     gatt_fsm_step(&f, &EV(GE_CONNECTED));
     gatt_fsm_step(&f, &EV(GE_DISCOVERED));
-    gatt_fsm_step(&f, &EV(GE_WRITE_OK));
+    gatt_fsm_step(&f, &EV_WRITE(0x2A00));
     assert(f.state == GS_READING);
     assert(f.read_idx == 0);
 
@@ -206,6 +219,59 @@ static void test_read_ok_wrong_uuid_ignored(void)
     assert(f.state == GS_DECODING);
     assert(memcmp(decode.data, "\x11\x22", 2) == 0);       /* untouched by the 0x2A6E duplicate */
     assert(memcmp(decode.data + 16, "\x33\x44", 2) == 0);
+}
+
+/* A WRITE_OK's handle must match the write currently expected -- mirrors
+ * test_read_ok_wrong_uuid_ignored exactly, for the write path the
+ * coordinator's fix-round-2 ruling extended the same check to (round 1
+ * only required it for reads; round 2 found the write path skips a real
+ * write silently, the same wrong-value hazard one event kind over -- a
+ * device left unwoken or in its default mode still answers the reads
+ * that follow with plausible bytes). Needs PLAN_2READ_2WRITE so a
+ * duplicate for write 0 can be delivered while write 1 is still
+ * outstanding -- PLAN_2READ_1WRITE's single write can't exercise that. */
+static void test_write_ok_wrong_uuid_ignored(void)
+{
+    gatt_fsm_t f;
+    gatt_fsm_init(&f, PLAN_2READ_2WRITE, sizeof PLAN_2READ_2WRITE, false);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    assert(gatt_fsm_step(&f, &EV(GE_DISCOVERED)).kind == GA_WRITE);
+    assert(f.state == GS_WRITING);
+    assert(f.write_idx == 0);
+
+    /* Correct completion for write 0 (0x2A00). */
+    gatt_act_t w1 = gatt_fsm_step(&f, &EV_WRITE(0x2A00));
+    assert(w1.kind == GA_WRITE);
+    assert(w1.uuid16 == 0x2A01);
+    assert(f.write_idx == 1);
+
+    /* Duplicate completion for the write that already finished (0x2A00
+     * again, not the 0x2A01 now expected, with write 1 still outstanding)
+     * -- ignored, does not advance. */
+    gatt_act_t dup = gatt_fsm_step(&f, &EV_WRITE(0x2A00));
+    assert(dup.kind == GA_NONE);
+    assert(f.state == GS_WRITING);
+    assert(f.write_idx == 1);
+
+    /* A completion carrying a uuid16 that isn't in this plan at all is
+     * equally ignored. */
+    gatt_act_t bogus = gatt_fsm_step(&f, &EV_WRITE(0x9999));
+    assert(bogus.kind == GA_NONE);
+    assert(f.state == GS_WRITING);
+    assert(f.write_idx == 1);
+
+    /* The correct next write still completes normally afterwards -- the
+     * mismatches above did not corrupt write_idx, and the sequence
+     * proceeds into reading exactly as it would have without them. A
+     * guard written too strictly would break this assertion, which is
+     * why it matters as much as the mismatch ones above: rejecting every
+     * legitimate write completion would be worse than the bug it
+     * replaces. */
+    gatt_act_t r = gatt_fsm_step(&f, &EV_WRITE(0x2A01));
+    assert(r.kind == GA_READ);
+    assert(f.state == GS_READING);
+    assert(r.uuid16 == 0x2A6E);
 }
 
 /* Every path from GS_CONNECTING to a terminal state must close the link
@@ -237,7 +303,7 @@ static void test_exactly_one_disconnect_per_terminal_path(void)
     /* success */
     gatt_fsm_init(&f, PLAN_2READ_1WRITE, sizeof PLAN_2READ_1WRITE, false);
     gatt_ev_t success_seq[] = {
-        EV(GE_START), EV(GE_CONNECTED), EV(GE_DISCOVERED), EV(GE_WRITE_OK),
+        EV(GE_START), EV(GE_CONNECTED), EV(GE_DISCOVERED), EV_WRITE(0x2A00),
         EV_READ(0x2A6E, "\x11\x22", 2), EV_READ(0x2A6F, "\x33\x44", 2), EV(GE_DECODED),
     };
     run_and_count(&f, success_seq, sizeof success_seq / sizeof success_seq[0], &nd, &nr);
@@ -296,7 +362,7 @@ static void test_unexpected_event_ignored(void)
     gatt_fsm_step(&f, &EV(GE_START));
     gatt_fsm_step(&f, &EV(GE_CONNECTED));
     gatt_fsm_step(&f, &EV(GE_DISCOVERED));
-    gatt_fsm_step(&f, &EV(GE_WRITE_OK));
+    gatt_fsm_step(&f, &EV_WRITE(0x2A00));
     assert(f.state == GS_READING);
     assert(gatt_fsm_step(&f, &EV(GE_WRITE_OK)).kind == GA_NONE);
     assert(f.state == GS_READING);
@@ -323,6 +389,7 @@ int main(void)
     test_unsolicited_disconnect();
     test_unexpected_event_ignored();
     test_read_ok_wrong_uuid_ignored();
+    test_write_ok_wrong_uuid_ignored();
     test_exactly_one_disconnect_per_terminal_path();
 
     printf("test_gatt_fsm: OK\n");
