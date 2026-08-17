@@ -72,6 +72,29 @@ int  registry_count(const registry_t *r);
 int  registry_set_cap(registry_t *r, const device_id_t *id, uint8_t cap_id,
                       int16_t raw, uint32_t now_s);
 
+/* Finds id's registry slot, or claims a free one when id is unknown -- same
+ * find-or-create primitive registry_set_cap()/registry_attribute() already
+ * use internally, exposed directly for a caller that has confirmed a device
+ * is present but has no capability value (or attribution decision) to write
+ * yet (M5a gate fix 3: a connect-only GATT device's matched advertisement,
+ * before any GATT read has happened -- see ble_collector.c's decode_adv_item()
+ * and data_core_find_or_create_index(), which wraps this under s_mutex).
+ *
+ * now_s stamps the NEW entry's last_seen_s -- ONLY on the create path, since
+ * this call is itself the sighting that justifies the slot existing at all.
+ * An ALREADY-known device's last_seen_s is left exactly as it was: finding
+ * it here asserts nothing new about when it was last heard from, unlike
+ * registry_set_cap()/registry_attribute(), which always refresh it because
+ * they represent a real reading. Calling this repeatedly for the same known
+ * device is therefore side-effect-free after the first call.
+ *
+ * Returns -1 when the table is full and id is unknown -- nothing is created
+ * or modified in that case, same as every other find_or_create()-backed
+ * entry point here. The caller decides what "full" means for it; this
+ * function only guarantees it never silently overwrites another device's
+ * slot to make room. */
+int registry_find_or_create(registry_t *r, const device_id_t *id, uint32_t now_s);
+
 /* Attribution decision, unchanged semantics from M5b (see the original
  * registry_update_from() comment this carries forward verbatim):
  *   - A brand-new device (never seen before) is unconditionally attributed

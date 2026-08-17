@@ -59,6 +59,45 @@ static struct {
 } s_unreg_warned[UNREG_WARN_SLOTS];
 static uint8_t s_unreg_next;  /* round-robin eviction index */
 
+/* M5a gate fix 3: running count of data_core_find_or_create_index() calls
+ * that found the registry full and unknown id -- see data_core.h's doc
+ * comment. Single-writer (adv_decoder_task, the only caller of that
+ * function today) -- a plain uint32_t is safe unlocked, same reasoning as
+ * ble_collector.c's own adv_dropped counter and this file's s_dropped_stale
+ * just below. */
+static uint32_t s_registry_full_drops;
+
+/* Shared by data_core_submit_cap()'s "device never registered" throttle
+ * (Bypass B, Task 5 review round 2, below) and
+ * data_core_find_or_create_index()'s "registry is full" throttle (M5a gate
+ * fix 3) -- both are symptoms of the exact same fact, "this MAC has no
+ * registry slot", and both want the identical policy: warn once per such
+ * MAC, then go quiet for the rest of the boot, across a small bounded set
+ * of distinct offenders rather than only ever reporting the first one.
+ * Returns true if mac was already recorded (caller should stay silent);
+ * false the first time (and records it before returning, so the caller's
+ * own log line fires exactly once per mac). Must be called with s_mutex
+ * held -- shares s_unreg_warned/s_unreg_next with every other access here. */
+static bool unreg_warn_seen(const uint8_t mac[6])
+{
+    for (int i = 0; i < UNREG_WARN_SLOTS; i++) {
+        if (s_unreg_warned[i].used && memcmp(s_unreg_warned[i].mac, mac, 6) == 0) {
+            return true;
+        }
+    }
+    int slot = -1;
+    for (int i = 0; i < UNREG_WARN_SLOTS; i++) {
+        if (!s_unreg_warned[i].used) { slot = i; break; }
+    }
+    if (slot < 0) {
+        slot = s_unreg_next;
+        s_unreg_next = (s_unreg_next + 1) % UNREG_WARN_SLOTS;
+    }
+    memcpy(s_unreg_warned[slot].mac, mac, 6);
+    s_unreg_warned[slot].used = true;
+    return false;
+}
+
 esp_err_t data_core_init(void)
 {
     s_mutex = xSemaphoreCreateMutex();
@@ -288,29 +327,10 @@ bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
             s_cap_warned[idx] |= bit;
         } else {
             unregistered = true;
-            /* Check if this MAC is already in the bounded throttle table */
-            int slot = -1;
-            for (int i = 0; i < UNREG_WARN_SLOTS; i++) {
-                if (s_unreg_warned[i].used && memcmp(s_unreg_warned[i].mac, mac, 6) == 0) {
-                    already_warned = true;
-                    break;
-                }
-                if (!s_unreg_warned[i].used && slot < 0) {
-                    slot = i;
-                }
-            }
-            /* If not found and we have an unused slot, record it */
-            if (!already_warned && slot >= 0) {
-                memcpy(s_unreg_warned[slot].mac, mac, 6);
-                s_unreg_warned[slot].used = true;
-            }
-            /* If not found and no unused slot, evict the next slot round-robin */
-            if (!already_warned && slot < 0) {
-                slot = s_unreg_next;
-                memcpy(s_unreg_warned[slot].mac, mac, 6);
-                s_unreg_warned[slot].used = true;
-                s_unreg_next = (s_unreg_next + 1) % UNREG_WARN_SLOTS;
-            }
+            /* Bounded per-MAC throttle, shared with
+             * data_core_find_or_create_index()'s "registry full" warning --
+             * see unreg_warn_seen()'s own doc comment above. */
+            already_warned = unreg_warn_seen(mac);
         }
         xSemaphoreGive(s_mutex);
 
@@ -354,4 +374,34 @@ int data_core_find_index(const device_id_t *id)
     int idx = registry_find(&s_registry, id);
     xSemaphoreGive(s_mutex);
     return idx;
+}
+
+int data_core_find_or_create_index(const device_id_t *id, uint32_t now_s)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int idx = registry_find_or_create(&s_registry, id, now_s);
+    /* already_warned computed under the SAME lock as the throttle table it
+     * reads/updates (unreg_warn_seen()'s own contract); the log line itself
+     * fires below, outside the lock, same "decide under lock, log after
+     * giving it up" shape data_core_submit_cap() already uses just above. */
+    bool already_warned = true;
+    if (idx < 0) {
+        s_registry_full_drops++;
+        already_warned = unreg_warn_seen(id->addr);
+    }
+    xSemaphoreGive(s_mutex);
+
+    if (idx < 0 && !already_warned) {
+        ESP_LOGW(TAG, "registry full, no slot for new device " MACSTR_FMT
+                 " (registry_full_drops=%lu since boot; further repeats for "
+                 "THIS device are suppressed, but a different never-seen "
+                 "device will still be reported, up to %d at a time)",
+                 MAC_ARG(id->addr), (unsigned long)s_registry_full_drops, UNREG_WARN_SLOTS);
+    }
+    return idx;
+}
+
+uint32_t data_core_registry_full_drops(void)
+{
+    return s_registry_full_drops;
 }

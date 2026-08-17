@@ -146,3 +146,48 @@ bool      data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value
  * lifetime -- the memo table never needs to worry about a slot being
  * silently reused by a different device. */
 int       data_core_find_index(const device_id_t *id);
+
+/* M5a gate fix 3 (spec §5/§8): a connect-only GATT device's FIRST matched
+ * advertisement is the earliest moment it can be given a stable registry
+ * index -- gatt_sched_due()/gatt_engine_request() (ble_collector.c) need one
+ * to schedule a read at all, and section 5's "a connect block that never
+ * succeeds must stay visible" cannot hold for a device that never even gets
+ * a GET /api/v1/devices entry, since data_core_find_index() above never
+ * creates one. Unlike that function, this one DOES create a slot when id is
+ * unknown (registry_find_or_create(), registry.h), via the same s_mutex
+ * every other accessor here takes.
+ *
+ * The device this creates has NO capability yet -- confirmed tolerated
+ * end to end (device_json() already renders an empty caps[] array for any
+ * device between boot and its first successful reading; the dashboard,
+ * Plants tab binding pickers, MQTT/HA discovery and history all iterate
+ * `caps[c].valid` and simply publish/offer nothing for a device with none
+ * set, same as any brand-new advert-only device already does before its
+ * first frame decodes). now_s stamps the NEW entry's last_seen_s (this call
+ * IS the sighting) -- only on the create path; calling this for an
+ * already-known device never touches its last_seen_s.
+ *
+ * Returns -1 when the registry is already full (REGISTRY_MAX_DEVICES,
+ * currently 16) and id is unknown -- nothing is created, and the caller
+ * must treat this exactly like data_core_find_index() returning -1 (no
+ * memo write, no schedule check -- ble_collector.c already has that
+ * fallback for "device not yet registered"). NOT fatal, and NOT silent: a
+ * `service`-UUID connect wrapper can plausibly match several distinct
+ * devices at once, so a hub can genuinely run out of the 16-slot budget on
+ * devices that never get to read successfully -- a real, reachable limit,
+ * not a theoretical one. Each distinct device that hits this is logged
+ * once (WARN), throttled per-device via the exact same bounded table
+ * data_core_submit_cap()'s pre-existing "device never registered" warning
+ * already uses (data_core.c) -- one shared mechanism for "this MAC has no
+ * registry slot", not two independently-drifting ones. The running total
+ * is exposed via data_core_registry_full_drops() below. */
+int       data_core_find_or_create_index(const device_id_t *id, uint32_t now_s);
+
+/* Running count of data_core_find_or_create_index() calls that returned -1
+ * because the registry was already full -- exposed at GET /api/v1/status as
+ * "registry_full_drops", the same "a saturated resource is visible, not
+ * silent" idiom ble_collector_adv_dropped() already established for the raw
+ * advert ring (ble_collector.h). Never decreases; registry entries are
+ * never removed once created (registry.h), so once this budget is spent for
+ * a boot it stays spent. */
+uint32_t  data_core_registry_full_drops(void);

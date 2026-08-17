@@ -426,14 +426,40 @@ static void decode_adv_item(const adv_item_t *item)
              * yet due a read does LITERALLY nothing else on this
              * advertisement below.
              *
-             * midx = ridx, not a re-resolve: nothing on THIS path can have
-             * just registered the device (no EMIT ran, unlike the
-             * advert-wrapper branch below), so ridx from above is still
-             * accurate. Recording the memo here only ever short-circuits
-             * the match-index lookup above for this device's NEXT
-             * advertisement -- no observable effect (no decode, no error,
-             * no counter, no registry write, no rules wake). */
-            int midx = ridx;
+             * M5a gate fix 3 (hardware gate, spec section 5/8): before this
+             * fix, midx was just ridx, and a connect-only device deadlocked
+             * here -- ridx is -1 on its very first advertisement (nothing
+             * before this point can have registered it: no EMIT ever ran,
+             * unlike the advert-wrapper branch below), so midx stayed -1
+             * forever, so gatt_sched_due()/gatt_engine_request() below were
+             * never reached, so no read was ever requested, so no EMIT ever
+             * ran to create a registry entry -- no capability, no registry
+             * entry, no GET /api/v1/devices row, forever, for the exact
+             * class of device this milestone exists to serve.
+             *
+             * data_core_find_or_create_index() (data_core.h) gives this
+             * advertisement itself a stable index when ridx doesn't already
+             * have one -- the earliest possible point, with no capability
+             * written yet (that function's own doc comment has the "every
+             * consumer already tolerates zero capabilities" argument).
+             * item->uptime_s (the same clock last_seen_s is measured in
+             * everywhere else -- gatt_sched_ok()/fail(), the age_s
+             * conversions in devices_json.c) stamps the new entry's
+             * last_seen_s, since this advertisement genuinely IS the
+             * sighting that justifies the slot existing.
+             *
+             * -1 here means the registry is already full and this MAC
+             * isn't in it -- falls through exactly as -1 always has (no
+             * memo write, no schedule check below), not fatal and not
+             * silent: data_core_find_or_create_index() itself throttles and
+             * warns (its own doc comment). Calling this on EVERY matched
+             * advertisement of a still-unregistered device, rather than
+             * trying once and giving up, is deliberate: it costs one
+             * registry scan under the mutex ridx's own lookup above already
+             * pays every advertisement, and it is the only way a device
+             * that eventually gets a slot is ever picked up. */
+            int midx = (ridx >= 0) ? ridx
+                                   : data_core_find_or_create_index(&wid, item->uptime_s);
             if (midx >= 0 && midx < REGISTRY_MAX_DEVICES) {
                 s_wrapper_memo[midx] = (uint16_t)wrapper_id;
             }

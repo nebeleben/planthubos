@@ -214,6 +214,13 @@ static esp_err_t status_get(httpd_req_t *req)
     /* M3 §1: raw-advert queue drop counter, so a saturated queue shows up
      * here instead of silently losing advertisements. */
     cJSON_AddNumberToObject(root, "adv_dropped", ble_collector_adv_dropped());
+    /* M5a gate fix 3: registry-full counter, same idiom as adv_dropped just
+     * above -- a device a connect wrapper matched but the 16-slot registry
+     * had no room for is a real, reachable outcome (a broad `service`-UUID
+     * match can hit several distinct devices), so it must be visible here
+     * rather than only in a throttled log line (data_core.h's doc comment
+     * on data_core_registry_full_drops()). */
+    cJSON_AddNumberToObject(root, "registry_full_drops", data_core_registry_full_drops());
     const esp_partition_t *running = esp_ota_get_running_partition();
     if (running) cJSON_AddStringToObject(root, "partition", running->label);
     return send_json(req, root);

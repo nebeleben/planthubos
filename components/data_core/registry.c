@@ -44,6 +44,19 @@ static int find_or_create(registry_t *r, const device_id_t *id, bool *created)
     return -1;
 }
 
+int registry_find_or_create(registry_t *r, const device_id_t *id, uint32_t now_s)
+{
+    bool created;
+    int idx = find_or_create(r, id, &created);
+    /* Only the CREATE path gets a fresh last_seen_s -- an already-known
+     * device returned here (created == false) keeps whatever last_seen_s a
+     * real reading last gave it; see this function's doc comment
+     * (registry.h) for why finding it here must not itself count as a
+     * sighting for a device that has one already. */
+    if (idx >= 0 && created) r->devices[idx].last_seen_s = now_s;
+    return idx;
+}
+
 int registry_set_cap(registry_t *r, const device_id_t *id, uint8_t cap_id,
                       int16_t raw, uint32_t now_s)
 {
