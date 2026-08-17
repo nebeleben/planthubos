@@ -78,6 +78,10 @@ $CC -Wall -Wextra -Werror -I../../components/psvm/include \
     test_psvm.c ../../components/psvm/psvm.c -o test_psvm -lm
 ./test_psvm
 
+$CC -Wall -Wextra -Werror -I../../components/gatt/include \
+    test_gatt_fsm.c ../../components/gatt/gatt_fsm.c -o test_gatt_fsm
+./test_gatt_fsm
+
 $CC -Wall -Wextra -Werror -I../../components/rules/include \
     test_rules_fsm.c ../../components/rules/rules_fsm.c -o test_rules_fsm
 ./test_rules_fsm
