@@ -153,6 +153,18 @@ void gatt_sched_fail(int dev_idx, uint32_t now_s)
     if (s_sched[dev_idx].fails < 255) s_sched[dev_idx].fails++;
 }
 
+void gatt_sched_attempt(int dev_idx, uint32_t now_s)
+{
+    if (!dev_idx_valid(dev_idx)) return;
+    /* Deliberately the intersection of the two above: the attempt bookkeeping
+     * and backoff clearing of gatt_sched_ok(), with gatt_sched_fail()'s
+     * hands-off treatment of last_ok_s/has_ok. See the header doc comment
+     * for why neither of those two alone tells the truth about this case. */
+    s_sched[dev_idx].last_attempt_s = now_s;
+    s_sched[dev_idx].attempted = 1;
+    s_sched[dev_idx].fails = 0;
+}
+
 uint8_t gatt_sched_fail_count(int dev_idx)
 {
     if (!dev_idx_valid(dev_idx)) return 0;

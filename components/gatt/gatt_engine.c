@@ -16,7 +16,6 @@
 #include "gatt_fsm.h"
 #include "gatt_sched.h"
 #include "wrapper_exec.h"
-#include "event_log.h"
 #include "psvm.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -25,7 +24,6 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_npl.h"
 #include <string.h>
-#include <stdio.h>
 
 static const char *TAG = "gatt_engine";
 
@@ -37,15 +35,38 @@ static const char *TAG = "gatt_engine";
  * indefinitely without ever technically timing out. */
 #define GATT_ATTEMPT_DEADLINE_MS 5000
 
+/* Deliberately SHORTER than the attempt deadline (fix round 1, Critical 1,
+ * contributor 1). Handing ble_gap_connect() the same 5000 ms meant our
+ * microsecond-resolution timer always beat NimBLE's later, tick-granular
+ * one, so the single most common real failure -- a battery sensor that went
+ * back to sleep before the connect landed -- always took the timeout path
+ * instead of the CONNECT-with-nonzero-status path that already works and
+ * that leaves the stack's master state cleanly reset. With this margin the
+ * ordinary case is handled by the ordinary path and our timer is what it
+ * was meant to be: a backstop. CONFIG_BT_NIMBLE_MAX_CONN_REATTEMPT is 3, so
+ * the stack may retry within this window; that is still bounded by it. */
+#define GATT_CONNECT_TIMEOUT_MS 3000
+
 /* Not a second deadline: this is armed only AFTER the attempt deadline has
  * already expired and a disconnect has been commanded, to bound the wait
- * for the BLE_GAP_EVENT_DISCONNECT that confirms it. Without it, a
- * teardown whose confirmation never arrives would leave s_active true
- * forever, and since restarting the scan is part of ending an attempt, the
- * hub would stay deaf to every advertisement for the rest of the boot --
- * the exact failure the deadline exists to prevent, reintroduced one step
- * later. battery_poll.c's POLL_WATCHDOG_S guards the same hazard. */
+ * for the event that confirms it. Without it, a teardown whose confirmation
+ * never arrives would leave s_active true forever, and since restarting the
+ * scan is part of ending an attempt, the hub would stay deaf to every
+ * advertisement for the rest of the boot -- the exact failure the deadline
+ * exists to prevent, reintroduced one step later. battery_poll.c's
+ * POLL_WATCHDOG_S guards the same hazard. */
 #define GATT_TEARDOWN_GRACE_MS 1000
+
+/* Scan-restart retry (fix round 1, Critical 1, contributor 3). ble_gap_disc()
+ * returns BLE_HS_EBUSY while a connect procedure is still outstanding, and
+ * ble_gap_conn_cancel() does NOT clear that state synchronously -- it only
+ * transmits the HCI cancel and sets master.conn.cancel, with master.op
+ * cleared later, when the controller reports the aborted connection (read
+ * out of ble_gap.c, not assumed). So a restart can legitimately fail for a
+ * few milliseconds after an aborted attempt. 10 x 250 ms covers that with
+ * wide margin while still giving up rather than retrying forever. */
+#define GATT_SCAN_RETRY_MS  250
+#define GATT_SCAN_RETRY_MAX 10
 
 /* Largest connect-plan section psvm.h's on-blob layout can produce:
  * u8 read_count + u8 write_count + u32 interval_s, then the read uuid16s,
@@ -59,17 +80,29 @@ static const char *TAG = "gatt_engine";
 #define GATT_PLAN_MAX (6 + PSVM_PLAN_MAX_READS * 2 + \
                        PSVM_PLAN_MAX_WRITES * (3 + PSVM_PLAN_WRITE_MAX))
 
+/* What the single esp_timer is currently counting down, so its one callback
+ * can tell three unrelated deadlines apart. They can never overlap: the
+ * teardown grace only starts once the attempt deadline has expired, and a
+ * scan retry only starts once the attempt has ended (and gatt_engine_busy()
+ * reports busy while one is pending, so no new attempt can begin under it). */
+typedef enum { TP_IDLE, TP_ATTEMPT, TP_TEARDOWN, TP_SCAN_RETRY } timer_phase_t;
+
 /* ---------------- state ----------------
  *
  * All of this is static, per spec section 6's budget: one attempt at a time
  * is the same single-writer argument the shared read buffer rests on.
  *
- * Unless a field's comment says otherwise it is owned by the NimBLE host
- * task and touched nowhere else (see gatt_engine.h's task-ownership note).
+ * The NimBLE host task is the only WRITER of everything here. Two fields
+ * are also read from adv_decoder_task and are marked as such; see
+ * gatt_engine.h's task-ownership note for why that is safe and what would
+ * not be.
  */
 static gatt_fsm_t s_fsm;
-static bool     s_active;          /* an attempt is open: from start_attempt() to attempt_finish() */
-static bool     s_grace;           /* the deadline already fired; the timer is now the teardown watchdog */
+static bool     s_active;          /* attempt open: set by on_start_req(), cleared by attempt_finish().
+                                    * Also READ from adv_decoder_task via gatt_engine_busy(). */
+static bool     s_link_up;         /* did this attempt ever get a connection up (scopes the cache drop) */
+static timer_phase_t s_phase;
+static uint8_t  s_scan_retries;
 static uint16_t s_wrapper_id;
 static int      s_dev_idx = -1;
 static uint8_t  s_mac_gap[6];      /* raw GAP/on-air order -- what ble_gap_connect() wants */
@@ -85,39 +118,37 @@ static uint16_t s_plan_len;
  * spec section 6 budgets ~200 B for the whole connection manager, and 16
  * devices x even a modest fixed-size string is several times that. Every
  * value ever stored here is a string literal chosen at the point of
- * failure, so a per-device pointer table costs 64 B and keeps the
- * budget honest. The NimBLE status code that a formatted string would have
- * carried is not lost -- it goes to the log line at the point of failure,
- * where it is actually useful for diagnosis, rather than into a UI field
- * whose job is to say WHAT failed in words a user can act on. */
+ * failure, so a per-device pointer table costs 64 B and keeps the budget
+ * honest, and a reader on another task can never see a half-written string
+ * -- only one pointer or the other, both to immortal storage. The NimBLE
+ * status code that a formatted string would have carried goes to the log
+ * line at the point of failure, where it is actually useful for diagnosis,
+ * rather than into a UI field whose job is to say WHAT failed in words a
+ * user can act on. */
 static const char *s_last_error[GATT_SCHED_MAX_DEVICES];
 static const char *s_err;          /* reason for the failure currently being processed */
 
-/* Set by the host task, consumed by adv_decoder_task (gatt_engine_service()).
- * Plain volatile bools, exactly like ble_collector.c's
- * s_wrapper_reindex_pending: one bit of information each, nothing else
- * depends on their ordering relative to anything but the fields they gate,
- * and each is written by one task and cleared by the other. */
-static volatile bool s_decode_pending;
-static volatile bool s_report_pending;
-static volatile bool s_req_pending;    /* the other direction: decoder task -> host task */
+/* The two cross-task flags, each written by one task and cleared by the
+ * other -- plain volatile bools, exactly like ble_collector.c's
+ * s_wrapper_reindex_pending: one bit of information each, and nothing else
+ * depends on their ordering relative to anything but the fields they gate. */
+static volatile bool s_req_pending;      /* decoder task -> host task */
+static volatile bool s_decode_pending;   /* host task -> decoder task */
 static uint8_t  s_decode_len;
-static bool     s_decode_wrote;        /* did the decode actually write a capability value */
-
-/* Snapshot of the finished attempt, for the deferred event-log entry.
- * event_log_append() writes LittleFS and then runs the SSE and MQTT hooks,
- * so it can never be called from the NimBLE host task; attempt_finish()
- * fills this in instead and adv_decoder_task writes the entry. */
-static bool     s_report_ok;
-static const char *s_report_err;
-static uint8_t  s_report_mac[6];
-static uint8_t  s_report_fails;
+/* Written by BOTH tasks, at points that cannot overlap: the host task
+ * clears it when an attempt starts, adv_decoder_task sets it to the decode's
+ * result, and the host task reads it only after the GE_DECODED that the
+ * decoder task posts AFTER writing it. Not a data race, but it is not a
+ * single-writer field either, and claiming otherwise would be a false
+ * invariant. */
+static bool     s_decode_wrote;
 
 static esp_timer_handle_t s_deadline;
 static struct ble_npl_event s_ev_start;
 static struct ble_npl_event s_ev_deadline;
 static struct ble_npl_event s_ev_decoded;
 static gatt_scan_resume_fn_t s_resume_scan;
+static gatt_conn_busy_fn_t   s_conn_busy;
 static bool s_inited;
 
 static uint32_t now_s(void)
@@ -134,17 +165,65 @@ static void post_to_host(struct ble_npl_event *ev)
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), ev);
 }
 
+/* ---------------- getting scanning back ----------------
+ *
+ * Restarting the scan is the single most important thing this file does,
+ * and it is the one radio operation that can fail for reasons that have
+ * nothing to do with the attempt that just ended: ble_gap_disc() returns
+ * BLE_HS_EBUSY while any connect procedure is still outstanding. Nothing in
+ * this firmware supervises scan health, so an unnoticed failure here is
+ * permanent deafness -- and invisible, because /api/v1/status's adv_dropped
+ * counter cannot rise when nothing is being received to drop. So the
+ * restart is verified and retried rather than merely attempted.
+ *
+ * If every retry fails, this logs at ERROR and stops. That is a deliberate
+ * end state rather than an infinite retry: 2.5 s of EBUSY means something
+ * is wrong that reissuing the same call cannot fix, and a timer looping
+ * forever would hide it. The hub then still recovers on any path that calls
+ * ble_collector's start_scan() again -- ble_collector.c's
+ * BLE_GAP_EVENT_DISC_COMPLETE handler, battery_poll.c's next poll ending,
+ * or the next GATT attempt ending -- and otherwise stays deaf until reboot,
+ * with a loud ERROR line naming it. */
+static void resume_scan_or_retry(void)
+{
+    if (!s_resume_scan) {
+        ESP_LOGE(TAG, "no scan-resume hook installed: scanning is NOT running and this hub "
+                      "is now deaf to advertisements");
+        s_phase = TP_IDLE;
+        return;
+    }
+    if (s_resume_scan()) {
+        s_scan_retries = 0;
+        s_phase = TP_IDLE;
+        return;
+    }
+    if (s_scan_retries >= GATT_SCAN_RETRY_MAX) {
+        ESP_LOGE(TAG, "scanning could not be restarted after %d retries over %d ms -- this hub "
+                      "is deaf to advertisements until something else restarts the scan",
+                 GATT_SCAN_RETRY_MAX, GATT_SCAN_RETRY_MAX * GATT_SCAN_RETRY_MS);
+        s_scan_retries = 0;
+        s_phase = TP_IDLE;
+        return;
+    }
+    s_scan_retries++;
+    s_phase = TP_SCAN_RETRY;
+    if (esp_timer_start_once(s_deadline, (uint64_t)GATT_SCAN_RETRY_MS * 1000) != ESP_OK) {
+        ESP_LOGE(TAG, "scan-retry timer failed to arm; scanning is NOT running");
+        s_scan_retries = 0;
+        s_phase = TP_IDLE;
+    }
+}
+
 /* ---------------- the one place an attempt ends ----------------
  *
  * SUCCESS, read error, timeout, an unsolicited disconnect, a connect that
  * never established, a NimBLE call refused at issue time -- every route out
- * of an attempt passes through here, and this function ALWAYS restarts
- * scanning. That is the whole reason it exists as a single function rather
- * than as a line in each callback: a hub that stops scanning after a failed
- * connection is worse than one that never connected, because it goes
+ * of an attempt passes through here, and this function ALWAYS goes on to
+ * restart scanning. That is the whole reason it exists as a single function
+ * rather than as a line in each callback: a hub that stops scanning after a
+ * failed connection is worse than one that never connected, because it goes
  * silently deaf to every advertisement afterwards -- including the ones
- * that would have triggered a retry. There is no path that ends an attempt
- * without calling this, and this cannot run without resuming the scan.
+ * that would have triggered a retry.
  *
  * (The brief's wording was "put the restart in the disconnect callback so
  * it cannot be forgotten per-path". This is that rule, widened: a connect
@@ -156,55 +235,73 @@ static void attempt_finish(void)
 {
     if (!s_active) return;
     esp_timer_stop(s_deadline);
-    s_grace = false;
+    s_phase = TP_IDLE;
 
     /* The one fact only the state machine knows: which terminal state this
      * attempt reached. GS_DONE is reached solely via GE_DECODED, i.e. every
      * declared read landed and the decode ran. */
-    bool ok = (s_fsm.state == GS_DONE);
+    bool radio_ok = (s_fsm.state == GS_DONE);
     uint32_t now = now_s();
 
-    if (ok) {
+    if (radio_ok && s_decode_wrote) {
         gatt_sched_ok(s_dev_idx, now);
+        ESP_LOGD(TAG, "gatt read ok: dev=%d", s_dev_idx);
+    } else if (radio_ok) {
+        /* Third outcome (fix round 1): the radio behaved perfectly and the
+         * wrapper emitted nothing. Not a failure -- no backoff, no cache
+         * drop, the handles are demonstrably fine -- but NOT a successful
+         * read either: gatt_sched_attempt() moves the interval gate without
+         * advancing the last-successful-read timestamp section 8 renders,
+         * so a connect block contributing nothing stays visibly silent
+         * instead of looking freshly read. See gatt_sched.h. */
+        gatt_sched_attempt(s_dev_idx, now);
+        ESP_LOGI(TAG, "gatt read ok but the wrapper emitted nothing: dev=%d wrapper=%u",
+                 s_dev_idx, (unsigned)s_wrapper_id);
     } else {
         gatt_sched_fail(s_dev_idx, now);
-        /* Design spec section 4: a failed attempt is precisely the right
-         * trigger to rediscover next time -- a device firmware update is
-         * the likeliest reason a cached handle stopped working, and
-         * rediscovery is the only thing that fixes it. */
-        gatt_cache_drop(s_dev_idx);
+        /* Design spec section 4's rationale for dropping the cache is a
+         * STALE HANDLE after a device firmware update -- which is only
+         * possible if a handle was actually exercised. Scoped to failures
+         * that happened after the link came up (fix round 1): a connect
+         * that never landed, a refused connect and a deadline in
+         * GS_CONNECTING all leave the cached handles untouched and
+         * unimpeached, and dropping them there would cost a full
+         * rediscovery on the next attempt for exactly the flaky, sleepy
+         * devices that can least afford the extra radio time. */
+        if (s_link_up) gatt_cache_drop(s_dev_idx);
+        ESP_LOGW(TAG, "gatt read failed: dev=%d %s (consecutive failures: %u)",
+                 s_dev_idx, s_err ? s_err : "unknown error",
+                 (unsigned)gatt_sched_fail_count(s_dev_idx));
     }
 
     if (s_dev_idx >= 0 && s_dev_idx < GATT_SCHED_MAX_DEVICES) {
-        if (!ok) {
+        if (!radio_ok) {
             s_last_error[s_dev_idx] = s_err;
         } else if (!s_decode_wrote) {
-            /* Radio-wise this attempt worked, so it does NOT count as a
-             * failure (no backoff, no cache drop: the handles are demonstrably
-             * fine). But spec section 5 exists so that a connect block
-             * contributing nothing is visible rather than silently installed
-             * and enabled, so the device says so. */
             s_last_error[s_dev_idx] = "read ok, decode emitted nothing";
         } else {
             s_last_error[s_dev_idx] = NULL;
         }
     }
 
-    s_report_ok = ok;
-    s_report_err = ok ? "" : (s_err ? s_err : "unknown error");
-    memcpy(s_report_mac, s_mac_disp, 6);
-    s_report_fails = gatt_sched_fail_count(s_dev_idx);
-    s_report_pending = true;
+    /* No event-log entry. M5a's spec section 5 originally required one per
+     * attempt; the amended section 5 CUT it, because event_log_append()
+     * writes a LittleFS record and then runs the SSE hook, whose
+     * main.c on_event_logged() opens with a ~2 KB rule_info_t array in one
+     * frame -- a chain rules_engine.c:22-27 already sized ITS task at
+     * 8192 B for. The only tasks that may write it are ones with a stack
+     * to match, and neither raising adv_decoder_task's 3072 B nor adding a
+     * task fits section 6's 9216 B free-heap floor. Visibility is met by
+     * the surface a user actually looks at instead: last_error above,
+     * gatt_sched's fail count, and the last successful read, all rendered
+     * by Task 7 in the Devices tab. Do not restore an event_log_append()
+     * here without re-reading that amendment -- the stack cannot hold it. */
 
     s_active = false;
+    s_link_up = false;
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
-    if (s_resume_scan) {
-        s_resume_scan();
-    } else {
-        ESP_LOGE(TAG, "no scan-resume hook installed: scanning is NOT running and this hub "
-                      "is now deaf to advertisements");
-    }
+    resume_scan_or_retry();
 }
 
 /* Defined below; declared here because perform() hands each of them to
@@ -244,11 +341,7 @@ static bool perform(const gatt_act_t *a)
         }
         ble_addr_t peer = { .type = s_addr_type };
         memcpy(peer.val, s_mac_gap, 6);
-        /* NimBLE gets the same 5-second budget as our own deadline, so a
-         * peer that never answers the connection request is reported by the
-         * stack itself (a CONNECT event with a nonzero status) instead of
-         * only ever by our timer. Our timer remains the backstop. */
-        rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer, GATT_ATTEMPT_DEADLINE_MS,
+        rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer, GATT_CONNECT_TIMEOUT_MS,
                              NULL, gatt_gap_event, NULL);
         if (rc != 0) {
             ESP_LOGI(TAG, "ble_gap_connect refused: %d", rc);
@@ -315,17 +408,39 @@ static bool perform(const gatt_act_t *a)
         return false;
 
     case GA_DISCONNECT: {
-        int rc = BLE_HS_ENOTCONN;
         if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-            rc = ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            int rc = ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            if (rc != 0) {
+                /* The link is already gone; no disconnect event is coming. */
+                attempt_finish();
+            }
+            return false;
         }
-        if (rc != 0) {
-            /* There is no link to close -- a connect that never established,
-             * or one already gone. No BLE_GAP_EVENT_DISCONNECT will ever
-             * arrive, so ending the attempt here is the only way scanning
-             * comes back. */
-            attempt_finish();
+
+        /* No link -- so this is a connect that never established, and the
+         * connect PROCEDURE may still be outstanding in the stack (fix
+         * round 1, Critical 1, contributor 2). It must be cancelled
+         * explicitly: ble_gap_disc() refuses with BLE_HS_EBUSY for as long
+         * as ble_gap_conn_active() is true, so finishing here without
+         * cancelling would restart the scan into a guaranteed EBUSY.
+         *
+         * And cancelling is not enough on its own: ble_gap_conn_cancel()
+         * only transmits the HCI cancel and sets master.conn.cancel -- it
+         * does NOT clear master.op, which the stack clears later, when the
+         * controller reports the aborted connection (verified in
+         * ble_gap.c, not assumed). So on a successful cancel the attempt is
+         * deliberately left OPEN and ended by the resulting
+         * BLE_GAP_EVENT_CONNECT instead, by which time the scan can
+         * actually start. The teardown grace timer bounds that wait, and
+         * the scan-restart retry covers it even if the ordering still
+         * surprises us -- three independent guards, because the review's
+         * point stands that betting on ordering is betting on a race. */
+        int rc = ble_gap_conn_cancel();
+        if (rc == 0) return false;   /* cancel in flight: finish when it lands */
+        if (rc != BLE_HS_EALREADY) {
+            ESP_LOGI(TAG, "conn_cancel refused: %d (finishing anyway)", rc);
         }
+        attempt_finish();
         return false;
     }
 
@@ -363,7 +478,25 @@ static void engine_feed(gatt_ev_kind_t kind, uint16_t handle,
     ESP_LOGW(TAG, "engine_feed guard tripped in state %d", (int)s_fsm.state);
 }
 
+/* Ends an attempt that has run out of time, closing whatever the stack may
+ * still be holding first -- a live link, or an outstanding connect
+ * procedure that would otherwise make the scan restart fail with EBUSY. */
+static void force_close(void)
+{
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    } else {
+        ble_gap_conn_cancel();
+    }
+    attempt_finish();
+}
+
 /* ---------------- NimBLE callbacks (all on the host task) ---------------- */
+
+static bool fsm_terminal(void)
+{
+    return s_fsm.state == GS_DONE || s_fsm.state == GS_FAILED;
+}
 
 static int gatt_gap_event(struct ble_gap_event *event, void *arg)
 {
@@ -371,25 +504,39 @@ static int gatt_gap_event(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
-            if (!s_active) {
-                /* The attempt this connection belongs to was already forced
-                 * closed (a teardown that never confirmed). Nothing owns
-                 * this link, and with CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1 an
-                 * unowned link would block every future attempt, so close
-                 * it rather than leak it. */
+            if (!s_active || fsm_terminal()) {
+                /* A connection that arrived for an attempt already given up
+                 * on -- the classic case being a cancel that lost its race
+                 * with the controller. Nothing owns this link, and with
+                 * CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1 an unowned link would
+                 * block every future attempt, so close it. If the attempt
+                 * is still formally open, record the handle so the
+                 * resulting disconnect is recognised as its ending. */
+                ESP_LOGI(TAG, "connection arrived for an abandoned attempt; closing it");
+                if (s_active) s_conn_handle = event->connect.conn_handle;
                 ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
                 return 0;
             }
             s_conn_handle = event->connect.conn_handle;
+            s_link_up = true;
             engine_feed(GE_CONNECTED, 0, NULL, 0);
         } else {
-            /* A connect failure and NimBLE's own connect timeout both land
-             * here with the same nonzero status, and neither leaves a link
-             * behind. */
-            ESP_LOGI(TAG, "connect failed/timed out: %d", event->connect.status);
+            /* A connect failure, NimBLE's own connect timeout and the
+             * completion of a ble_gap_conn_cancel() all land here with the
+             * same nonzero status, and none of them leaves a link behind.
+             * By the time this fires the stack's master state is clear, so
+             * this is the path on which a scan restart actually succeeds --
+             * which is why GATT_CONNECT_TIMEOUT_MS is set below the attempt
+             * deadline, to make this the ordinary path rather than the
+             * exception. */
+            ESP_LOGI(TAG, "connect failed/timed out/cancelled: %d", event->connect.status);
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            s_err = "connect failed";
+            if (!fsm_terminal()) s_err = "connect failed";
             engine_feed(GE_ERROR, 0, NULL, 0);
+            /* Terminal already (the attempt timed out and asked for a
+             * cancel): gatt_fsm_step() ignored the event, so nothing above
+             * ended the attempt. This is the moment it is really over. */
+            if (s_active) attempt_finish();
         }
         return 0;
 
@@ -399,7 +546,7 @@ static int gatt_gap_event(struct ble_gap_event *event, void *arg)
          * applied to the GATT callbacks. */
         if (!s_active || event->disconnect.conn.conn_handle != s_conn_handle) return 0;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        if (s_fsm.state != GS_DONE && s_fsm.state != GS_FAILED) {
+        if (!fsm_terminal()) {
             /* Unsolicited: the state machine turns this into GA_REPORT_FAIL,
              * which ends the attempt through attempt_finish() like everything
              * else. */
@@ -576,7 +723,24 @@ static void on_start_req(struct ble_npl_event *ev)
     (void)ev;
     if (!s_req_pending) return;
     s_req_pending = false;
-    if (s_active) return;   /* cannot happen: gatt_engine_request() gates on busy */
+    /* s_active covers an attempt in flight; s_phase covers the tail of one
+     * (a scan restart still being retried), during which starting a new
+     * attempt would stop scanning again and burn the retry budget. */
+    if (s_active || s_phase != TP_IDLE) return;
+
+    /* The hub has ONE outbound connection (CONFIG_BT_NIMBLE_MAX_CONNECTIONS
+     * = 1) and two independent schedulers wanting it. Checked here, on the
+     * host task, immediately before connecting rather than back at request
+     * time, so the window between the check and the connect is as small as
+     * this design can make it. Dropping the request costs nothing: the
+     * device will advertise again and gatt_sched_due() will still say yes.
+     * Crucially it is dropped WITHOUT recording a failure -- the device did
+     * nothing wrong, and a backoff plus a cache drop here would punish it
+     * for the hub's own scheduling. */
+    if (s_conn_busy && s_conn_busy()) {
+        ESP_LOGD(TAG, "another connection owner has the radio; dropping this request");
+        return;
+    }
 
     /* Parsed twice, deliberately. gatt_fsm_init() is what knows the plan's
      * on-blob layout, and have_all_handles() needs the parsed uuid16s to
@@ -595,7 +759,7 @@ static void on_start_req(struct ble_npl_event *ev)
     gatt_fsm_init(&s_fsm, s_plan, s_plan_len, warm);
 
     s_active = true;
-    s_grace = false;
+    s_link_up = false;
     s_decode_wrote = false;
     s_err = "unknown error";
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -610,6 +774,7 @@ static void on_start_req(struct ble_npl_event *ev)
         s_active = false;
         return;
     }
+    s_phase = TP_ATTEMPT;
 
     ESP_LOGD(TAG, "gatt attempt: dev=%d wrapper=%u reads=%u writes=%u warm=%d",
              s_dev_idx, (unsigned)s_wrapper_id, (unsigned)s_fsm.read_count,
@@ -620,28 +785,41 @@ static void on_start_req(struct ble_npl_event *ev)
 static void on_deadline(struct ble_npl_event *ev)
 {
     (void)ev;
-    if (!s_active) return;
+    switch (s_phase) {
 
-    if (!s_grace) {
+    case TP_ATTEMPT:
+        if (!s_active) { s_phase = TP_IDLE; return; }
         ESP_LOGW(TAG, "attempt deadline (%d ms) expired in state %d",
                  GATT_ATTEMPT_DEADLINE_MS, (int)s_fsm.state);
         s_err = "timed out";
-        s_grace = true;
+        s_phase = TP_TEARDOWN;
         engine_feed(GE_TIMEOUT, 0, NULL, 0);
-        /* Still open means a disconnect has been commanded and its
-         * confirmation is outstanding -- bound that wait too, see
-         * GATT_TEARDOWN_GRACE_MS. */
-        if (s_active) {
-            esp_timer_start_once(s_deadline, (uint64_t)GATT_TEARDOWN_GRACE_MS * 1000);
+        if (!s_active) return;   /* the teardown completed synchronously */
+        /* Still open means a disconnect (or a connect cancel) has been
+         * commanded and its confirmation is outstanding -- bound that wait
+         * too, see GATT_TEARDOWN_GRACE_MS. Same rigour as on_start_req()'s
+         * arming check (fix round 1): if this fails to arm, the only
+         * remaining exit is the very confirmation it was meant to bound, so
+         * close the attempt now rather than gamble on it arriving. */
+        if (esp_timer_start_once(s_deadline, (uint64_t)GATT_TEARDOWN_GRACE_MS * 1000) != ESP_OK) {
+            ESP_LOGE(TAG, "teardown grace timer failed to arm; closing the attempt now");
+            force_close();
         }
         return;
-    }
 
-    ESP_LOGW(TAG, "teardown confirmation never arrived; forcing the attempt closed");
-    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    case TP_TEARDOWN:
+        if (!s_active) { s_phase = TP_IDLE; return; }
+        ESP_LOGW(TAG, "teardown confirmation never arrived; forcing the attempt closed");
+        force_close();
+        return;
+
+    case TP_SCAN_RETRY:
+        resume_scan_or_retry();
+        return;
+
+    default:
+        return;
     }
-    attempt_finish();
 }
 
 static void on_decoded(struct ble_npl_event *ev)
@@ -684,6 +862,7 @@ void gatt_engine_init(void)
     ble_npl_event_init(&s_ev_decoded, on_decoded, NULL);
 
     for (int i = 0; i < GATT_SCHED_MAX_DEVICES; i++) s_last_error[i] = NULL;
+    s_phase = TP_IDLE;
     s_inited = true;
 }
 
@@ -692,9 +871,14 @@ void gatt_engine_set_scan_resume(gatt_scan_resume_fn_t fn)
     s_resume_scan = fn;
 }
 
+void gatt_engine_set_conn_busy_hook(gatt_conn_busy_fn_t fn)
+{
+    s_conn_busy = fn;
+}
+
 bool gatt_engine_busy(void)
 {
-    return s_active || s_req_pending || s_decode_pending || s_report_pending;
+    return s_active || s_req_pending || s_decode_pending || s_phase == TP_SCAN_RETRY;
 }
 
 void gatt_engine_request(uint16_t wrapper_id, int dev_idx, const uint8_t mac[6],
@@ -725,44 +909,17 @@ void gatt_engine_request(uint16_t wrapper_id, int dev_idx, const uint8_t mac[6],
 
 void gatt_engine_service(void)
 {
-    if (s_decode_pending) {
-        /* The wrapper VM and the flash-backed arena, on the task that is
-         * allowed to use both. The buffer is gatt_fsm_t's own concatenated
-         * read buffer -- PSVM_PLAN_MAX_READS fixed 16-byte slots, which is
-         * exactly the layout the compiler turned each named buffer into a
-         * constant offset within (spec section 2). */
-        s_decode_wrote = wrapper_exec_run_buffer(s_wrapper_id, s_mac_disp,
-                                                 s_fsm.buf, s_decode_len);
-        s_decode_pending = false;
-        post_to_host(&s_ev_decoded);
-    }
+    if (!s_decode_pending) return;
 
-    if (s_report_pending) {
-        /* Deferred off the NimBLE host task on purpose: event_log_append()
-         * writes a LittleFS record and then runs the SSE and MQTT hooks.
-         * Stack-wise this is the same order of magnitude as the LittleFS
-         * read chain this task already runs on every arena miss
-         * (wrapper_arena_get -> wrapper_store_read_psbc -> fopen/fread), and
-         * it is never nested inside the decode above -- they are sequential
-         * statements, not a call chain -- so the task's peak does not stack
-         * the two. Spec section 5: every attempt, success and failure,
-         * writes to the event log, so the Rules tab's feed shows connection
-         * history without a new UI surface. */
-        char msg[EVENT_MSG_MAX + 1];
-        if (s_report_ok) {
-            snprintf(msg, sizeof msg, "GATT read ok: %02X:%02X:%02X:%02X:%02X:%02X",
-                     s_report_mac[0], s_report_mac[1], s_report_mac[2],
-                     s_report_mac[3], s_report_mac[4], s_report_mac[5]);
-        } else {
-            snprintf(msg, sizeof msg,
-                     "GATT read failed: %02X:%02X:%02X:%02X:%02X:%02X -- %s (fail #%u)",
-                     s_report_mac[0], s_report_mac[1], s_report_mac[2],
-                     s_report_mac[3], s_report_mac[4], s_report_mac[5],
-                     s_report_err, (unsigned)s_report_fails);
-        }
-        event_log_append(0, 0, msg);
-        s_report_pending = false;
-    }
+    /* The wrapper VM and the flash-backed arena, on the task that is
+     * allowed to use both. The buffer is gatt_fsm_t's own concatenated
+     * read buffer -- PSVM_PLAN_MAX_READS fixed 16-byte slots, which is
+     * exactly the layout the compiler turned each named buffer into a
+     * constant offset within (spec section 2). */
+    s_decode_wrote = wrapper_exec_run_buffer(s_wrapper_id, s_mac_disp,
+                                             s_fsm.buf, s_decode_len);
+    s_decode_pending = false;
+    post_to_host(&s_ev_decoded);
 }
 
 const char *gatt_engine_last_error(int dev_idx)

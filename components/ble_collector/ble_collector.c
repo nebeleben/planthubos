@@ -143,7 +143,20 @@ static SemaphoreHandle_t s_batt_mutex;
 
 static int gap_event(struct ble_gap_event *event, void *arg);
 
-static void start_scan(void)
+/* Returns true iff passive scanning is actually running when this returns.
+ * BLE_HS_EALREADY counts as running -- it means a scan was already up.
+ *
+ * M5a Task 6 fix round 1: this used to be void, and a failure was a log
+ * line nobody could act on. It is not a theoretical failure: ble_gap_disc()
+ * validates with ble_gap_conn_active() and returns BLE_HS_EBUSY while ANY
+ * connect procedure is still outstanding, so a caller restarting the scan
+ * right after an aborted connection can legitimately be refused. Nothing in
+ * this firmware supervises scan health, so an unnoticed refusal means the
+ * hub is deaf to every advertisement for the rest of the boot -- and
+ * invisible with it, since adv_dropped cannot rise when nothing is being
+ * received to drop. Reporting the outcome is what lets gatt_engine.c retry
+ * (see gatt_engine_set_scan_resume()). */
+static bool start_scan(void)
 {
     struct ble_gap_disc_params params = {
         .passive = 1,
@@ -154,12 +167,14 @@ static void start_scan(void)
     int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &params, gap_event, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         ESP_LOGE(TAG, "ble_gap_disc failed: %d", rc);
+        return false;
     }
+    return true;
 }
 
-void ble_collector_resume_scan(void)
+bool ble_collector_resume_scan(void)
 {
-    start_scan();
+    return start_scan();
 }
 
 /* M3 Task 3 (spec §4): BTHome v2 is a built-in decoder, matched by its
@@ -563,7 +578,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         return 0;
     }
     case BLE_GAP_EVENT_DISC_COMPLETE:
-        start_scan();   /* should not happen with BLE_HS_FOREVER, but be safe */
+        (void)start_scan();   /* should not happen with BLE_HS_FOREVER, but be safe */
         return 0;
     default:
         return 0;
@@ -574,7 +589,7 @@ static void on_sync(void)
 {
     ESP_LOGI(TAG, "NimBLE synced, starting passive scan (itvl=%dms window=%dms)",
              CONFIG_PLANTHUB_BLE_SCAN_ITVL_MS, CONFIG_PLANTHUB_BLE_SCAN_WINDOW_MS);
-    start_scan();
+    (void)start_scan();
 }
 
 static void on_reset(int reason)
@@ -694,6 +709,12 @@ esp_err_t ble_collector_start(void)
          * would be a cycle (same shape as wrapper_arena_set_loader()). */
         gatt_engine_init();
         gatt_engine_set_scan_resume(ble_collector_resume_scan);
+        /* Fix round 1: the two owners of the hub's single outbound
+         * connection made mutually aware. battery_poll.c's handle_tick()
+         * checks gatt_engine_busy() in the other direction. Installed after
+         * battery_poll_start() so the poller exists before the engine can
+         * ask it anything. */
+        gatt_engine_set_conn_busy_hook(battery_poll_busy);
     }
     return ESP_OK;
 }

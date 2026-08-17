@@ -12,12 +12,30 @@
  *
  * Both tables are static module state, keyed by registry slot index
  * (dev_idx), not by a caller-owned struct -- same shape as
- * unknown_capture.c's s_tbl, chosen for the same reason: Task 6's adapter
- * calls these once per connection attempt from a single task, so there is
- * exactly one writer and no benefit to threading a struct pointer through
- * every call. gatt_cache_reset()/gatt_sched_reset() exist for host test
- * isolation between cases (and for a fresh boot) -- Task 6 does not call
- * them itself. */
+ * unknown_capture.c's s_tbl, chosen for the same reason: there is no
+ * benefit to threading a struct pointer through every call when there is
+ * exactly one of each table.
+ *
+ * CONCURRENCY (corrected in Task 6 fix round 1; the original wording here
+ * claimed a single TASK, which is no longer true and a false invariant is
+ * worse than none). Every WRITER is still the NimBLE host task --
+ * gatt_sched_ok()/fail()/attempt() and gatt_cache_store()/drop() are called
+ * only from gatt_engine.c's callbacks and npl handlers, which all run
+ * there. The READERS are spread: gatt_sched_due() is called from
+ * adv_decoder_task (ble_collector.c's per-advertisement trigger), and Task
+ * 7's httpd handler will call gatt_sched_last_ok()/fail_count() from a
+ * third task. That single-writer/multi-reader shape needs no lock on this
+ * target: every field read across a task boundary is a naturally-aligned
+ * u32 or u8, so a reader can never see a torn value -- only, at worst, one
+ * field of an attempt's bookkeeping updated a few instructions before
+ * another, costing one mistimed due() decision on a device that is about to
+ * be re-evaluated on its next advertisement anyway. Anything added here
+ * that needed a multi-word invariant to hold across tasks would need a real
+ * lock.
+ *
+ * gatt_cache_reset()/gatt_sched_reset() exist for host test isolation
+ * between cases (and for a fresh boot) -- Task 6 does not call them
+ * itself. */
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -128,6 +146,31 @@ void gatt_sched_ok(int dev_idx, uint32_t now_s);
  * would show "last read: Ns ago" forever, which hides exactly the silence
  * section 5 exists to make loud. dev_idx outside range is a no-op. */
 void gatt_sched_fail(int dev_idx, uint32_t now_s);
+
+/* Records an attempt whose RADIO WORK SUCCEEDED but which produced no
+ * value: every declared read landed and the decode ran, and the decode
+ * emitted nothing (Task 6 fix round 1, controller ruling). A third outcome
+ * is needed because neither existing one is honest about this case:
+ *
+ *   - gatt_sched_ok() would advance last_ok_s, so section 8's Devices tab
+ *     would render the device as freshly read while it contributes nothing
+ *     to history -- exactly the silence section 5 exists to make loud, and
+ *     since the event-log entry was cut from M5a (see the amended section
+ *     5), the last-successful-read timestamp and last_error ARE the whole
+ *     visibility surface. Advancing it would hide the one thing left.
+ *   - gatt_sched_fail() would back the device off and (in Task 6's adapter)
+ *     drop its handle cache, punishing a device whose radio behaviour was
+ *     faultless for a decision its wrapper's `require` made.
+ *
+ * So this advances last_attempt_s (the interval gate must move, or the hub
+ * would reconnect on the very next advertisement forever) and marks
+ * `attempted`, CLEARS the consecutive-failure count exactly as
+ * gatt_sched_ok() does -- consecutive RADIO failures are demonstrably over,
+ * and leaving an 8x backoff on a device that answers every read would be
+ * backing off the wrong thing -- and leaves last_ok_s and the "has ever
+ * succeeded" flag untouched, exactly as gatt_sched_fail() does. dev_idx
+ * outside range is a no-op. */
+void gatt_sched_attempt(int dev_idx, uint32_t now_s);
 
 /* Current consecutive-failure count for dev_idx (0 = last attempt, if
  * any, was a success). dev_idx outside range returns 0. */

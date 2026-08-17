@@ -6,6 +6,7 @@
  * explaining why there's no header; this file replaces both comments with
  * one that can't drift out of sync between the two callers. */
 #pragma once
+#include <stdbool.h>
 #include "battery_sched.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -19,7 +20,24 @@
  * the node's single radio). */
 void battery_poll_start(batt_entry_t *tab, SemaphoreHandle_t batt_mutex);
 
-/* Implemented in ble_collector.c; resumes the passive scan a poll attempt
- * paused for its connect/read/terminate cycle. Called from battery_poll.c
- * after a poll attempt ends (success, failure, timeout, disconnect). */
-void ble_collector_resume_scan(void);
+/* Implemented in ble_collector.c; resumes the passive scan a poll or GATT
+ * attempt paused for its connect/read/terminate cycle. Called from
+ * battery_poll.c after a poll attempt ends (success, failure, timeout,
+ * disconnect), and injected into the M5a GATT engine
+ * (gatt_engine_set_scan_resume()).
+ *
+ * Returns true iff scanning is actually running when it returns -- see
+ * start_scan()'s own comment for why a failure here is permanent, invisible
+ * deafness rather than a log line, and what the GATT engine does with a
+ * false. */
+bool ble_collector_resume_scan(void);
+
+/* Implemented in battery_poll.c; true while a battery poll owns the hub's
+ * single outbound connection (CONFIG_BT_NIMBLE_MAX_CONNECTIONS = 1).
+ * Injected into the M5a GATT engine (gatt_engine_set_conn_busy_hook()) so
+ * the two independent connect-out schedulers stop colliding: without it the
+ * loser's ble_gap_connect() simply fails, and the GATT side would record a
+ * failure, a backoff and a handle-cache drop against a device that did
+ * nothing wrong. The GATT side is visible to battery_poll.c in the other
+ * direction through gatt_engine_busy(), which handle_tick() checks. */
+bool battery_poll_busy(void);

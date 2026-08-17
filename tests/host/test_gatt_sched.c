@@ -179,6 +179,65 @@ static void test_never_contacted_due_immediately(void)
     assert(gatt_sched_last_ok(8) == 0);
 }
 
+/* Task 6 fix round 1: the third outcome -- the radio worked, the decode
+ * emitted nothing. It must move the interval gate (or the hub reconnects on
+ * every advertisement forever), clear the failure backoff (the radio is
+ * demonstrably fine), and leave the last SUCCESSFUL read timestamp exactly
+ * where it was (that timestamp plus last_error is the whole visibility
+ * surface for a connect block that contributes nothing, now that the
+ * event-log entry is cut from M5a). Each of those three is asserted
+ * separately below, because getting any one of them from the wrong existing
+ * function is precisely the mistake this outcome exists to prevent. */
+static void test_attempt_moves_gate_without_faking_a_read(void)
+{
+    gatt_sched_reset();
+
+    gatt_sched_ok(3, 1000);
+    assert(gatt_sched_last_ok(3) == 1000);
+
+    /* Two radio-fine/decode-empty attempts, well after the interval. */
+    gatt_sched_attempt(3, 2000);
+    assert(gatt_sched_last_ok(3) == 1000);   /* NOT advanced: this was not a read */
+    assert(gatt_sched_fail_count(3) == 0);
+    assert(gatt_sched_due(3, 600, 2599) == false);   /* gate DID move to 2000 */
+    assert(gatt_sched_due(3, 600, 2600) == true);
+
+    gatt_sched_attempt(3, 3000);
+    assert(gatt_sched_last_ok(3) == 1000);   /* still frozen after a second one */
+
+    /* And it clears an existing backoff rather than compounding it: three
+     * failures put the device at the 8x cap, one radio-fine attempt returns
+     * it to 1x. */
+    gatt_sched_reset();
+    gatt_sched_fail(4, 100);
+    gatt_sched_fail(4, 200);
+    gatt_sched_fail(4, 300);
+    assert(gatt_sched_fail_count(4) == 3);
+    assert(gatt_sched_due(4, 600, 300 + 4799) == false);   /* 8x600 = 4800 */
+    gatt_sched_attempt(4, 400);
+    assert(gatt_sched_fail_count(4) == 0);
+    assert(gatt_sched_due(4, 600, 400 + 599) == false);
+    assert(gatt_sched_due(4, 600, 400 + 600) == true);     /* back to 1x */
+    assert(gatt_sched_last_ok(4) == 0);                    /* never succeeded, still never */
+
+    /* A device that has ONLY ever had radio-fine/decode-empty attempts must
+     * be indistinguishable from one that has never read: last_ok stays 0 and
+     * "has ever succeeded" stays false. */
+    gatt_sched_reset();
+    gatt_sched_attempt(5, 0);
+    assert(gatt_sched_last_ok(5) == 0);
+    assert(gatt_sched_due(5, 600, 599) == false);   /* attempted at t=0, not "never" */
+    assert(gatt_sched_due(5, 600, 600) == true);
+
+    /* Out of range is a no-op, like every other entry point here. */
+    gatt_sched_attempt(-1, 5);
+    gatt_sched_attempt(GATT_SCHED_MAX_DEVICES, 5);
+    gatt_sched_attempt(1000000, 5);
+    assert(gatt_sched_fail_count(15) == 0);
+    assert(gatt_sched_last_ok(15) == 0);
+    assert(gatt_sched_due(15, 600, 0) == true);   /* untouched: still never attempted */
+}
+
 int main(void)
 {
     test_backoff_doubles_and_caps();
@@ -191,6 +250,7 @@ int main(void)
     test_fail_at_time_zero_backs_off();
     test_ok_at_time_zero_is_recorded_and_distinct_from_never();
     test_never_contacted_due_immediately();
+    test_attempt_moves_gate_without_faking_a_read();
 
     printf("test_gatt_sched: OK\n");
     return 0;

@@ -18,6 +18,7 @@
  */
 #include "battery_sched.h"
 #include "ble_collector_internal.h"
+#include "gatt_engine.h"
 #include "data_core.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -67,10 +68,18 @@ static batt_entry_t *s_tab;
 static SemaphoreHandle_t s_batt_mutex;    /* guards every s_tab access -- shared with ble_collector.c */
 static QueueHandle_t s_queue;
 
-/* s_in_flight and s_inflight_started_s are touched only on poll_task: set
+/* s_in_flight and s_inflight_started_s are WRITTEN only on poll_task: set
  * when a poll attempt starts (handle_tick) and cleared on POLL_MSG_DONE or
- * by the watchdog, both handled in poll_task's own loop -- no cross-task
- * access, so no lock needed for these (contrast s_tab above).
+ * by the watchdog, both handled in poll_task's own loop -- so no lock is
+ * needed for these (contrast s_tab above). Since M5a, s_in_flight is also
+ * READ from the NimBLE host task, through battery_poll_busy(), by the GATT
+ * engine deciding whether the radio is free; it is a single aligned bool
+ * with one writer, so that read can see a stale value for a few
+ * instructions but never a torn one, and the worst case is one GATT request
+ * dropped or one poll deferred -- both of which the next advertisement or
+ * the next 60 s tick retries anyway. An earlier version of this comment
+ * claimed "no cross-task access", which stopped being true when that
+ * accessor was added.
  *
  * s_conn_handle and s_got_result are NOT poll_task-only, despite an earlier
  * version of this comment claiming otherwise: s_conn_handle is written by
@@ -178,21 +187,42 @@ static int poll_gap_event(struct ble_gap_event *event, void *arg)
              * (last_attempt_s is already set). */
             ESP_LOGI(TAG, "battery poll connect failed/timed out: %d", event->connect.status);
             post_done(generation);
-            ble_collector_resume_scan();
+            (void)ble_collector_resume_scan();
         }
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
         post_done(generation);
-        ble_collector_resume_scan();
+        (void)ble_collector_resume_scan();
         return 0;
     default:
         return 0;
     }
 }
 
+/* See ble_collector_internal.h. s_in_flight is written only by poll_task
+ * (handle_tick/POLL_MSG_DONE/handle_watchdog) and read here from the NimBLE
+ * host task; a single aligned bool, same "atomic enough on this target"
+ * standard ble_collector.c's own volatile flags are held to. */
+bool battery_poll_busy(void)
+{
+    return s_in_flight;
+}
+
 static void handle_tick(void)
 {
     if (s_in_flight) return;   /* single in-flight poll */
+
+    /* M5a Task 6 fix round 1: the hub has ONE outbound connection and, as
+     * of M5a, two independent schedulers wanting it. Starting a poll while
+     * a GATT read is in flight would fail this poll's connect AND, worse,
+     * make its failure path call ble_collector_resume_scan() -- restarting
+     * the scan while the GATT engine's link is still open. A poll is
+     * retried in an hour anyway (and last_attempt_s is deliberately NOT
+     * advanced here, so this defers rather than skips the poll). */
+    if (gatt_engine_busy()) {
+        ESP_LOGD(TAG, "skipping this poll tick: a GATT read has the radio");
+        return;
+    }
 
     uint32_t now = now_s();
 
@@ -225,7 +255,7 @@ static void handle_tick(void)
     if (rc != 0) {
         ESP_LOGI(TAG, "battery poll connect failed to start: %d", rc);
         s_in_flight = false;
-        ble_collector_resume_scan();
+        (void)ble_collector_resume_scan();
     }
 }
 
@@ -273,7 +303,7 @@ static void handle_watchdog(void)
     }
     s_in_flight = false;
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-    ble_collector_resume_scan();
+    (void)ble_collector_resume_scan();
     /* If the terminate above does still produce a DISCONNECT event, its
      * POLL_MSG_DONE/resume-scan are both idempotent no-ops on top of this. */
 }
