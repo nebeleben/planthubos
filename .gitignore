@@ -24,6 +24,7 @@ tests/host/test_plants_table
 tests/host/test_plants_migrate
 tests/host/test_psvm
 tests/host/test_gatt_fsm
+tests/host/test_gatt_sched
 tests/host/test_rules_fsm
 tests/host/test_event_ring
 tests/host/test_capability

@@ -82,6 +82,10 @@ $CC -Wall -Wextra -Werror -I../../components/gatt/include \
     test_gatt_fsm.c ../../components/gatt/gatt_fsm.c -o test_gatt_fsm
 ./test_gatt_fsm
 
+$CC -Wall -Wextra -Werror -I../../components/gatt/include \
+    test_gatt_sched.c ../../components/gatt/gatt_sched.c -o test_gatt_sched
+./test_gatt_sched
+
 $CC -Wall -Wextra -Werror -I../../components/rules/include \
     test_rules_fsm.c ../../components/rules/rules_fsm.c -o test_rules_fsm
 ./test_rules_fsm
