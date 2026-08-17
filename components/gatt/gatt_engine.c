@@ -118,15 +118,27 @@ _Static_assert(GATT_SCAN_RETRY_MS * GATT_SCAN_RETRY_MAX > GATT_CONNECT_TIMEOUT_M
  *
  * The phase is read by on_deadline() on the host task, but the post that
  * gets it there carries no phase of its own, so a post can outlive the
- * phase it was made in. What bounds the damage is that ALL THREE phases
- * share the one s_ev_deadline event, and ble_npl_eventq_put() no-ops on an
- * event that is already queued: at most one deadline post is ever in flight,
- * so at most one handler run can be acting on a phase that has since moved
- * on. Every arm site therefore stops the timer first and every handler
- * branch re-checks s_active, and the cost of a stale run is bounded to one
- * extra scan retry rather than a lost timer. This property is load-bearing
- * -- a second ble_npl_event for any of these phases would remove the bound
- * and need a real generation counter in its place. */
+ * phase it was made in. Two things bound that, and it is worth being exact
+ * about which one does the work, because an earlier version of this comment
+ * credited the wrong one (fix round 3).
+ *
+ * First: all three phases share the one s_ev_deadline event, and
+ * ble_npl_eventq_put() no-ops on an event that is already queued, so at most
+ * ONE deadline post is ever in flight. A second ble_npl_event for any of
+ * these phases would remove that and need a real generation counter in its
+ * place.
+ *
+ * Second, and this is the part that actually makes a stale post harmless:
+ * the timer is never left armed by a function that is not about to service
+ * it. resume_scan_or_retry() stops it on entry and therefore owns it on
+ * every path out, and the attempt/teardown arms stop first too. Re-checking
+ * s_active in each handler branch is NOT sufficient on its own and must not
+ * be read as if it were: once the phase can move TP_SCAN_RETRY -> TP_IDLE ->
+ * TP_ATTEMPT with a post in flight, a stale post arriving in TP_ATTEMPT sees
+ * a perfectly live s_active and is indistinguishable from a real deadline --
+ * it would time out a brand-new attempt at t~0 and record a failure and a
+ * backoff against an innocent device. Nothing about the shared event stops
+ * that; only never leaving a stray one-shot armed does. */
 typedef enum { TP_IDLE, TP_ATTEMPT, TP_TEARDOWN, TP_SCAN_RETRY } timer_phase_t;
 
 /* ---------------- state ----------------
@@ -244,6 +256,28 @@ static void post_to_host(struct ble_npl_event *ev)
  * call this function even with no attempt of ours open. */
 static void resume_scan_or_retry(void)
 {
+    /* This function OWNS the deadline timer for as long as it runs, and
+     * every path out of it leaves the timer in a state this function chose
+     * (fix round 3). Stopping here rather than just before the re-arm is
+     * the whole of that guarantee: the success path and the
+     * budget-exhausted path below both set TP_IDLE and return, and before
+     * this line they could return with a one-shot from an earlier retry
+     * still armed.
+     *
+     * That was harmless while the only ways in were attempt_finish() (which
+     * stops first) and on_deadline()'s already-fired one-shot. Round 2 added
+     * three call sites in gatt_gap_event() whose entire purpose is to be
+     * reached mid-retry, and a live one-shot surviving into TP_IDLE is not a
+     * cosmetic leak: gatt_engine_busy() goes false, a new request is
+     * accepted, and if the host task is behind by up to GATT_SCAN_RETRY_MS
+     * the queue order becomes on_start_req (arming TP_ATTEMPT, its own stop
+     * a no-op on an already-fired timer) followed by the stale post, which
+     * takes the TP_ATTEMPT branch with s_active true and times out a
+     * brand-new attempt at t~0 -- a "timed out", a gatt_sched_fail() and a
+     * backoff against a device that did nothing wrong. Self-healing, and
+     * still exactly the harm the round-2 fixes existed to stop. */
+    esp_timer_stop(s_deadline);
+
     if (!s_resume_scan) {
         ESP_LOGE(TAG, "no scan-resume hook installed: scanning is NOT running and this hub "
                       "is now deaf to advertisements");
@@ -265,19 +299,14 @@ static void resume_scan_or_retry(void)
     }
     s_scan_retries++;
     s_phase = TP_SCAN_RETRY;
-    /* Stop before arming (fix round 2, N2). esp_timer_start_once() on an
-     * ALREADY-ARMED timer returns ESP_ERR_INVALID_STATE, and this function
-     * can legitimately be re-entered while its own retry timer is still
-     * armed -- a stale deadline post, or one of the CONNECT/DISCONNECT
-     * paths that restart scanning. Without the stop, that arm failed, and
-     * the failure was handled as "the timer is broken": budget reset, phase
-     * dropped to TP_IDLE, a log line blaming the timer, and the loop
-     * abandoned after two of its retries while the still-armed timer later
-     * landed in TP_IDLE as a silent no-op. Stopping first makes re-entry
-     * simply restart the interval; the only cost is the one extra retry
-     * consumed from the budget, which GATT_SCAN_RETRY_MAX is sized to
-     * absorb. */
-    esp_timer_stop(s_deadline);
+    /* The timer is guaranteed stopped by the top of this function, so this
+     * arm cannot fail with ESP_ERR_INVALID_STATE the way it did before fix
+     * round 2 -- when re-entry while the retry timer was still armed made
+     * the arm fail, and that failure was then handled as "the timer is
+     * broken": budget reset, phase dropped to TP_IDLE, a log line blaming
+     * the timer, and the loop abandoned after two of its retries. Re-entry
+     * now simply restarts the interval, costing one retry from a budget
+     * GATT_SCAN_RETRY_MAX is sized to absorb. */
     if (esp_timer_start_once(s_deadline, (uint64_t)GATT_SCAN_RETRY_MS * 1000) != ESP_OK) {
         ESP_LOGE(TAG, "scan-retry timer failed to arm; scanning is NOT running");
         s_scan_retries = 0;
