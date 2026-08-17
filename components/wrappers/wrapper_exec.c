@@ -6,6 +6,7 @@
 #include "capability.h"
 #include "data_core.h"
 #include "esp_log.h"
+#include <string.h>
 
 static const char *TAG = "wrapper_exec";
 
@@ -136,16 +137,17 @@ static const char *wrapper_err_short(psvm_err_t e)
     }
 }
 
-bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
-                      const uint8_t *payload, uint8_t payload_len)
+/* The whole of a wrapper run except the match counter: resolve the blob,
+ * validate it, run it over `payload`, and record/clear last_error. Shared
+ * verbatim by the advertisement entry point below and by M5a's GATT buffer
+ * entry point (wrapper_exec_run_buffer()) -- the two differ ONLY in which
+ * bytes they hand in and in whether the match counter is bumped (see
+ * wrapper_exec.h for why the GATT path must not bump it), so this is one
+ * implementation rather than two copies that could drift in their EMIT
+ * sink, their step budget or their error reporting. */
+static bool run_payload(uint16_t id, const uint8_t mac[6],
+                        const uint8_t *payload, uint8_t payload_len)
 {
-    /* Task 7 (controller RULING-3): "the only way a user can tell whether a
-     * hand-written wrapper is matching anything" -- bumped once per actual
-     * invocation, regardless of whether the run below ends up emitting
-     * anything, since "matching" is decided by the match-index lookup that
-     * already happened before this function was ever called. */
-    wrapper_store_note_match(id);
-
     size_t blob_len = 0;
     const uint8_t *blob = wrapper_arena_get(id, &blob_len);
     if (!blob) {
@@ -203,4 +205,64 @@ bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
         wrapper_store_note_error(id, NULL);
     }
     return ectx.wrote_any;
+}
+
+bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
+                      const uint8_t *payload, uint8_t payload_len)
+{
+    /* Task 7 (controller RULING-3): "the only way a user can tell whether a
+     * hand-written wrapper is matching anything" -- bumped once per actual
+     * invocation, regardless of whether the run below ends up emitting
+     * anything, since "matching" is decided by the match-index lookup that
+     * already happened before this function was ever called. */
+    wrapper_store_note_match(id);
+    return run_payload(id, mac, payload, payload_len);
+}
+
+bool wrapper_exec_run_buffer(uint16_t id, const uint8_t mac[6],
+                             const uint8_t *buf, uint8_t len)
+{
+    /* No wrapper_store_note_match() here -- see wrapper_exec.h. */
+    return run_payload(id, mac, buf, len);
+}
+
+uint16_t wrapper_exec_plan_get(uint16_t id, uint8_t *out, uint16_t cap,
+                               uint32_t *interval_s_out)
+{
+    if (interval_s_out) *interval_s_out = 0;
+
+    size_t blob_len = 0;
+    const uint8_t *blob = wrapper_arena_get(id, &blob_len);
+    if (!blob) return 0;
+
+    psvm_prog_t prog;
+    if (psvm_validate(blob, blob_len, PSVM_DIALECT_WRAPPERS,
+                      CAPABILITY_COUNT - 1, 0, &prog) != PSVM_OK) {
+        /* Deliberately silent: this is a query, not a run. The very next
+         * advertisement from this device takes wrapper_exec_run() above,
+         * which logs and records the same failure through
+         * wrapper_store_note_error() -- doing it twice per advertisement
+         * would just double the noise. */
+        return 0;
+    }
+    /* prog.plan is NULL unless PSVM_FLAG_CONNECT_PLAN was set, and
+     * psvm_validate() has already bounds-checked the whole section (its
+     * header alone is 6 bytes: read_count, write_count, interval_s). */
+    if (prog.plan == NULL || prog.plan_len < 6) return 0;
+
+    if (out) {
+        /* Checked before interval_s_out is written, so a caller that gets 0
+         * back never also gets an interval it might act on. */
+        if (prog.plan_len > cap) {
+            ESP_LOGW(TAG, "wrapper %u: connect plan is %u B, does not fit the caller's %u B",
+                     (unsigned)id, (unsigned)prog.plan_len, (unsigned)cap);
+            return 0;
+        }
+        memcpy(out, prog.plan, prog.plan_len);
+    }
+    if (interval_s_out) {
+        *interval_s_out = (uint32_t)prog.plan[2] | ((uint32_t)prog.plan[3] << 8) |
+                          ((uint32_t)prog.plan[4] << 16) | ((uint32_t)prog.plan[5] << 24);
+    }
+    return prog.plan_len;
 }

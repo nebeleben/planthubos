@@ -69,3 +69,49 @@
  * ble_collector.c's decode_bthome_item()/wrote_any. */
 bool wrapper_exec_run(uint16_t id, const uint8_t mac[6],
                       const uint8_t *payload, uint8_t payload_len);
+
+/* M5a Task 6: the same run, over the CONCATENATED GATT READ BUFFER instead
+ * of an advertisement payload (design spec section 2). Identical machinery
+ * -- same arena, same validation, same EMIT sink into
+ * data_core_submit_cap(), same last_error bookkeeping -- because a wrapper
+ * with a `connect` block differs only in which bytes its accessors address:
+ * PSVM_PLAN_MAX_READS fixed 16-byte slots rather than one advert, which is
+ * exactly what let M5a add a GATT path without touching the VM.
+ *
+ * The one deliberate difference from wrapper_exec_run() above: this does NOT
+ * bump the wrapper's match counter. The advertisement that triggered this
+ * connection already ran wrapper_exec_run() for the same wrapper moments
+ * earlier and counted itself; counting again here would report two matches
+ * per advertisement for a connect wrapper and make that counter -- whose
+ * whole purpose is "is my hand-written wrapper matching anything at all"
+ * (Task 7, RULING-3) -- mean something different depending on whether the
+ * wrapper happens to carry a connect block.
+ *
+ * Returns true iff at least one capability value was actually written, same
+ * convention as wrapper_exec_run(). */
+bool wrapper_exec_run_buffer(uint16_t id, const uint8_t mac[6],
+                             const uint8_t *buf, uint8_t len);
+
+/* M5a Task 6: reports whether wrapper `id` carries a connect plan
+ * (psvm.h's PSVM_FLAG_CONNECT_PLAN trailing section) and hands back a COPY
+ * of it. Returns the plan's length in bytes, or 0 when the wrapper has no
+ * plan, cannot be loaded, fails validation, or its plan does not fit `cap`.
+ *
+ * Copies rather than returning a pointer on purpose: the plan lives inside
+ * a blob owned by the shared wrapper arena, and ANY later
+ * wrapper_arena_get() from ANY caller can evict it (wrapper_arena.h's
+ * FINDING 2 doc comment). M5a's GATT engine keeps the plan alive across a
+ * whole connection attempt, long after the arena pointer it came from could
+ * have gone stale.
+ *
+ * out may be NULL with cap 0 to ask only "is there a plan, and what
+ * interval does it declare" without copying -- the cheap form the
+ * per-advertisement trigger in ble_collector.c uses.
+ * interval_s_out, when non-NULL, receives the plan's declared read interval
+ * in seconds (psvm_validate() has already bounded it to 60..86400), or 0
+ * when this function returns 0.
+ *
+ * Loads through the arena, so like wrapper_exec_run() it may read flash and
+ * must only be called from a task where that is allowed. */
+uint16_t wrapper_exec_plan_get(uint16_t id, uint8_t *out, uint16_t cap,
+                               uint32_t *interval_s_out);

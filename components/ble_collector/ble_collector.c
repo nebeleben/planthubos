@@ -11,6 +11,8 @@
 #include "wrapper_arena.h"
 #include "wrapper_exec.h"
 #include "unknown_capture.h"
+#include "gatt_engine.h"
+#include "gatt_sched.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
@@ -351,6 +353,37 @@ static void decode_adv_item(const adv_item_t *item)
             s_wrapper_memo[midx] = (uint16_t)wrapper_id;
         }
         if (wrote) rules_notify_value_update();
+
+        /* M5a Task 6 (spec sections 3 and 5): if this wrapper carries a
+         * `connect` block, this advertisement is also the trigger for a GATT
+         * read. Connecting on an advertisement is the ONLY reliable moment
+         * for a battery sensor -- it is connectable for a short window after
+         * it advertises and asleep the rest of the time, so a periodic
+         * scheduler would spend most of its attempts talking to a sleeping
+         * device.
+         *
+         * Nothing here connects: gatt_engine_request() sets a request and
+         * returns, and the engine performs it on the NimBLE host task. Same
+         * request/perform split as do_wrapper_reindex() above, for the same
+         * reason -- a connection attempt is hundreds of milliseconds of radio
+         * work and this task must keep draining the advertisement ring.
+         *
+         * Order of the tests is deliberate: the two free ones (a registry
+         * index, and the engine being idle) come before the plan lookup,
+         * which resolves the wrapper's bytecode through the arena and
+         * validates it. gatt_sched_due() needs the plan's declared interval,
+         * so it must come last. item->uptime_s is the uptime captured when
+         * gap_event received this advertisement -- the same clock
+         * gatt_sched_ok()/gatt_sched_fail() are stamped with. */
+        uint32_t interval_s = 0;
+        if (midx >= 0 && !gatt_engine_busy() &&
+            wrapper_exec_plan_get((uint16_t)wrapper_id, NULL, 0, &interval_s) > 0 &&
+            gatt_sched_due(midx, interval_s, item->uptime_s)) {
+            /* item->mac/item->addr_type: the RAW GAP address, which is what
+             * gatt_engine_request() documents it wants (a connection is
+             * addressed on-air, not in display order) -- NOT mac_disp. */
+            gatt_engine_request((uint16_t)wrapper_id, midx, item->mac, item->addr_type);
+        }
         return;   /* a matched wrapper's key can never also be MiFlora's (distinct match kinds/keys) -- nothing further to dispatch */
     }
 
@@ -451,6 +484,16 @@ static void adv_decoder_task(void *arg)
             s_wrapper_reindex_pending = false;
             do_wrapper_reindex();
         }
+
+        /* M5a Task 6: the decoder-task half of a GATT attempt -- the wrapper
+         * decode of a completed read, and the event-log entry a finished
+         * attempt owes. Both touch flash or run the VM, so neither may
+         * happen on the NimBLE host task that drives the connection itself
+         * (see gatt_engine.h's task-ownership note). Same safe point as the
+         * reindex above and for the same reason: at the TOP of the loop,
+         * never between popping an item and finishing decode_adv_item() for
+         * it. A no-op when nothing is owed. */
+        gatt_engine_service();
 
         adv_item_t item;
         portENTER_CRITICAL(&s_adv_mux);
@@ -635,6 +678,22 @@ esp_err_t ble_collector_start(void)
      * runs on both roles; only the poll timer/task is hub-only. */
     if (swarm_store_role() != SWARM_ROLE_NODE) {
         battery_poll_start(s_batt_tab, s_batt_mutex);
+        /* M5a Task 6: hub-only for exactly the reason battery polling above
+         * is -- a GATT read connects out and would fight ESP-NOW timing on a
+         * node's single radio (and spec section 9 makes GATT on nodes via
+         * the swarm an M7 non-goal). Until this runs, gatt_engine_request()
+         * is a no-op, so the decoder task above starting first is harmless:
+         * requests from those first few advertisements are simply dropped,
+         * exactly as they are whenever the engine is busy.
+         *
+         * After nimble_port_init() (top of this function): the engine's hops
+         * onto the NimBLE host task allocate through the npl function table
+         * that call installs. gatt_engine_set_scan_resume() injects the scan
+         * restart rather than the engine calling into this file directly --
+         * ble_collector already depends on gatt, and the reverse dependency
+         * would be a cycle (same shape as wrapper_arena_set_loader()). */
+        gatt_engine_init();
+        gatt_engine_set_scan_resume(ble_collector_resume_scan);
     }
     return ESP_OK;
 }
