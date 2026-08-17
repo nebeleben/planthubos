@@ -6,21 +6,21 @@
 /* Trailing PSBC connect-plan section bytes (psvm.h's PSVM_FLAG_CONNECT_PLAN
  * doc comment / components/psvm/psvm.c's parser): read_count, write_count,
  * interval_s (u32 LE), reads[] (u16 LE each), writes[] (u16 LE uuid, u8
- * len, u8 data[len]). This is the exact 14-byte shape the M5a spec's own
+ * len, u8 data[len]). This is the exact 16-byte shape the M5a spec's own
  * `connect` block example compiles to (design spec section 2): one write
  * (0x2A00 = 01), two reads (0x2A6E temp, 0x2A6F hum). */
 static const uint8_t PLAN_2READ_1WRITE[] = {
     2, 1,                       /* read_count=2, write_count=1 */
     0x58, 0x02, 0x00, 0x00,     /* interval_s = 600 */
-    0x6E, 0x2A,                 /* read 0x2A6E */
-    0x6F, 0x2A,                 /* read 0x2A6F */
+    0x6E, 0x2A, 2,              /* read 0x2A6E, min_len 2 */
+    0x6F, 0x2A, 2,              /* read 0x2A6F, min_len 2 */
     0x00, 0x2A, 1, 0x01,        /* write 0x2A00 = 01 */
 };
 
 static const uint8_t PLAN_1READ[] = {
     1, 0,                       /* read_count=1, write_count=0 */
     0x2C, 0x01, 0x00, 0x00,     /* interval_s = 300 */
-    0x6E, 0x2A,                 /* read 0x2A6E */
+    0x6E, 0x2A, 2,              /* read 0x2A6E, min_len 2 */
 };
 
 /* Two writes, so a duplicate GE_WRITE_OK for write 0 can be delivered
@@ -29,8 +29,8 @@ static const uint8_t PLAN_1READ[] = {
 static const uint8_t PLAN_2READ_2WRITE[] = {
     2, 2,                       /* read_count=2, write_count=2 */
     0x58, 0x02, 0x00, 0x00,     /* interval_s = 600 */
-    0x6E, 0x2A,                 /* read 0x2A6E */
-    0x6F, 0x2A,                 /* read 0x2A6F */
+    0x6E, 0x2A, 2,              /* read 0x2A6E, min_len 2 */
+    0x6F, 0x2A, 2,              /* read 0x2A6F, min_len 2 */
     0x00, 0x2A, 1, 0x01,        /* write 0x2A00 = 01 */
     0x01, 0x2A, 1, 0x02,        /* write 0x2A01 = 02 */
 };
@@ -140,6 +140,41 @@ static void drive_to_state(gatt_fsm_t *f, gatt_state_t target)
     gatt_fsm_step(f, &EV_READ(0x2A6E, "\x11\x22", 2));
     gatt_fsm_step(f, &EV_READ(0x2A6F, "\x33\x44", 2));
     /* target == GS_DECODING */
+}
+
+/* A read shorter than the plan's min_len must FAIL the attempt, not
+ * zero-pad its slot. Zero-padding would emit a plausible wrong value with
+ * no failure recorded -- the silent-wrong-value shape spec section 4 exists
+ * to prevent, reached by a short characteristic rather than handle drift. */
+static void test_short_read_fails(void)
+{
+    gatt_fsm_t f;
+    drive_to_state(&f, GS_READING);
+    /* min_len is 2 for both reads in PLAN_2READ_1WRITE. */
+    gatt_act_t a = gatt_fsm_step(&f, &EV_READ(0x2A6E, "\x11", 1));
+    assert(a.kind == GA_DISCONNECT);
+    assert(f.state == GS_FAILED);
+}
+
+/* A zero-length response is the same defect at its limit: it must not count
+ * as a successful read of a characteristic that returned nothing. */
+static void test_empty_read_fails(void)
+{
+    gatt_fsm_t f;
+    drive_to_state(&f, GS_READING);
+    gatt_act_t a = gatt_fsm_step(&f, &EV_READ(0x2A6E, NULL, 0));
+    assert(a.kind == GA_DISCONNECT);
+    assert(f.state == GS_FAILED);
+}
+
+/* Exactly min_len bytes is enough -- the boundary is inclusive. */
+static void test_exact_min_len_read_ok(void)
+{
+    gatt_fsm_t f;
+    drive_to_state(&f, GS_READING);
+    gatt_act_t a = gatt_fsm_step(&f, &EV_READ(0x2A6E, "\x11\x22", 2));
+    assert(a.kind == GA_READ);          /* proceeds to the second read */
+    assert(f.state == GS_READING);
 }
 
 static const gatt_state_t OPEN_CONNECTION_STATES[] = {
@@ -390,6 +425,9 @@ int main(void)
     test_read_ok_wrong_uuid_ignored();
     test_write_ok_wrong_uuid_ignored();
     test_exactly_one_disconnect_per_terminal_path();
+    test_short_read_fails();
+    test_empty_read_fails();
+    test_exact_min_len_read_ok();
 
     printf("test_gatt_fsm: OK\n");
     return 0;

@@ -444,6 +444,9 @@ static size_t build_wrapper_with_plan(uint8_t *b, size_t bufsz,
     memcpy(b + o, &interval_s, 4); o += 4;
     for (uint8_t i = 0; i < read_count; i++) {
         memcpy(b + o, &reads[i], 2); o += 2;
+        /* min_len: 2 bytes, what an i16_le/u16_le accessor at offset 0
+         * needs. Every read here is a 2-byte characteristic. */
+        b[o++] = 2;
     }
     for (uint8_t i = 0; i < write_count; i++) {
         memcpy(b + o, &write_uuids[i], 2); o += 2;
@@ -534,6 +537,31 @@ static void test_plan_interval_bounds(void) {
 
     n = build_wrapper_with_plan(blob, sizeof blob, 1, (uint16_t[]){1},
         0, NULL, NULL, NULL, 86400);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_OK);
+}
+
+/* read_count 0 validates as a plan the engine will never run but the
+ * scheduler never gates, so every advertisement retries it forever. */
+static void test_plan_zero_reads_rejected(void) {
+    uint8_t blob[128]; psvm_prog_t p;
+    size_t n = build_wrapper_with_plan(blob, sizeof blob, 0, NULL,
+                                       0, NULL, NULL, NULL, 600);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_ERR_LIMITS);
+}
+
+/* min_len must be 1..PSVM_PLAN_SLOT: 0 would let an empty response count as
+ * a successful read, and > a slot could never be satisfied. */
+static void test_plan_min_len_bounds(void) {
+    uint8_t blob[128]; psvm_prog_t p;
+    size_t n = build_wrapper_with_plan(blob, sizeof blob, 1, (uint16_t[]){0x2A6E},
+                                       0, NULL, NULL, NULL, 600);
+    /* The min_len byte is the last of the single read entry. */
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_OK);
+    blob[n - 1] = 0;
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_ERR_LIMITS);
+    blob[n - 1] = PSVM_PLAN_SLOT + 1;
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_ERR_LIMITS);
+    blob[n - 1] = PSVM_PLAN_SLOT;
     assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 7, 0, &p) == PSVM_OK);
 }
 
@@ -1088,6 +1116,8 @@ int main(void) {
     test_plan_limits();
     test_plan_interval_bounds();
     test_plan_rejected_for_rules();
+    test_plan_zero_reads_rejected();
+    test_plan_min_len_bounds();
 
     printf("test_psvm: all passed\n");
     return 0;

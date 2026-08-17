@@ -30,9 +30,18 @@ void gatt_fsm_init(gatt_fsm_t *f, const uint8_t *plan, size_t plan_len)
 
     uint8_t reads_parsed = 0;
     for (uint8_t i = 0; i < read_count; i++) {
-        if (off + 2 > plan_len) break;
+        /* {u16 uuid16, u8 min_len} -- 3 bytes, not 2. */
+        if (off + 3 > plan_len) break;
         f->read_uuid[i] = rd_u16(plan + off);
-        off += 2;
+        /* Clamped, not rejected: psvm_validate() has already refused a
+         * min_len outside 1..GATT_FSM_SLOT, and this parser's contract is
+         * to survive a truncated or hostile plan without reading past it
+         * rather than to re-adjudicate one. */
+        uint8_t min_len = plan[off + 2];
+        if (min_len < 1) min_len = 1;
+        if (min_len > GATT_FSM_SLOT) min_len = GATT_FSM_SLOT;
+        f->read_min_len[i] = min_len;
+        off += 3;
         reads_parsed++;
     }
     f->read_count = reads_parsed;
@@ -171,6 +180,14 @@ gatt_act_t gatt_fsm_step(gatt_fsm_t *f, const gatt_ev_t *ev)
              * ignored rather than mistaken for the next read's
              * completion (see gatt_ev_t.handle's doc comment). */
             if (ev->handle != f->read_uuid[f->read_idx]) return act(GA_NONE);
+
+            /* Too short to decode. Zero-padding the slot would hand the
+             * wrapper bytes the peer never sent and emit a plausible wrong
+             * value with fails at 0 -- exactly the silent-wrong-value shape
+             * spec section 4 exists to prevent, reached by a short
+             * characteristic rather than by handle drift. Fail the attempt
+             * instead, so it is visible as a failure. */
+            if (ev->len < f->read_min_len[f->read_idx]) return fail_disconnect(f);
 
             uint8_t *slot = &f->buf[(size_t)f->read_idx * GATT_FSM_SLOT];
             memset(slot, 0, GATT_FSM_SLOT);

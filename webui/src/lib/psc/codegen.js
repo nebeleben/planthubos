@@ -401,12 +401,22 @@ export function emitWrapper(ast) {
 
   if (hasConnect) {
     // read_count(u8) write_count(u8) interval_s(u32 LE)
-    //   read_count  x { uuid16(u16 LE) }
+    //   read_count  x { uuid16(u16 LE) min_len(u8) }
     //   write_count x { uuid16(u16 LE) len(u8) data[len] }
+    //
+    // min_len is max(offset + accessor width) over every accessor that
+    // reads that buffer (parser.js's bufMin), so the hub can reject a read
+    // too short to decode instead of zero-padding the slot and emitting a
+    // plausible wrong value -- the failure shape spec section 4 exists to
+    // prevent, which a shorter-than-expected characteristic reached by a
+    // different route than the handle drift that section already covers.
     w.u8(ast.connect.reads.length)
     w.u8(ast.connect.writes.length)
     w.u32(ast.connect.intervalS)
-    for (const r of ast.connect.reads) w.u16(r.uuid16)
+    for (const r of ast.connect.reads) {
+      w.u16(r.uuid16)
+      w.u8(r.minLen)
+    }
     for (const wr of ast.connect.writes) {
       w.u16(wr.uuid16)
       w.u8(wr.data.length)

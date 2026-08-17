@@ -35,11 +35,17 @@
  *
  * On-blob layout (present only when this flag is set), all multi-byte
  * fields little-endian like the rest of this format:
- *   u8  read_count            (0..PSVM_PLAN_MAX_READS)
+ *   u8  read_count            (1..PSVM_PLAN_MAX_READS)
  *   u8  write_count           (0..PSVM_PLAN_MAX_WRITES)
  *   u32 interval_s            (60..86400)
- *   read_count  x { u16 uuid16 }
+ *   read_count  x { u16 uuid16; u8 min_len (1..PSVM_PLAN_SLOT) }
  *   write_count x { u16 uuid16; u8 len (1..PSVM_PLAN_WRITE_MAX); u8 data[len] }
+ *
+ * min_len is the fewest bytes that read must return for the decode block to
+ * mean anything: the compiler's max(offset + accessor width) over every
+ * accessor addressing that buffer. A read shorter than it fails the attempt
+ * instead of zero-padding its slot, which would emit a plausible wrong value
+ * with no failure recorded -- the shape spec section 4 exists to prevent.
  *
  * interval_s is u32, not u16: the cap's upper bound (86400 s, a full day)
  * does not fit in a u16 (max 65535), and a narrower field would silently

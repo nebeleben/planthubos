@@ -38,6 +38,13 @@ class Parser {
     // section 2). null means "no connect block": accessors address
     // 'payload' exactly as M3 defined them, unchanged.
     this.buffers = null
+    // name -> the fewest bytes that buffer's slot must actually contain for
+    // the decode block to mean anything: max(offset + accessor width) over
+    // every accessor that reads it. Emitted into the plan as each read's
+    // min_len so the hub can reject a short read instead of zero-padding it
+    // into a plausible wrong value (M5a spec section 4). Populated only
+    // while this.buffers is set, i.e. only for a connect wrapper.
+    this.bufMin = null
   }
 
   peek(offset = 0) {
@@ -242,6 +249,7 @@ class Parser {
     if (this.isKeyword('connect')) {
       connect = this.parseConnectBlock()
       this.buffers = new Map(connect.reads.map((r) => [r.name, r.offset]))
+      this.bufMin = new Map(connect.reads.map((r) => [r.name, 0]))
     }
 
     this.expectKeyword('decode')
@@ -254,7 +262,23 @@ class Parser {
       throw new PSError('decode block must contain at least one statement', t.line, t.col)
     }
 
+    if (connect) {
+      // Every accessor has now been parsed, so bufMin is final. A buffer no
+      // accessor reads keeps minLen 1: the read still has to return
+      // SOMETHING for the attempt to count, and demanding 0 would let an
+      // empty response through as a success.
+      for (const r of connect.reads) r.minLen = Math.max(1, this.bufMin.get(r.name) || 0)
+    }
+
     return { name, match: { kind, key: keyTok.value }, connect, statements }
+  }
+
+  // Raises buffer `name`'s required length to `need` (offset + accessor
+  // width). See this.bufMin.
+  noteBufMin(name, need) {
+    if (!this.bufMin) return
+    const cur = this.bufMin.get(name) || 0
+    if (need > cur) this.bufMin.set(name, need)
   }
 
   // `connect every <duration>` followed by `read`/`write` lines (M5a spec
@@ -276,6 +300,18 @@ class Parser {
     while (this.isKeyword('read') || this.isKeyword('write')) {
       if (this.isKeyword('write')) {
         const wTok = this.advance()
+        // Every write is performed before every read, whatever order they
+        // were written in (gatt_fsm.c's begin_writes_or_reads()). Accepting
+        // a write after a read would compile to something that does not
+        // match what the author wrote, so say so instead of reordering
+        // silently -- a wake write placed after a read reads as "read, then
+        // wake", which is never what was meant.
+        if (reads.length > 0) {
+          throw new PSError(
+            'a connect block performs every write before every read, so `write` must come before the first `read`',
+            wTok.line, wTok.col
+          )
+        }
         const uuidTok = this.expectHex()
         if (uuidTok.value > 0xFFFF) {
           throw new PSError(`write UUID 0x${uuidTok.raw} out of range for a 16-bit UUID`, uuidTok.line, uuidTok.col)
@@ -308,6 +344,16 @@ class Parser {
         const uuidTok = this.expectHex()
         if (uuidTok.value > 0xFFFF) {
           throw new PSError(`read UUID 0x${uuidTok.raw} out of range for a 16-bit UUID`, uuidTok.line, uuidTok.col)
+        }
+        // Two reads of the same characteristic cost a redundant round trip
+        // and weaken gatt_fsm.c's completion-identity check, which
+        // distinguishes reads by uuid16 alone: a stale completion for the
+        // first would be accepted into the second's slot.
+        if (reads.some((r) => r.uuid16 === uuidTok.value)) {
+          throw new PSError(
+            `duplicate read of UUID 0x${uuidTok.raw}: each characteristic may be read once per connect block`,
+            uuidTok.line, uuidTok.col
+          )
         }
         this.expectKeyword('as')
         const nameTok = this.expectIdent()
@@ -443,6 +489,7 @@ class Parser {
             offTok.line, offTok.col
           )
         }
+        this.noteBufMin(buf.name, offTok.value + need)
         return {
           type: 'bits', offset: buf.slotOffset + offTok.value, lsb: lsbTok.value, width: widthTok.value,
           line: nameTok.line, col: nameTok.col,
@@ -468,6 +515,7 @@ class Parser {
           offTok.line, offTok.col
         )
       }
+      this.noteBufMin(buf.name, offTok.value + size)
       return { type: 'load', accessor: name, offset: buf.slotOffset + offTok.value, line: nameTok.line, col: nameTok.col }
     }
     if (offTok.value + size > 31) {

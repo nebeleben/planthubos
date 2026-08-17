@@ -104,6 +104,12 @@ typedef struct {
     uint8_t write_idx;
 
     uint16_t read_uuid[GATT_FSM_MAX_READS];
+    /* Fewest bytes each read must return for its slot to be decodable:
+     * max(offset + accessor width) over the decode block's accessors for
+     * that buffer, computed by the compiler and carried in the plan. A
+     * shorter read fails the attempt rather than zero-padding its slot into
+     * a plausible wrong value. 1..GATT_FSM_SLOT. */
+    uint8_t  read_min_len[GATT_FSM_MAX_READS];
 
     struct {
         uint16_t uuid16;
@@ -125,7 +131,7 @@ typedef struct {
 /* Parses the trailing PSBC connect-plan section (psvm.h's
  * PSVM_FLAG_CONNECT_PLAN doc comment has the on-blob layout this mirrors:
  * u8 read_count, u8 write_count, u32 interval_s LE, then read_count x
- * {u16 uuid16 LE}, then write_count x {u16 uuid16 LE, u8 len, u8
+ * {u16 uuid16 LE, u8 min_len}, then write_count x {u16 uuid16 LE, u8 len, u8
  * data[len]}) directly from (plan, plan_len). This module does NOT assume
  * psvm_validate() already ran: every offset is bounds-checked against
  * plan_len as it is derived, never trusted from the counts alone, and

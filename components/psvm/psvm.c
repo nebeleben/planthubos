@@ -206,14 +206,33 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
         uint8_t plan_write_count = blob[po + 1];
         uint32_t interval_s = rd_u32(blob + po + 2);
         po += 6;
-        if (plan_read_count > PSVM_PLAN_MAX_READS) return PSVM_ERR_LIMITS;
+        /* At least one read. A zero-read plan is not merely useless: the
+         * engine refuses to start an attempt for it, so it never reaches
+         * the scheduler that would have moved the interval gate, and
+         * gatt_sched_due() therefore stays true forever -- every
+         * advertisement from that device (about one a second, for the life
+         * of the boot) pays an arena fetch, a psvm_validate() and a plan
+         * copy to be refused again. The compiler already requires a read
+         * ("connect block must declare at least one read", parser.js), so
+         * this rejects only a hand-built or corrupted blob. */
+        if (plan_read_count < 1 || plan_read_count > PSVM_PLAN_MAX_READS) return PSVM_ERR_LIMITS;
         if (plan_write_count > PSVM_PLAN_MAX_WRITES) return PSVM_ERR_LIMITS;
         /* interval_s is u32 (psvm.h's PSVM_FLAG_CONNECT_PLAN doc comment has
          * the reasoning): both bounds are representable and enforced. */
         if (interval_s < 60 || interval_s > 86400) return PSVM_ERR_LIMITS;
 
-        if (po + (size_t)plan_read_count * 2u > len) return PSVM_ERR_TRUNCATED;
-        po += (size_t)plan_read_count * 2u;
+        /* Each read entry is {u16 uuid16, u8 min_len}. min_len must be
+         * 1..PSVM_PLAN_SLOT: 0 would let an empty response count as a
+         * successful read, and anything past a slot could never be
+         * satisfied, so both are rejected here rather than being clamped
+         * into something that silently behaves differently from what the
+         * wrapper's author wrote. */
+        if (po + (size_t)plan_read_count * 3u > len) return PSVM_ERR_TRUNCATED;
+        for (uint8_t i = 0; i < plan_read_count; i++) {
+            uint8_t min_len = blob[po + (size_t)i * 3u + 2u];
+            if (min_len < 1 || min_len > PSVM_PLAN_SLOT) return PSVM_ERR_LIMITS;
+        }
+        po += (size_t)plan_read_count * 3u;
 
         for (uint8_t i = 0; i < plan_write_count; i++) {
             if (po + 3 > len) return PSVM_ERR_TRUNCATED;   /* uuid16 + len */

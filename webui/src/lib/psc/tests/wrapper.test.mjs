@@ -212,6 +212,56 @@ decode
   assert.deepEqual(r.plan.writes, [{ uuid16: 0x2A00, data: [0x01] }])
   // the named buffer became a compile-time offset: hum reads at 16
   assert.match(disassemble(r.bytecode), /LOAD_U16LE 16/)
+  // each read carries the fewest bytes its accessors need (M5a spec §4):
+  // both are read by a 2-byte accessor at offset 0.
+  assert.deepEqual(r.plan.reads.map(x => x.minLen), [2, 2])
+  assert.match(disassemble(r.bytecode), /READ 0x2A6E -> slot 0 \(offset 0, min 2 B\)/)
+})
+
+test('min_len follows the widest accessor, not the first', () => {
+  const r = compileWrapper(`wrapper "wide" match service 0x181A
+connect every 10min
+  read 2A6E as t
+decode
+  emit air.temperature  i16_le(t, 0) * 0.01
+  emit air.humidity     u32_le(t, 4) * 0.01`)
+  assert.equal(r.ok, true)
+  // u32_le at offset 4 needs 8 bytes; i16_le at 0 needs 2. The larger wins.
+  assert.deepEqual(r.plan.reads.map(x => x.minLen), [8])
+})
+
+test('a read no accessor touches still requires one byte', () => {
+  const r = compileWrapper(`wrapper "unused" match service 0x181A
+connect every 10min
+  read 2A6E as t
+  read 2A6F as unused
+decode
+  emit air.temperature  i16_le(t, 0) * 0.01`)
+  assert.equal(r.ok, true)
+  // An empty response must never count as a successful read.
+  assert.deepEqual(r.plan.reads.map(x => x.minLen), [2, 1])
+})
+
+test('write after the first read is a compile error, not a silent reorder', () => {
+  const r = compileWrapper(`wrapper "order" match service 0x181A
+connect every 10min
+  read 2A6E as t
+  write 2A00 = 01
+decode
+  emit air.temperature  i16_le(t, 0) * 0.01`)
+  assert.equal(r.ok, false)
+  assert.match(r.errors[0].message, /every write before every read/)
+})
+
+test('the same characteristic may not be read twice in one connect block', () => {
+  const r = compileWrapper(`wrapper "dup" match service 0x181A
+connect every 10min
+  read 2A6E as a
+  read 2A6E as b
+decode
+  emit air.temperature  i16_le(a, 0) * 0.01`)
+  assert.equal(r.ok, false)
+  assert.match(r.errors[0].message, /duplicate read of UUID/)
 })
 
 test('a wrapper with no connect block is byte-identical to before', () => {

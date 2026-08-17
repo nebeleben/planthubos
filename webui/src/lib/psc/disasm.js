@@ -182,8 +182,9 @@ export function disassemble(bytecode) {
     lines.push(`-- connect: every ${intervalS}s, ${readCount} read(s), ${writeCount} write(s) --`)
     for (let i = 0; i < readCount; i++) {
       const uuid = view.getUint16(po, true)
-      lines.push(`READ ${hex16(uuid)} -> slot ${i} (offset ${i * PSVM_PLAN_SLOT})`)
-      po += 2
+      const minLen = bytes[po + 2]
+      lines.push(`READ ${hex16(uuid)} -> slot ${i} (offset ${i * PSVM_PLAN_SLOT}, min ${minLen} B)`)
+      po += 3
     }
     for (let i = 0; i < writeCount; i++) {
       const uuid = view.getUint16(po, true)

@@ -107,7 +107,7 @@ _Static_assert(GATT_SCAN_RETRY_MS * GATT_SCAN_RETRY_MAX > GATT_CONNECT_TIMEOUT_M
  * gatt_fsm_init() was given and is dereferenced later, on another task,
  * while an arena eviction from any caller can invalidate an arena pointer
  * at any time (wrapper_arena.h's FINDING 2 doc comment). */
-#define GATT_PLAN_MAX (6 + PSVM_PLAN_MAX_READS * 2 + \
+#define GATT_PLAN_MAX (6 + PSVM_PLAN_MAX_READS * 3 + \
                        PSVM_PLAN_MAX_WRITES * (3 + PSVM_PLAN_WRITE_MAX))
 
 /* What the single esp_timer is currently counting down, so its one callback
@@ -200,6 +200,10 @@ static uint8_t  s_read_buf[GATT_FSM_SLOT];
 static uint8_t  s_read_len;
 static bool     s_read_copy_failed;
 static uint16_t s_resolved_handle;   /* GA_WRITE's resolved target, parked for the same reason */
+/* Set when an attempt is abandoned for a reason that is not the device's
+ * fault, so attempt_finish() moves the interval gate without recording a
+ * failure or a last_error. Reset at the start of every attempt. */
+static bool     s_drop_without_failure;
 static const uint8_t *s_pending_write_data;  /* GA_WRITE's payload -- points into s_plan */
 static uint8_t  s_pending_write_len;
 static uint8_t  s_plan[GATT_PLAN_MAX];
@@ -388,6 +392,14 @@ static void attempt_finish(void)
         gatt_sched_attempt(s_dev_idx, now);
         ESP_LOGI(TAG, "gatt read ok but the wrapper emitted nothing: dev=%d wrapper=%u",
                  s_dev_idx, (unsigned)s_wrapper_id);
+    } else if (s_drop_without_failure) {
+        /* Abandoned before the peer was ever contacted (see GA_CONNECT's
+         * EALREADY branch). Not this device's failure, so no backoff and no
+         * last_error -- but the interval gate still moves, so a losing race
+         * cannot spin on every advertisement. */
+        gatt_sched_attempt(s_dev_idx, now);
+        ESP_LOGI(TAG, "gatt attempt dropped before contact: dev=%d (%s)",
+                 s_dev_idx, s_err ? s_err : "unknown");
     } else {
         gatt_sched_fail(s_dev_idx, now);
         /* No handle cache to drop any more (removed during the M5a
@@ -401,7 +413,10 @@ static void attempt_finish(void)
     }
 
     if (s_dev_idx >= 0 && s_dev_idx < GATT_SCHED_MAX_DEVICES) {
-        if (!radio_ok) {
+        if (s_drop_without_failure) {
+            /* Leave whatever the last real attempt concluded standing: a
+             * race we lost says nothing about this device. */
+        } else if (!radio_ok) {
             s_last_error[s_dev_idx] = s_err;
         } else if (!s_decode_wrote) {
             s_last_error[s_dev_idx] = "read ok, decode emitted nothing";
@@ -436,7 +451,7 @@ static int gatt_gap_event(struct ble_gap_event *event, void *arg);
 static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                    struct ble_gatt_attr *attr, void *arg);
 static int write_resolve_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
-                            struct ble_gatt_attr *attr, void *arg);
+                            const struct ble_gatt_chr *chr, void *arg);
 static int write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                     struct ble_gatt_attr *attr, void *arg);
 
@@ -479,6 +494,16 @@ static bool perform(const gatt_act_t *a)
              * teardown below from cancelling their procedure. */
             ESP_LOGI(TAG, "ble_gap_connect refused: %d", rc);
             s_err = "connect refused";
+            /* EALREADY is the poller collision above, not a fault of this
+             * device: on_start_req() drops an attempt for exactly the same
+             * reason (battery_poll_busy()) WITHOUT recording a failure, and
+             * this path is only reached because that check and
+             * battery_poll.c's own s_in_flight store are not one atomic
+             * step. Recording a failure here would back off, and eventually
+             * surface "connect refused" on, a device that was never asked
+             * anything. Drop it the same way and let the next
+             * advertisement try again. */
+            s_drop_without_failure = (rc == BLE_HS_EALREADY);
             return true;
         }
         s_own_conn_proc = true;
@@ -518,20 +543,32 @@ static bool perform(const gatt_act_t *a)
         /* No handle to write to yet -- and, per GA_READ's comment above,
          * nothing here may cache one across a connection. So a write is
          * two ATT operations, not one: resolve the uuid16 to THIS
-         * connection's handle via the same server-side read-by-UUID
-         * procedure GA_READ uses (write_resolve_cb, below), then write to
-         * the handle it hands back -- which is safe to use immediately
-         * (the same connection, the same round trip's answer) even though
-         * it is never stored anywhere afterward. The plan's optional
-         * pre-read write is the ONLY write M5a performs; actuators and any
-         * other state-changing write are M5b (spec section 9). a->data
-         * points into s_plan, which outlives this call. */
+         * connection's handle, then write to the handle that resolution
+         * hands back -- safe to use immediately (the same connection, the
+         * same round trip's answer) even though it is never stored
+         * anywhere afterward. The plan's optional pre-read write is the
+         * ONLY write M5a performs; actuators and any other state-changing
+         * write are M5b (spec section 9). a->data points into s_plan,
+         * which outlives this call.
+         *
+         * CHARACTERISTIC DISCOVERY, not the read-by-UUID that GA_READ
+         * uses. Read By Type resolves a UUID by READING the value, so it
+         * can only ever resolve a readable characteristic -- and the wake
+         * and mode-set characteristics this write exists for (spec section
+         * 2) are commonly write-only. The hardware gate hit exactly that:
+         * a write-only target answered the resolve with ATT 0x0E and the
+         * whole attempt failed and backed off, with no way for any plan to
+         * reach it. Discovery instead reads the characteristic
+         * DECLARATION, which is always readable whatever the value's
+         * permissions are, and hands back val_handle. The server still
+         * does the resolving, so this keeps the same immunity to handle
+         * drift that made GA_READ read by UUID in the first place. */
         s_pending_uuid16 = a->uuid16;
         s_pending_write_data = a->data;
         s_pending_write_len = a->len;
         s_uuid_op_got_result = false;
-        int rc = ble_gattc_read_by_uuid(s_conn_handle, 1, 0xffff,
-                                        BLE_UUID16_DECLARE(a->uuid16), write_resolve_cb, NULL);
+        int rc = ble_gattc_disc_chrs_by_uuid(s_conn_handle, 1, 0xffff,
+                                             BLE_UUID16_DECLARE(a->uuid16), write_resolve_cb, NULL);
         if (rc != 0) {
             ESP_LOGI(TAG, "write resolve of 0x%04X refused: %d", (unsigned)a->uuid16, rc);
             s_err = "write refused";
@@ -827,7 +864,20 @@ static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     if (stale_completion(conn_handle)) return 0;
 
     if (error->status == 0 && attr != NULL) {
-        if (s_uuid_op_got_result) return 0;   /* a second instance of this uuid16 on the peer: first wins */
+        if (s_uuid_op_got_result) {
+            /* A second attribute with this uuid16. M5a plans name a bare
+             * 16-bit UUID with no way to say WHICH service's instance they
+             * mean, and this procedure scans the peer's whole handle range,
+             * so the first match wins and the rest are dropped. That is a
+             * silent wrong-value risk on any peer that exposes the same
+             * characteristic twice -- two ESS instances, or a vendor
+             * service duplicating 0x2A6E -- so say so once per occurrence
+             * rather than leaving it invisible. Scoping a read to a service
+             * is M5b's problem (spec section 9). */
+            ESP_LOGW(TAG, "read of 0x%04X: peer exposes more than one instance, using the first",
+                     (unsigned)s_pending_uuid16);
+            return 0;
+        }
         s_uuid_op_got_result = true;
 
         /* Park only -- the machine is fed from the EDONE branch below. See
@@ -865,20 +915,26 @@ static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     return 0;
 }
 
-/* ble_gattc_read_by_uuid callback for GA_WRITE's handle-resolve half (see
- * perform()'s GA_WRITE case) -- the same procedure and the same
- * once-per-attribute/once-EDONE shape as read_cb above, but the resolved
- * attribute's handle is not this attempt's answer: it is what the actual
- * write (issued from here, via write_cb below) is addressed to. Nothing
- * about the resolved handle is stored anywhere past this function. */
+/* ble_gattc_disc_chrs_by_uuid callback for GA_WRITE's handle-resolve half
+ * (see perform()'s GA_WRITE case) -- the same once-per-match/once-EDONE
+ * shape as read_cb above, but what comes back is a characteristic
+ * DEFINITION rather than a value, and its val_handle is not this attempt's
+ * answer: it is what the actual write (issued from the EDONE branch below,
+ * via write_cb) is addressed to. Nothing about the resolved handle is
+ * stored anywhere past this attempt. */
 static int write_resolve_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
-                            struct ble_gatt_attr *attr, void *arg)
+                            const struct ble_gatt_chr *chr, void *arg)
 {
     (void)arg;
     if (stale_completion(conn_handle)) return 0;
 
-    if (error->status == 0 && attr != NULL) {
-        if (s_uuid_op_got_result) return 0;   /* a second instance of this uuid16 on the peer: first wins */
+    if (error->status == 0 && chr != NULL) {
+        if (s_uuid_op_got_result) {
+            /* Same first-wins hazard as read_cb's, see its comment. */
+            ESP_LOGW(TAG, "write of 0x%04X: peer exposes more than one instance, using the first",
+                     (unsigned)s_pending_uuid16);
+            return 0;
+        }
         s_uuid_op_got_result = true;
 
         /* Park the handle only. Issuing the write from here would start a
@@ -886,7 +942,7 @@ static int write_resolve_cb(uint16_t conn_handle, const struct ble_gatt_error *e
          * resolve's EDONE would then land on whatever state the write's own
          * completion had already moved on to -- the same misattribution
          * s_read_buf's declaration describes. */
-        s_resolved_handle = attr->handle;
+        s_resolved_handle = chr->val_handle;
         return 0;
     }
 
@@ -967,6 +1023,7 @@ static void on_start_req(struct ble_npl_event *ev)
     s_active = true;
     s_own_conn_proc = false;
     s_decode_wrote = false;
+    s_drop_without_failure = false;
     s_err = "unknown error";
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
