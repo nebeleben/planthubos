@@ -179,6 +179,27 @@ static uint16_t s_pending_uuid16;  /* the characteristic the in-flight read/writ
  * genuine completion, exactly like battery_poll.c's own s_got_result. Reset
  * at the start of every GA_READ/GA_WRITE in perform(). */
 static bool     s_uuid_op_got_result;
+/* Where a read-by-UUID's matching attribute is PARKED until its procedure
+ * terminates. The engine must not advance the state machine from the
+ * status-0 callback: gatt_fsm_step() runs synchronously inside
+ * engine_feed(), so the very next plan action -- another read -- would be
+ * issued from inside the previous procedure, resetting s_pending_uuid16 and
+ * s_uuid_op_got_result while that procedure is still live. Its terminating
+ * BLE_HS_EDONE would then arrive against the NEXT read's state, find
+ * s_uuid_op_got_result false, and report the next characteristic as "not
+ * found" -- which is precisely what the M5a hardware gate observed: a
+ * temperature read that the peer served correctly, followed instantly by
+ * "read of 0x2A6F: characteristic not found" and a teardown, while the peer
+ * went on to serve the humidity read into a connection that was already
+ * closing. The plain ble_gattc_read() this replaced had a single callback
+ * and no terminator, so the old cached-handle path never had a second
+ * callback to misattribute. Parking here and feeding the machine from the
+ * EDONE branch keeps it to exactly one event per procedure, raised only
+ * after NimBLE has finished with that procedure. */
+static uint8_t  s_read_buf[GATT_FSM_SLOT];
+static uint8_t  s_read_len;
+static bool     s_read_copy_failed;
+static uint16_t s_resolved_handle;   /* GA_WRITE's resolved target, parked for the same reason */
 static const uint8_t *s_pending_write_data;  /* GA_WRITE's payload -- points into s_plan */
 static uint8_t  s_pending_write_len;
 static uint8_t  s_plan[GATT_PLAN_MAX];
@@ -481,6 +502,8 @@ static bool perform(const gatt_act_t *a)
          * characteristic; read_cb below follows it. */
         s_pending_uuid16 = a->uuid16;
         s_uuid_op_got_result = false;
+        s_read_len = 0;
+        s_read_copy_failed = false;
         int rc = ble_gattc_read_by_uuid(s_conn_handle, 1, 0xffff,
                                         BLE_UUID16_DECLARE(a->uuid16), read_cb, NULL);
         if (rc != 0) {
@@ -797,18 +820,13 @@ static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
         if (s_uuid_op_got_result) return 0;   /* a second instance of this uuid16 on the peer: first wins */
         s_uuid_op_got_result = true;
 
-        uint8_t buf[GATT_FSM_SLOT];
+        /* Park only -- the machine is fed from the EDONE branch below. See
+         * s_read_buf's declaration for why feeding from here corrupts the
+         * next read's state. */
         uint16_t n = OS_MBUF_PKTLEN(attr->om);
         if (n > GATT_FSM_SLOT) n = GATT_FSM_SLOT;   /* a longer value is truncated to its slot */
-        if (n > 0 && os_mbuf_copydata(attr->om, 0, n, buf) != 0) {
-            s_err = "read failed";
-            engine_feed(GE_ERROR, 0, NULL, 0);
-            return 0;
-        }
-        /* A short read zero-pads its slot inside gatt_fsm_step(), which
-         * re-zeroes the slot before copying -- no previous device's bytes
-         * can survive in a slot this attempt did not fill. */
-        engine_feed(GE_READ_OK, s_pending_uuid16, buf, (uint8_t)n);
+        s_read_copy_failed = (n > 0 && os_mbuf_copydata(attr->om, 0, n, s_read_buf) != 0);
+        s_read_len = s_read_copy_failed ? 0 : (uint8_t)n;
         return 0;
     }
 
@@ -817,8 +835,17 @@ static int read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
             ESP_LOGI(TAG, "read of 0x%04X: characteristic not found", (unsigned)s_pending_uuid16);
             s_err = "characteristic not found";
             engine_feed(GE_ERROR, 0, NULL, 0);
+            return 0;
         }
-        /* else: already delivered GE_READ_OK in the status==0 branch above. */
+        if (s_read_copy_failed) {
+            s_err = "read failed";
+            engine_feed(GE_ERROR, 0, NULL, 0);
+            return 0;
+        }
+        /* A short read zero-pads its slot inside gatt_fsm_step(), which
+         * re-zeroes the slot before copying -- no previous device's bytes
+         * can survive in a slot this attempt did not fill. */
+        engine_feed(GE_READ_OK, s_pending_uuid16, s_read_buf, s_read_len);
         return 0;
     }
 
@@ -844,13 +871,12 @@ static int write_resolve_cb(uint16_t conn_handle, const struct ble_gatt_error *e
         if (s_uuid_op_got_result) return 0;   /* a second instance of this uuid16 on the peer: first wins */
         s_uuid_op_got_result = true;
 
-        int rc = ble_gattc_write_flat(conn_handle, attr->handle, s_pending_write_data,
-                                      s_pending_write_len, write_cb, NULL);
-        if (rc != 0) {
-            ESP_LOGI(TAG, "write of 0x%04X refused: %d", (unsigned)s_pending_uuid16, rc);
-            s_err = "write refused";
-            engine_feed(GE_ERROR, 0, NULL, 0);
-        }
+        /* Park the handle only. Issuing the write from here would start a
+         * second GATT procedure inside the resolve procedure, and the
+         * resolve's EDONE would then land on whatever state the write's own
+         * completion had already moved on to -- the same misattribution
+         * s_read_buf's declaration describes. */
+        s_resolved_handle = attr->handle;
         return 0;
     }
 
@@ -859,9 +885,16 @@ static int write_resolve_cb(uint16_t conn_handle, const struct ble_gatt_error *e
             ESP_LOGI(TAG, "write of 0x%04X: characteristic not found", (unsigned)s_pending_uuid16);
             s_err = "characteristic not found";
             engine_feed(GE_ERROR, 0, NULL, 0);
+            return 0;
         }
-        /* else: the actual write is already in flight from the status==0
-         * branch above, and write_cb owns the event from here. */
+        int rc = ble_gattc_write_flat(conn_handle, s_resolved_handle, s_pending_write_data,
+                                      s_pending_write_len, write_cb, NULL);
+        if (rc != 0) {
+            ESP_LOGI(TAG, "write of 0x%04X refused: %d", (unsigned)s_pending_uuid16, rc);
+            s_err = "write refused";
+            engine_feed(GE_ERROR, 0, NULL, 0);
+        }
+        /* else: the write is in flight and write_cb owns the event now. */
         return 0;
     }
 
