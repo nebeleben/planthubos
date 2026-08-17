@@ -43,8 +43,24 @@ static const char *TAG = "gatt_engine";
  * instead of the CONNECT-with-nonzero-status path that already works and
  * that leaves the stack's master state cleanly reset. With this margin the
  * ordinary case is handled by the ordinary path and our timer is what it
- * was meant to be: a backstop. CONFIG_BT_NIMBLE_MAX_CONN_REATTEMPT is 3, so
- * the stack may retry within this window; that is still bounded by it. */
+ * was meant to be: a backstop.
+ *
+ * This value ALSO bounds something that happens entirely outside our
+ * attempt, which is why the scan-retry budget below is sized against it
+ * (fix round 2, N3/N4 -- an earlier version of this comment claimed the
+ * stack's reattempts were "still bounded by" our window, which is simply
+ * false). CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT is on with
+ * CONFIG_BT_NIMBLE_MAX_CONN_REATTEMPT = 3: when a master link breaks with
+ * BLE_ERR_CONN_ESTABLISHMENT, ble_hs_hci_evt.c aborts our GATT procedure,
+ * DELETES the connection (so no BLE_GAP_EVENT_DISCONNECT ever reaches us --
+ * we see only the aborted read/discovery callback) and re-issues
+ * ble_gap_connect() with a FRESH copy of this duration, not the remainder.
+ * That reattempt is issued after our attempt has already ended, so it holds
+ * the radio -- and blocks ble_gap_disc() with BLE_HS_EBUSY -- for up to
+ * another full GATT_CONNECT_TIMEOUT_MS that nothing in this file started or
+ * can shorten. Its outcome does come back to gatt_gap_event() as a CONNECT
+ * event with s_active already false, which is why that branch restarts
+ * scanning too. */
 #define GATT_CONNECT_TIMEOUT_MS 3000
 
 /* Not a second deadline: this is armed only AFTER the attempt deadline has
@@ -63,10 +79,24 @@ static const char *TAG = "gatt_engine";
  * transmits the HCI cancel and sets master.conn.cancel, with master.op
  * cleared later, when the controller reports the aborted connection (read
  * out of ble_gap.c, not assumed). So a restart can legitimately fail for a
- * few milliseconds after an aborted attempt. 10 x 250 ms covers that with
- * wide margin while still giving up rather than retrying forever. */
+ * while after an attempt ends.
+ *
+ * The budget is sized against the LONGEST such block, not the shortest
+ * (fix round 2, N3): a cancel completing is milliseconds, but a stack-issued
+ * connection reattempt holds the radio for up to a fresh
+ * GATT_CONNECT_TIMEOUT_MS (3000 ms -- see its comment above). The round-1
+ * budget of 10 x 250 ms = 2500 ms was provably shorter than exactly the
+ * case that most needs it, exhausting ~500 ms early and leaving the hub
+ * deaf. 32 x 250 ms = 8000 ms clears one reattempt window by 2.7x, and
+ * still covers it even after the one extra retry a stale timer post can
+ * consume (see on_deadline()). 250 ms is kept as the step so an ordinary
+ * few-millisecond block still clears almost immediately; in the common case
+ * the very first attempt succeeds and no timer is armed at all. */
 #define GATT_SCAN_RETRY_MS  250
-#define GATT_SCAN_RETRY_MAX 10
+#define GATT_SCAN_RETRY_MAX 32
+_Static_assert(GATT_SCAN_RETRY_MS * GATT_SCAN_RETRY_MAX > GATT_CONNECT_TIMEOUT_MS,
+               "the scan-restart budget must outlast a stack-issued connection reattempt, "
+               "which holds the radio for a fresh GATT_CONNECT_TIMEOUT_MS after our attempt ends");
 
 /* Largest connect-plan section psvm.h's on-blob layout can produce:
  * u8 read_count + u8 write_count + u32 interval_s, then the read uuid16s,
@@ -84,7 +114,19 @@ static const char *TAG = "gatt_engine";
  * can tell three unrelated deadlines apart. They can never overlap: the
  * teardown grace only starts once the attempt deadline has expired, and a
  * scan retry only starts once the attempt has ended (and gatt_engine_busy()
- * reports busy while one is pending, so no new attempt can begin under it). */
+ * reports busy while one is pending, so no new attempt can begin under it).
+ *
+ * The phase is read by on_deadline() on the host task, but the post that
+ * gets it there carries no phase of its own, so a post can outlive the
+ * phase it was made in. What bounds the damage is that ALL THREE phases
+ * share the one s_ev_deadline event, and ble_npl_eventq_put() no-ops on an
+ * event that is already queued: at most one deadline post is ever in flight,
+ * so at most one handler run can be acting on a phase that has since moved
+ * on. Every arm site therefore stops the timer first and every handler
+ * branch re-checks s_active, and the cost of a stale run is bounded to one
+ * extra scan retry rather than a lost timer. This property is load-bearing
+ * -- a second ble_npl_event for any of these phases would remove the bound
+ * and need a real generation counter in its place. */
 typedef enum { TP_IDLE, TP_ATTEMPT, TP_TEARDOWN, TP_SCAN_RETRY } timer_phase_t;
 
 /* ---------------- state ----------------
@@ -101,6 +143,12 @@ static gatt_fsm_t s_fsm;
 static bool     s_active;          /* attempt open: set by on_start_req(), cleared by attempt_finish().
                                     * Also READ from adv_decoder_task via gatt_engine_busy(). */
 static bool     s_link_up;         /* did this attempt ever get a connection up (scopes the cache drop) */
+/* Did THIS attempt's ble_gap_connect() actually start a connect procedure?
+ * ble_gap_conn_cancel() is process-global -- it cancels whatever connect is
+ * outstanding, with no notion of whose it is -- so cancelling without this
+ * would abort battery_poll.c's poll instead of ours. See the GA_DISCONNECT
+ * case in perform() for the sequence that made that reachable. */
+static bool     s_own_conn_proc;
 static timer_phase_t s_phase;
 static uint8_t  s_scan_retries;
 static uint16_t s_wrapper_id;
@@ -177,13 +225,23 @@ static void post_to_host(struct ble_npl_event *ev)
  * restart is verified and retried rather than merely attempted.
  *
  * If every retry fails, this logs at ERROR and stops. That is a deliberate
- * end state rather than an infinite retry: 2.5 s of EBUSY means something
- * is wrong that reissuing the same call cannot fix, and a timer looping
- * forever would hide it. The hub then still recovers on any path that calls
- * ble_collector's start_scan() again -- ble_collector.c's
- * BLE_GAP_EVENT_DISC_COMPLETE handler, battery_poll.c's next poll ending,
- * or the next GATT attempt ending -- and otherwise stays deaf until reboot,
- * with a loud ERROR line naming it. */
+ * end state rather than an infinite retry: seconds of continuous EBUSY mean
+ * something reissuing the same call cannot fix, and a timer looping forever
+ * would hide it.
+ *
+ * What actually recovers the hub after that is worth being honest about
+ * (fix round 2), because an earlier version of this comment listed three
+ * paths and two of them are dead exactly when they would be needed: a hub
+ * that is not scanning receives no advertisements, so no advertisement can
+ * trigger the next GATT attempt, and BLE_GAP_EVENT_DISC_COMPLETE cannot
+ * fire for a scan that never started. The one live path is battery_poll.c,
+ * whose 60-second tick is timer-driven rather than advertisement-driven:
+ * the next poll to come due terminates by calling
+ * ble_collector_resume_scan() itself. That needs a known MiFlora and can be
+ * up to a day away. On a hub with none, the recovery is a reboot -- which
+ * is what the ERROR line is for. The stack-issued reattempt paths in
+ * gatt_gap_event() are the other way back, and they are why those branches
+ * call this function even with no attempt of ours open. */
 static void resume_scan_or_retry(void)
 {
     if (!s_resume_scan) {
@@ -207,6 +265,19 @@ static void resume_scan_or_retry(void)
     }
     s_scan_retries++;
     s_phase = TP_SCAN_RETRY;
+    /* Stop before arming (fix round 2, N2). esp_timer_start_once() on an
+     * ALREADY-ARMED timer returns ESP_ERR_INVALID_STATE, and this function
+     * can legitimately be re-entered while its own retry timer is still
+     * armed -- a stale deadline post, or one of the CONNECT/DISCONNECT
+     * paths that restart scanning. Without the stop, that arm failed, and
+     * the failure was handled as "the timer is broken": budget reset, phase
+     * dropped to TP_IDLE, a log line blaming the timer, and the loop
+     * abandoned after two of its retries while the still-armed timer later
+     * landed in TP_IDLE as a silent no-op. Stopping first makes re-entry
+     * simply restart the interval; the only cost is the one extra retry
+     * consumed from the budget, which GATT_SCAN_RETRY_MAX is sized to
+     * absorb. */
+    esp_timer_stop(s_deadline);
     if (esp_timer_start_once(s_deadline, (uint64_t)GATT_SCAN_RETRY_MS * 1000) != ESP_OK) {
         ESP_LOGE(TAG, "scan-retry timer failed to arm; scanning is NOT running");
         s_scan_retries = 0;
@@ -299,6 +370,7 @@ static void attempt_finish(void)
 
     s_active = false;
     s_link_up = false;
+    s_own_conn_proc = false;
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
     resume_scan_or_retry();
@@ -344,10 +416,18 @@ static bool perform(const gatt_act_t *a)
         rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &peer, GATT_CONNECT_TIMEOUT_MS,
                              NULL, gatt_gap_event, NULL);
         if (rc != 0) {
+            /* BLE_HS_EALREADY specifically means a connect procedure is
+             * already running and it is NOT ours (ble_gap_connect() checks
+             * ble_gap_conn_active() first) -- the other owner of the hub's
+             * single outbound connection won the race that
+             * gatt_engine_set_conn_busy_hook()'s check narrows but cannot
+             * close. s_own_conn_proc stays false, which is what stops the
+             * teardown below from cancelling their procedure. */
             ESP_LOGI(TAG, "ble_gap_connect refused: %d", rc);
             s_err = "connect refused";
             return true;
         }
+        s_own_conn_proc = true;
         return false;
     }
 
@@ -417,12 +497,32 @@ static bool perform(const gatt_act_t *a)
             return false;
         }
 
-        /* No link -- so this is a connect that never established, and the
-         * connect PROCEDURE may still be outstanding in the stack (fix
-         * round 1, Critical 1, contributor 2). It must be cancelled
-         * explicitly: ble_gap_disc() refuses with BLE_HS_EBUSY for as long
-         * as ble_gap_conn_active() is true, so finishing here without
-         * cancelling would restart the scan into a guaranteed EBUSY.
+        /* No link. If we never started a connect procedure -- the connect
+         * was refused, most importantly with BLE_HS_EALREADY because the
+         * battery poller already had one running -- then there is nothing
+         * of OURS outstanding and nothing to wait for, so finish now.
+         *
+         * Cancelling here instead would be actively destructive (fix round
+         * 2, N1): ble_gap_conn_cancel() is process-global, so it would abort
+         * the POLLER's connect, return 0, and leave this attempt open
+         * waiting for a CONNECT event that gets delivered to the poller's
+         * callback and never to ours -- hanging until the deadline plus the
+         * grace with gatt_engine_busy() true throughout, destroying one
+         * battery poll, and recording a failure and a backoff against a
+         * device that did nothing wrong. That is the exact outcome the
+         * mutual-awareness hook exists to prevent, and it was reachable
+         * only through this path. */
+        if (!s_own_conn_proc) {
+            attempt_finish();
+            return false;
+        }
+
+        /* Our own connect never established, and the PROCEDURE may still be
+         * outstanding in the stack (fix round 1, Critical 1, contributor 2).
+         * It must be cancelled explicitly: ble_gap_disc() refuses with
+         * BLE_HS_EBUSY for as long as ble_gap_conn_active() is true, so
+         * finishing here without cancelling would restart the scan into a
+         * guaranteed EBUSY.
          *
          * And cancelling is not enough on its own: ble_gap_conn_cancel()
          * only transmits the HCI cancel and sets master.conn.cancel -- it
@@ -431,10 +531,11 @@ static bool perform(const gatt_act_t *a)
          * ble_gap.c, not assumed). So on a successful cancel the attempt is
          * deliberately left OPEN and ended by the resulting
          * BLE_GAP_EVENT_CONNECT instead, by which time the scan can
-         * actually start. The teardown grace timer bounds that wait, and
-         * the scan-restart retry covers it even if the ordering still
-         * surprises us -- three independent guards, because the review's
-         * point stands that betting on ordering is betting on a race. */
+         * actually start -- ble_gap_master_connect_cancelled() resets master
+         * state BEFORE invoking the callback. The teardown grace timer
+         * bounds that wait, and the scan-restart retry covers it even if the
+         * ordering still surprises us -- three independent guards, because
+         * betting on ordering is betting on a race. */
         int rc = ble_gap_conn_cancel();
         if (rc == 0) return false;   /* cancel in flight: finish when it lands */
         if (rc != BLE_HS_EALREADY) {
@@ -485,7 +586,10 @@ static void force_close(void)
 {
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-    } else {
+    } else if (s_own_conn_proc) {
+        /* Same rule as perform()'s GA_DISCONNECT: only ever cancel a connect
+         * procedure this attempt actually started, never whatever happens to
+         * be outstanding process-wide. */
         ble_gap_conn_cancel();
     }
     attempt_finish();
@@ -503,6 +607,9 @@ static int gatt_gap_event(struct ble_gap_event *event, void *arg)
     (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
+        /* Either way the connect PROCEDURE is over: it either produced a
+         * link or failed. Nothing left for us to cancel. */
+        s_own_conn_proc = false;
         if (event->connect.status == 0) {
             if (!s_active || fsm_terminal()) {
                 /* A connection that arrived for an attempt already given up
@@ -513,8 +620,24 @@ static int gatt_gap_event(struct ble_gap_event *event, void *arg)
                  * is still formally open, record the handle so the
                  * resulting disconnect is recognised as its ending. */
                 ESP_LOGI(TAG, "connection arrived for an abandoned attempt; closing it");
-                if (s_active) s_conn_handle = event->connect.conn_handle;
-                ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                if (s_active) {
+                    s_conn_handle = event->connect.conn_handle;
+                    ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                    return 0;
+                }
+                /* No attempt owns this at all -- typically a connection
+                 * reattempt the STACK issued after our attempt already ended
+                 * (see GATT_CONNECT_TIMEOUT_MS). Close it, and make sure
+                 * scanning comes back: while that reattempt was running,
+                 * ble_gap_disc() was refused with BLE_HS_EBUSY, so a
+                 * scan-restart retry may have been burning its budget --
+                 * or may already have given up. If the terminate lands, the
+                 * disconnect below restarts scanning; if it does not, no
+                 * disconnect is coming and this is the last chance. */
+                if (ble_gap_terminate(event->connect.conn_handle,
+                                       BLE_ERR_REM_USER_CONN_TERM) != 0) {
+                    resume_scan_or_retry();
+                }
                 return 0;
             }
             s_conn_handle = event->connect.conn_handle;
@@ -531,6 +654,20 @@ static int gatt_gap_event(struct ble_gap_event *event, void *arg)
              * exception. */
             ESP_LOGI(TAG, "connect failed/timed out/cancelled: %d", event->connect.status);
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            if (!s_active) {
+                /* No attempt of ours is open, so this is the outcome of a
+                 * connect the STACK re-issued on its own after ours ended
+                 * (fix round 2, N3). That reattempt has been blocking
+                 * ble_gap_disc() with BLE_HS_EBUSY for up to a full
+                 * GATT_CONNECT_TIMEOUT_MS, and this event is the first
+                 * moment a scan can succeed again -- so this path has to
+                 * restart scanning too, or the hub stays deaf whenever the
+                 * retry budget ran out first. Idempotent: if scanning is
+                 * already running the hook reports success and this resets
+                 * the retry state. */
+                resume_scan_or_retry();
+                return 0;
+            }
             if (!fsm_terminal()) s_err = "connect failed";
             engine_feed(GE_ERROR, 0, NULL, 0);
             /* Terminal already (the attempt timed out and asked for a
@@ -541,10 +678,20 @@ static int gatt_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
-        /* Ignore a disconnect belonging to a link this engine has already
-         * stopped tracking -- see stale_completion() for the same argument
-         * applied to the GATT callbacks. */
-        if (!s_active || event->disconnect.conn.conn_handle != s_conn_handle) return 0;
+        if (!s_active) {
+            /* Nothing of ours is open, so this is a link that was closed
+             * without an attempt behind it -- the abandoned-connection
+             * branch above being the way that happens. Scanning was blocked
+             * for as long as that link existed, so make sure it is back;
+             * see the CONNECT branch's own note. */
+            resume_scan_or_retry();
+            return 0;
+        }
+        /* Ignore a disconnect belonging to a link this engine is not driving
+         * while it IS driving another -- see stale_completion() for the same
+         * argument applied to the GATT callbacks. Deliberately does NOT
+         * restart scanning: an attempt is in flight and owns the radio. */
+        if (event->disconnect.conn.conn_handle != s_conn_handle) return 0;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         if (!fsm_terminal()) {
             /* Unsolicited: the state machine turns this into GA_REPORT_FAIL,
@@ -760,6 +907,7 @@ static void on_start_req(struct ble_npl_event *ev)
 
     s_active = true;
     s_link_up = false;
+    s_own_conn_proc = false;
     s_decode_wrote = false;
     s_err = "unknown error";
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -801,6 +949,7 @@ static void on_deadline(struct ble_npl_event *ev)
          * arming check (fix round 1): if this fails to arm, the only
          * remaining exit is the very confirmation it was meant to bound, so
          * close the attempt now rather than gamble on it arriving. */
+        esp_timer_stop(s_deadline);   /* see resume_scan_or_retry() on why every arm stops first */
         if (esp_timer_start_once(s_deadline, (uint64_t)GATT_TEARDOWN_GRACE_MS * 1000) != ESP_OK) {
             ESP_LOGE(TAG, "teardown grace timer failed to arm; closing the attempt now");
             force_close();
