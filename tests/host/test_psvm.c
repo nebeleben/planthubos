@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "psvm.h"
+#include "action.h"
 
 /* --- minimal PSBC builder: header + consts + refs + code --- */
 static size_t emit_header_d(uint8_t *b, uint8_t dialect, uint32_t builtins, uint16_t nconst,
@@ -573,6 +574,104 @@ static void test_plan_rejected_for_rules(void) {
     assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 7, 0, &p) == PSVM_ERR_HEADER);
 }
 
+/* --- M5b: PSBC trailing action-table section builders --- */
+
+/* One action, no confirm: write 0x01 + u16le(param) to 0x2AF0 (psvm.h's
+ * PSVM_FLAG_ACTION_TABLE doc comment has the full on-blob layout). flags
+ * here is the action entry's OWN flags byte (bit 0 device-local timed-off,
+ * bit 1 has confirm) -- not to be confused with the blob header's flags
+ * word, which build_wrapper_with_action sets separately. */
+static size_t append_action_section(uint8_t *b, size_t o, uint8_t action_id,
+                                    uint16_t param_max, uint8_t flags) {
+    b[o++] = 1;                 /* action_count */
+    b[o++] = action_id;
+    b[o++] = (uint8_t)(param_max & 0xFF);
+    b[o++] = (uint8_t)(param_max >> 8);
+    b[o++] = flags;
+    b[o++] = 0xF0; b[o++] = 0x2A;   /* write uuid16 0x2AF0 */
+    b[o++] = 1;                     /* write_len */
+    b[o++] = 0x01;                  /* constant byte */
+    b[o++] = 1;                     /* param_offset */
+    b[o++] = 1;                     /* param_encoding: 1 = u16le */
+    return o;
+}
+
+/* Dialect=2 (wrapper) blob with PSVM_FLAG_ACTION_TABLE set and a trailing
+ * one-action, no-confirm action section appended after a bare HALT code
+ * body -- this builder's whole point is the action section, not the code
+ * preceding it (same shape as build_wrapper_with_plan). */
+static size_t build_wrapper_with_action(uint8_t *b, size_t bufsz,
+                                        uint8_t action_id, uint16_t param_max,
+                                        uint8_t flags) {
+    (void)bufsz;
+    uint8_t code[1] = { 0xFF };   /* HALT */
+    size_t o = emit_header_d(b, PSVM_DIALECT_WRAPPERS, 0, 0, 0, (uint16_t)sizeof code);
+    memcpy(b + o, code, sizeof code);
+    o += sizeof code;
+
+    uint16_t hflags = PSVM_FLAG_ACTION_TABLE;
+    memcpy(b + 6, &hflags, 2);
+
+    return append_action_section(b, o, action_id, param_max, flags);
+}
+
+/* Dialect=1 (rules) header-only blob with PSVM_FLAG_ACTION_TABLE set --
+ * proves the validator refuses an action table on a rules blob outright, at
+ * the header, before parsing anything past it (same reasoning as
+ * build_rules_blob_with_plan_flag: a rules program has no actuators). */
+static size_t build_rules_blob_with_action_flag(uint8_t *b, size_t bufsz) {
+    (void)bufsz;
+    size_t o = emit_header(b, 0, 0, 0, 0);   /* dialect=RULES, empty body */
+    uint16_t flags = PSVM_FLAG_ACTION_TABLE;
+    memcpy(b + 6, &flags, 2);
+    return o;
+}
+
+static void test_action_section_parsed(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_wrapper_with_action(blob, sizeof blob,
+                                         ACT_IRRIGATION_OPEN, 300, 0x01);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+    assert(p.actions != NULL);
+    assert(p.actions[0] == 1);
+}
+
+/* The bound may only be LOWERED. This is the single most important check in
+ * the validator: M4 lets an AI write wrapper source, so a generated wrapper
+ * must not be able to raise a safety bound. */
+static void test_action_param_max_cannot_exceed_firmware(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_wrapper_with_action(blob, sizeof blob, ACT_IRRIGATION_OPEN, 301, 0x01);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+
+    n = build_wrapper_with_action(blob, sizeof blob, ACT_IRRIGATION_OPEN, 60, 0x01);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+}
+
+static void test_action_unknown_id_rejected(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_wrapper_with_action(blob, sizeof blob, ACTION_COUNT, 0, 0x01);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+}
+
+/* Truncation at EVERY boundary, not just the last one. M5a's gate proved a
+ * validator that trusts its counts reads past its buffer. */
+static void test_action_section_truncated(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_wrapper_with_action(blob, sizeof blob, ACT_IRRIGATION_OPEN, 300, 0x01);
+    for (size_t cut = 1; cut < 12; cut++) {
+        assert(psvm_validate(blob, n - cut, PSVM_DIALECT_WRAPPERS, 8, 0, &p)
+               != PSVM_OK);
+    }
+}
+
+/* A rules blob may never carry an action section. */
+static void test_action_section_rejected_for_rules(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_rules_blob_with_action_flag(blob, sizeof blob);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 8, 0, &p) == PSVM_ERR_HEADER);
+}
+
 int main(void) {
     uint8_t blob[512]; psvm_prog_t p;
     size_t len = build_demo(blob);
@@ -1118,6 +1217,13 @@ int main(void) {
     test_plan_rejected_for_rules();
     test_plan_zero_reads_rejected();
     test_plan_min_len_bounds();
+
+    /* M5b: PSBC trailing action-table section */
+    test_action_section_parsed();
+    test_action_param_max_cannot_exceed_firmware();
+    test_action_unknown_id_rejected();
+    test_action_section_truncated();
+    test_action_section_rejected_for_rules();
 
     printf("test_psvm: all passed\n");
     return 0;

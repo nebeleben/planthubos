@@ -1,6 +1,7 @@
 /* psvm.c -- PSBC v1 bytecode validator + interpreter.
  * Pure C99 + libc, no ESP-IDF includes (host-testable, spec section 2/3). */
 #include "psvm.h"
+#include "action.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -145,11 +146,15 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
     if (memcmp(blob, "PSBC", 4) != 0) return PSVM_ERR_HEADER;
     if (blob[4] != PSVM_FMT_VER || blob[5] != dialect) return PSVM_ERR_HEADER;
     uint16_t flags = rd_u16(blob + 6);
-    if (flags & ~(uint16_t)PSVM_FLAG_CONNECT_PLAN) return PSVM_ERR_HEADER;
+    if (flags & ~(uint16_t)(PSVM_FLAG_CONNECT_PLAN | PSVM_FLAG_ACTION_TABLE)) return PSVM_ERR_HEADER;
     /* A rules program has no radio: letting dialect=1 declare a GATT connect
      * plan would be a category error, so it's refused outright at the
      * header, before anything else in the blob is even looked at. */
     if ((flags & PSVM_FLAG_CONNECT_PLAN) && dialect == PSVM_DIALECT_RULES) return PSVM_ERR_HEADER;
+    /* Same reasoning for the action table: a rules program has no
+     * actuators either, refused at the header before anything past it is
+     * looked at. */
+    if ((flags & PSVM_FLAG_ACTION_TABLE) && dialect == PSVM_DIALECT_RULES) return PSVM_ERR_HEADER;
 
     uint32_t builtins = rd_u32(blob + 8);
     if (builtins & ~builtins_impl) return PSVM_ERR_LIMITS;
@@ -247,6 +252,61 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
         plan_section_len = (uint16_t)(po - plan_off);
     }
 
+    /* M5b action table (PSVM_FLAG_ACTION_TABLE): a second trailing section,
+     * after the connect plan when both are present (psvm.h's own doc
+     * comment on the flag has the on-blob layout). act_off is the end of
+     * the plan section when one was parsed above, or plan_off (== right
+     * after the code) when it was not -- plan_off/plan_section_len are
+     * already 0/unset in that case, so this one line covers both. Every
+     * field is bounds-checked against `len` as it is derived, exactly like
+     * the connect-plan block just above: never trust action_count or
+     * write_len alone. */
+    size_t act_off = plan_off + (size_t)plan_section_len;
+    const uint8_t *act_ptr = NULL;
+    uint16_t act_section_len = 0;
+    if (flags & PSVM_FLAG_ACTION_TABLE) {
+        size_t ao = act_off;
+        if (ao + 1 > len) return PSVM_ERR_TRUNCATED;
+        uint8_t count = blob[ao];
+        ao += 1;
+        if (count < 1 || count > PSVM_ACTION_MAX) return PSVM_ERR_LIMITS;
+
+        for (uint8_t i = 0; i < count; i++) {
+            /* Fixed part up to and including write_len: id(1) param_max(2)
+             * flags(1) write_uuid16(2) write_len(1) = 7 bytes. */
+            if (ao + 7 > len) return PSVM_ERR_TRUNCATED;
+            uint8_t  id        = blob[ao];
+            uint16_t param_max = rd_u16(blob + ao + 1);
+            uint8_t  aflags    = blob[ao + 3];
+            uint8_t  wlen      = blob[ao + 6];
+
+            const action_t *spec_a = action_get(id);
+            if (!spec_a) return PSVM_ERR_LIMITS;
+            /* The safety bound: a wrapper (M4 lets an AI write its source)
+             * may tighten the firmware's hard param_max and may never
+             * loosen it. */
+            if (param_max > spec_a->param_max) return PSVM_ERR_LIMITS;
+            if (wlen < 1 || wlen > PSVM_PLAN_WRITE_MAX) return PSVM_ERR_LIMITS;
+            ao += 7;
+
+            if (ao + (size_t)wlen > len) return PSVM_ERR_TRUNCATED;
+            ao += wlen;
+
+            if (ao + 2 > len) return PSVM_ERR_TRUNCATED;   /* param_offset, param_encoding */
+            ao += 2;
+
+            if (aflags & 0x02) {   /* has confirm */
+                if (ao + 8 > len) return PSVM_ERR_TRUNCATED;
+                uint8_t cmin = blob[ao + 2];
+                if (cmin < 1 || cmin > PSVM_PLAN_SLOT) return PSVM_ERR_LIMITS;
+                ao += 8;
+            }
+        }
+
+        act_ptr = blob + act_off;
+        act_section_len = (uint16_t)(ao - act_off);
+    }
+
     if (out) {
         out->blob = blob;
         out->len = len;
@@ -259,6 +319,8 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
         out->code = blob + code_off;
         out->plan = plan_ptr;
         out->plan_len = plan_section_len;
+        out->actions = act_ptr;
+        out->actions_len = act_section_len;
     }
     return PSVM_OK;
 }

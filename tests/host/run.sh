@@ -78,8 +78,8 @@ $CC -Wall -Wextra -Werror -I../../components/plants/include -I../../components/c
     ../../components/actions/action.c -o test_plants_migrate
 ./test_plants_migrate
 
-$CC -Wall -Wextra -Werror -I../../components/psvm/include \
-    test_psvm.c ../../components/psvm/psvm.c -o test_psvm -lm
+$CC -Wall -Wextra -Werror -I../../components/psvm/include -I../../components/actions/include \
+    test_psvm.c ../../components/psvm/psvm.c ../../components/actions/action.c -o test_psvm -lm
 ./test_psvm
 
 $CC -Wall -Wextra -Werror -I../../components/gatt/include \

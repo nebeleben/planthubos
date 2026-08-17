@@ -69,6 +69,37 @@
 _Static_assert(PSVM_PLAN_MAX_READS * PSVM_PLAN_SLOT == PSVM_PAYLOAD_MAX,
                "concatenated GATT read buffer: PSVM_PLAN_MAX_READS * PSVM_PLAN_SLOT must equal PSVM_PAYLOAD_MAX");
 
+/* M5b: a wrapper may carry a declarative ACTION table as a second trailing
+ * section, after the connect plan when both are present. Gated by its own
+ * flag bit so a blob with only one of the two parses unambiguously.
+ *
+ * On-blob layout (spec section 2), little-endian throughout:
+ *   u8  action_count            (1..PSVM_ACTION_MAX)
+ *   action_count x {
+ *     u8  action_id             (< ACTION_COUNT)
+ *     u16 param_max             (<= the firmware action table's param_max)
+ *     u8  flags                 bit 0: device-local timed-off
+ *                               bit 1: has confirm
+ *     u16 write_uuid16
+ *     u8  write_len             (1..PSVM_PLAN_WRITE_MAX)
+ *     u8  write_bytes[write_len]
+ *     u8  param_offset          (0xFF = no parameter)
+ *     u8  param_encoding        0 u8, 1 u16le, 2 u16be, 0xFF none
+ *     -- present only when flags bit 1 is set:
+ *     u16 confirm_uuid16
+ *     u8  confirm_min_len       (1..PSVM_PLAN_SLOT)
+ *     u8  confirm_offset
+ *     u8  confirm_encoding      0 u8, 1 u16le, 2 u16be
+ *     u8  confirm_op            0 ==, 1 !=
+ *     u16 confirm_value
+ *   }
+ *
+ * param_max is checked against action_get(action_id)->param_max here, and
+ * may only be LOWER. The hard bound is the firmware's; a wrapper -- which
+ * M4 lets an AI write -- may tighten it and may never loosen it. */
+#define PSVM_FLAG_ACTION_TABLE 0x0002u
+#define PSVM_ACTION_MAX        4
+
 typedef enum { PSVM_OK = 0, PSVM_ERR_HEADER, PSVM_ERR_LIMITS, PSVM_ERR_TRUNCATED,
                PSVM_ERR_BADOP, PSVM_ERR_STACK, PSVM_ERR_STEPS, PSVM_ERR_DIV0,
                PSVM_ERR_JUMP, PSVM_ERR_TYPE, PSVM_ERR_REF } psvm_err_t;
@@ -154,6 +185,11 @@ typedef struct {
      * PSVM_FLAG_CONNECT_PLAN's own doc comment above for the on-blob
      * layout). Tasks 3 and 6 read these. */
     const uint8_t *plan; uint16_t plan_len;
+    /* M5b action table (PSVM_FLAG_ACTION_TABLE): NULL/0 when the flag is
+     * clear, otherwise points at the validated trailing action section
+     * (see PSVM_FLAG_ACTION_TABLE's own doc comment above for the on-blob
+     * layout). Follows the connect plan when both are present. */
+    const uint8_t *actions; uint16_t actions_len;
 } psvm_prog_t;
 
 /* Parses+bounds-checks the blob (spec section 2). dialect = the ONE
