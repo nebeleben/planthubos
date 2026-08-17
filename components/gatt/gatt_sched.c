@@ -20,28 +20,34 @@ _Static_assert(sizeof(gatt_cache_dev_t) == GATT_CACHE_MAX_ENTRIES * 4,
 
 static gatt_cache_dev_t s_cache[GATT_SCHED_MAX_DEVICES];
 
-/* {u32 last_ok_s, u8 fails, u8 pad}, packed to exactly 6 B/device -- the
- * natural (unpacked) layout of a u32 followed by two u8s pads to 8 B (a
- * struct's size must be a multiple of its largest member's alignment, 4
- * here, for correct array element spacing; 6 is not a multiple of 4, so
- * an unpacked compile would round up to 8, giving 128 B total instead of
- * this task's brief's exact 96 B). Packed the same way
- * components/swarm/include/swarm_frame.h's wire structs already are in
- * this codebase, and compiled the same way in the host test (plain cc,
- * no -std= override) -- see that header for the precedent. `pad` is
- * explicit (rather than left as compiler-inserted padding) so the layout
- * is documented, not implied -- same discipline this task's brief asked
- * for on the handle-0 sentinel. */
+/* {u32 last_ok_s, u32 last_attempt_s, u8 fails, u8 pad[3]} = 12 B/device,
+ * 192 B total for GATT_SCHED_MAX_DEVICES (16) -- fix round 1's controller
+ * ruling on this task: the original brief's single shared timestamp
+ * (u32 last_ok_s, u8 fails, u8 pad = 6 B/device, 96 B total) could not
+ * serve both gatt_sched_due()'s need to anchor backoff on the last
+ * ATTEMPT and gatt_sched_last_ok()'s need to report the last SUCCESS --
+ * see gatt_sched_fail()/gatt_sched_due()'s header doc comments for why
+ * that conflict is real, not cosmetic. This is the natural (unpacked)
+ * layout: two u32s (8 B, 4-B aligned) + fails (1 B) + 3 B of trailing pad
+ * to keep the struct's own size a multiple of its largest member's
+ * alignment (4) -- already exactly 12 with no rounding needed, so no
+ * __attribute__((packed)) is required here (unlike the 6-B/device layout
+ * this replaces). `pad` is explicit, not left as compiler-inserted
+ * padding, so the layout is documented rather than implied -- same
+ * discipline this task's brief asked for on the handle-0 sentinel. The
+ * amended spec budgeted 10 B/device; 12 is the real, natural figure --
+ * see this task's report for that reconciliation. */
 typedef struct {
     uint32_t last_ok_s;
+    uint32_t last_attempt_s;
     uint8_t  fails;
-    uint8_t  pad;
-} __attribute__((packed)) gatt_sched_entry_t;
+    uint8_t  pad[3];
+} gatt_sched_entry_t;
 
-_Static_assert(sizeof(gatt_sched_entry_t) == 6,
-               "gatt_sched_entry_t layout drifted from this file's documented 6 B/device");
-_Static_assert(sizeof(gatt_sched_entry_t) * GATT_SCHED_MAX_DEVICES == 96,
-               "gatt scheduler table drifted from this task's brief's documented 96 B");
+_Static_assert(sizeof(gatt_sched_entry_t) == 12,
+               "gatt_sched_entry_t layout drifted from this file's documented 12 B/device");
+_Static_assert(sizeof(gatt_sched_entry_t) * GATT_SCHED_MAX_DEVICES == 192,
+               "gatt scheduler table drifted from this file's documented 192 B total");
 
 static gatt_sched_entry_t s_sched[GATT_SCHED_MAX_DEVICES];
 
@@ -100,7 +106,7 @@ bool gatt_sched_due(int dev_idx, uint32_t interval_s, uint32_t now_s)
     if (!dev_idx_valid(dev_idx)) return false;
 
     const gatt_sched_entry_t *e = &s_sched[dev_idx];
-    if (e->last_ok_s == 0) return true;   /* never contacted: due immediately */
+    if (e->last_attempt_s == 0) return true;   /* never attempted: due immediately */
 
     /* 1x/2x/4x/8x for fails 0/1/2/>=3 -- capped, never shifted past the
      * cap, so this never risks undefined behaviour from shifting a u32 by
@@ -108,20 +114,27 @@ bool gatt_sched_due(int dev_idx, uint32_t interval_s, uint32_t now_s)
     uint32_t scale = (e->fails >= 3) ? (uint32_t)GATT_SCHED_BACKOFF_CAP : (1u << e->fails);
     uint32_t effective_interval_s = interval_s * scale;
 
-    return (now_s - e->last_ok_s) >= effective_interval_s;
+    /* Anchored on last_attempt_s, NOT last_ok_s -- see gatt_sched_due()'s
+     * header doc comment for why anchoring on the last success instead
+     * would defeat backoff entirely. */
+    return (now_s - e->last_attempt_s) >= effective_interval_s;
 }
 
 void gatt_sched_ok(int dev_idx, uint32_t now_s)
 {
     if (!dev_idx_valid(dev_idx)) return;
     s_sched[dev_idx].last_ok_s = now_s;
+    s_sched[dev_idx].last_attempt_s = now_s;
     s_sched[dev_idx].fails = 0;
 }
 
 void gatt_sched_fail(int dev_idx, uint32_t now_s)
 {
     if (!dev_idx_valid(dev_idx)) return;
-    s_sched[dev_idx].last_ok_s = now_s;   /* anchor for gatt_sched_due(); see gatt_sched.h */
+    /* last_ok_s is deliberately untouched -- see this function's header
+     * doc comment: a device failing every attempt must keep reporting
+     * its true last success (or none at all) via gatt_sched_last_ok(). */
+    s_sched[dev_idx].last_attempt_s = now_s;
     if (s_sched[dev_idx].fails < 255) s_sched[dev_idx].fails++;
 }
 
