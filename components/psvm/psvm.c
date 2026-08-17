@@ -271,6 +271,14 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
         ao += 1;
         if (count < 1 || count > PSVM_ACTION_MAX) return PSVM_ERR_LIMITS;
 
+        /* One entry per action_count, checked against every OTHER entry
+         * already seen in this table -- a hand-posted blob reaches this
+         * validator with no compiler involved, and a duplicate action_id
+         * would leave Task 5's lookup to silently pick one of two
+         * conflicting limits. count <= PSVM_ACTION_MAX, so this stays a
+         * tiny fixed array, no allocation. */
+        uint8_t seen_ids[PSVM_ACTION_MAX];
+
         for (uint8_t i = 0; i < count; i++) {
             /* Fixed part up to and including write_len: id(1) param_max(2)
              * flags(1) write_uuid16(2) write_len(1) = 7 bytes. */
@@ -282,18 +290,43 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
 
             const action_t *spec_a = action_get(id);
             if (!spec_a) return PSVM_ERR_LIMITS;
+            for (uint8_t j = 0; j < i; j++) {
+                if (seen_ids[j] == id) return PSVM_ERR_LIMITS;
+            }
+            seen_ids[i] = id;
             /* The safety bound: a wrapper (M4 lets an AI write its source)
              * may tighten the firmware's hard param_max and may never
              * loosen it. */
             if (param_max > spec_a->param_max) return PSVM_ERR_LIMITS;
             if (wlen < 1 || wlen > PSVM_PLAN_WRITE_MAX) return PSVM_ERR_LIMITS;
+            /* Entry-level forward-compat gate, same reasoning as the
+             * header flags word's own unknown-bits check above: only bits
+             * 0-1 are defined, so anything else is refused now rather than
+             * silently ignored by an old validator reading a newer blob. */
+            if (aflags & ~(uint8_t)0x03) return PSVM_ERR_LIMITS;
             ao += 7;
 
             if (ao + (size_t)wlen > len) return PSVM_ERR_TRUNCATED;
             ao += wlen;
 
             if (ao + 2 > len) return PSVM_ERR_TRUNCATED;   /* param_offset, param_encoding */
+            uint8_t param_offset   = blob[ao];
+            uint8_t param_encoding = blob[ao + 1];
             ao += 2;
+            /* Task 8's executor splices the parameter into a write_len-byte
+             * buffer at param_offset -- this is the one function standing
+             * between an HTTP client and that splice, so the invariant
+             * (psvm.h's own doc comment on the flag has the full rule) is
+             * established here, not left for code that doesn't exist yet. */
+            if (param_offset == 0xFF || param_encoding == 0xFF) {
+                if (param_offset != 0xFF || param_encoding != 0xFF) return PSVM_ERR_LIMITS;
+            } else {
+                uint8_t width;
+                if (param_encoding == 0) width = 1;
+                else if (param_encoding == 1 || param_encoding == 2) width = 2;
+                else return PSVM_ERR_LIMITS;
+                if ((uint32_t)param_offset + width > wlen) return PSVM_ERR_LIMITS;
+            }
 
             if (aflags & 0x02) {   /* has confirm */
                 if (ao + 8 > len) return PSVM_ERR_TRUNCATED;

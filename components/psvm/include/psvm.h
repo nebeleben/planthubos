@@ -76,10 +76,11 @@ _Static_assert(PSVM_PLAN_MAX_READS * PSVM_PLAN_SLOT == PSVM_PAYLOAD_MAX,
  * On-blob layout (spec section 2), little-endian throughout:
  *   u8  action_count            (1..PSVM_ACTION_MAX)
  *   action_count x {
- *     u8  action_id             (< ACTION_COUNT)
+ *     u8  action_id             (< ACTION_COUNT, and unique within this table)
  *     u16 param_max             (<= the firmware action table's param_max)
  *     u8  flags                 bit 0: device-local timed-off
  *                               bit 1: has confirm
+ *                               bits 2-7 reserved, must be 0
  *     u16 write_uuid16
  *     u8  write_len             (1..PSVM_PLAN_WRITE_MAX)
  *     u8  write_bytes[write_len]
@@ -96,7 +97,18 @@ _Static_assert(PSVM_PLAN_MAX_READS * PSVM_PLAN_SLOT == PSVM_PAYLOAD_MAX,
  *
  * param_max is checked against action_get(action_id)->param_max here, and
  * may only be LOWER. The hard bound is the firmware's; a wrapper -- which
- * M4 lets an AI write -- may tighten it and may never loosen it. */
+ * M4 lets an AI write -- may tighten it and may never loosen it.
+ *
+ * param_offset/param_encoding are a matched pair, validated together: either
+ * both are the "no parameter" sentinel (0xFF/0xFF), or param_encoding is
+ * 0/1/2 and param_offset + width(param_encoding) <= write_len (width 1 for
+ * u8, 2 for u16le/u16be) -- Task 8's executor splices the parameter into a
+ * write_len-byte buffer at param_offset, and this is the one function
+ * standing between an HTTP client and that splice, so the invariant is
+ * established here rather than left for code that has not been written
+ * yet. Any other combination (a real encoding with offset==0xFF or vice
+ * versa, an offset that would run past write_len, an encoding outside
+ * 0/1/2/0xFF) is PSVM_ERR_LIMITS. */
 #define PSVM_FLAG_ACTION_TABLE 0x0002u
 #define PSVM_ACTION_MAX        4
 

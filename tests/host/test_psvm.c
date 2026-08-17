@@ -576,24 +576,36 @@ static void test_plan_rejected_for_rules(void) {
 
 /* --- M5b: PSBC trailing action-table section builders --- */
 
-/* One action, no confirm: write 0x01 + u16le(param) to 0x2AF0 (psvm.h's
- * PSVM_FLAG_ACTION_TABLE doc comment has the full on-blob layout). flags
- * here is the action entry's OWN flags byte (bit 0 device-local timed-off,
- * bit 1 has confirm) -- not to be confused with the blob header's flags
- * word, which build_wrapper_with_action sets separately. */
-static size_t append_action_section(uint8_t *b, size_t o, uint8_t action_id,
-                                    uint16_t param_max, uint8_t flags) {
-    b[o++] = 1;                 /* action_count */
+/* One action entry (no confirm, no action_count byte): write a single
+ * constant byte to 0x2AF0, that same byte doubling as a u8 parameter slot
+ * at offset 0 (psvm.h's PSVM_FLAG_ACTION_TABLE doc comment has the full
+ * on-blob layout, including the param_offset/param_encoding-must-fit-
+ * write_len invariant this shape satisfies: offset 0 + width 1 <=
+ * write_len 1). flags here is the action entry's OWN flags byte (bit 0
+ * device-local timed-off, bit 1 has confirm) -- not to be confused with
+ * the blob header's flags word, which the blob-level builders below set
+ * separately. Factored out of append_action_section so
+ * build_wrapper_with_duplicate_action_ids can place two of these under one
+ * action_count without duplicating the byte layout. */
+static size_t append_one_action_entry(uint8_t *b, size_t o, uint8_t action_id,
+                                      uint16_t param_max, uint8_t flags) {
     b[o++] = action_id;
     b[o++] = (uint8_t)(param_max & 0xFF);
     b[o++] = (uint8_t)(param_max >> 8);
     b[o++] = flags;
     b[o++] = 0xF0; b[o++] = 0x2A;   /* write uuid16 0x2AF0 */
     b[o++] = 1;                     /* write_len */
-    b[o++] = 0x01;                  /* constant byte */
-    b[o++] = 1;                     /* param_offset */
-    b[o++] = 1;                     /* param_encoding: 1 = u16le */
+    b[o++] = 0x01;                  /* constant byte / u8 param slot */
+    b[o++] = 0;                     /* param_offset: byte 0 of write_bytes */
+    b[o++] = 0;                     /* param_encoding: 0 = u8 */
     return o;
+}
+
+/* action_count=1 wrapping a single append_one_action_entry. */
+static size_t append_action_section(uint8_t *b, size_t o, uint8_t action_id,
+                                    uint16_t param_max, uint8_t flags) {
+    b[o++] = 1;                 /* action_count */
+    return append_one_action_entry(b, o, action_id, param_max, flags);
 }
 
 /* Dialect=2 (wrapper) blob with PSVM_FLAG_ACTION_TABLE set and a trailing
@@ -670,6 +682,247 @@ static void test_action_section_rejected_for_rules(void) {
     uint8_t blob[160]; psvm_prog_t p;
     size_t n = build_rules_blob_with_action_flag(blob, sizeof blob);
     assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 8, 0, &p) == PSVM_ERR_HEADER);
+}
+
+/* --- M5b fix round 1: param_offset/param_encoding, confirm block, both
+ * section flags together, duplicate action_id, reserved per-action flag
+ * bits --- */
+
+/* Wraps a single append_one_action_entry with a caller-chosen write_len and
+ * an all-zero write_bytes, and caller-chosen param_offset/param_encoding --
+ * exists to probe that pair's validity directly, independent of any other
+ * field. */
+static size_t append_action_entry_param(uint8_t *b, size_t o, uint8_t action_id,
+                                        uint16_t param_max, uint8_t write_len,
+                                        uint8_t param_offset, uint8_t param_encoding) {
+    b[o++] = action_id;
+    b[o++] = (uint8_t)(param_max & 0xFF);
+    b[o++] = (uint8_t)(param_max >> 8);
+    b[o++] = 0x01;                  /* flags: device-local timed-off, no confirm */
+    b[o++] = 0xF0; b[o++] = 0x2A;   /* write uuid16 0x2AF0 */
+    b[o++] = write_len;
+    for (uint8_t i = 0; i < write_len; i++) b[o++] = 0;
+    b[o++] = param_offset;
+    b[o++] = param_encoding;
+    return o;
+}
+
+static size_t build_wrapper_with_action_param(uint8_t *b, size_t bufsz,
+                                              uint8_t write_len, uint8_t param_offset,
+                                              uint8_t param_encoding) {
+    (void)bufsz;
+    uint8_t code[1] = { 0xFF };   /* HALT */
+    size_t o = emit_header_d(b, PSVM_DIALECT_WRAPPERS, 0, 0, 0, (uint16_t)sizeof code);
+    memcpy(b + o, code, sizeof code);
+    o += sizeof code;
+
+    uint16_t hflags = PSVM_FLAG_ACTION_TABLE;
+    memcpy(b + 6, &hflags, 2);
+
+    b[o++] = 1;   /* action_count */
+    return append_action_entry_param(b, o, ACT_IRRIGATION_OPEN, 60,
+                                     write_len, param_offset, param_encoding);
+}
+
+/* Action entry with a 3-byte write_bytes AND (when has_confirm) a full
+ * confirm block -- append_one_action_entry's fixed write_len=1/no-confirm
+ * shape can exercise neither the multi-byte write_bytes truncation path nor
+ * the confirm branch, so this builder exists specifically for both. */
+static size_t append_action_entry_confirm(uint8_t *b, size_t o, uint8_t action_id,
+                                          uint16_t param_max, bool has_confirm,
+                                          uint8_t confirm_min_len) {
+    uint8_t aflags = (uint8_t)(0x01 | (has_confirm ? 0x02 : 0));
+    b[o++] = action_id;
+    b[o++] = (uint8_t)(param_max & 0xFF);
+    b[o++] = (uint8_t)(param_max >> 8);
+    b[o++] = aflags;
+    b[o++] = 0xF1; b[o++] = 0x2A;      /* write uuid16 0x2AF1 */
+    b[o++] = 3;                         /* write_len: 3 bytes */
+    b[o++] = 0x01; b[o++] = 0; b[o++] = 0;  /* constant byte + u16le param placeholder */
+    b[o++] = 1;                         /* param_offset: byte 1 of write_bytes */
+    b[o++] = 1;                         /* param_encoding: u16le, 1+2<=3 */
+    if (has_confirm) {
+        b[o++] = 0xF2; b[o++] = 0x2A;   /* confirm uuid16 0x2AF2 */
+        b[o++] = confirm_min_len;
+        b[o++] = 0;                     /* confirm_offset */
+        b[o++] = 1;                     /* confirm_encoding: u16le */
+        b[o++] = 0;                     /* confirm_op: == */
+        b[o++] = 0x2A; b[o++] = 0x00;   /* confirm_value: 42 */
+    }
+    return o;
+}
+
+static size_t build_wrapper_with_confirm_action(uint8_t *b, size_t bufsz) {
+    (void)bufsz;
+    uint8_t code[1] = { 0xFF };   /* HALT */
+    size_t o = emit_header_d(b, PSVM_DIALECT_WRAPPERS, 0, 0, 0, (uint16_t)sizeof code);
+    memcpy(b + o, code, sizeof code);
+    o += sizeof code;
+
+    uint16_t hflags = PSVM_FLAG_ACTION_TABLE;
+    memcpy(b + 6, &hflags, 2);
+
+    b[o++] = 1;   /* action_count */
+    return append_action_entry_confirm(b, o, ACT_PUMP_RUN, 60, true, 2);
+}
+
+/* Both PSVM_FLAG_CONNECT_PLAN and PSVM_FLAG_ACTION_TABLE set: the one case
+ * where the action section's start offset (plan_off + plan_section_len) is
+ * non-trivial, exercising that derivation directly instead of trusting it
+ * by construction. */
+static size_t build_wrapper_with_plan_and_action(uint8_t *b, size_t bufsz) {
+    (void)bufsz;
+    uint8_t code[1] = { 0xFF };   /* HALT */
+    size_t o = emit_header_d(b, PSVM_DIALECT_WRAPPERS, 0, 0, 0, (uint16_t)sizeof code);
+    memcpy(b + o, code, sizeof code);
+    o += sizeof code;
+
+    uint16_t hflags = PSVM_FLAG_CONNECT_PLAN | PSVM_FLAG_ACTION_TABLE;
+    memcpy(b + 6, &hflags, 2);
+
+    /* connect plan: 1 read, 0 writes, interval 600s */
+    b[o++] = 1;      /* read_count */
+    b[o++] = 0;      /* write_count */
+    uint32_t interval_s = 600;
+    memcpy(b + o, &interval_s, 4); o += 4;
+    uint16_t read_uuid = 0x2A6E;
+    memcpy(b + o, &read_uuid, 2); o += 2;
+    b[o++] = 2;      /* min_len */
+
+    return append_action_section(b, o, ACT_IRRIGATION_OPEN, 60, 0x01);
+}
+
+/* Two action entries under one action_count sharing the same action_id
+ * (different param_max) -- a hand-posted blob reaches psvm_validate() with
+ * no compiler involved, so this invariant must hold here, not just in
+ * Task 4's (untrusted) compiler. */
+static size_t build_wrapper_with_duplicate_action_ids(uint8_t *b, size_t bufsz) {
+    (void)bufsz;
+    uint8_t code[1] = { 0xFF };   /* HALT */
+    size_t o = emit_header_d(b, PSVM_DIALECT_WRAPPERS, 0, 0, 0, (uint16_t)sizeof code);
+    memcpy(b + o, code, sizeof code);
+    o += sizeof code;
+
+    uint16_t hflags = PSVM_FLAG_ACTION_TABLE;
+    memcpy(b + 6, &hflags, 2);
+
+    b[o++] = 2;   /* action_count */
+    o = append_one_action_entry(b, o, ACT_IRRIGATION_OPEN, 60, 0x01);
+    o = append_one_action_entry(b, o, ACT_IRRIGATION_OPEN, 30, 0x01);
+    return o;
+}
+
+/* param_offset/param_encoding: either both the "no parameter" sentinel
+ * (0xFF/0xFF), or a real encoding (0/1/2) whose width fits within
+ * write_len. Task 8's executor splices the parameter at this offset into a
+ * write_len-byte buffer, so this is the one function standing between an
+ * HTTP client and that splice. */
+static void test_action_param_offset_encoding_bounds(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+
+    /* The exact garbage combo the reviewer found accepted before this fix:
+     * write_len=1, param_offset=200, param_encoding=126. */
+    size_t n = build_wrapper_with_action_param(blob, sizeof blob, 1, 200, 126);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+
+    /* no-parameter sentinel: both 0xFF is legal. */
+    n = build_wrapper_with_action_param(blob, sizeof blob, 1, 0xFF, 0xFF);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+
+    /* mismatched sentinel, both directions. */
+    n = build_wrapper_with_action_param(blob, sizeof blob, 1, 0xFF, 0);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+    n = build_wrapper_with_action_param(blob, sizeof blob, 1, 0, 0xFF);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+
+    /* encoding outside 0/1/2/0xFF. */
+    n = build_wrapper_with_action_param(blob, sizeof blob, 1, 0, 3);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+
+    /* u16le (width 2) at the exact boundary: offset=0 fits write_len=2;
+     * offset=1 would need bytes [1,3) but write_len=2 only has byte 1. */
+    n = build_wrapper_with_action_param(blob, sizeof blob, 2, 0, 1);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+    n = build_wrapper_with_action_param(blob, sizeof blob, 2, 1, 1);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+
+    /* u8 (width 1) at the exact boundary: offset=0 fits write_len=1;
+     * offset=1 does not. */
+    n = build_wrapper_with_action_param(blob, sizeof blob, 1, 0, 0);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+    n = build_wrapper_with_action_param(blob, sizeof blob, 1, 1, 0);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+}
+
+static void test_action_confirm_parsed(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_wrapper_with_confirm_action(blob, sizeof blob);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+    assert(p.actions != NULL);
+    assert(p.actions_len == 21);
+}
+
+/* Truncation at every boundary of a blob whose action section HAS a
+ * confirm block and a multi-byte write_bytes -- the shape
+ * test_action_section_truncated's 1-byte-write_len/no-confirm blob can
+ * never reach. */
+static void test_action_confirm_section_truncated(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_wrapper_with_confirm_action(blob, sizeof blob);
+    for (size_t cut = 1; cut < 22; cut++) {
+        assert(psvm_validate(blob, n - cut, PSVM_DIALECT_WRAPPERS, 8, 0, &p)
+               != PSVM_OK);
+    }
+}
+
+static void test_action_confirm_min_len_bounds(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_wrapper_with_confirm_action(blob, sizeof blob);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+
+    /* confirm_min_len sits 6 bytes from the end: offset(1) + encoding(1) +
+     * op(1) + value(2) follow it, i.e. index n-6. */
+    size_t idx = n - 6;
+    uint8_t saved = blob[idx];
+    blob[idx] = 0;
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+    blob[idx] = PSVM_PLAN_SLOT + 1;
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+    blob[idx] = saved;
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+}
+
+/* The action section's start offset (plan_off + plan_section_len) is only
+ * non-trivial when a connect plan actually precedes it -- assert both
+ * sections' pointers/lengths land exactly where expected. */
+static void test_action_section_after_connect_plan(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_wrapper_with_plan_and_action(blob, sizeof blob);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+
+    assert(p.plan != NULL);
+    assert(p.plan_len == 9);   /* read_count(1)+write_count(1)+interval(4)+one read entry(3) */
+    assert(p.plan[0] == 1 && p.plan[1] == 0);
+
+    assert(p.actions != NULL);
+    assert(p.actions_len == 11);   /* single no-confirm entry, see append_action_section */
+    assert(p.actions[0] == 1);
+    assert(p.actions == p.plan + p.plan_len);
+}
+
+static void test_action_duplicate_id_rejected(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_wrapper_with_duplicate_action_ids(blob, sizeof blob);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+}
+
+/* Header flags already reject unknown bits (psvm.c); the per-action flags
+ * byte gets the same entry-level forward-compat gate -- only bits 0-1 are
+ * defined. */
+static void test_action_reserved_flag_bits_rejected(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+    size_t n = build_wrapper_with_action(blob, sizeof blob, ACT_IRRIGATION_OPEN, 60, 0xFC);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
 }
 
 int main(void) {
@@ -1224,6 +1477,15 @@ int main(void) {
     test_action_unknown_id_rejected();
     test_action_section_truncated();
     test_action_section_rejected_for_rules();
+
+    /* M5b fix round 1 */
+    test_action_param_offset_encoding_bounds();
+    test_action_confirm_parsed();
+    test_action_confirm_section_truncated();
+    test_action_confirm_min_len_bounds();
+    test_action_section_after_connect_plan();
+    test_action_duplicate_id_rejected();
+    test_action_reserved_flag_bits_rejected();
 
     printf("test_psvm: all passed\n");
     return 0;
