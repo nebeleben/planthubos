@@ -4,10 +4,25 @@
 
 import { OPCODES } from './codegen.js'
 import { CAPS_BY_ID } from './caps.js'
-import { PSVM_FLAG_CONNECT_PLAN, PSVM_PLAN_SLOT } from './plan-limits.js'
+import {
+  PSVM_FLAG_CONNECT_PLAN, PSVM_PLAN_SLOT, PSVM_FLAG_ACTION_TABLE, ACTIONS, ACTION_ENCODING,
+} from './plan-limits.js'
 
 const OPNAME = Object.fromEntries(Object.entries(OPCODES).map(([k, v]) => [v, k]))
 const BUILTIN_NAME = { 0: 'log', 1: 'notify' }
+// id -> name, inverted from plan-limits.js's ACTIONS/ACTION_ENCODING -- the
+// blob only carries ids, never the source-level names, so rendering them
+// back requires the same tables the compiler used to assign them.
+const ACTION_NAME_BY_ID = Object.fromEntries(Object.entries(ACTIONS).map(([name, d]) => [d.id, name]))
+const ACTION_ENCODING_NAME_BY_ID = Object.fromEntries(Object.entries(ACTION_ENCODING).map(([name, d]) => [d.id, name]))
+
+function hex16(v) {
+  return `0x${v.toString(16).toUpperCase().padStart(4, '0')}`
+}
+
+function hexBytes(bytes) {
+  return Array.from(bytes).map((b) => b.toString(16).toUpperCase().padStart(2, '0')).join('')
+}
 
 const HEADER_LEN = 18
 
@@ -167,18 +182,21 @@ export function disassemble(bytecode) {
     }
   }
 
-  // M5a connect plan: a trailing section right after the code, present only
-  // when the header flag is set (Task 1's layout). Names aren't on the
-  // blob -- only the compiler's symbol table knew them -- so reads render
-  // as (uuid, slot offset) instead.
+  // Trailing sections (present only when their header flag bit is set):
+  // M5a's connect plan, then M5b's action table (psvm.h: "Follows the
+  // connect plan when both are present"). `po` tracks the read cursor
+  // across both -- the action table's start is wherever the connect plan
+  // (if any) left off, never a fixed offset.
   const flags = view.getUint16(6, true)
+  let po = codeStart + codeLen
+
   if (flags & PSVM_FLAG_CONNECT_PLAN) {
-    let po = codeStart + codeLen
+    // Names aren't on the blob -- only the compiler's symbol table knew
+    // them -- so reads render as (uuid, slot offset) instead.
     const readCount = bytes[po]
     const writeCount = bytes[po + 1]
     const intervalS = view.getUint32(po + 2, true)
     po += 6
-    const hex16 = (v) => `0x${v.toString(16).toUpperCase().padStart(4, '0')}`
     lines.push(`-- connect: every ${intervalS}s, ${readCount} read(s), ${writeCount} write(s) --`)
     for (let i = 0; i < readCount; i++) {
       const uuid = view.getUint16(po, true)
@@ -190,10 +208,47 @@ export function disassemble(bytecode) {
       const uuid = view.getUint16(po, true)
       const wlen = bytes[po + 2]
       po += 3
-      const hex = Array.from(bytes.subarray(po, po + wlen))
-        .map((b) => b.toString(16).toUpperCase().padStart(2, '0')).join('')
-      lines.push(`WRITE ${hex16(uuid)} = ${hex}`)
+      lines.push(`WRITE ${hex16(uuid)} = ${hexBytes(bytes.subarray(po, po + wlen))}`)
       po += wlen
+    }
+  }
+
+  if (flags & PSVM_FLAG_ACTION_TABLE) {
+    const actionCount = bytes[po]
+    po += 1
+    lines.push(`-- actions: ${actionCount} --`)
+    for (let i = 0; i < actionCount; i++) {
+      const actionId = bytes[po]; po += 1
+      po += 2 // param_max -- not rendered in the compact one-liner below
+      const aflags = bytes[po]; po += 1
+      const writeUuid = view.getUint16(po, true); po += 2
+      const writeLen = bytes[po]; po += 1
+      const writeBytes = bytes.subarray(po, po + writeLen)
+      po += writeLen
+      const paramOffset = bytes[po]; po += 1
+      const paramEncoding = bytes[po]; po += 1
+
+      const actionName = ACTION_NAME_BY_ID[actionId] !== undefined ? ACTION_NAME_BY_ID[actionId] : `action${actionId}`
+      let line = `ACTION ${actionName} write ${hex16(writeUuid)} = `
+      if (paramOffset === 0xFF) {
+        line += hexBytes(writeBytes)
+      } else {
+        line += hexBytes(writeBytes.subarray(0, paramOffset))
+        const encName = ACTION_ENCODING_NAME_BY_ID[paramEncoding] !== undefined ? ACTION_ENCODING_NAME_BY_ID[paramEncoding] : paramEncoding
+        line += ` <param ${encName} @${paramOffset}>`
+      }
+
+      if (aflags & 0x02) {
+        const confirmUuid = view.getUint16(po, true); po += 2
+        po += 1 // confirm_min_len -- implied by offset+encoding, not rendered
+        const confirmOffset = bytes[po]; po += 1
+        po += 1 // confirm_encoding -- brief's rendering omits it (offset/op/value suffice)
+        const confirmOp = bytes[po]; po += 1
+        const confirmValue = view.getUint16(po, true); po += 2
+        const opStr = confirmOp === 0 ? '==' : '!='
+        line += ` confirm ${hex16(confirmUuid)} [${confirmOffset}]${opStr}${confirmValue}`
+      }
+      lines.push(line)
     }
   }
 

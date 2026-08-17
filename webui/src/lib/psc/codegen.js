@@ -7,7 +7,13 @@
 
 import { CAPS } from './caps.js'
 import { PSError } from './lexer.js'
-import { PSVM_FLAG_CONNECT_PLAN } from './plan-limits.js'
+import { PSVM_FLAG_CONNECT_PLAN, PSVM_FLAG_ACTION_TABLE, ACTION_ENCODING } from './plan-limits.js'
+
+// id -> width, inverted from ACTION_ENCODING (plan-limits.js): codegen only
+// ever has the encoding id in hand (parser.js already resolved the name).
+const ACTION_ENCODING_WIDTH_BY_ID = Object.fromEntries(
+  Object.values(ACTION_ENCODING).map((e) => [e.id, e.width])
+)
 
 // Mirrors PSVM_MAX_EMITS in components/psvm/include/psvm.h: the VM's emit
 // buffer is a fixed array (16 slots), not a growable one, so a wrapper
@@ -382,12 +388,21 @@ export function emitWrapper(ast) {
   // what this function produced before M5a -- flags stays 0, no trailing
   // bytes -- which is the M3/M4 compatibility guarantee.
   const hasConnect = !!ast.connect
+  // M5b: a wrapper with one or more `action` blocks sets
+  // PSVM_FLAG_ACTION_TABLE and carries a second trailing section, after the
+  // connect plan when both are present (psvm.h's PSVM_FLAG_ACTION_TABLE doc
+  // comment, which is ground truth for the byte layout below).
+  const hasActions = ast.actions.length > 0
+
+  let flags = 0
+  if (hasConnect) flags |= PSVM_FLAG_CONNECT_PLAN
+  if (hasActions) flags |= PSVM_FLAG_ACTION_TABLE
 
   const w = new ByteWriter()
   w.raw([0x50, 0x53, 0x42, 0x43]) // "PSBC"
   w.u8(1) // fmt_ver
   w.u8(2) // dialect (wrappers)
-  w.u16(hasConnect ? PSVM_FLAG_CONNECT_PLAN : 0) // flags
+  w.u16(flags)
   w.u32(0) // builtins — unused by this dialect
   w.u16(consts.entries.length)
   w.u16(0) // ref_count — always 0
@@ -424,5 +439,64 @@ export function emitWrapper(ast) {
     }
   }
 
-  return { bytecode: w.toUint8Array(), capsUsed, plan: hasConnect ? ast.connect : null }
+  if (hasActions) {
+    // psvm.h's PSVM_FLAG_ACTION_TABLE doc comment, byte for byte:
+    //   u8  action_count
+    //   action_count x {
+    //     u8  action_id
+    //     u16 param_max
+    //     u8  flags               bit 0 device-local timed-off, bit 1 has confirm
+    //     u16 write_uuid16
+    //     u8  write_len           (constant prefix + spliced-param width)
+    //     u8  write_bytes[write_len]
+    //     u8  param_offset        0xFF = no parameter
+    //     u8  param_encoding      0 u8, 1 u16le, 2 u16be, 0xFF none
+    //     -- present only when flags bit 1 is set:
+    //     u16 confirm_uuid16
+    //     u8  confirm_min_len
+    //     u8  confirm_offset
+    //     u8  confirm_encoding
+    //     u8  confirm_op          0 ==, 1 !=
+    //     u16 confirm_value
+    //   }
+    //
+    // The compiler only ever splices a parameter immediately after the
+    // constant prefix (parser.js's parseActionWriteLine), so param_offset is
+    // always exactly write_bytes.length before the placeholder bytes below
+    // are appended -- the matched-pair and offset+width<=write_len
+    // invariants psvm.c enforces are satisfied by construction, never as an
+    // afterthought here.
+    w.u8(ast.actions.length)
+    for (const a of ast.actions) {
+      w.u8(a.actionId)
+      w.u16(a.paramMax)
+      let aflags = 0
+      if (a.deviceLocal) aflags |= 0x01
+      if (a.confirm) aflags |= 0x02
+      w.u8(aflags)
+
+      w.u16(a.write.uuid16)
+      const hasParam = a.write.paramOffset !== 0xFF
+      const paramWidth = hasParam ? ACTION_ENCODING_WIDTH_BY_ID[a.write.paramEncoding] : 0
+      w.u8(a.write.bytes.length + paramWidth)
+      w.raw(a.write.bytes)
+      // Placeholder bytes for the spliced parameter: the executor (Task 8)
+      // overwrites these at actuation time, so their value on the blob is
+      // never read -- zero is simplest and matches "no meaningful value here".
+      for (let i = 0; i < paramWidth; i++) w.u8(0)
+      w.u8(a.write.paramOffset)
+      w.u8(a.write.paramEncoding)
+
+      if (a.confirm) {
+        w.u16(a.confirm.uuid16)
+        w.u8(a.confirm.minLen)
+        w.u8(a.confirm.offset)
+        w.u8(a.confirm.encoding)
+        w.u8(a.confirm.op)
+        w.u16(a.confirm.value)
+      }
+    }
+  }
+
+  return { bytecode: w.toUint8Array(), capsUsed, plan: hasConnect ? ast.connect : null, actions: hasActions ? ast.actions : [] }
 }

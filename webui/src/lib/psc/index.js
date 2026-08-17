@@ -30,19 +30,22 @@ export function compile(source) {
   }
 }
 
-// compileWrapper(source) -> {ok:true, name, match:{kind,key}, bytecode, capsUsed, plan}
+// compileWrapper(source) -> {ok:true, name, match:{kind,key}, bytecode, capsUsed, plan, actions}
 //                         | {ok:false, errors:[{line,col,message}]}
 // The wrapper dialect (M3 spec section 3, dialect=2). match.kind matches
 // wmatch_kind_t in components/wrappers/include/wrapper_index.h
 // (0 service, 1 manufacturer, 2 mac_prefix). `plan` (M5a spec section 2) is
 // {intervalS, reads:[{uuid16,name,offset}], writes:[{uuid16,data}]} when the
-// wrapper has a `connect` block, else null.
+// wrapper has a `connect` block, else null. `actions` (M5b spec section 2) is
+// [{actionId, name, paramMax, deviceLocal, write:{uuid16,bytes,paramOffset,
+// paramEncoding}, confirm:{uuid16,minLen,offset,encoding,op,value}|null}],
+// empty when the wrapper has no `action` block.
 export function compileWrapper(source) {
   try {
     const tokens = tokenize(source)
     const ast = parseWrapper(tokens)
-    const { bytecode, capsUsed, plan } = emitWrapper(ast)
-    return { ok: true, name: ast.name, match: ast.match, bytecode, capsUsed, plan }
+    const { bytecode, capsUsed, plan, actions } = emitWrapper(ast)
+    return { ok: true, name: ast.name, match: ast.match, bytecode, capsUsed, plan, actions }
   } catch (err) {
     if (err instanceof PSError) {
       return { ok: false, errors: [{ line: err.line, col: err.col, message: err.message }] }

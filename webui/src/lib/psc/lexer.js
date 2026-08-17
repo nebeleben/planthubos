@@ -22,6 +22,8 @@ const KEYWORDS = new Set([
   'service', 'manufacturer', 'mac_prefix',
   // connect block (M5a spec section 2).
   'connect', 'read', 'write', 'as',
+  // action block (M5b spec section 2).
+  'action', 'confirm', 'max',
 ])
 
 const UNIT_CHAR = /[A-Za-z%°]/

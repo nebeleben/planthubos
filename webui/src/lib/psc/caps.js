@@ -20,6 +20,11 @@ export const CAPS = {
   'air.humidity': { id: 5, unit: '%', aliases: ['%'] },
   'air.pressure': { id: 6, unit: 'hPa', aliases: ['hPa'] },
   'signal.rssi': { id: 7, unit: 'dBm', aliases: ['dBm'] },
+  // Id 8, added to components/capability/capability.c by M5b Task 2
+  // (CAP_SWITCH_STATE) -- the action block's `confirm` and the decode
+  // block that reads a switch/valve's reported state both emit this.
+  // Unitless (capability.c's .unit is ""), so no alias suffix applies.
+  'switch.state': { id: 8, unit: '', aliases: [] },
 }
 
 export const CAPS_BY_ID = Object.fromEntries(

@@ -362,3 +362,67 @@ decode
   assert.match(asm, /PAYLOAD_LEN/)
   assert.match(asm, /AES_CCM/)
 })
+
+// ---- action block (M5b spec section 2, task 4) ----
+
+test('an action block compiles with its write and confirm', () => {
+  const r = compileWrapper(`wrapper "acme valve" match service 0x181A
+
+action irrigation.open(duration_s max 300)
+  write 2AF0 = 01 u16le(duration_s)
+  confirm read 2AF1 as st
+    require u8(st, 0) == 1
+
+connect every 5min
+  read 2AF1 as st
+decode
+  emit switch.state  u8(st, 0)`)
+  assert.equal(r.ok, true)
+  assert.equal(r.actions.length, 1)
+  assert.equal(r.actions[0].actionId, 2)
+  assert.equal(r.actions[0].paramMax, 300)
+  assert.deepEqual(r.actions[0].write.bytes, [0x01])
+  assert.equal(r.actions[0].write.paramOffset, 1)
+  assert.equal(r.actions[0].confirm.value, 1)
+  assert.match(disassemble(r.bytecode), /ACTION irrigation\.open/)
+})
+
+test('a wrapper may not raise an action bound above the firmware maximum', () => {
+  const r = compileWrapper(`wrapper "greedy" match service 0x181A
+action irrigation.open(duration_s max 600)
+  write 2AF0 = 01 u16le(duration_s)
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, false)
+  assert.match(r.errors[0].message, /max 600 exceeds the 300/)
+})
+
+test('an unknown action name is a compile error', () => {
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action laser.fire(duration_s max 5)
+  write 2AF0 = 01
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, false)
+  assert.match(r.errors[0].message, /unknown action 'laser\.fire'/)
+})
+
+test('a parameterless action rejects a parameter splice', () => {
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action switch.on()
+  write 2AF0 = 01 u16le(duration_s)
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, false)
+  assert.match(r.errors[0].message, /switch\.on takes no parameter/)
+})
+
+test('an action with no confirm compiles and is marked unconfirmable', () => {
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action switch.off()
+  write 2AF0 = 00
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, true)
+  assert.equal(r.actions[0].confirm, null)
+})

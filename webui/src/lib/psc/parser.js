@@ -3,12 +3,18 @@
 
 import { PSError } from './lexer.js'
 import { CAPS } from './caps.js'
-import { PSVM_PLAN_MAX_READS, PSVM_PLAN_MAX_WRITES, PSVM_PLAN_WRITE_MAX, PSVM_PLAN_SLOT } from './plan-limits.js'
+import {
+  PSVM_PLAN_MAX_READS, PSVM_PLAN_MAX_WRITES, PSVM_PLAN_WRITE_MAX, PSVM_PLAN_SLOT,
+  ACTIONS as ACTION_DEFS, PSVM_ACTION_MAX, ACTION_ENCODING,
+} from './plan-limits.js'
 
 const DURATION_UNITS = { s: 1, sec: 1, m: 60, min: 60, h: 3600, hr: 3600 }
 const CMP_OPS = new Set(['<', '<=', '>', '>=', '==', '!='])
 const MODES = new Set(['edge', 'level'])
-const ACTIONS = new Set(['log', 'notify'])
+// rule dialect `then` clause actions (log/notify) -- named RULE_ACTIONS, not
+// ACTIONS, because ACTION_DEFS above (the M5b action-block table) is a
+// completely different thing that happens to share the English word.
+const RULE_ACTIONS = new Set(['log', 'notify'])
 
 // Wrapper dialect (M3 spec section 3).
 const MATCH_KIND_ID = { service: 0, manufacturer: 1, mac_prefix: 2 }
@@ -22,6 +28,29 @@ const ACCESSOR_WIDTH = {
 // dialect: the fixed-width loads above plus 'bits' and 'len', which have
 // their own arg shapes (parseAccessorCall() branches on the name).
 const ACCESSOR_NAMES = new Set([...Object.keys(ACCESSOR_WIDTH), 'bits', 'len'])
+
+// Shared by noteBufMin()'s connect-block callers AND the action block's
+// `confirm` parsing (M5b spec section 2): the fewest bytes a read must
+// return for an accessor at `offset` with byte width `width` to mean
+// anything. One formula, two call sites -- see parser.js's noteBufMin doc
+// comment and parseConfirmBlock() below.
+function accessorMinLen(offset, width) {
+  return offset + width
+}
+
+// id -> width, inverted from ACTION_ENCODING (plan-limits.js) for the one
+// spot that only has the encoding id in hand (an already-built write, when
+// computing its total write_len including the spliced parameter).
+const ACTION_ENCODING_WIDTH_BY_ID = Object.fromEntries(
+  Object.values(ACTION_ENCODING).map((e) => [e.id, e.width])
+)
+
+// action block (M5b spec section 2): the write-splice / confirm require
+// accessor names. Deliberately NOT the same spellings as ACCESSOR_WIDTH
+// above (no underscore: `u16le`/`u16be`) -- these are psvm.h's own
+// param_encoding/confirm_encoding names, and this grammar position is
+// parsed by dedicated methods below rather than parseAccessorCall(), so the
+// two sets never need to agree.
 
 class Parser {
   // dialect: 'rules' (default) or 'wrapper' -- selects parseFile()'s entry
@@ -242,6 +271,33 @@ class Parser {
       )
     }
 
+    // action blocks (M5b spec section 2): zero or more, between the header
+    // and `connect`/`decode`. Parsed before the connect block, so a
+    // `confirm` buffer name here never interacts with connect's this.buffers
+    // (that map doesn't exist yet) -- the two namespaces are unrelated even
+    // when a wrapper reuses the same identifier for both, as the brief's own
+    // example does (`st` names both an action's confirm buffer and, later,
+    // a completely separate connect-block read).
+    const actions = []
+    const usedActionIds = new Set()
+    while (this.isKeyword('action')) {
+      const action = this.parseActionBlock()
+      if (usedActionIds.has(action.actionId)) {
+        throw new PSError(
+          `duplicate action '${action.name}': each action may be declared once per wrapper`,
+          action.line, action.col
+        )
+      }
+      if (actions.length >= PSVM_ACTION_MAX) {
+        throw new PSError(
+          `wrapper declares more than ${PSVM_ACTION_MAX} actions (PSVM_ACTION_MAX)`,
+          action.line, action.col
+        )
+      }
+      usedActionIds.add(action.actionId)
+      actions.push(action)
+    }
+
     // connect block (M5a spec section 2): optional, between the header and
     // `decode`. Builds the name -> slot-offset table `decode` resolves
     // buffer identifiers against (expectBufferIdent()).
@@ -270,7 +326,7 @@ class Parser {
       for (const r of connect.reads) r.minLen = Math.max(1, this.bufMin.get(r.name) || 0)
     }
 
-    return { name, match: { kind, key: keyTok.value }, connect, statements }
+    return { name, match: { kind, key: keyTok.value }, actions, connect, statements }
   }
 
   // Raises buffer `name`'s required length to `need` (offset + accessor
@@ -279,6 +335,200 @@ class Parser {
     if (!this.bufMin) return
     const cur = this.bufMin.get(name) || 0
     if (need > cur) this.bufMin.set(name, need)
+  }
+
+  // action block (M5b spec section 2):
+  //   action <name>(<param> max <n>)   or   action <name>()
+  //     write <uuid16> = <hexbytes>[ <accessor>(<param>)]
+  //     [confirm read <uuid16> as <name>
+  //       require <accessor>(<name>, <offset>) <op> <int>]
+  // `<name>` is a dotted action id (irrigation.open, pump.run, ...) looked up
+  // in ACTION_DEFS (plan-limits.js's mirror of action.h's ACTION_COUNT
+  // table). Every field here maps 1:1 onto psvm.h's PSVM_FLAG_ACTION_TABLE
+  // doc comment, which is ground truth for codegen.js's byte layout.
+  parseActionBlock() {
+    const aTok = this.expectKeyword('action')
+    const seg1 = this.expectIdent()
+    this.expectPunct('.')
+    const seg2 = this.expectIdent()
+    const name = `${seg1.value}.${seg2.value}`
+    const defn = ACTION_DEFS[name]
+    if (!defn) {
+      throw new PSError(`unknown action '${name}'`, seg1.line, seg1.col)
+    }
+
+    this.expectPunct('(')
+    let paramName = null
+    let paramMax = 0
+    if (this.isPunct(')')) {
+      if (defn.param !== null) {
+        throw new PSError(`${name} requires a parameter '${defn.param}'`, aTok.line, aTok.col)
+      }
+    } else {
+      if (defn.param === null) {
+        throw new PSError(`${name} takes no parameter`, aTok.line, aTok.col)
+      }
+      const pNameTok = this.expectIdent()
+      if (pNameTok.value !== defn.param) {
+        throw new PSError(`expected parameter '${defn.param}', got '${pNameTok.value}'`, pNameTok.line, pNameTok.col)
+      }
+      this.expectKeyword('max')
+      const maxTok = this.expectIntLiteral()
+      if (maxTok.value > defn.paramMax) {
+        throw new PSError(
+          `max ${maxTok.value} exceeds the ${defn.paramMax} firmware maximum for ${name}`,
+          maxTok.line, maxTok.col
+        )
+      }
+      if (maxTok.value < 1) {
+        throw new PSError(`max must be at least 1`, maxTok.line, maxTok.col)
+      }
+      paramName = pNameTok.value
+      paramMax = maxTok.value
+    }
+    this.expectPunct(')')
+
+    const write = this.parseActionWriteLine(name, paramName)
+    if (paramName !== null && write.paramOffset === 0xFF) {
+      throw new PSError(
+        `${name} declares parameter '${paramName}' but its write never splices it`,
+        aTok.line, aTok.col
+      )
+    }
+
+    let confirm = null
+    if (this.isKeyword('confirm')) {
+      confirm = this.parseConfirmBlock()
+    }
+
+    // deviceLocal (psvm.h flags bit 0, "device-local timed-off"): no wrapper
+    // grammar sets this yet, so every action compiled here is bit 0 clear.
+    return {
+      actionId: defn.id, name, paramMax, deviceLocal: false, write, confirm,
+      line: aTok.line, col: aTok.col,
+    }
+  }
+
+  // `write <uuid16> = <hexbytes>[ <accessor>(<paramName>)]`. The hex bytes
+  // are the write's constant prefix; splicing a parameter appends
+  // `accessor`'s width right after that prefix (psvm.h: param_offset is
+  // exactly where the constant bytes end, so the pair the compiler emits is
+  // always trivially valid: param_offset + width === write_len).
+  parseActionWriteLine(actionName, declaredParamName) {
+    this.expectKeyword('write')
+    const uuidTok = this.expectHex()
+    if (uuidTok.value > 0xFFFF) {
+      throw new PSError(`write UUID 0x${uuidTok.raw} out of range for a 16-bit UUID`, uuidTok.line, uuidTok.col)
+    }
+    this.expectPunct('=')
+    const dataTok = this.expectHex()
+    if (dataTok.raw.length % 2 !== 0) {
+      throw new PSError(
+        `write data must be a whole number of bytes (an even number of hex digits), got '${dataTok.raw}'`,
+        dataTok.line, dataTok.col
+      )
+    }
+    const bytes = []
+    for (let i = 0; i < dataTok.raw.length; i += 2) bytes.push(parseInt(dataTok.raw.slice(i, i + 2), 16))
+
+    let paramOffset = 0xFF
+    let paramEncoding = 0xFF
+    const t = this.peek()
+    if (t.type === 'IDENT' && t.value in ACTION_ENCODING) {
+      const accTok = this.advance()
+      if (declaredParamName === null) {
+        throw new PSError(`${actionName} takes no parameter`, accTok.line, accTok.col)
+      }
+      this.expectPunct('(')
+      const pTok = this.expectIdent()
+      if (pTok.value !== declaredParamName) {
+        throw new PSError(`unknown parameter '${pTok.value}' (expected '${declaredParamName}')`, pTok.line, pTok.col)
+      }
+      this.expectPunct(')')
+      const { id, width } = ACTION_ENCODING[accTok.value]
+      paramOffset = bytes.length
+      paramEncoding = id
+      if (paramOffset + width > PSVM_PLAN_WRITE_MAX) {
+        throw new PSError(
+          `write is ${paramOffset + width} bytes with its spliced parameter, exceeding ${PSVM_PLAN_WRITE_MAX} (PSVM_PLAN_WRITE_MAX)`,
+          accTok.line, accTok.col
+        )
+      }
+    } else if (t.type === 'IDENT') {
+      throw new PSError(`expected 'u8', 'u16le' or 'u16be', got '${describeToken(t)}'`, t.line, t.col)
+    }
+
+    const writeLen = bytes.length + (paramOffset === 0xFF ? 0 : ACTION_ENCODING_WIDTH_BY_ID[paramEncoding])
+    if (writeLen < 1) {
+      throw new PSError('write must be at least 1 byte', uuidTok.line, uuidTok.col)
+    }
+    if (writeLen > PSVM_PLAN_WRITE_MAX) {
+      throw new PSError(
+        `write data must be at most ${PSVM_PLAN_WRITE_MAX} bytes (PSVM_PLAN_WRITE_MAX), got ${writeLen}`,
+        dataTok.line, dataTok.col
+      )
+    }
+
+    return { uuid16: uuidTok.value, bytes, paramOffset, paramEncoding }
+  }
+
+  // `confirm read <uuid16> as <name>` followed by exactly one
+  // `require <accessor>(<name>, <offset>) <op> <int>` (`op` is `==`/`!=`).
+  // confirm_min_len is offset + accessor width -- the identical arithmetic
+  // noteBufMin's connect-block callers use (accessorMinLen() above), reused
+  // here rather than written a second time.
+  parseConfirmBlock() {
+    this.expectKeyword('confirm')
+    this.expectKeyword('read')
+    const uuidTok = this.expectHex()
+    if (uuidTok.value > 0xFFFF) {
+      throw new PSError(`confirm UUID 0x${uuidTok.raw} out of range for a 16-bit UUID`, uuidTok.line, uuidTok.col)
+    }
+    this.expectKeyword('as')
+    const nameTok = this.expectIdent()
+
+    this.expectKeyword('require')
+    const accTok = this.peek()
+    if (!(accTok.type === 'IDENT' && accTok.value in ACTION_ENCODING)) {
+      throw new PSError(`expected 'u8', 'u16le' or 'u16be', got '${describeToken(accTok)}'`, accTok.line, accTok.col)
+    }
+    this.advance()
+    this.expectPunct('(')
+    const bufTok = this.expectIdent()
+    if (bufTok.value !== nameTok.value) {
+      throw new PSError(`unknown buffer '${bufTok.value}'`, bufTok.line, bufTok.col)
+    }
+    this.expectPunct(',')
+    const offTok = this.expectIntLiteral()
+    this.expectPunct(')')
+
+    const opTok = this.peek()
+    if (!(opTok.type === 'PUNCT' && (opTok.value === '==' || opTok.value === '!='))) {
+      throw new PSError(`expected '==' or '!=', got '${describeToken(opTok)}'`, opTok.line, opTok.col)
+    }
+    this.advance()
+    const valTok = this.expectIntLiteral()
+    if (valTok.value > 0xFFFF) {
+      throw new PSError(`confirm value ${valTok.value} out of range for a u16`, valTok.line, valTok.col)
+    }
+
+    const { id: encoding, width } = ACTION_ENCODING[accTok.value]
+    const minLen = accessorMinLen(offTok.value, width)
+    if (minLen > PSVM_PLAN_SLOT) {
+      throw new PSError(
+        `offset ${offTok.value} (width ${width}) is outside the confirm buffer (each slot is ${PSVM_PLAN_SLOT} bytes)`,
+        offTok.line, offTok.col
+      )
+    }
+
+    return {
+      uuid16: uuidTok.value,
+      minLen,
+      offset: offTok.value,
+      encoding,
+      op: opTok.value === '==' ? 0 : 1,
+      value: valTok.value,
+    }
   }
 
   // `connect every <duration>` followed by `read`/`write` lines (M5a spec
@@ -526,7 +776,7 @@ class Parser {
           offTok.line, offTok.col
         )
       }
-      this.noteBufMin(buf.name, offTok.value + size)
+      this.noteBufMin(buf.name, accessorMinLen(offTok.value, size))
       return { type: 'load', accessor: name, offset: buf.slotOffset + offTok.value, line: nameTok.line, col: nameTok.col }
     }
     if (offTok.value + size > 31) {
@@ -577,7 +827,7 @@ class Parser {
     const actions = []
     for (;;) {
       const nameTok = this.expectIdent()
-      if (!ACTIONS.has(nameTok.value)) {
+      if (!RULE_ACTIONS.has(nameTok.value)) {
         throw new PSError(`unknown action '${nameTok.value}'`, nameTok.line, nameTok.col)
       }
       this.expectPunct('(')
