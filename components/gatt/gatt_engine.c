@@ -790,7 +790,17 @@ static int gatt_gap_event(struct ble_gap_event *event, void *arg)
  * its queued messages is required here. */
 static bool stale_completion(uint16_t conn_handle)
 {
-    return !s_active || conn_handle != s_conn_handle;
+    /* TP_TEARDOWN is set in exactly one place -- on_deadline()'s TP_ATTEMPT
+     * case -- and means this attempt has ALREADY been decided and only its
+     * disconnect confirmation is outstanding. A GATT completion arriving in
+     * that window belongs to a procedure the deadline has already given up
+     * on, and the peer aborting it reports BLE_HS_ENOTCONN. Letting it
+     * through overwrote s_err with the generic "read failed" on top of the
+     * accurate "timed out" the deadline had just set -- the gate's stalled
+     * peripheral was reported to the user as a broken read rather than a
+     * sleepy sensor -- and pushed a spurious GE_ERROR into a machine that
+     * had already been fed GE_TIMEOUT. */
+    return !s_active || s_phase == TP_TEARDOWN || conn_handle != s_conn_handle;
 }
 
 /* ble_gattc_read_by_uuid callback for GA_READ -- runs on the NimBLE host
