@@ -101,6 +101,32 @@ static wrapper_index_t s_wrapper_index;
  * of failing after ~255 wrapper creations. */
 #define WRAPPER_MEMO_NONE 0xFFFFu
 static uint16_t s_wrapper_memo[REGISTRY_MAX_DEVICES];
+/* Per-device connect-plan interval, 0 meaning "no plan" -- written ONLY by
+ * adv_decoder_task, read by the httpd and SSE tasks through
+ * ble_collector_plan_interval_for_device().
+ *
+ * This exists because GET /api/v1/devices must not reach the wrapper arena.
+ * devices_json.c originally answered its "gatt" object by calling
+ * wrapper_exec_plan_get(), which calls wrapper_arena_get() -- and the arena
+ * has no lock at all, because ble_collector.h's reindex-request comment
+ * makes decoder-task exclusivity the arena's whole concurrency argument. An
+ * arena miss evicts and memmove()s the backing buffer; the httpd task (prio
+ * 5) and the SSE event-loop task both preempt the decoder task (prio 3), so
+ * a Devices-tab poll could relocate bytecode underneath a psvm_run() that
+ * was executing it -- memory corruption, not a stale read. The miss path
+ * also loads from LittleFS, which does not belong on the event loop's
+ * 2304 B stack (the same reasoning that cut the event-log write from M5a,
+ * spec section 5).
+ *
+ * decode_adv_item() already computes this value on the decoder task for its
+ * own scheduling decision, so memoising it costs one store and no extra
+ * lookup. Single writer, naturally-aligned uint32_t elements: a concurrent
+ * reader sees either the previous advertisement's value or this one, never
+ * a torn one -- the same argument s_wrapper_memo's own doc comment makes,
+ * and here there is no memset()-the-whole-table write shape to qualify it,
+ * because a reindex leaves these entries alone and the next advertisement
+ * refreshes them. */
+static uint32_t s_plan_interval_memo[REGISTRY_MAX_DEVICES];
 
 /* Task 5 review FINDING 4/2, corrected by M5a Task 7 fix round 1: s_wrapper_index
  * and the arena are decoder-task-exclusive, full stop -- no reader anywhere
@@ -462,6 +488,7 @@ static void decode_adv_item(const adv_item_t *item)
                                    : data_core_find_or_create_index(&wid, item->uptime_s);
             if (midx >= 0 && midx < REGISTRY_MAX_DEVICES) {
                 s_wrapper_memo[midx] = (uint16_t)wrapper_id;
+                s_plan_interval_memo[midx] = interval_s;
             }
 
             /* M3 Task 6 (spec sections 3 and 5): if this wrapper carries a
@@ -539,6 +566,11 @@ static void decode_adv_item(const adv_item_t *item)
         int midx = (ridx >= 0) ? ridx : data_core_find_index(&wid);
         if (midx >= 0 && midx < REGISTRY_MAX_DEVICES) {
             s_wrapper_memo[midx] = (uint16_t)wrapper_id;
+            /* Reached only for a wrapper with no connect block, so clear any
+             * interval a previous connect wrapper left on this device --
+             * otherwise editing a wrapper from connect to advert would leave
+             * /api/v1/devices reporting a "gatt" object forever. */
+            s_plan_interval_memo[midx] = 0;
         }
         if (wrote) rules_notify_value_update();
         return;   /* a matched wrapper's key can never also be MiFlora's (distinct match kinds/keys) -- nothing further to dispatch */
@@ -694,6 +726,13 @@ int ble_collector_wrapper_for_device(int dev_idx)
     if (dev_idx < 0 || dev_idx >= REGISTRY_MAX_DEVICES) return -1;
     uint16_t id = s_wrapper_memo[dev_idx];
     return (id == WRAPPER_MEMO_NONE) ? -1 : (int)id;
+}
+
+/* See ble_collector.h's doc comment. */
+uint32_t ble_collector_plan_interval_for_device(int dev_idx)
+{
+    if (dev_idx < 0 || dev_idx >= REGISTRY_MAX_DEVICES) return 0;
+    return s_plan_interval_memo[dev_idx];
 }
 
 static int gap_event(struct ble_gap_event *event, void *arg)

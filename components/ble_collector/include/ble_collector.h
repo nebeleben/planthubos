@@ -83,3 +83,13 @@ void ble_collector_wrapper_reindex_request(void);
  *     but the possibility is real and belongs on the record, not papered
  *     over by a "never torn" claim that only covers the other write path. */
 int ble_collector_wrapper_for_device(int dev_idx);
+
+/* The connect-plan interval memoised for dev_idx by adv_decoder_task, in
+ * seconds; 0 means "no connect plan" (or nothing memoised yet). This is how
+ * GET /api/v1/devices and the SSE device payload learn that a device has a
+ * plan at all -- they must NOT ask wrapper_exec_plan_get(), because that
+ * reaches wrapper_arena_get() and the arena's only concurrency guarantee is
+ * the decoder-task exclusivity this header's reindex-request comment above
+ * insists on. See s_plan_interval_memo in ble_collector.c for the full
+ * argument and for why an unsynchronised read of it is safe. */
+uint32_t ble_collector_plan_interval_for_device(int dev_idx);

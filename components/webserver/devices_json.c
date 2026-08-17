@@ -6,7 +6,6 @@
 #include "bthome.h"
 #include "data_core.h"
 #include "ble_collector.h"
-#include "wrapper_exec.h"
 #include "gatt_sched.h"
 #include "gatt_engine.h"
 #include <stdio.h>
@@ -127,10 +126,15 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
      * show up -- which is why last_error rides along here rather than only
      * being logged. */
     int dev_idx = data_core_find_index(&e->id);
-    int wrapper_id = (dev_idx >= 0) ? ble_collector_wrapper_for_device(dev_idx) : -1;
-    uint32_t interval_s = 0;
-    if (wrapper_id >= 0 &&
-        wrapper_exec_plan_get((uint16_t)wrapper_id, NULL, 0, &interval_s) > 0) {
+    /* The interval comes from the decoder task's memo, NOT from
+     * wrapper_exec_plan_get(): this function runs on the httpd task and on
+     * the SSE event-loop task, and plan_get() reaches the unlocked wrapper
+     * arena, whose eviction path memmove()s bytecode that the decoder task
+     * may be executing. See ble_collector_plan_interval_for_device(). */
+    uint32_t interval_s = (dev_idx >= 0)
+                              ? ble_collector_plan_interval_for_device(dev_idx)
+                              : 0;
+    if (interval_s > 0) {
         cJSON *g = cJSON_AddObjectToObject(o, "gatt");
         cJSON_AddNumberToObject(g, "interval_s", interval_s);
 
