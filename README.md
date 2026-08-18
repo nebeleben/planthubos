@@ -25,7 +25,7 @@ join its setup WiFi once, and it quietly watches your plants for you:
 
 Grab the latest firmware from the
 [Releases](https://github.com/nebeleben/planthubos/releases) page and flash
-it to an ESP32, ESP32-C3 or ESP32-C5 board.
+it to an ESP32-C6 or ESP32-C5 board.
 
 ### Which download?
 
@@ -40,21 +40,30 @@ region's build for your location is a regulatory violation.** You're not
 locked in: the region is also changeable later from the hub's own Config
 page, and takes effect on the next reboot.
 
-Full flash (first install, ESP32-C3, EU build):
+Full flash (first install, ESP32-C6, EU build):
 
 ```
-esptool --chip esp32c3 write_flash \
-  0x0 bootloader-esp32c3.bin \
-  0x8000 partition-table-esp32c3.bin \
-  0xf000 ota_data_initial-esp32c3.bin \
-  0x20000 planthub-esp32c3-eu.bin
+esptool --chip esp32c6 write_flash \
+  0x0 bootloader-esp32c6.bin \
+  0x8000 partition-table-esp32c6.bin \
+  0x19000 ota_data_initial-esp32c6.bin \
+  0x30000 planthub-esp32c6-eu.bin
 ```
 
-(Swap `planthub-esp32c3-eu.bin` for the `-us`/`-jp` variant, or the
-`esp32`/`esp32c5` filenames, as needed — `bootloader`/`partition-table`/`ota_data_initial`
-don't vary by region, only by chip. The bootloader offset does vary:
-`0x0` on ESP32-C3, `0x2000` on ESP32-C5, `0x1000` on classic ESP32 — the
-release notes carry the full command for every chip.)
+(Swap `planthub-esp32c6-eu.bin` for the `-us`/`-jp` variant as needed —
+`bootloader`/`partition-table`/`ota_data_initial` don't vary by region,
+only by chip.)
+
+**Do not reuse these offsets for the ESP32-C5.** It is still on the older
+4 MB partition layout, and every offset in the command differs:
+
+```
+esptool --chip esp32c5 write_flash \
+  0x2000 bootloader-esp32c5.bin \
+  0x8000 partition-table-esp32c5.bin \
+  0xf000 ota_data_initial-esp32c5.bin \
+  0x20000 planthub-esp32c5-eu.bin
+```
 
 Then connect to the `PlantHub-XXXX` WiFi it broadcasts and follow the setup
 page. Updates after that happen over the air from the hub's own web page.

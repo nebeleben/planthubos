@@ -52,13 +52,12 @@ jobs:
     runs-on: ubuntu-latest
     container:
       # v2 builds every chip with one IDF: v5.5+ is required by the esp32c5
-      # (preview-only before that) and the Zigbee stack, and esp32/esp32c3
-      # moved up with it in V2/M0.
+      # (preview-only before that) and by the Zigbee stack M6b adds.
       image: espressif/idf:v5.5.5
     strategy:
       fail-fast: false
       matrix:
-        chip: [esp32, esp32c3, esp32c5]
+        chip: [esp32c6, esp32c5]
         # Per-region release builds (M9): each region overlay sets its own
         # CONFIG_PLANTHUB_WIFI_COUNTRY (sdkconfig.region.<region>) -- see
         # PlanV1 8e for why this can't just be one world-safe build. Region
@@ -96,8 +95,10 @@ jobs:
                  -D IDF_TARGET=${{ matrix.chip }} build 2>&1 | tee build.log
           # Size report: the partition-size check line ("planthub.bin binary
           # size ... free") lands in the job summary so per-chip headroom is
-          # one click away on every release -- the C3 1600K ceiling is a
-          # tracked V2 risk (roadmap spec section 9).
+          # one click away on every release. The tracked risk is now the
+          # 4 MB esp32c5 leg, which had 106 KB free (6%) at M6a and will
+          # overflow its 1792K slot within a milestone or two -- see the
+          # roadmap spec section 9. The 16 MB esp32c6 has about 2.45 MB.
           echo '### ${{ matrix.chip }} (${{ matrix.region }})' >> "$GITHUB_STEP_SUMMARY"
           grep -o 'planthub.bin binary size.*' build.log >> "$GITHUB_STEP_SUMMARY" || echo 'size line not found' >> "$GITHUB_STEP_SUMMARY"
 
@@ -153,7 +154,7 @@ jobs:
           | United States / Canada (channels 1-11) | `planthub-<chip>-us.bin` |
           | Japan (channels 1-14) | `planthub-<chip>-jp.bin` |
 
-          `<chip>` is `esp32c3`, `esp32c5` or `esp32`, matching your board. The region can
+          `<chip>` is `esp32c6` or `esp32c5`, matching your board. The region can
           also be changed later on the hub's Config page. Using a build for a
           region you are not in is a regulatory violation.
 
@@ -163,31 +164,23 @@ jobs:
 
           ## First install (USB)
 
-          ESP32-C3:
+          ESP32-C6 (16 MB, the reference hub):
           ```
-          esptool --chip esp32c3 write_flash \
-            0x0 bootloader-esp32c3.bin \
-            0x8000 partition-table-esp32c3.bin \
-            0xf000 ota_data_initial-esp32c3.bin \
-            0x20000 planthub-esp32c3-eu.bin
+          esptool --chip esp32c6 write_flash \
+            0x0 bootloader-esp32c6.bin \
+            0x8000 partition-table-esp32c6.bin \
+            0x19000 ota_data_initial-esp32c6.bin \
+            0x30000 planthub-esp32c6-eu.bin
           ```
 
-          ESP32-C5 (note the different bootloader offset):
+          ESP32-C5 (4 MB, and every offset differs — it is still on the
+          older 4 MB layout):
           ```
           esptool --chip esp32c5 write_flash \
             0x2000 bootloader-esp32c5.bin \
             0x8000 partition-table-esp32c5.bin \
             0xf000 ota_data_initial-esp32c5.bin \
             0x20000 planthub-esp32c5-eu.bin
-          ```
-
-          Classic ESP32 (again a different bootloader offset):
-          ```
-          esptool --chip esp32 write_flash \
-            0x1000 bootloader-esp32.bin \
-            0x8000 partition-table-esp32.bin \
-            0xf000 ota_data_initial-esp32.bin \
-            0x20000 planthub-esp32-eu.bin
           ```
 
           Then join the `PlantHub-XXXX` WiFi the device broadcasts and follow
