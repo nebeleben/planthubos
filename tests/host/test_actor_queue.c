@@ -1,9 +1,13 @@
-/* tests/host/test_actor_queue.c -- the pure command queue (M5b Task 7,
- * spec sections 3 and 4.1). Exercises only actor_queue_t and its
- * actor_queue_* operations: TTL (a late command is dropped, never
- * executed late) and priority (a safety close jumps the queue). See
- * actor.h's own comment for why actor_request()/actor_service() -- which
- * touch alert_post() and the radio -- are NOT exercised here. */
+/* tests/host/test_actor_queue.c -- the pure command queue and decision
+ * logic (M5b Task 7, spec sections 3 and 4.1, plus fix round 1). Exercises
+ * actor_queue_t/actor_queue_* (TTL and priority -- a late command is
+ * dropped, never executed late; a safety close jumps the queue, and now
+ * evicts to get in when the queue is full) and the pure decision
+ * functions actor_request_decide()/actor_service_step() added in fix
+ * round 1 to close the "checked at enqueue, never re-checked at dispatch"
+ * gap. See actor.h's own comment for why actor_request()/actor_service()
+ * themselves -- the thin ESP-IDF wrappers around these, which touch
+ * alert_post() and the radio -- are NOT exercised here. */
 #include "actor.h"
 #include "action.h"
 #include <assert.h>
@@ -137,6 +141,125 @@ static void test_full_queue_of_expired_commands_still_refuses_push(void) {
     assert(!actor_queue_push(&q, &(actor_cmd_t){ .dev_idx = 1, .deadline_s = 9999 }));
 }
 
+/* ---- Fix round 1 (review): findings 1, 2 and 3 ---- */
+
+/* Review finding 1 (CRITICAL): a safety close must be able to reach the
+ * queue even when it is full of ordinary commands -- refusing it would
+ * strand the actuator the close exists to shut. It evicts the OLDEST
+ * non-safety entry, preserves FIFO order among the rest, and the new
+ * safety entry still competes on priority at pop time like any other. */
+static void test_safety_push_evicts_oldest_ordinary_when_full(void) {
+    actor_queue_t q; actor_queue_init(&q);
+    for (int i = 0; i < ACTOR_QUEUE_MAX; i++)
+        assert(actor_queue_push(&q, &(actor_cmd_t){ .dev_idx = (int8_t)i,
+                                                     .source = ACTOR_SRC_RULE, .deadline_s = 9999 }));
+    assert(actor_queue_push(&q, &(actor_cmd_t){ .dev_idx = 9, .source = ACTOR_SRC_SAFETY,
+                                                .deadline_s = 9999 }));
+    assert(q.last_evicted_valid);
+    assert(q.last_evicted.dev_idx == 0); /* the oldest (first-pushed) entry */
+
+    actor_cmd_t out;
+    assert(actor_queue_pop(&q, &out, 1)); assert(out.source == ACTOR_SRC_SAFETY && out.dev_idx == 9);
+    assert(actor_queue_pop(&q, &out, 1)); assert(out.dev_idx == 1);
+    assert(actor_queue_pop(&q, &out, 1)); assert(out.dev_idx == 2);
+    assert(actor_queue_pop(&q, &out, 1)); assert(out.dev_idx == 3);
+}
+
+/* A safety push is refused ONLY when every queued entry is itself a
+ * safety command -- a genuine overload with nothing left to evict. */
+static void test_safety_push_refused_only_when_all_queued_are_safety(void) {
+    actor_queue_t q; actor_queue_init(&q);
+    for (int i = 0; i < ACTOR_QUEUE_MAX; i++)
+        assert(actor_queue_push(&q, &(actor_cmd_t){ .dev_idx = (int8_t)i,
+                                                     .source = ACTOR_SRC_SAFETY, .deadline_s = 9999 }));
+    assert(!actor_queue_push(&q, &(actor_cmd_t){ .dev_idx = 9, .source = ACTOR_SRC_SAFETY,
+                                                 .deadline_s = 9999 }));
+    assert(!q.last_evicted_valid);
+}
+
+/* last_evicted_valid is one-shot, reset at the start of every push -- a
+ * caller checking it after an ORDINARY push (that neither evicted nor
+ * needed to) must not see a stale true from an earlier eviction. */
+static void test_eviction_flag_is_one_shot(void) {
+    actor_queue_t q; actor_queue_init(&q);
+    for (int i = 0; i < ACTOR_QUEUE_MAX; i++)
+        assert(actor_queue_push(&q, &(actor_cmd_t){ .dev_idx = (int8_t)i,
+                                                     .source = ACTOR_SRC_RULE, .deadline_s = 9999 }));
+    assert(actor_queue_push(&q, &(actor_cmd_t){ .dev_idx = 9, .source = ACTOR_SRC_SAFETY,
+                                                .deadline_s = 9999 }));
+    assert(q.last_evicted_valid);
+
+    actor_cmd_t out;
+    actor_queue_pop(&q, &out, 1); /* makes room again */
+    assert(actor_queue_push(&q, &(actor_cmd_t){ .dev_idx = 8, .source = ACTOR_SRC_RULE,
+                                                .deadline_s = 9999 }));
+    assert(!q.last_evicted_valid);
+}
+
+/* Review finding 2 (CRITICAL): two commands for the same rate-capped pair
+ * can both pass actor_request_decide() before either is serviced (they
+ * "raced" ahead of any recording) -- the enqueue-time check alone cannot
+ * see that. actor_service_step()'s RE-check at dispatch time is what
+ * catches it: the first dispatch records the fire, and the second
+ * dispatch's re-check now sees the spent budget and drops the command
+ * instead of sending it. */
+static void test_dispatch_recheck_catches_rate_cap_raced_at_enqueue(void) {
+    actor_table_t t; actor_table_init(&t);
+    assert(actor_table_add(&t, 3, ACT_IRRIGATION_OPEN, 300, 0));
+    actor_table_set_guards(&t, 3, ACT_IRRIGATION_OPEN, /*cooldown_s*/ 0, /*max_per_hour*/ 1);
+    actor_queue_t q; actor_queue_init(&q);
+
+    actor_request_result_t r1 = actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 10,
+                                                       ACTOR_SRC_RULE, 9999, 100);
+    assert(r1.verdict == ACTOR_OK && r1.queued);
+    actor_request_result_t r2 = actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 10,
+                                                       ACTOR_SRC_MANUAL, 9999, 101);
+    assert(r2.verdict == ACTOR_OK && r2.queued); /* neither has recorded yet */
+
+    actor_service_result_t s1 = actor_service_step(&t, &q, 102);
+    assert(s1.dispatched && !s1.redecline);
+
+    actor_service_result_t s2 = actor_service_step(&t, &q, 103);
+    assert(!s2.dispatched);
+    assert(s2.redecline && s2.redecline_verdict == ACTOR_REFUSED_RATE);
+}
+
+/* Same finding: an operator setting lockout AFTER a rule's command is
+ * already queued must still stop it -- "the operator pressed stop" has to
+ * reach a command that is merely waiting for the radio, not just the next
+ * one requested. */
+static void test_dispatch_recheck_catches_lockout_set_after_enqueue(void) {
+    actor_table_t t; actor_table_init(&t);
+    assert(actor_table_add(&t, 3, ACT_IRRIGATION_OPEN, 300, 0));
+    actor_queue_t q; actor_queue_init(&q);
+
+    actor_request_result_t r = actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 10,
+                                                      ACTOR_SRC_RULE, 9999, 100);
+    assert(r.verdict == ACTOR_OK && r.queued);
+
+    actor_table_set_lockout(&t, 3, true); /* operator hits stop before dispatch */
+
+    actor_service_result_t s = actor_service_step(&t, &q, 101);
+    assert(!s.dispatched);
+    assert(s.redecline && s.redecline_verdict == ACTOR_REFUSED_LOCKOUT);
+}
+
+/* The re-check must not fire on an otherwise-healthy dispatch: a queued
+ * command whose guard state hasn't changed still dispatches and records. */
+static void test_dispatch_recheck_permits_unchanged_guard_state(void) {
+    actor_table_t t; actor_table_init(&t);
+    assert(actor_table_add(&t, 3, ACT_IRRIGATION_OPEN, 300, 0));
+    actor_queue_t q; actor_queue_init(&q);
+
+    actor_request_result_t r = actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 10,
+                                                      ACTOR_SRC_RULE, 9999, 100);
+    assert(r.verdict == ACTOR_OK && r.queued);
+
+    actor_service_result_t s = actor_service_step(&t, &q, 101);
+    assert(s.dispatched && !s.redecline);
+    assert(s.cmd.dev_idx == 3 && s.cmd.param == 10);
+}
+
 int main(void) {
     test_expired_command_dropped();
     test_deadline_boundary_is_inclusive();
@@ -149,6 +272,12 @@ int main(void) {
     test_duplicate_pair_not_deduplicated();
     test_expired_counter_is_cumulative();
     test_full_queue_of_expired_commands_still_refuses_push();
+    test_safety_push_evicts_oldest_ordinary_when_full();
+    test_safety_push_refused_only_when_all_queued_are_safety();
+    test_eviction_flag_is_one_shot();
+    test_dispatch_recheck_catches_rate_cap_raced_at_enqueue();
+    test_dispatch_recheck_catches_lockout_set_after_enqueue();
+    test_dispatch_recheck_permits_unchanged_guard_state();
     printf("test_actor_queue: OK\n");
     return 0;
 }

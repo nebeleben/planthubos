@@ -41,6 +41,7 @@ typedef enum {
     ALERT_CODE_COMMAND_EXPIRED,    /* command dropped past its deadline */
     ALERT_CODE_CLOSE_UNCONFIRMED,  /* safety close sent but not confirmed */
     ALERT_CODE_QUEUE_FULL,         /* actor_request() refused: command queue full */
+    ALERT_CODE_COMMAND_EVICTED,    /* command bumped from the queue by a safety close */
 } alert_code_t;
 
 #define ALERT_RING_LEN 8

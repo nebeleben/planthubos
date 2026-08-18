@@ -1,6 +1,9 @@
 /* actor.c -- actor_request(), the command queue and its TTL (M5b Task 7).
  * See actor.h's top comment for the pure/impure split this file holds
- * itself to. */
+ * itself to, including the fix-round-1 change: the DECISION logic
+ * (actor_request_decide()/actor_service_step()) is pure and directly
+ * host-tested; actor_request()/actor_service() are now thin ESP-IDF
+ * wrappers around them. */
 #include "actor.h"
 #include "alert.h"
 #include "event_log.h"
@@ -23,14 +26,41 @@ void actor_queue_init(actor_queue_t *q)
     memset(q, 0, sizeof(*q));
     q->last_expired_dev = -1;
     q->last_expired_action = ACTION_NONE;
+    q->last_evicted_valid = false;
 }
 
 bool actor_queue_push(actor_queue_t *q, const actor_cmd_t *cmd)
 {
-    if (q->count >= ACTOR_QUEUE_MAX) return false;
-    q->cmds[q->count] = *cmd;
-    q->count++;
-    return true;
+    q->last_evicted_valid = false;
+
+    if (q->count < ACTOR_QUEUE_MAX) {
+        q->cmds[q->count] = *cmd;
+        q->count++;
+        return true;
+    }
+
+    /* Queue full. An ordinary command is simply refused -- only a safety
+     * close is allowed to displace something already queued. */
+    if (cmd->source != ACTOR_SRC_SAFETY) return false;
+
+    /* Evict the OLDEST non-safety entry, if any, preserving FIFO order
+     * among the survivors, then append the new safety command at the end
+     * (it still competes on priority at pop time like any other safety
+     * entry -- see actor_queue_pop()). Refusing here would strand the
+     * actuator this push exists to close. */
+    for (uint8_t i = 0; i < q->count; i++) {
+        if (q->cmds[i].source != ACTOR_SRC_SAFETY) {
+            q->last_evicted = q->cmds[i];
+            q->last_evicted_valid = true;
+            for (uint8_t j = i; (uint8_t)(j + 1) < q->count; j++) q->cmds[j] = q->cmds[j + 1];
+            q->cmds[q->count - 1] = *cmd;
+            return true;
+        }
+    }
+
+    /* Every queued entry is itself a safety command -- a genuine overload
+     * with nothing left to evict. */
+    return false;
 }
 
 /* Drops every entry whose deadline has passed (deadline_s < now_s),
@@ -78,10 +108,99 @@ uint32_t actor_queue_expired(const actor_queue_t *q)
 }
 
 /* ---------------------------------------------------------------------
- * Impure wrapper -- actor_request()/actor_service() and the shared table/
- * queue instances they operate on. Every ESP-IDF-only line is gated so
- * this section still compiles (though nothing here is exercised) when
- * ESP_PLATFORM is undefined, i.e. under the host test's plain `cc`.
+ * Pure decision logic (review fix round 1) -- also no ESP-IDF, also
+ * linked directly into tests/host/test_actor_queue.c.
+ * --------------------------------------------------------------------- */
+
+actor_request_result_t actor_request_decide(actor_table_t *t, actor_queue_t *q,
+    int dev_idx, uint8_t action_id, uint16_t param, actor_source_t source,
+    uint32_t deadline_s, uint32_t now_s)
+{
+    actor_request_result_t r;
+    memset(&r, 0, sizeof(r));
+
+    r.verdict = actor_table_check(t, dev_idx, action_id, param, source, now_s);
+    if (r.verdict != ACTOR_OK) return r;
+
+    actor_cmd_t cmd;
+    cmd.dev_idx = (int8_t)dev_idx;
+    cmd.action_id = action_id;
+    cmd.source = (uint8_t)source;
+    cmd.param = param;
+    cmd.deadline_s = deadline_s;
+
+    r.queued = actor_queue_push(q, &cmd);
+    if (r.queued && q->last_evicted_valid) {
+        r.evicted = true;
+        r.evicted_cmd = q->last_evicted;
+    }
+    return r;
+}
+
+actor_service_result_t actor_service_step(actor_table_t *t, actor_queue_t *q, uint32_t now_s)
+{
+    actor_service_result_t r;
+    memset(&r, 0, sizeof(r));
+
+    uint32_t before = actor_queue_expired(q);
+    bool got = actor_queue_pop(q, &r.cmd, now_s);
+    uint32_t after = actor_queue_expired(q);
+    r.ttl_dropped = after - before;
+    r.ttl_last_dev = q->last_expired_dev;
+    r.ttl_last_action = q->last_expired_action;
+
+    if (!got) return r; /* dispatched stays false; cmd left zeroed */
+
+    /* Review finding 2: re-examine the guard immediately before recording
+     * or dispatching. Time has passed since this command was queued --
+     * another command from another task may have consumed the rate cap,
+     * or an operator may have set lockout -- so the enqueue-time OK is
+     * not trusted to still hold. */
+    actor_verdict_t v = actor_table_check(t, r.cmd.dev_idx, r.cmd.action_id, r.cmd.param,
+                                           (actor_source_t)r.cmd.source, now_s);
+    if (v != ACTOR_OK) {
+        r.redecline = true;
+        r.redecline_verdict = v;
+        r.redecline_dev = r.cmd.dev_idx;
+        r.redecline_action = r.cmd.action_id;
+        r.redecline_param = r.cmd.param;
+        return r; /* dispatched stays false: dropped, never sent */
+    }
+
+    actor_table_record(t, r.cmd.dev_idx, r.cmd.action_id, now_s);
+    r.dispatched = true;
+    return r;
+}
+
+/* Maps a guard refusal to the (level, code) pair alert_post() wants.
+ * Deliberately NOT gated behind #ifdef ESP_PLATFORM (review finding 3's
+ * "cheap and worth doing" list): this switch has no `default`, so a
+ * future actor_verdict_t value that isn't added here trips -Werror=switch
+ * on the host build too, not only in the ESP-IDF build. UNKNOWN/BOUND get
+ * EVENT_LEVEL_ALERT because either one means something upstream is
+ * misconfigured (a rule targeting an undeclared action, or a parameter
+ * that should never have reached this door); LOCKOUT/COOLDOWN/RATE are a
+ * guard doing its ordinary job and get EVENT_LEVEL_NOTIFY. */
+static void verdict_alert(actor_verdict_t v, uint8_t *level_out, uint8_t *code_out)
+{
+    *level_out = EVENT_LEVEL_ALERT;
+    *code_out  = ALERT_CODE_UNKNOWN;
+    switch (v) {
+    case ACTOR_REFUSED_UNKNOWN:  *code_out = ALERT_CODE_UNKNOWN;  break;
+    case ACTOR_REFUSED_BOUND:    *code_out = ALERT_CODE_BOUND;    break;
+    case ACTOR_REFUSED_LOCKOUT:  *level_out = EVENT_LEVEL_NOTIFY; *code_out = ALERT_CODE_LOCKOUT;  break;
+    case ACTOR_REFUSED_COOLDOWN: *level_out = EVENT_LEVEL_NOTIFY; *code_out = ALERT_CODE_COOLDOWN; break;
+    case ACTOR_REFUSED_RATE:     *level_out = EVENT_LEVEL_NOTIFY; *code_out = ALERT_CODE_RATE;     break;
+    case ACTOR_OK: break; /* unreachable by contract: callers only invoke this on refusal */
+    }
+}
+
+/* ---------------------------------------------------------------------
+ * Impure wrapper -- actor_request()/actor_service(), the shared table/
+ * queue instances they operate on, and the lock-taking accessors. Every
+ * ESP-IDF-only line is gated so this section still compiles (though
+ * nothing here is exercised) when ESP_PLATFORM is undefined, i.e. under
+ * the host test's plain `cc`.
  * --------------------------------------------------------------------- */
 
 static actor_table_t       s_table;
@@ -96,7 +215,7 @@ static SemaphoreHandle_t s_lock;
 static inline void actor_lock(void)   { if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY); }
 static inline void actor_unlock(void) { if (s_lock) xSemaphoreGive(s_lock); }
 
-static uint32_t now_uptime_s(void)
+uint32_t actor_now_s(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000000);
 }
@@ -108,7 +227,7 @@ static uint32_t now_uptime_s(void)
  * file link-clean without pulling in FreeRTOS. */
 static inline void actor_lock(void)   { }
 static inline void actor_unlock(void) { }
-static uint32_t now_uptime_s(void)    { return 0; }
+uint32_t actor_now_s(void)            { return 0; }
 
 #endif
 
@@ -121,96 +240,112 @@ void actor_init(void)
     actor_queue_init(&s_queue);
 }
 
-actor_table_t *actor_table_get(void)
-{
-    return &s_table;
-}
-
 void actor_set_dispatch_hook(actor_dispatch_fn_t fn)
 {
     s_dispatch = fn;
 }
 
-/* Names the guard that refused a command (spec section 4.2 / 4.6: "a guard
- * refusal is not silent"). UNKNOWN and BOUND get EVENT_LEVEL_ALERT because
- * either one means something upstream is misconfigured (a rule targeting
- * an undeclared action, or a parameter that should never have reached
- * this door at all); LOCKOUT/COOLDOWN/RATE are the guards doing their
- * ordinary job and get EVENT_LEVEL_NOTIFY. */
-static void alert_refusal(actor_verdict_t v, int dev_idx, uint8_t action_id, uint16_t param)
+bool actor_declare(int dev_idx, uint8_t action_id, uint16_t param_max, uint8_t flags)
 {
-#ifdef ESP_PLATFORM
-    uint8_t code, level;
-    switch (v) {
-    case ACTOR_REFUSED_UNKNOWN:  code = ALERT_CODE_UNKNOWN;  level = EVENT_LEVEL_ALERT;  break;
-    case ACTOR_REFUSED_BOUND:    code = ALERT_CODE_BOUND;    level = EVENT_LEVEL_ALERT;  break;
-    case ACTOR_REFUSED_LOCKOUT:  code = ALERT_CODE_LOCKOUT;  level = EVENT_LEVEL_NOTIFY; break;
-    case ACTOR_REFUSED_COOLDOWN: code = ALERT_CODE_COOLDOWN; level = EVENT_LEVEL_NOTIFY; break;
-    case ACTOR_REFUSED_RATE:     code = ALERT_CODE_RATE;     level = EVENT_LEVEL_NOTIFY; break;
-    default: return; /* ACTOR_OK never reaches here */
-    }
-    alert_post(level, code, dev_idx, action_id, param);
-#else
-    (void)v; (void)dev_idx; (void)action_id; (void)param;
-#endif
+    actor_lock();
+    bool ok = actor_table_add(&s_table, dev_idx, action_id, param_max, flags);
+    actor_unlock();
+    return ok;
+}
+
+bool actor_configure_guards(int dev_idx, uint8_t action_id,
+                             uint16_t cooldown_s, uint8_t max_per_hour)
+{
+    actor_lock();
+    bool ok = actor_table_set_guards(&s_table, dev_idx, action_id, cooldown_s, max_per_hour);
+    actor_unlock();
+    return ok;
+}
+
+void actor_set_lockout(int dev_idx, bool on)
+{
+    actor_lock();
+    actor_table_set_lockout(&s_table, dev_idx, on);
+    actor_unlock();
+}
+
+uint32_t actor_full_drops(void)
+{
+    actor_lock();
+    uint32_t n = actor_table_full_drops(&s_table);
+    actor_unlock();
+    return n;
 }
 
 bool actor_request(int dev_idx, uint8_t action_id, uint16_t param,
                     actor_source_t source, uint32_t deadline_s)
 {
-    uint32_t now_s = now_uptime_s();
+    uint32_t now_s = actor_now_s();
 
     actor_lock();
-    actor_verdict_t v = actor_table_check(&s_table, dev_idx, action_id, param, source, now_s);
-    if (v != ACTOR_OK) {
-        actor_unlock();
-        alert_refusal(v, dev_idx, action_id, param);
+    actor_request_result_t r = actor_request_decide(&s_table, &s_queue, dev_idx, action_id,
+                                                      param, source, deadline_s, now_s);
+    actor_unlock();
+
+    if (r.verdict != ACTOR_OK) {
+        uint8_t level, code;
+        verdict_alert(r.verdict, &level, &code);
+#ifdef ESP_PLATFORM
+        alert_post(level, code, dev_idx, action_id, param);
+#else
+        (void)level; (void)code;
+#endif
         return false;
     }
 
-    actor_cmd_t cmd;
-    cmd.dev_idx = (int8_t)dev_idx;
-    cmd.action_id = action_id;
-    cmd.source = (uint8_t)source;
-    cmd.param = param;
-    cmd.deadline_s = deadline_s;
-    bool queued = actor_queue_push(&s_queue, &cmd);
-    actor_unlock();
-
-    if (!queued) {
+    if (r.evicted) {
 #ifdef ESP_PLATFORM
-        alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_QUEUE_FULL, dev_idx, action_id, param);
+        alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_COMMAND_EVICTED,
+                   r.evicted_cmd.dev_idx, r.evicted_cmd.action_id, r.evicted_cmd.param);
 #endif
     }
-    return queued;
+
+    if (!r.queued) {
+        /* Only reachable when every queued entry is itself a safety
+         * command (ordinary-source refusals are already covered by the
+         * eviction path above) -- a genuine overload, CRITICAL. An
+         * ordinary command refused by a queue full of ordinary commands
+         * is the more common, less dire case and stays at ALERT. */
+        uint8_t level = (source == ACTOR_SRC_SAFETY) ? EVENT_LEVEL_CRITICAL : EVENT_LEVEL_ALERT;
+#ifdef ESP_PLATFORM
+        alert_post(level, ALERT_CODE_QUEUE_FULL, dev_idx, action_id, param);
+#else
+        (void)level;
+#endif
+    }
+
+    return r.queued;
 }
 
 void actor_service(void)
 {
-    uint32_t now_s = now_uptime_s();
-    actor_cmd_t cmd;
-    bool got;
-    uint32_t before, after;
-    int8_t   edev;
-    uint8_t  eaction;
+    uint32_t now_s = actor_now_s();
 
     actor_lock();
-    before = actor_queue_expired(&s_queue);
-    got = actor_queue_pop(&s_queue, &cmd, now_s);
-    after = actor_queue_expired(&s_queue);
-    edev = s_queue.last_expired_dev;
-    eaction = s_queue.last_expired_action;
-    if (got) actor_table_record(&s_table, cmd.dev_idx, cmd.action_id, now_s);
+    actor_service_result_t r = actor_service_step(&s_table, &s_queue, now_s);
     actor_unlock();
 
-    if (after > before) {
+    if (r.ttl_dropped > 0) {
 #ifdef ESP_PLATFORM
-        alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_COMMAND_EXPIRED, edev, eaction,
-                   (uint16_t)(after - before));
-#else
-        (void)edev; (void)eaction;
+        alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_COMMAND_EXPIRED, r.ttl_last_dev, r.ttl_last_action,
+                   (uint16_t)r.ttl_dropped);
 #endif
     }
 
-    if (got && s_dispatch) s_dispatch(&cmd);
+    if (r.redecline) {
+        uint8_t level, code;
+        verdict_alert(r.redecline_verdict, &level, &code);
+#ifdef ESP_PLATFORM
+        alert_post(level, code, r.redecline_dev, r.redecline_action, r.redecline_param);
+#else
+        (void)level; (void)code;
+#endif
+    }
+
+    if (r.dispatched && s_dispatch) s_dispatch(&r.cmd);
 }
