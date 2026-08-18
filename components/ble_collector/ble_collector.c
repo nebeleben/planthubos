@@ -222,6 +222,29 @@ static actor_cmd_t s_cmd_inflight = { .dev_idx = -1, .action_id = ACTION_NONE };
 static actor_cmd_t s_requeue;          /* the command to put back, valid iff pending */
 static volatile bool s_requeue_pending;
 
+/* M5b Task 9 fix round 1 (Critical finding 1): on_gatt_cmd_done() runs on
+ * the NimBLE host task, and pending_close_arm()/pending_close_clear() (via
+ * pending_close_note_result()) both touch LittleFS -- a blocking, flash-
+ * erasing write that must never happen on that task (this file's own
+ * comment on the switch.state write, just above, states the same
+ * invariant; gatt_engine.c repeats it for adv_decoder_task being the only
+ * task allowed to touch flash at all). So the hook only LATCHES what it
+ * learned; adv_decoder_task drains and acts on it, exactly like
+ * s_requeue/s_requeue_pending above and s_cmd_state_pending in
+ * gatt_engine.c. Single-slot is safe for the same reason s_cmd_inflight is:
+ * only one command is ever in flight, so at most one outcome is ever
+ * pending here at a time. This also closes fix round 1 finding 3 (the
+ * pending_close RAM table race) BY CONSTRUCTION: every mutation of that
+ * table now happens only on adv_decoder_task, both here and from
+ * pending_close_service(). */
+typedef enum { PC_DEFER_NONE = 0, PC_DEFER_ARM, PC_DEFER_NOTE_RESULT } pc_defer_kind_t;
+static volatile pc_defer_kind_t s_pc_defer_kind;
+static int      s_pc_defer_dev_idx;
+static uint8_t  s_pc_defer_close_action;   /* PC_DEFER_ARM only */
+static uint32_t s_pc_defer_deadline_s;     /* PC_DEFER_ARM only */
+static bool     s_pc_defer_ok;             /* PC_DEFER_NOTE_RESULT only */
+static bool     s_pc_defer_confirmed;      /* PC_DEFER_NOTE_RESULT only */
+
 /* Set once both hooks are registered, which happens on the HUB only -- a
  * node's radio belongs to ESP-NOW, exactly as it does for battery polling
  * and for M5a's GATT reads. Until then (and forever on a node) no device is
@@ -569,26 +592,35 @@ static void on_gatt_cmd_done(int dev_idx, bool ok, bool confirmed, const char *e
              dev_idx, (unsigned)s_cmd_inflight.action_id, (unsigned)s_cmd_inflight.param);
 
     /* M5b Task 9: the write landed. Two distinct things follow, depending
-     * on which side of a pending-close obligation this command was on. */
+     * on which side of a pending-close obligation this command was on --
+     * both only LATCH what was learned; the actual flash-touching call
+     * (pending_close_arm()/pending_close_note_result()) happens on
+     * adv_decoder_task (see s_pc_defer_kind's own comment: fix round 1,
+     * finding 1 -- this task must never touch LittleFS). */
     if (s_cmd_inflight.source == ACTOR_SRC_SAFETY) {
         /* This WAS a scheduled (or retried) close: tell the safety core the
          * outcome so it can stop retrying once the close is actually
          * confirmed -- pending_close_note_result() itself treats "landed
          * but unconfirmed" (spec section 4.4) as still open and does
          * nothing, exactly like a genuine failure would. */
-        pending_close_note_result(dev_idx, ok, confirmed);
+        s_pc_defer_dev_idx = dev_idx;
+        s_pc_defer_ok = ok;
+        s_pc_defer_confirmed = confirmed;
+        s_pc_defer_kind = PC_DEFER_NOTE_RESULT; /* set LAST, like every cross-task flag here */
     } else {
-        /* An ordinary open landed. If it is a timed action (a duration
-         * parameter, action.h's ACTION_PARAM_DURATION_S) and this device's
-         * declared action does NOT carry ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF
-         * (actor_table.h -- the device closes itself), the hub now owns
-         * the close: arm it for now + the duration that was just sent. */
-        const action_t *a = action_get(s_cmd_inflight.action_id);
+        /* An ordinary open landed. actor_action_flags() is safe to call
+         * from this task (actor_table_t is genuinely cross-task and locked
+         * in actor.c, unlike pending_close.c's own table) -- only the
+         * DECISION runs here; pending_close_needed() is the pure predicate
+         * (fix round 1, finding 6) that decides whether the hub now owns
+         * the close. */
         uint8_t flags = 0;
-        if (a && a->param == ACTION_PARAM_DURATION_S &&
-            actor_action_flags(dev_idx, s_cmd_inflight.action_id, &flags) &&
-            !(flags & ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF)) {
-            pending_close_arm(dev_idx, ACT_SWITCH_OFF, actor_now_s() + s_cmd_inflight.param);
+        if (actor_action_flags(dev_idx, s_cmd_inflight.action_id, &flags) &&
+            pending_close_needed(s_cmd_inflight.action_id, flags)) {
+            s_pc_defer_dev_idx = dev_idx;
+            s_pc_defer_close_action = ACT_SWITCH_OFF;
+            s_pc_defer_deadline_s = actor_now_s() + s_cmd_inflight.param;
+            s_pc_defer_kind = PC_DEFER_ARM; /* set LAST, like every cross-task flag here */
         }
     }
 }
@@ -620,6 +652,40 @@ static void service_command_requeue(void)
                  (int)cmd.dev_idx, (unsigned)cmd.action_id);
         alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_COMMAND_FAILED, cmd.dev_idx,
                    cmd.action_id, cmd.param);
+    }
+}
+
+/* M5b Task 9 fix round 1 (finding 1): the decoder-task half of
+ * on_gatt_cmd_done()'s pending-close deferral -- see s_pc_defer_kind's own
+ * comment. This is where pending_close_arm()/pending_close_note_result()
+ * actually run, and so where the LittleFS write they may trigger actually
+ * happens -- adv_decoder_task, same as every other flash access in this
+ * file. Clears the flag BEFORE copying the latched fields out, same order
+ * service_command_requeue() above uses, so a new outcome latched while this
+ * runs is never silently dropped. */
+static void service_pending_close_defer(void)
+{
+    if (s_pc_defer_kind == PC_DEFER_NONE) return;
+    pc_defer_kind_t kind = s_pc_defer_kind;
+    s_pc_defer_kind = PC_DEFER_NONE;
+
+    int dev_idx = s_pc_defer_dev_idx;
+    switch (kind) {
+    case PC_DEFER_ARM: {
+        uint8_t close_action = s_pc_defer_close_action;
+        uint32_t deadline_s = s_pc_defer_deadline_s;
+        pending_close_arm(dev_idx, close_action, deadline_s);
+        break;
+    }
+    case PC_DEFER_NOTE_RESULT: {
+        bool ok = s_pc_defer_ok;
+        bool confirmed = s_pc_defer_confirmed;
+        pending_close_note_result(dev_idx, ok, confirmed);
+        break;
+    }
+    case PC_DEFER_NONE:
+    default:
+        break;
     }
 }
 
@@ -1101,20 +1167,29 @@ static void adv_decoder_task(void *arg)
          * advertisement could start another read in front of it. It is
          * also true because of our own pending command, which would make
          * this gate partly self-referential. */
-        /* M5b Task 9: pending-close due-check. Deliberately OUTSIDE the
+        /* M5b Task 9: pending-close due-check, and the deferred arm/
+         * note_result drain that feeds it (fix round 1, finding 1) --
+         * drained FIRST so a close just confirmed (PC_DEFER_NOTE_RESULT)
+         * clears its obligation before this pass can re-attempt it, and an
+         * open that just landed (PC_DEFER_ARM) is armed before the very
+         * first due-check can run against it. Deliberately OUTSIDE the
          * s_actors_wired gate below and unconditional on role: unlike
-         * actor_service(), this never touches the radio itself -- it only
-         * decides whether an obligation is due and, if so, calls
-         * actor_request() to enqueue the close, so it needs none of the two
-         * busy gates that protect the pop-and-charge step, and it must keep
-         * running even where s_actors_wired never becomes true (a node, or
-         * the brief window on a hub before the GATT hooks are registered)
-         * so that a stale obligation still retries, backs off and -- on a
-         * node, which has no GATT radio to close anything with at all --
-         * eventually exhausts into a CRITICAL alert instead of sitting in
-         * RAM forever, silently, because nothing ever called it again. Costs
-         * a no-op table scan (PENDING_CLOSE_MAX == 4 rows) when nothing is
-         * due. */
+         * actor_service(), pending_close_service() never touches the radio
+         * itself -- it only decides whether an obligation is due and, if
+         * so, calls actor_request() to enqueue the close, so it needs none
+         * of the two busy gates that protect the pop-and-charge step, and
+         * it must keep running even where s_actors_wired never becomes true
+         * (a node, or the brief window on a hub before the GATT hooks are
+         * registered) so that a stale obligation still retries, backs off
+         * and -- on a node, which has no GATT radio to close anything with
+         * at all -- eventually exhausts into a CRITICAL alert instead of
+         * sitting in RAM forever, silently, because nothing ever called it
+         * again. service_pending_close_defer() is a no-op check
+         * (s_pc_defer_kind can only be set by the GATT completion hook,
+         * which only fires once actors are wired) and pending_close_service()
+         * is a no-op table scan (PENDING_CLOSE_MAX == 4 rows) when nothing
+         * is due -- both cheap on every tick regardless of role. */
+        service_pending_close_defer();
         pending_close_service();
 
         if (s_actors_wired) {

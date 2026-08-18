@@ -4,20 +4,33 @@
  * already established for this component:
  *
  *   - a small RAM table plus pure C99 operations on it (arm/clear/due/
- *     retry/boot_load/serialize/deserialize) -- no ESP-IDF anywhere in this
- *     half, so tests/host/test_pending_close.c links this file directly
- *     with plain `cc` and proves it by direct execution;
+ *     step/boot_load/needed/serialize/deserialize) -- no ESP-IDF anywhere
+ *     in this half, so tests/host/test_pending_close.c links this file
+ *     directly with plain `cc` and proves it by direct execution;
  *   - an impure wrapper (pending_close_init()/pending_close_service()/
  *     pending_close_note_result(), plus the LittleFS read/write) that is
  *     `#ifdef ESP_PLATFORM`-gated, exactly like actor_request()'s
  *     alert_post()/dispatch-hook calls are.
  *
+ * Fix round 1 moved every call into this impure half onto
+ * ble_collector.c's adv_decoder_task ONLY -- the GATT completion hook
+ * (on_gatt_cmd_done()) runs on the NimBLE host task, where a blocking
+ * LittleFS write must never happen, so it now latches the outcome into a
+ * deferred flag that adv_decoder_task drains before calling
+ * pending_close_arm()/pending_close_note_result(). That single-task
+ * discipline is also why `s_table` below carries no lock of its own: every
+ * writer is now the same task.
+ *
  * Deliberately does NOT persist on every retry -- only pending_close_arm()
- * (a fresh obligation) and pending_close_clear() (confirmed done, or given
- * up) touch flash. Retries/backoff live in RAM only; a reboot mid-retry
- * just restarts the retry count against the SAME on-disk deadline, which is
+ * (a fresh obligation) and pending_close_clear() (confirmed done) touch
+ * flash. Retries/backoff live in RAM only; a reboot mid-retry just
+ * restarts the retry count against the SAME on-disk deadline, which is
  * harmless because boot replay ignores that deadline anyway (see
- * pending_close_is_boot_due()). */
+ * pending_close_is_boot_due()). Exhaustion (pending_close_step() returning
+ * PENDING_CLOSE_STEP_EXHAUSTED) does NOT clear or rewrite the file either
+ * -- fix round 1, finding 2: the obligation the file already recorded must
+ * survive so the next boot tries again, or the one mechanism that exists
+ * to catch a stranded actuator would erase its own evidence. */
 #include "actor.h"
 #include "alert.h"
 #include "event_log.h" /* EVENT_LEVEL_CRITICAL, used in the gated section below --
@@ -41,6 +54,13 @@ static void pending_close_save(void);
  * --------------------------------------------------------------------- */
 
 static pending_close_t s_table[PENDING_CLOSE_MAX];
+
+/* Sentinel deadline for a record that has reached
+ * PENDING_CLOSE_STEP_EXHAUSTED: pending_close_due() will never again treat
+ * it as due (this boot), without removing it from the table or touching
+ * the file. actor_now_s() reaching this value would need ~136 years of
+ * uptime -- not a practical wraparound concern. */
+#define PENDING_CLOSE_GIVEN_UP 0xFFFFFFFFu
 
 static int table_find(int dev_idx)
 {
@@ -129,14 +149,38 @@ int pending_close_due(uint32_t now_s, pending_close_t *out)
     return 1;
 }
 
-bool pending_close_retry(int dev_idx, uint32_t now_s)
+pending_close_step_t pending_close_step(int dev_idx, uint32_t now_s, bool device_known,
+                                         pending_close_t *out)
 {
     int i = table_find(dev_idx);
-    if (i < 0) return false;
-    if (s_table[i].retries >= PENDING_CLOSE_MAX_RETRIES) return false;
+    if (i < 0) return PENDING_CLOSE_STEP_NONE;
+
+    /* Checked FIRST, before issuing anything new: this can only be reached
+     * on a call that follows the FINAL attempt's own backoff period (the
+     * caller only gets here via pending_close_due(), which will not
+     * surface this record again until that period has elapsed) -- so this
+     * never fires synchronously with the attempt whose outcome it is
+     * reporting on (fix round 1, finding 5). NOT cleared, NOT rewritten to
+     * the file (fix round 1, finding 2): given up for THIS BOOT only. */
+    if (s_table[i].retries >= PENDING_CLOSE_MAX_RETRIES) {
+        if (out) *out = s_table[i];
+        s_table[i].deadline_s = PENDING_CLOSE_GIVEN_UP;
+        return PENDING_CLOSE_STEP_EXHAUSTED;
+    }
+
+    if (!device_known) {
+        /* The hub is not ready (the device has not been rediscovered yet),
+         * not the device refusing -- does not spend the retry budget above
+         * (fix round 1, finding 2's first ruling). */
+        s_table[i].deadline_s = now_s + PENDING_CLOSE_UNKNOWN_RECHECK_S;
+        if (out) *out = s_table[i];
+        return PENDING_CLOSE_STEP_DEFERRED;
+    }
+
     s_table[i].retries++;
     s_table[i].deadline_s = now_s + backoff_s(s_table[i].retries);
-    return true;
+    if (out) *out = s_table[i];
+    return PENDING_CLOSE_STEP_REQUEST;
 }
 
 bool pending_close_is_boot_due(const pending_close_t *r)
@@ -162,6 +206,13 @@ size_t pending_close_active_count(void)
     for (int i = 0; i < PENDING_CLOSE_MAX; i++)
         if (s_table[i].dev_idx >= 0) n++;
     return n;
+}
+
+bool pending_close_needed(uint8_t action_id, uint8_t flags)
+{
+    const action_t *a = action_get(action_id);
+    return a != NULL && a->param == ACTION_PARAM_DURATION_S &&
+           !(flags & ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF);
 }
 
 /* ---------------------------------------------------------------------
@@ -256,18 +307,29 @@ size_t pending_close_deserialize(const uint8_t *buf, size_t len, pending_close_t
 /* ---------------------------------------------------------------------
  * Impure wrapper -- LittleFS, actor_request(), alert_post(). Gated exactly
  * like actor.c's own alert_post()/dispatch-hook calls; the whole file still
- * compiles (though this half is unreachable) under plain `cc`.
+ * compiles (though this half is unreachable) under plain `cc`. Every
+ * function in this section is called ONLY from ble_collector.c's
+ * adv_decoder_task -- see this file's top comment.
  * --------------------------------------------------------------------- */
 
 #ifdef ESP_PLATFORM
 
 #define PENDING_CLOSE_PATH        "/storage/pending_close.bin"
+#define PENDING_CLOSE_TMP_PATH    "/storage/pending_close.tmp"
 #define PENDING_CLOSE_ATTEMPT_TTL 30u /* actor_request() deadline for a
                                         * single dispatch attempt to reach
                                         * the queue -- not this obligation's
                                         * own retry policy, which is
-                                        * pending_close_retry()'s job */
+                                        * pending_close_step()'s job */
 
+/* Atomic write: the full file goes to a sibling .tmp path first, flushed
+ * and closed, then rename()d over the real path -- same discipline
+ * plants.c's write_file() uses (see its own comment for the rationale in
+ * more detail: rename() is atomic on LittleFS, so a reader or a power loss
+ * only ever sees the old complete file or the new complete one, never a
+ * partial write). Fix round 1, finding 4: `fopen(..., "wb")` directly on
+ * the real path truncates before writing, so a power loss mid-write used
+ * to lose EVERY device's obligation, not just the one being armed. */
 static void pending_close_save(void)
 {
     pending_close_t recs[PENDING_CLOSE_MAX];
@@ -296,17 +358,37 @@ static void pending_close_save(void)
         return;
     }
 
-    FILE *f = fopen(PENDING_CLOSE_PATH, "wb");
+    FILE *f = fopen(PENDING_CLOSE_TMP_PATH, "wb");
     if (!f) {
         ESP_LOGW(TAG, "could not open %s for write (errno=%d); a reboot now "
                        "would lose %u pending close obligation(s)",
-                 PENDING_CLOSE_PATH, errno, (unsigned)n);
+                 PENDING_CLOSE_TMP_PATH, errno, (unsigned)n);
         return;
     }
     size_t wrote = fwrite(buf, 1, len, f);
-    fclose(f);
     if (wrote != len) {
-        ESP_LOGW(TAG, "short write persisting %u pending close obligation(s)", (unsigned)n);
+        ESP_LOGW(TAG, "short write to %s persisting %u pending close obligation(s)",
+                 PENDING_CLOSE_TMP_PATH, (unsigned)n);
+        fclose(f);
+        remove(PENDING_CLOSE_TMP_PATH);
+        return;
+    }
+    if (fflush(f) != 0) {
+        ESP_LOGW(TAG, "fflush(%s) failed (errno=%d)", PENDING_CLOSE_TMP_PATH, errno);
+        fclose(f);
+        remove(PENDING_CLOSE_TMP_PATH);
+        return;
+    }
+    if (fclose(f) != 0) {
+        ESP_LOGW(TAG, "fclose(%s) failed (errno=%d)", PENDING_CLOSE_TMP_PATH, errno);
+        remove(PENDING_CLOSE_TMP_PATH);
+        return;
+    }
+    if (rename(PENDING_CLOSE_TMP_PATH, PENDING_CLOSE_PATH) != 0) {
+        ESP_LOGW(TAG, "rename %s -> %s failed (errno=%d); a reboot now would lose "
+                      "%u pending close obligation(s)",
+                 PENDING_CLOSE_TMP_PATH, PENDING_CLOSE_PATH, errno, (unsigned)n);
+        remove(PENDING_CLOSE_TMP_PATH);
     }
 }
 
@@ -315,19 +397,33 @@ void pending_close_service(void)
     uint32_t now = actor_now_s();
     pending_close_t rec;
     while (pending_close_due(now, &rec)) {
-        /* ACTOR_SRC_SAFETY: exempt from lockout/cooldown/rate (actor_table.h),
-         * still bound by the parameter bound and by "unknown device" -- both
-         * of those simply make this attempt fail, which pending_close_retry()
-         * below treats exactly like any other failed attempt. */
-        actor_request(rec.dev_idx, rec.close_action, 0, ACTOR_SRC_SAFETY,
-                       now + PENDING_CLOSE_ATTEMPT_TTL);
+        uint8_t flags = 0;
+        bool known = actor_action_flags(rec.dev_idx, rec.close_action, &flags);
 
-        if (!pending_close_retry(rec.dev_idx, now)) {
-            /* Retries exhausted. The engine can only ever try; this is the
-             * honest end of that path -- loud, not a silent give-up. */
+        pending_close_t out;
+        pending_close_step_t st = pending_close_step(rec.dev_idx, now, known, &out);
+        switch (st) {
+        case PENDING_CLOSE_STEP_REQUEST:
+            /* ACTOR_SRC_SAFETY: exempt from lockout/cooldown/rate
+             * (actor_table.h), still bound by the parameter bound -- moot
+             * here (a close carries no parameter) -- and, in principle, by
+             * "unknown device", but pending_close_step() already screened
+             * that out above via `known`. */
+            actor_request(out.dev_idx, out.close_action, 0, ACTOR_SRC_SAFETY,
+                           now + PENDING_CLOSE_ATTEMPT_TTL);
+            break;
+        case PENDING_CLOSE_STEP_EXHAUSTED:
+            /* The engine can only ever try; this is the honest end of that
+             * path -- loud, not a silent give-up. Deliberately does NOT
+             * clear the record (fix round 1, finding 2): the file already
+             * holds this obligation, and it stays there for the next boot. */
             alert_post(EVENT_LEVEL_CRITICAL, ALERT_CODE_CLOSE_UNCONFIRMED,
-                       rec.dev_idx, rec.close_action, rec.retries);
-            pending_close_clear(rec.dev_idx);
+                       out.dev_idx, out.close_action, out.retries);
+            break;
+        case PENDING_CLOSE_STEP_DEFERRED:
+        case PENDING_CLOSE_STEP_NONE:
+        default:
+            break;
         }
     }
 }

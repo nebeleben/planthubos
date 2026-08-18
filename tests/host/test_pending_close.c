@@ -175,10 +175,9 @@ static void test_due_picks_earliest_when_multiple_due(void) {
 static void test_rearm_replaces_and_resets_retries(void) {
     pending_close_init();
     pending_close_arm(1, ACT_SWITCH_OFF, 100);
-    assert(pending_close_retry(1, 100));
-    assert(pending_close_retry(1, 100));
     pending_close_t out;
-    assert(pending_close_due(100, &out) == 0); /* pushed into the future by retry() */
+    assert(pending_close_step(1, 100, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+    assert(pending_close_due(100, &out) == 0); /* pushed into the future by step() */
 
     pending_close_arm(1, ACT_SWITCH_OFF, 500); /* device opened again */
     assert(pending_close_active_count() == 1); /* still one row, not two */
@@ -186,49 +185,117 @@ static void test_rearm_replaces_and_resets_retries(void) {
     assert(out.deadline_s == 500 && out.retries == 0);
 }
 
-static void test_retry_backoff_increases_deadline(void) {
+/* ---------------------------------------------------------------------
+ * pending_close_step(): fix round 1 findings 2 and 5.
+ * --------------------------------------------------------------------- */
+
+static void test_step_known_device_backs_off(void) {
     pending_close_init();
     pending_close_arm(1, ACT_SWITCH_OFF, 100);
     pending_close_t out;
     assert(pending_close_due(100, &out) == 1);
 
-    assert(pending_close_retry(1, 100));
+    assert(pending_close_step(1, 100, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+    assert(out.retries == 1);
     assert(pending_close_due(100, &out) == 0); /* rescheduled forward */
     assert(pending_close_due(1000, &out) == 1);
     uint32_t first_deadline = out.deadline_s;
     assert(first_deadline > 100);
 
-    assert(pending_close_retry(1, first_deadline));
+    assert(pending_close_step(1, first_deadline, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+    assert(out.retries == 2);
     assert(pending_close_due(first_deadline, &out) == 0);
     assert(pending_close_due(100000, &out) == 1);
     assert(out.deadline_s > first_deadline); /* backoff, not a fixed step */
 }
 
-static void test_retry_is_bounded_and_exhausts(void) {
+/* Fix round 1, finding 2's first ruling: an attempt against a device the
+ * hub hasn't rediscovered yet must not spend the retry budget. */
+static void test_step_unknown_device_does_not_consume_retry(void) {
+    pending_close_init();
+    pending_close_arm(1, ACT_SWITCH_OFF, 100);
+    pending_close_t out;
+    assert(pending_close_due(100, &out) == 1);
+
+    assert(pending_close_step(1, 100, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+    assert(out.retries == 0); /* NOT spent */
+    assert(pending_close_due(100, &out) == 0); /* rescheduled a short delay ahead */
+    assert(pending_close_due(100 + PENDING_CLOSE_UNKNOWN_RECHECK_S, &out) == 1);
+    assert(out.retries == 0);
+
+    /* A device that stays unknown forever can be deferred indefinitely
+     * without ever spending a retry or reaching exhaustion -- the recorded
+     * consequence of the ruling (pending_close_step()'s own doc comment). */
+    uint32_t now = 100 + PENDING_CLOSE_UNKNOWN_RECHECK_S;
+    for (int i = 0; i < 4 * PENDING_CLOSE_MAX_RETRIES; i++) {
+        assert(pending_close_due(now, &out) == 1);
+        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        assert(out.retries == 0);
+        now = out.deadline_s;
+    }
+}
+
+/* Fix round 1, finding 5: exhaustion must be declared on a check that
+ * follows the final real attempt's own backoff period -- never in the same
+ * pass that issues that attempt, whose outcome is not yet known. */
+static void test_step_exhaustion_follows_final_backoff_not_synchronous(void) {
     pending_close_init();
     pending_close_arm(1, ACT_SWITCH_OFF, 0);
     uint32_t now = 0;
-    int ok_count = 0;
-    for (int i = 0; i < 100; i++) {
-        if (pending_close_retry(1, now)) {
-            ok_count++;
-            now += 100000; /* always advance past the new backoff deadline */
-        } else {
-            break;
-        }
+    pending_close_t out;
+
+    for (int i = 0; i < PENDING_CLOSE_MAX_RETRIES; i++) {
+        assert(pending_close_due(now, &out) == 1);
+        pending_close_step_t st = pending_close_step(1, now, true, &out);
+        /* Every one of the MAX_RETRIES real attempts is a REQUEST, never
+         * EXHAUSTED -- in particular the LAST one: the alert must not fire
+         * in the same call that just launched the final attempt. */
+        assert(st == PENDING_CLOSE_STEP_REQUEST);
+        assert(out.retries == (uint8_t)(i + 1));
+        now = out.deadline_s; /* jump to exactly when it is due again */
     }
-    assert(ok_count == PENDING_CLOSE_MAX_RETRIES); /* bounded, not infinite */
-    /* One more call must keep refusing -- exhaustion is a stable state, not
-     * a one-shot false. */
-    assert(!pending_close_retry(1, now));
-    /* The record itself is untouched by the refusal (still one row; a
-     * caller decides whether/when to clear it after alerting). */
+
+    /* Only NOW -- a full backoff period after the final attempt, with the
+     * record still present (so that attempt did not succeed) -- is
+     * exhaustion declared. */
+    assert(pending_close_due(now, &out) == 1);
+    assert(pending_close_step(1, now, true, &out) == PENDING_CLOSE_STEP_EXHAUSTED);
+    assert(out.retries == PENDING_CLOSE_MAX_RETRIES);
+
+    /* Given up for this boot: never due again... */
+    assert(pending_close_due(now, &out) == 0);
+    assert(pending_close_due(0xFFFFFFF0u, &out) == 0);
+    /* ...but fix round 1, finding 2: NOT cleared -- the obligation the file
+     * already recorded survives for the next boot to retry from scratch. */
     assert(pending_close_active_count() == 1);
 }
 
-static void test_retry_unknown_device_returns_false(void) {
+static void test_step_no_record_returns_none(void) {
     pending_close_init();
-    assert(!pending_close_retry(42, 0));
+    pending_close_t out;
+    assert(pending_close_step(42, 0, true, &out) == PENDING_CLOSE_STEP_NONE);
+}
+
+/* ---------------------------------------------------------------------
+ * pending_close_needed(): fix round 1, finding 6 -- the arm decision moved
+ * out of ble_collector.c's GATT completion path into pure, testable code.
+ * --------------------------------------------------------------------- */
+
+static void test_needed_true_for_timed_action_without_device_local(void) {
+    assert(pending_close_needed(ACT_IRRIGATION_OPEN, 0x00));
+}
+
+static void test_needed_false_when_device_local_flag_set(void) {
+    assert(!pending_close_needed(ACT_IRRIGATION_OPEN, ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF));
+}
+
+static void test_needed_false_for_parameterless_action(void) {
+    assert(!pending_close_needed(ACT_SWITCH_ON, 0x00));
+    assert(!pending_close_needed(ACT_SWITCH_OFF, 0x00));
+}
+
+static void test_needed_false_for_unknown_action_id(void) {
+    assert(!pending_close_needed(0xFEu, 0x00));
 }
 
 static void test_boot_load_ignores_stored_deadline(void) {
@@ -295,9 +362,14 @@ int main(void) {
     test_two_devices_independent();
     test_due_picks_earliest_when_multiple_due();
     test_rearm_replaces_and_resets_retries();
-    test_retry_backoff_increases_deadline();
-    test_retry_is_bounded_and_exhausts();
-    test_retry_unknown_device_returns_false();
+    test_step_known_device_backs_off();
+    test_step_unknown_device_does_not_consume_retry();
+    test_step_exhaustion_follows_final_backoff_not_synchronous();
+    test_step_no_record_returns_none();
+    test_needed_true_for_timed_action_without_device_local();
+    test_needed_false_when_device_local_flag_set();
+    test_needed_false_for_parameterless_action();
+    test_needed_false_for_unknown_action_id();
     test_boot_load_ignores_stored_deadline();
     test_boot_load_skips_invalid_records();
     test_is_boot_due_true_for_device_zero();
