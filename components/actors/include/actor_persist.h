@@ -103,6 +103,25 @@ int actor_persist_find(const actor_guard_row_t *rows, size_t n,
  * when the file is absent or unreadable. */
 void actor_persist_init(void);
 
+/* Brings the in-RAM image up to date with the live table WITHOUT writing
+ * the file, and without clearing the dirty flag -- the write stays where it
+ * already is, on actor_persist_service()'s next decoder pass.
+ *
+ * Exists because actor_persist_restore_device() READS the image, and a
+ * do_wrapper_reindex() re-runs that restore for every bound device (it
+ * clears s_actor_conn and s_actor_asked, so the next advertisement takes
+ * the full declare path again). If a lockout toggle or an activation had
+ * set the dirty flag but not yet been merged, the restore re-applied the
+ * OLDER image -- silently clearing a stop button an operator had just
+ * pressed, or refunding one activation against the hourly cap.
+ *
+ * MUST be called BEFORE the device's key is set for a device being
+ * declared for the FIRST time: a keyless row is skipped by the merge
+ * (actor_table_guard_merge()'s own contract), which is exactly what keeps
+ * a brand-new device's empty live guards from overwriting the saved rows
+ * that are about to be restored INTO it. */
+void actor_persist_sync(void);
+
 /* Re-applies the saved guards for `dev_idx`, whose stable identity is
  * `key`, to every action that device has just declared. Called from the
  * same code path that declares an actuator, so the guards are back in the

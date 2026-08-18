@@ -503,6 +503,36 @@ static void note_actor_device(int idx, uint16_t wrapper_id, const adv_item_t *it
     uint8_t n = wrapper_exec_actions_list(wrapper_id, acts, ACTOR_MAX_ACTIONS);
     if (n == 0) return;   /* an ordinary sensor wrapper: nothing to bind */
 
+    /* Scoped re-review residual 1: fold any unmerged guard change into the
+     * persisted image BEFORE the restore below reads it.
+     *
+     * do_wrapper_reindex() clears s_actor_conn and s_actor_asked, so
+     * installing, editing or deleting ANY wrapper sends every bound
+     * actuator back through this path. If an operator had just pressed
+     * lockout -- or a command had just fired -- and the decoder loop had
+     * not yet reached actor_persist_service(), the restore would re-apply
+     * the older image and silently un-press the stop button, or refund one
+     * activation against the hourly cap.
+     *
+     * Fixing the CAUSE (a stale image) rather than this one path that
+     * reads it: any future reader of the image is covered by the same
+     * invariant, "the image is never older than the table when it is
+     * read". The alternative the review offered -- skip the restore while
+     * dirty -- was rejected because the dirty flag is global: an unrelated
+     * device's activation would then leave a genuinely NEW device with no
+     * guards at all, and s_actor_asked is already set by then, so nothing
+     * would ever retry it. That trades a narrow window for a permanent
+     * hole in the same direction the finding is about.
+     *
+     * BEFORE actor_set_device_key() below, and that ordering is
+     * load-bearing: a device being declared for the first time has no key
+     * yet, so the merge skips it (actor_table_guard_merge()'s contract)
+     * and its empty live guards cannot overwrite the saved rows that are
+     * about to be restored into it. A device coming back through a reindex
+     * still HAS its key -- its actor-table row was never removed -- so its
+     * live guards are exactly what gets folded in. */
+    actor_persist_sync();
+
     int slot = -1;
     for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
         if (s_actor_conn[i].dev_idx < 0) { slot = i; break; }

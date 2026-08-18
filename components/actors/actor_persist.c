@@ -263,6 +263,18 @@ void actor_persist_init(void)
     }
 }
 
+void actor_persist_sync(void)
+{
+    /* Peeked, not taken: this makes the IMAGE current, it does not
+     * discharge the obligation to put it on flash. actor_persist_service()
+     * still sees the flag on its next pass, merges again (idempotent) and
+     * writes. Splitting it this way keeps every LittleFS access for this
+     * file on the one call site at the top of the decoder loop, rather
+     * than adding one nested under decode_adv_item(). */
+    if (!actor_guards_dirty()) return;
+    s_img_n = actor_guards_merge(s_img, s_img_n, ACTOR_GUARD_ROWS_MAX);
+}
+
 void actor_persist_restore_device(int dev_idx, const uint8_t key[ACTOR_DEVICE_KEY_LEN])
 {
     if (dev_idx < 0 || key == NULL) return;

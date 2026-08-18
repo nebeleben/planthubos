@@ -265,6 +265,13 @@ int      actor_find_by_key(const uint8_t key[ACTOR_DEVICE_KEY_LEN]);
  * actor_undeclare() and by every dispatch that charges an activation. */
 bool     actor_guards_take_dirty(void);
 
+/* The same question WITHOUT clearing -- for a caller that needs to bring
+ * the persisted image up to date before reading it, but must leave the
+ * obligation to actually write the file where it already is
+ * (actor_persist_service(), on the decoder loop). See
+ * actor_persist_sync(). */
+bool     actor_guards_dirty(void);
+
 /* actor_table_guard_merge() / actor_table_guard_apply() under the lock.
  * See their contracts in actor_table.h -- including, for apply(), what the
  * restored uptime timestamps are taken to mean. */

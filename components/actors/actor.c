@@ -324,6 +324,14 @@ int actor_find_by_key(const uint8_t key[ACTOR_DEVICE_KEY_LEN])
     return idx;
 }
 
+bool actor_guards_dirty(void)
+{
+    actor_lock();
+    bool was = s_guards_dirty;
+    actor_unlock();
+    return was;
+}
+
 bool actor_guards_take_dirty(void)
 {
     actor_lock();

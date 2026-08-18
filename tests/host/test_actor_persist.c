@@ -393,6 +393,105 @@ static void test_apply_rejects_an_undeclared_pair_or_device(void)
     assert(!actor_table_guard_apply(&T, 3, NULL, 50));
 }
 
+/* Scoped re-review residual 1, the half a host test can actually reach.
+ *
+ * A wrapper reindex sends every bound actuator back through declare +
+ * restore. If a lockout an operator just pressed has not yet been merged
+ * into the persisted image, restoring from that OLDER image un-presses it.
+ * The fix is to merge first, so the image is never older than the table
+ * when it is read -- and that composition is pure, so it is proved here.
+ *
+ * NOT reachable from a host test: the s_actor_conn / s_actor_asked
+ * clearing in do_wrapper_reindex() that triggers the re-restore, and the
+ * s_img instance actor_persist_sync() operates on, both live in
+ * ESP_PLATFORM-only code (ble_collector.c and actor_persist.c's gated
+ * half) that this suite does not link. What is proved here is the decision
+ * those two lines exist to make; the wiring is stated in the report as
+ * hardware-only. */
+static void test_merge_before_restore_keeps_a_lockout_the_image_predates(void)
+{
+    /* The image as last written: no lockout, budget untouched. */
+    setup_one_device();
+    actor_guard_row_t img[ACTOR_GUARD_ROWS_MAX];
+    memset(img, 0, sizeof img);
+    size_t n = actor_table_guard_merge(&T, img, 0, ACTOR_GUARD_ROWS_MAX);
+    assert(n == 2);
+    for (size_t i = 0; i < n; i++) assert(!img[i].lockout);
+
+    /* The operator presses the stop button and a command fires. Both land
+     * in the LIVE table; neither has reached the image yet. */
+    actor_table_set_lockout(&T, 3, true);
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 1000);
+    assert(actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, 0, 4));
+
+    /* WITHOUT the merge, restoring from the stale image is exactly the
+     * bug: the stop button comes back up, and the activation is refunded.
+     * Asserted first so this test provably fails if the fix is reverted. */
+    {
+        actor_table_t stale = T;
+        for (size_t i = 0; i < n; i++) {
+            (void)actor_table_guard_apply(&stale, 3, &img[i], /*now_s*/ 2000);
+        }
+        bool lock = true;
+        assert(actor_table_lockout(&stale, 3, &lock) && !lock);   /* un-pressed */
+        actor_pair_state_t ps;
+        assert(actor_table_pair_state(&stale, 3, ACT_IRRIGATION_OPEN, 2000, &ps));
+        assert(ps.activations_this_hour == 0);                    /* refunded */
+    }
+
+    /* WITH the merge -- what actor_persist_sync() does before the restore
+     * reads the image -- the image now carries both, so re-applying it is
+     * a no-op on the operator's intent. */
+    n = actor_table_guard_merge(&T, img, n, ACTOR_GUARD_ROWS_MAX);
+    assert(n == 2);
+    for (size_t i = 0; i < n; i++) {
+        assert(actor_table_guard_apply(&T, 3, &img[i], /*now_s*/ 2000));
+    }
+    bool lock = false;
+    assert(actor_table_lockout(&T, 3, &lock) && lock);            /* still pressed */
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 2000)
+           == ACTOR_REFUSED_LOCKOUT);
+    actor_pair_state_t ps;
+    assert(actor_table_pair_state(&T, 3, ACT_IRRIGATION_OPEN, 2000, &ps));
+    assert(ps.activations_this_hour == 1);                        /* still spent */
+}
+
+/* The other half of actor_persist_sync()'s ordering contract: a device
+ * declared for the FIRST time has no key yet, so merging at that moment
+ * must not write its empty live guards over the saved rows that are about
+ * to be restored into it. */
+static void test_merge_before_key_is_set_cannot_erase_saved_rows(void)
+{
+    /* An image holding a configured, locked-out device. */
+    actor_guard_row_t img[ACTOR_GUARD_ROWS_MAX];
+    memset(img, 0, sizeof img);
+    memcpy(img[0].key, KEY_A, ACTOR_DEVICE_KEY_LEN);
+    img[0].action_id = ACT_IRRIGATION_OPEN;
+    img[0].lockout = true;
+    img[0].cooldown_s = 600;
+    img[0].max_per_hour = 4;
+    img[0].window_count = 4;
+
+    /* The device is declared this boot but its key is not set yet -- the
+     * exact instant actor_persist_sync() runs. */
+    actor_table_init(&T);
+    assert(actor_table_add(&T, 3, ACT_IRRIGATION_OPEN, 300, 0x00));
+    assert(actor_table_add(&T, 3, ACT_SWITCH_OFF, 0, 0x00));
+
+    size_t n = actor_table_guard_merge(&T, img, 1, ACTOR_GUARD_ROWS_MAX);
+    assert(n == 1);                       /* the keyless device contributed nothing */
+    assert(img[0].lockout);               /* and erased nothing */
+    assert(img[0].window_count == 4);
+
+    /* Now the key is set and the restore runs, as in note_actor_device(). */
+    actor_table_set_key(&T, 3, KEY_A);
+    assert(actor_table_guard_apply(&T, 3, &img[0], /*now_s*/ 10));
+    bool lock = false;
+    assert(actor_table_lockout(&T, 3, &lock) && lock);
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_MANUAL, 10)
+           == ACTOR_REFUSED_COOLDOWN);
+}
+
 /* End to end, the sequence the hub actually performs: configure guards,
  * spend some budget, serialise, "reboot" (a fresh table), re-declare, and
  * restore. */
@@ -456,6 +555,8 @@ int main(void)
     test_apply_restores_config_and_does_not_refund_the_budget();
     test_apply_of_a_never_fired_row_leaves_clocks_at_zero();
     test_apply_rejects_an_undeclared_pair_or_device();
+    test_merge_before_restore_keeps_a_lockout_the_image_predates();
+    test_merge_before_key_is_set_cannot_erase_saved_rows();
     test_reboot_round_trip();
     printf("test_actor_persist: OK (sizeof(actor_guard_row_t)=%u, image=%u B, file<=%u B)\n",
            (unsigned)sizeof(actor_guard_row_t),
