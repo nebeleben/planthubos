@@ -87,7 +87,7 @@ jobs:
           # -- sdkconfig.defaults first, the region overlay second so it
           # wins on the one key they share (CONFIG_PLANTHUB_WIFI_COUNTRY);
           # IDF still auto-appends each listed file's own
-          # "<file>.<target>" variant (e.g. sdkconfig.defaults.esp32) on top
+          # "<file>.<target>" variant (e.g. sdkconfig.defaults.esp32c5) on top
           # of that, unchanged from the pre-region build.
           idf.py -B "build_${{ matrix.chip }}_${{ matrix.region }}" \
                  -D SDKCONFIG="build_${{ matrix.chip }}_${{ matrix.region }}/sdkconfig" \
@@ -96,9 +96,10 @@ jobs:
           # Size report: the partition-size check line ("planthub.bin binary
           # size ... free") lands in the job summary so per-chip headroom is
           # one click away on every release. The tracked risk is now the
-          # 4 MB esp32c5 leg, which had 106 KB free (6%) at M6a and will
+          # 4 MB esp32c5 leg, which had ~114 KiB free (6%) at M6a and will
           # overflow its 1792K slot within a milestone or two -- see the
-          # roadmap spec section 9. The 16 MB esp32c6 has about 2.45 MB.
+          # roadmap spec section 9. The 16 MB esp32c6 has ≈2.4 MiB free
+          # today, ≈2.0 MiB with Zigbee.
           echo '### ${{ matrix.chip }} (${{ matrix.region }})' >> "$GITHUB_STEP_SUMMARY"
           grep -o 'planthub.bin binary size.*' build.log >> "$GITHUB_STEP_SUMMARY" || echo 'size line not found' >> "$GITHUB_STEP_SUMMARY"
 
@@ -112,7 +113,7 @@ jobs:
           # affects app.bin's embedded Kconfig value, not these three) --
           # their filenames deliberately carry no region suffix. Emitting
           # them from every region leg would make two same-chip legs upload
-          # identically-named files (e.g. bootloader-esp32.bin from both the
+          # identically-named files (e.g. bootloader-esp32c6.bin from both the
           # eu and us legs); the release job's merge-multiple download
           # writes all artifacts into one flat directory, so that would
           # collide. Emit them from exactly one region per chip (eu) instead.

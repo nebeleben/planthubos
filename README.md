@@ -25,7 +25,15 @@ join its setup WiFi once, and it quietly watches your plants for you:
 
 Grab the latest firmware from the
 [Releases](https://github.com/nebeleben/planthubos/releases) page and flash
-it to an ESP32-C6 or ESP32-C5 board.
+it to an **ESP32-C6 with 16 MB of flash** (for example a DevKitC-1 carrying an
+ESP32-C6-WROOM-1-**N16** module) or an ESP32-C5 board.
+
+> **The C6 build requires the full 16 MB.** Plenty of C6 devkits ship 8 MB or
+> 4 MB parts, and flashing this image to one *appears* to work — every file
+> lands below `0x1D0000` and esptool reports success — but the bootloader then
+> refuses to start it on every boot, because the image declares a flash size
+> larger than the chip. Check first with `esptool --port <your-port> flash_id`
+> and look for `Detected flash size: 16MB`.
 
 ### Which download?
 

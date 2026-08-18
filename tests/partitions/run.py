@@ -88,7 +88,13 @@ def check(name, flash_size, expected_end):
                 return "FAIL %s: %s starts at %#x, expected %#x (app partition, first 64K boundary at or after %s's end %#x)" % (
                     name, curr_name, curr_offset, expected_offset, prev_name, prev_end)
         else:
-            # Data partitions must start immediately after previous partition
+            # Data partitions must start immediately after previous partition.
+            # This is a deliberate house rule stricter than ESP-IDF's own
+            # requirement (ESP-IDF only requires 4K alignment for data
+            # partitions), so that an unintended gap in the table cannot pass
+            # this check. App partitions are the sole exception, handled in
+            # the branch above, because ESP-IDF itself requires them to start
+            # on a 64K boundary.
             if curr_offset != prev_end:
                 return "FAIL %s: %s starts at %#x, expected %#x (data partition must start where %s ends)" % (
                     name, curr_name, curr_offset, prev_end, prev_name)

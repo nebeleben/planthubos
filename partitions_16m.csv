@@ -3,8 +3,16 @@
 #
 # Sized to end the 4 MB era, not to postpone it: a Zigbee coordinator was
 # measured at 413 KB marginal (M6a spec section 1) against 1600K app slots
-# that the C6 image already overflows. 4096K slots leave ~2.45 MB free with
-# Zigbee in, so M6b, M7 and M8 do not re-open this file.
+# that the C6 image already overflows. 4096K slots leave ≈2.4 MiB free today,
+# ≈2.0 MiB with Zigbee in, so M6b, M7 and M8 do not re-open this file.
+#
+# That "do not re-open" is affordability, not immutability: the region
+# below app0 is packed to the byte with no reserve, which is only free to do
+# while nothing has shipped -- V2 is still pre-release (v2.0.0-beta.N) and
+# no C6 is in the field yet. Any layout change wanted for M6b (a larger
+# zb_storage, for instance) must land before v2.0.0 tags, not after; once a
+# device is out there running this table, re-laying it out becomes the
+# expensive kind of change.
 #
 # zb_storage/zb_fct are provisioned EMPTY and unused until M6b. They are
 # here now because partitions_c5.csv's own comment records the trap: that

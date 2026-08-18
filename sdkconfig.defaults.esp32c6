@@ -1,0 +1,13 @@
+# Auto-applied on top of sdkconfig.defaults when IDF_TARGET=esp32c6.
+#
+# Core dumps land in the `coredump` partition that partitions_16m.csv
+# provisions (60K). This is deliberately NOT in the shared defaults: the 4 MB
+# partitions_c5.csv has no coredump partition and no room to add one, so
+# enabling this globally would fail the C5 build at the partition check.
+#
+# This project's recurring failure mode is memory -- heap exhaustion and stack
+# overflow have each cost a milestone -- and until M6a there was no partition
+# to write a post-mortem into. The ELF format is what `idf.py coredump-info`
+# and `idf.py coredump-debug` consume directly.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y

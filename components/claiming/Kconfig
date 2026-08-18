@@ -23,8 +23,10 @@ config PLANTHUB_FACTORY_RESET_GPIO
         BOOT reset an ESP32-C3 node -- GPIO0 is simply not wired to a
         button there, so the only documented recovery path did nothing at
         all on what was then the primary target. That chip was dropped in
-        M6a; the lesson was not, which is why the C6 value above is
-        confirmed on hardware rather than assumed. Change this only for a
-        custom board whose button is on some other pin.
+        M6a; the lesson was not, which is why the C6 value above has to be
+        verified by actually holding the pin on a devkit before any
+        release ships. GPIO9 is the ESP32-C6-DevKitC-1's BOOT button on
+        paper -- and paper is exactly what was wrong last time. Change
+        this only for a custom board whose button is on some other pin.
 
 endmenu
