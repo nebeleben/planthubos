@@ -93,6 +93,7 @@ int main(void)
     torn[0].rule_id = 11;
     torn[0].level = 0;
     snprintf(torn[0].msg, sizeof(torn[0].msg), "valid1");
+    torn[0].crc = event_record_crc(&torn[0]);   /* hand-built: must set crc itself */
 
     /* torn write: bogus huge seq + invalid level (>1) -- must be zeroed */
     torn[1].seq = 0xFFFFFFFFu;
@@ -114,6 +115,7 @@ int main(void)
     torn[3].rule_id = 14;
     torn[3].level = 1;
     snprintf(torn[3].msg, sizeof(torn[3].msg), "valid4");
+    torn[3].crc = event_record_crc(&torn[3]);   /* hand-built: must set crc itself */
 
     event_ring_sanitize(torn);
     assert(torn[0].seq == 1);

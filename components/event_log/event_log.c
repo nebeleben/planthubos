@@ -10,6 +10,18 @@
 static const char *TAG = "event_log";
 #define EVENTS_PATH "/storage/events.bin"
 
+/* On-disk format marker, written as a 4-byte header before the raw slot
+ * array. M5b Task 5 changed event_t's layout (added `crc`, shortened
+ * `msg`) without changing sizeof(event_t) (still 132 B) -- so a length
+ * check on the file can't tell an old-format file from a current one, and
+ * reinterpreting old bytes under the new layout would read stale message
+ * bytes as a bogus crc field. Bumped whenever event_t's on-disk layout
+ * changes. The event log is a rolling diagnostic feed, not durable state
+ * anyone depends on, so on a mismatch (or a missing/short file) we discard
+ * rather than try to migrate. */
+#define EVENT_LOG_FORMAT_MAGIC ((uint32_t)0x45563032u) /* "EV02" */
+#define EVENT_LOG_HEADER_SIZE  (sizeof(uint32_t))
+
 static event_t s_slots[EVENT_SLOTS];
 static event_ring_t s_ring;
 static SemaphoreHandle_t s_mutex;
@@ -29,11 +41,31 @@ void event_log_init(void)
 
     memset(s_slots, 0, sizeof(s_slots));
     FILE *f = fopen(EVENTS_PATH, "rb");
+    bool format_ok = false;
     if (f) {
-        /* A missing or short file just leaves the tail zeroed (empty
-         * slots, seq 0) -- fread returning short is not an error here. */
-        fread(s_slots, sizeof(event_t), EVENT_SLOTS, f);
+        uint32_t magic = 0;
+        if (fread(&magic, sizeof(magic), 1, f) == 1 && magic == EVENT_LOG_FORMAT_MAGIC) {
+            /* A short read here just leaves the tail zeroed (empty slots,
+             * seq 0) -- fread returning short is not an error. */
+            fread(s_slots, sizeof(event_t), EVENT_SLOTS, f);
+            format_ok = true;
+        }
         fclose(f);
+    }
+    if (!format_ok) {
+        /* Missing, unreadable, or an old-format file (see
+         * EVENT_LOG_FORMAT_MAGIC above) -- start empty and rewrite the
+         * header now so every later event_log_append() (which assumes the
+         * header is already there) finds a current-format file. */
+        if (f) ESP_LOGW(TAG, "%s: format changed, discarding old records", EVENTS_PATH);
+        FILE *wf = fopen(EVENTS_PATH, "wb");
+        if (wf) {
+            uint32_t magic = EVENT_LOG_FORMAT_MAGIC;
+            fwrite(&magic, sizeof(magic), 1, wf);
+            fclose(wf);
+        } else {
+            ESP_LOGW(TAG, "failed to reset %s to current format (errno=%d)", EVENTS_PATH, errno);
+        }
     }
     /* A torn write (unclean power loss mid-record) can leave a slot with
      * garbage -- including a bogus seq that event_ring_init would
@@ -66,17 +98,25 @@ uint32_t event_log_append(uint8_t level, uint32_t rule_id, const char *msg)
          * just un-persisted for this one event.
          *
          * Because seq assigns idx = (seq-1) % EVENT_SLOTS sequentially
-         * (0,1,2,...,EVENT_SLOTS-1,0,1,...), the ENOENT/create path can
-         * now only ever be taken on the very first append ever made
-         * (idx 0) -- every append after that finds an existing file whose
-         * size already covers its target offset (append grows the file by
-         * exactly one record each time, and a wrap rewrites an offset
-         * already inside the file). So there's no sparse/short-file gap
-         * to worry about here. */
+         * (0,1,2,...,EVENT_SLOTS-1,0,1,...), and event_log_init() already
+         * (re)wrote the format header if needed, the ENOENT/create path
+         * below should only ever fire if the file was removed out from
+         * under us after init -- every append after the first finds an
+         * existing file whose size already covers its target offset
+         * (append grows the file by exactly one record each time, and a
+         * wrap rewrites an offset already inside the file). So there's no
+         * sparse/short-file gap to worry about here; EVENT_LOG_HEADER_SIZE
+         * shifts every record offset past the format-magic header written
+         * by event_log_init() (or, on this fallback path, right here). */
         FILE *f = fopen(EVENTS_PATH, "r+b");
-        if (!f && errno == ENOENT) f = fopen(EVENTS_PATH, "w+b");
+        bool created = false;
+        if (!f && errno == ENOENT) { f = fopen(EVENTS_PATH, "w+b"); created = true; }
         if (f) {
-            if (fseek(f, (long)(idx * sizeof(event_t)), SEEK_SET) == 0) {
+            if (created) {
+                uint32_t magic = EVENT_LOG_FORMAT_MAGIC;
+                fwrite(&magic, sizeof(magic), 1, f);
+            }
+            if (fseek(f, (long)(EVENT_LOG_HEADER_SIZE + idx * sizeof(event_t)), SEEK_SET) == 0) {
                 if (fwrite(&written, sizeof(event_t), 1, f) != 1) {
                     ESP_LOGW(TAG, "event %u: short write", (unsigned)seq);
                 } else {

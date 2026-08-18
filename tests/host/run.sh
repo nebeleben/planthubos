@@ -98,6 +98,10 @@ $CC -Wall -Wextra -Werror -I../../components/event_log/include \
     test_event_ring.c ../../components/event_log/event_ring.c -o test_event_ring
 ./test_event_ring
 
+$CC -Wall -Wextra -Werror -I../../components/event_log/include \
+    test_event_integrity.c ../../components/event_log/event_ring.c -o test_event_integrity
+./test_event_integrity
+
 $CC -Wall -Wextra -Werror -I../../components/capability/include \
     test_capability.c ../../components/capability/capability.c -o test_capability -lm
 ./test_capability

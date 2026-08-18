@@ -34,6 +34,7 @@
  * of from a call-chain estimate. */
 #include "rules_internal.h"
 #include "event_log.h"
+#include "alert.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -402,6 +403,11 @@ static void engine_task(void *arg)
     for (;;) {
         EventBits_t bits = xEventGroupWaitBits(s_events, VALUE_UPDATE_BIT | PERIODIC_BIT,
                                                pdTRUE, pdFALSE, portMAX_DELAY);
+        /* Drain the alert ring before evaluating: this task is the only one
+         * sized for event_log_append's LittleFS + SSE/MQTT chain (see
+         * alert.h and this file's header comment), so it is the only safe
+         * place to turn a queued alert_post() into a persisted event. */
+        alert_drain();
         if (bits & VALUE_UPDATE_BIT) {
             /* Debounce (brief step 3): collapse a burst of sensor updates
              * into one evaluation pass. Re-clear VALUE_UPDATE_BIT after the
