@@ -208,6 +208,15 @@ $CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/a
     ../../components/actions/action.c -o test_pending_close
 ./test_pending_close
 
+# Guard persistence across a reboot (M5b whole-branch review, ruling
+# FINAL-persist): the wire format in actor_persist.c plus the merge/apply
+# decisions in actor_table.c, which are one mechanism and are tested as one.
+$CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/actions/include \
+    test_actor_persist.c ../../components/actors/actor_persist.c \
+    ../../components/actors/actor_table.c ../../components/actions/action.c \
+    -o test_actor_persist
+./test_actor_persist
+
 # The pure ring/collapsing decision behind alert_post() (M5b Task 11).
 $CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/actions/include \
     test_alert_ring.c ../../components/actors/alert_ring.c -o test_alert_ring

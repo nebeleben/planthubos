@@ -240,6 +240,29 @@ bool     actor_action_flags(int dev_idx, uint8_t action_id, uint8_t *flags_out);
 bool     actor_pair_state(int dev_idx, uint8_t action_id, actor_pair_state_t *out);
 bool     actor_lockout(int dev_idx, bool *out);
 
+/* ---------------------------------------------------------------------
+ * Whole-branch review, ruling FINAL-persist: the lock-taking half of guard
+ * persistence. actor_persist.c owns the file and calls these; the table
+ * itself is reached only through them, the same discipline every other
+ * accessor in this header is held to.
+ * --------------------------------------------------------------------- */
+
+/* Records `dev_idx`'s stable identity (actor_table.h's ACTOR_DEVICE_KEY_LEN
+ * device_id_t bytes) so its guards can be persisted and found again after a
+ * reboot. Called by whoever declares the device as an actuator. */
+void     actor_set_device_key(int dev_idx, const uint8_t key[ACTOR_DEVICE_KEY_LEN]);
+
+/* Test-and-clear: has anything the guard file records changed since the
+ * last call? Set by actor_configure_guards(), actor_set_lockout(),
+ * actor_undeclare() and by every dispatch that charges an activation. */
+bool     actor_guards_take_dirty(void);
+
+/* actor_table_guard_merge() / actor_table_guard_apply() under the lock.
+ * See their contracts in actor_table.h -- including, for apply(), what the
+ * restored uptime timestamps are taken to mean. */
+size_t   actor_guards_merge(actor_guard_row_t *rows, size_t n, size_t cap);
+bool     actor_guards_apply(int dev_idx, const actor_guard_row_t *row);
+
 /* The single door onto an actuator (spec section 3). Calls
  * actor_request_decide() under lock; on refusal (guard OR a full queue),
  * posts a named alert and returns false. On success -- including when

@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "action.h"
 
@@ -17,6 +18,22 @@
 
 #define ACTOR_MAX_DEVICES 4
 #define ACTOR_MAX_ACTIONS 4
+
+/* A device's STABLE identity, as opposed to its registry index. Exactly
+ * sizeof(device_id_t) (capability.h: `{ uint8_t kind; uint8_t addr[8]; }`),
+ * carried here as opaque bytes so this module keeps no dependency on the
+ * registry -- the caller that declares an actuator supplies it
+ * (actor_table_set_key()).
+ *
+ * It exists because a registry index is NOT stable across a reboot: the
+ * registry is RAM-only (data_core.c's `static registry_t s_registry`) and
+ * slots are claimed in discovery order, so the valve that was device 2
+ * yesterday may be device 0 today. Anything persisted to flash and matched
+ * back to a device after a restart must therefore key on this, never on
+ * dev_idx -- see actor_persist.h. All-zero means "no key set", which is not
+ * a real device_id_t (kind 0 with an all-zero address is not a device this
+ * hub can address) and marks a row that must not be persisted. */
+#define ACTOR_DEVICE_KEY_LEN 9
 
 typedef enum {
     ACTOR_SRC_RULE = 0,
@@ -84,6 +101,12 @@ _Static_assert(sizeof(actor_slot_t) == 16, "spec section 8 budgets 16 B per (dev
 typedef struct {
     int          dev_idx;
     bool         lockout;
+    /* Whole-branch review, ruling FINAL-persist: the stable identity this
+     * row's guards are persisted under. Placed here, between two fields
+     * that already leave three bytes of alignment padding before
+     * `actions` needs 4-byte alignment, so it costs 8 B per device row
+     * (72 -> 80 B), 32 B across the table. */
+    uint8_t      key[ACTOR_DEVICE_KEY_LEN];
     actor_slot_t actions[ACTOR_MAX_ACTIONS];
 } actor_device_t;
 
@@ -273,3 +296,115 @@ bool actor_table_pair_state(const actor_table_t *t, int dev_idx, uint8_t action_
  * declared actions at all -- same not-declared contract as every other
  * accessor here. */
 bool actor_table_lockout(const actor_table_t *t, int dev_idx, bool *out);
+
+/* ---------------------------------------------------------------------
+ * Whole-branch review, ruling FINAL-persist: guards across a reboot.
+ *
+ * This table was RAM-only, so after an OTA, a brownout or a power cycle
+ * the operator's LOCKOUT came up OFF, every cooldown came up 0 and every
+ * hourly cap came up unlimited -- and ble_collector.c sets s_actors_wired
+ * long before an operator could re-set any of them, so the first sensor
+ * update could fire a rule into an unlocked actuator. A reboot LOOP reset
+ * the flood counter every cycle, which directly negates spec section
+ * 4.2's "max 4 opens per hour means the valve opens at most four times".
+ *
+ * The primitives below are the pure half; actor_persist.h owns the file.
+ * --------------------------------------------------------------------- */
+
+/* Records the stable identity of an already-declared device. A no-op when
+ * dev_idx is negative or not declared, or when `key` is NULL. Called once
+ * per device by whoever declares it (ble_collector.c), from the same
+ * advertisement that resolved the registry index. */
+void actor_table_set_key(actor_table_t *t, int dev_idx,
+                          const uint8_t key[ACTOR_DEVICE_KEY_LEN]);
+
+/* One persisted (device, action) pair: the guard CONFIG an operator set
+ * plus the guard STATE that says how much of the budget is already spent.
+ * 24 B, and ACTOR_MAX_DEVICES * ACTOR_MAX_ACTIONS (16) of them is the most
+ * that can ever exist.
+ *
+ * `lockout` is device-level (actor_device_t), replicated into every one of
+ * that device's rows: the rows are always written from one snapshot, so
+ * they cannot disagree, and it saves a second nested record type in the
+ * file -- which this milestone's own review history says is the right
+ * trade (a flat, exact-length record is what the validator can be trusted
+ * about).
+ *
+ * `window_start_s` and `last_fire_s` are UPTIME seconds (actor_now_s()),
+ * so they are meaningless across a restart -- uptime restarts at zero.
+ * They are written faithfully so the file is a true record of the state at
+ * save time, and deliberately RE-BASED, never believed, on load: see
+ * actor_table_guard_apply(). */
+typedef struct {
+    uint32_t window_start_s;
+    uint32_t last_fire_s;
+    uint16_t cooldown_s;
+    uint8_t  key[ACTOR_DEVICE_KEY_LEN];
+    uint8_t  action_id;
+    uint8_t  max_per_hour;
+    uint8_t  window_count;
+    bool     lockout;
+} actor_guard_row_t;
+_Static_assert(sizeof(actor_guard_row_t) == 24,
+               "ruling FINAL-persist budgets 24 B per persisted guard row");
+
+#define ACTOR_GUARD_ROWS_MAX (ACTOR_MAX_DEVICES * ACTOR_MAX_ACTIONS)
+
+/* Folds the live table into `rows` -- the image last written to flash --
+ * IN PLACE, and returns the new row count. Pure: no clock, no I/O.
+ *
+ * Three rules, in this order:
+ *
+ *   1. A row whose key belongs to a device that IS declared right now, for
+ *      an action that device no longer declares, is dropped. (The wrapper's
+ *      action block changed, or actor_table_remove() ran.)
+ *   2. Every declared pair with a key is written over the row with the
+ *      same (key, action_id), or into a free slot, or -- only when `cap` is
+ *      exhausted -- over the first row whose key belongs to NO currently
+ *      declared device. A live pair therefore always gets a slot: `cap` is
+ *      ACTOR_GUARD_ROWS_MAX, which is exactly the number of pairs that can
+ *      be live at once, so an eviction candidate provably exists whenever
+ *      one is needed.
+ *   3. Every OTHER row is left exactly as it was. This is the load-bearing
+ *      one: a valve that has not advertised since the last boot is not
+ *      declared, and its operator's lockout must not be erased from flash
+ *      just because some other device fired. A device that never comes
+ *      back keeps its row until rule 2 needs the slot.
+ *
+ * Rule 3 covers actor_table_remove() too, and deliberately: removing a
+ * device empties its LIVE guards (that function's own contract) but leaves
+ * its persisted ones, so reinstalling the wrapper an operator deleted
+ * gives them their lockout and cooldown back rather than silently
+ * unlocking the valve. Rows for devices that never return are bounded by
+ * rule 2's eviction, so they cannot accumulate.
+ *
+ * A declared device with no key (actor_table_set_key() never called) is
+ * skipped by rules 1 and 2 alike -- there is nothing to match it back to
+ * after a reboot, so persisting it would be worse than not. */
+size_t actor_table_guard_merge(const actor_table_t *t, actor_guard_row_t *rows,
+                                size_t n, size_t cap);
+
+/* Applies one restored row to an already-declared pair. Returns false
+ * (changing nothing) when dev_idx is negative, the device is not declared,
+ * or it does not declare row->action_id.
+ *
+ * THE TIMESTAMP DECISION, stated here because it is a safety choice and
+ * not an implementation detail: `window_start_s` and `last_fire_s` are
+ * uptime, and uptime restarts, so the file's values cannot be used as
+ * clock readings. Both are set to `now_s` -- the instant of the restore --
+ * while `window_count` is restored VERBATIM. That means:
+ *
+ *   - the hourly budget is NOT refunded by a reboot. A valve that has
+ *     spent 4 of 4 opens comes back having spent 4 of 4.
+ *   - the restored window is treated as still open, and stays open for a
+ *     full ACTOR_WINDOW_S from the restore. That is the most restrictive
+ *     honest reading: the alternative (crediting the elapsed time recorded
+ *     before the reboot) would hand back budget on evidence a crashed hub
+ *     cannot vouch for, and a reboot loop is exactly the case where that
+ *     matters.
+ *   - the cooldown likewise restarts in full rather than resuming.
+ *
+ * Both errors are in the direction of refusing a command that might have
+ * been allowed, never of allowing one that should have been refused. */
+bool actor_table_guard_apply(actor_table_t *t, int dev_idx,
+                              const actor_guard_row_t *row, uint32_t now_s);

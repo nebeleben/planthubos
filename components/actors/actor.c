@@ -211,6 +211,24 @@ static actor_table_t       s_table;
 static actor_queue_t       s_queue;
 static actor_dispatch_fn_t s_dispatch;
 
+/* Whole-branch review, ruling FINAL-persist: set whenever anything the
+ * guard file records has changed, read-and-cleared by
+ * actor_guards_take_dirty(). A flag rather than a write, because the
+ * producers include the httpd task and flash belongs to adv_decoder_task
+ * -- the same deferral shape the switch.state write and the pending-close
+ * outcome already use.
+ *
+ * Unlike this tree's other cross-task flags, this one is set and cleared
+ * INSIDE the actor mutex, not after releasing it. Those flags are
+ * single-producer/single-consumer stores; this is a read-modify-write
+ * (take_dirty reads then clears), so a producer landing between the two
+ * would silently lose an update -- and the update it would lose is an
+ * operator's lockout or a spent activation. Every setter below already
+ * holds the lock at that point, so this costs nothing. (The mutex is a
+ * real FreeRTOS mutex, not the portMUX spinlock alert.c must stay out of;
+ * a plain store inside it is unremarkable.) 1 B of static. */
+static bool s_guards_dirty;
+
 #ifdef ESP_PLATFORM
 
 static StaticSemaphore_t s_lock_buf;
@@ -262,6 +280,7 @@ bool actor_configure_guards(int dev_idx, uint8_t action_id,
 {
     actor_lock();
     bool ok = actor_table_set_guards(&s_table, dev_idx, action_id, cooldown_s, max_per_hour);
+    if (ok) s_guards_dirty = true;
     actor_unlock();
     return ok;
 }
@@ -270,13 +289,55 @@ void actor_set_lockout(int dev_idx, bool on)
 {
     actor_lock();
     actor_table_set_lockout(&s_table, dev_idx, on);
+    /* Unconditional: actor_table_set_lockout() returns nothing, and this
+     * is the operator's stop button -- an extra file write is a far better
+     * error than a stop button that a power cycle un-presses. */
+    s_guards_dirty = true;
     actor_unlock();
+}
+
+void actor_set_device_key(int dev_idx, const uint8_t key[ACTOR_DEVICE_KEY_LEN])
+{
+    actor_lock();
+    actor_table_set_key(&s_table, dev_idx, key);
+    actor_unlock();
+    /* Deliberately does NOT mark dirty. Learning a device's identity
+     * changes nothing an operator configured, and the caller
+     * (ble_collector.c) sets the key on the way IN to
+     * actor_persist_restore_device() -- marking dirty here would schedule
+     * a save of guards that have not been restored yet. */
+}
+
+bool actor_guards_take_dirty(void)
+{
+    actor_lock();
+    bool was = s_guards_dirty;
+    s_guards_dirty = false;
+    actor_unlock();
+    return was;
+}
+
+size_t actor_guards_merge(actor_guard_row_t *rows, size_t n, size_t cap)
+{
+    actor_lock();
+    size_t out = actor_table_guard_merge(&s_table, rows, n, cap);
+    actor_unlock();
+    return out;
+}
+
+bool actor_guards_apply(int dev_idx, const actor_guard_row_t *row)
+{
+    actor_lock();
+    bool ok = actor_table_guard_apply(&s_table, dev_idx, row, actor_now_s());
+    actor_unlock();
+    return ok;
 }
 
 bool actor_undeclare(int dev_idx)
 {
     actor_lock();
     bool removed = actor_table_remove(&s_table, dev_idx);
+    if (removed) s_guards_dirty = true;
     actor_unlock();
     /* Any command for this device still sitting in the queue is left where
      * it is on purpose: actor_service_step() re-runs actor_table_check()
@@ -385,6 +446,12 @@ void actor_service(void)
 
     actor_lock();
     actor_service_result_t r = actor_service_step(&s_table, &s_queue, now_s);
+    /* actor_service_step() has just charged this activation against the
+     * hourly window (actor_table_record()), and that counter has to be
+     * durable at the moment it is SPENT -- a crash between the fire and
+     * the write refunds it, which is the reboot-loop hole ruling
+     * FINAL-persist exists to close. */
+    if (r.dispatched) s_guards_dirty = true;
     actor_unlock();
 
     if (r.ttl_dropped > 0) {

@@ -14,6 +14,7 @@
 #include "gatt_engine.h"
 #include "gatt_sched.h"
 #include "actor.h"
+#include "actor_persist.h"
 #include "alert.h"
 #include "event_log.h"
 #include "esp_log.h"
@@ -446,6 +447,13 @@ static void decode_bthome_item(const uint8_t *data, size_t len, const uint8_t ga
 
 /* ---------------- M5b actuators: binding, dispatch, completion ---------- */
 
+/* Ruling FINAL-persist: the actor table's opaque device key IS a
+ * device_id_t, and note_actor_device() below hands one over by address.
+ * Pinned here so a change to either definition is a build failure rather
+ * than a guard file keyed on the wrong number of bytes. */
+_Static_assert(sizeof(device_id_t) == ACTOR_DEVICE_KEY_LEN,
+               "the actor table's device key is a device_id_t");
+
 /* Reports a command that never reached the radio through the SAME path a
  * radio failure takes, so "every failure is visible" holds for the half of
  * the path that happens before the connection as well as after it. Declared
@@ -510,6 +518,35 @@ static void note_actor_device(int idx, uint16_t wrapper_id, const adv_item_t *it
                      idx, (unsigned)acts[i].action_id);
         }
     }
+
+    /* Whole-branch review, ruling FINAL-persist: this device's guards --
+     * the operator's lockout, the cooldown, the hourly cap and how much of
+     * that cap is already spent -- come back from flash HERE, in the same
+     * call that declared the actions, keyed on the device's stable
+     * identity rather than on its registry index (which the RAM-only
+     * registry hands out in discovery order and so does not preserve
+     * across a reboot).
+     *
+     * The placement is the point: actor_table_check() refuses any command
+     * for a pair it does not know, so until the loop above ran nothing
+     * could be commanded at all, and by the time this function returns the
+     * guards are back. The only gap is a rules-task actor_request() landing
+     * between the two, and actor_service_step()'s dispatch-time re-check
+     * (Task 7 fix round 1) re-evaluates every guard before that command can
+     * actually fire -- by which point this has completed, on this task.
+     *
+     * item->mac is raw GAP/on-air order and device_id_from_mac() takes
+     * display order, so it is reversed here -- the same reversal
+     * decode_adv_item() does for its own device_id_t. Recomputed rather
+     * than passed in so this function stays callable from both of that
+     * function's two dispatch paths without either having to remember to
+     * hand it over. */
+    uint8_t akey_mac[6];
+    for (int i = 0; i < 6; i++) akey_mac[i] = item->mac[5 - i];
+    device_id_t akey = device_id_from_mac(DEV_KIND_BLE, akey_mac);
+    actor_set_device_key(idx, (const uint8_t *)&akey);
+    actor_persist_restore_device(idx, (const uint8_t *)&akey);
+
     ESP_LOGI(TAG, "device %d bound as an actuator: %u action(s) from wrapper %u",
              idx, (unsigned)n, (unsigned)wrapper_id);
 }
@@ -1230,6 +1267,14 @@ static void adv_decoder_task(void *arg)
         service_pending_close_defer();
         pending_close_service();
 
+        /* Ruling FINAL-persist: the guard file's only writer. A flag test
+         * when nothing has changed, and the reason a guard change arriving
+         * on the httpd task never touches flash from there. Outside the
+         * s_actors_wired gate for the same reason pending_close_service()
+         * is: it takes no radio, and a node that somehow holds guard state
+         * should still be able to flush it. */
+        actor_persist_service();
+
         if (s_actors_wired) {
             service_command_requeue();
             if (!gatt_engine_cmd_busy() && !battery_poll_busy()) actor_service();
@@ -1419,6 +1464,11 @@ esp_err_t ble_collector_start(void)
      * real registry index. */
     actor_init();
     for (int i = 0; i < ACTOR_MAX_DEVICES; i++) s_actor_conn[i].dev_idx = -1;
+    /* Whole-branch review, ruling FINAL-persist: reads the guard file into
+     * RAM. After actor_init() (which zeroes the table this restores INTO)
+     * and before adv_decoder_task exists, so no device can be declared --
+     * and so no restore attempted -- until the image is loaded. */
+    actor_persist_init();
     /* M5b Task 9: pending-close persistence and boot replay. After
      * actor_init() (the table pending_close_service()'s actor_request()
      * calls check against must already be initialised, even though it is

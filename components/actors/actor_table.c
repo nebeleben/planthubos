@@ -1,6 +1,7 @@
 #include "actor_table.h"
 #include "action.h"
 #include <stddef.h>
+#include <string.h>
 
 #define ACTOR_WINDOW_S 3600u
 
@@ -51,6 +52,7 @@ void actor_table_init(actor_table_t *t)
     for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
         t->devices[i].dev_idx = -1;
         t->devices[i].lockout = false;
+        memset(t->devices[i].key, 0, ACTOR_DEVICE_KEY_LEN);
         for (int j = 0; j < ACTOR_MAX_ACTIONS; j++) {
             actor_slot_t *s = &t->devices[i].actions[j];
             s->action_id = ACTION_NONE;
@@ -84,6 +86,7 @@ bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id,
         if (!row) { t->full_drops++; return false; }
         row->dev_idx = dev_idx;
         row->lockout = false;
+        memset(row->key, 0, ACTOR_DEVICE_KEY_LEN);
         for (int j = 0; j < ACTOR_MAX_ACTIONS; j++) row->actions[j].action_id = ACTION_NONE;
     }
 
@@ -243,6 +246,7 @@ bool actor_table_remove(actor_table_t *t, int dev_idx)
      * deliberately not touched. */
     row->dev_idx = -1;
     row->lockout = false;
+    memset(row->key, 0, ACTOR_DEVICE_KEY_LEN);
     for (int j = 0; j < ACTOR_MAX_ACTIONS; j++) {
         actor_slot_t *s = &row->actions[j];
         s->action_id = ACTION_NONE;
@@ -340,5 +344,148 @@ bool actor_table_lockout(const actor_table_t *t, int dev_idx, bool *out)
     if (!row) return false;
 
     if (out) *out = row->lockout;
+    return true;
+}
+
+/* ---------------------------------------------------------------------
+ * Whole-branch review, ruling FINAL-persist: the pure half of guard
+ * persistence. actor_persist.c owns the bytes and the file; everything
+ * that DECIDES anything lives here, where a host test runs it directly.
+ * --------------------------------------------------------------------- */
+
+/* All-zero is the "no key" sentinel (actor_table.h): it is not a real
+ * device_id_t, and a row carrying it can never be matched back to a device
+ * after a reboot, so it must never be persisted. */
+static bool key_is_set(const uint8_t key[ACTOR_DEVICE_KEY_LEN])
+{
+    for (int i = 0; i < ACTOR_DEVICE_KEY_LEN; i++)
+        if (key[i] != 0) return true;
+    return false;
+}
+
+static bool key_equal(const uint8_t a[ACTOR_DEVICE_KEY_LEN],
+                       const uint8_t b[ACTOR_DEVICE_KEY_LEN])
+{
+    return memcmp(a, b, ACTOR_DEVICE_KEY_LEN) == 0;
+}
+
+/* The declared device carrying `key`, or NULL. Only rows with a key set
+ * can match, so the sentinel can never alias a real device. */
+static const actor_device_t *find_row_by_key(const actor_table_t *t,
+                                              const uint8_t key[ACTOR_DEVICE_KEY_LEN])
+{
+    for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
+        const actor_device_t *row = &t->devices[i];
+        if (row->dev_idx < 0 || !key_is_set(row->key)) continue;
+        if (key_equal(row->key, key)) return row;
+    }
+    return NULL;
+}
+
+static bool row_declares_action(const actor_device_t *row, uint8_t action_id)
+{
+    for (int i = 0; i < ACTOR_MAX_ACTIONS; i++)
+        if (row->actions[i].action_id == action_id) return true;
+    return false;
+}
+
+void actor_table_set_key(actor_table_t *t, int dev_idx,
+                          const uint8_t key[ACTOR_DEVICE_KEY_LEN])
+{
+    if (dev_idx < 0 || key == NULL) return;
+    actor_device_t *row = find_row(t, dev_idx);
+    if (row) memcpy(row->key, key, ACTOR_DEVICE_KEY_LEN);
+}
+
+size_t actor_table_guard_merge(const actor_table_t *t, actor_guard_row_t *rows,
+                                size_t n, size_t cap)
+{
+    if (rows == NULL || cap == 0) return 0;
+    if (n > cap) n = cap;
+
+    /* Rule 1: drop rows belonging to a device that IS declared right now
+     * but no longer declares that action. Compacted in place, order of the
+     * survivors preserved (nothing depends on it, but a stable file is
+     * easier to diff by hand when something goes wrong on a rig). */
+    size_t w = 0;
+    for (size_t r = 0; r < n; r++) {
+        const actor_device_t *live = find_row_by_key(t, rows[r].key);
+        if (live != NULL && !row_declares_action(live, rows[r].action_id)) continue;
+        if (w != r) rows[w] = rows[r];
+        w++;
+    }
+    n = w;
+
+    /* Rule 2: write every live pair in. */
+    for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
+        const actor_device_t *dev = &t->devices[i];
+        if (dev->dev_idx < 0 || !key_is_set(dev->key)) continue;
+
+        for (int j = 0; j < ACTOR_MAX_ACTIONS; j++) {
+            const actor_slot_t *slot = &dev->actions[j];
+            if (slot->action_id == ACTION_NONE) continue;
+
+            size_t at = n;   /* n == "append" until proven otherwise */
+            for (size_t r = 0; r < n; r++) {
+                if (rows[r].action_id == slot->action_id && key_equal(rows[r].key, dev->key)) {
+                    at = r;
+                    break;
+                }
+            }
+            if (at == n && n >= cap) {
+                /* Full: evict the first row that belongs to no currently
+                 * declared device. One provably exists -- cap is
+                 * ACTOR_GUARD_ROWS_MAX, the exact number of pairs that can
+                 * be declared at once, so a full table with a live pair
+                 * still unwritten must contain at least one stale row. */
+                for (size_t r = 0; r < n; r++) {
+                    if (find_row_by_key(t, rows[r].key) == NULL) { at = r; break; }
+                }
+                if (at == n) continue;   /* unreachable by the argument above */
+            }
+
+            memcpy(rows[at].key, dev->key, ACTOR_DEVICE_KEY_LEN);
+            rows[at].action_id = slot->action_id;
+            rows[at].lockout = dev->lockout;
+            rows[at].cooldown_s = slot->cooldown_s;
+            rows[at].max_per_hour = slot->max_per_hour;
+            rows[at].window_count = slot->window_count;
+            rows[at].window_start_s = slot->window_start_s;
+            rows[at].last_fire_s = slot->last_fire_s;
+            if (at == n) n++;
+        }
+    }
+
+    /* Rule 3 needs no code: anything not touched above is still where it
+     * was, which is the whole point. */
+    return n;
+}
+
+bool actor_table_guard_apply(actor_table_t *t, int dev_idx,
+                              const actor_guard_row_t *row, uint32_t now_s)
+{
+    if (dev_idx < 0 || row == NULL) return false;
+
+    actor_device_t *dev = find_row(t, dev_idx);
+    if (!dev) return false;
+    actor_slot_t *slot = find_slot(dev, row->action_id);
+    if (!slot) return false;
+
+    slot->cooldown_s = row->cooldown_s;
+    slot->max_per_hour = row->max_per_hour;
+    slot->window_count = row->window_count;
+    /* See actor_table_guard_apply()'s doc comment for why the file's own
+     * timestamps are re-based rather than believed. window_count == 0 is
+     * "never fired", and both the cooldown check and window_still_open()
+     * already treat it that way, so leaving the clocks at 0 there keeps
+     * the restored slot byte-identical to a freshly declared one. */
+    if (row->window_count > 0) {
+        slot->window_start_s = now_s;
+        slot->last_fire_s = now_s;
+    } else {
+        slot->window_start_s = 0;
+        slot->last_fire_s = 0;
+    }
+    dev->lockout = row->lockout;
     return true;
 }
