@@ -55,12 +55,31 @@ static void pending_close_save(void);
 
 static pending_close_t s_table[PENDING_CLOSE_MAX];
 
+/* Fix round 2: how long (in consecutive DEFERRED outcomes, each
+ * PENDING_CLOSE_UNKNOWN_RECHECK_S apart) each row has been continuously
+ * unable to reach a known device, and whether the one-shot
+ * PENDING_CLOSE_STEP_DEFERRED_TIMEOUT alert has already fired for the
+ * CURRENT streak. Parallel arrays, not fields on pending_close_t: this is
+ * pure RAM/session bookkeeping, never serialized -- a reboot restarts the
+ * streak at 0 exactly like it restarts `retries`, which is correct (boot
+ * replay is its own fresh attempt, not a continuation of a pre-reboot
+ * silence). Indexed identically to s_table; reset alongside it. */
+static uint8_t s_deferred_streak[PENDING_CLOSE_MAX];
+static bool    s_deferred_alerted[PENDING_CLOSE_MAX];
+
 /* Sentinel deadline for a record that has reached
  * PENDING_CLOSE_STEP_EXHAUSTED: pending_close_due() will never again treat
  * it as due (this boot), without removing it from the table or touching
  * the file. actor_now_s() reaching this value would need ~136 years of
  * uptime -- not a practical wraparound concern. */
 #define PENDING_CLOSE_GIVEN_UP 0xFFFFFFFFu
+
+/* PENDING_CLOSE_DEFERRED_ALERT_S expressed in recheck cycles -- exact
+ * (120 / 5 == 24) so there is no rounding to reason about. uint8_t is
+ * plenty (24 fits many times over) but the streak counter itself saturates
+ * rather than wraps, below, so a change to either constant stays safe. */
+#define PENDING_CLOSE_DEFERRED_ALERT_STREAK \
+    (PENDING_CLOSE_DEFERRED_ALERT_S / PENDING_CLOSE_UNKNOWN_RECHECK_S)
 
 static int table_find(int dev_idx)
 {
@@ -83,6 +102,11 @@ static void table_upsert(int dev_idx, uint8_t close_action, uint32_t deadline_s,
     s_table[i].close_action = close_action;
     s_table[i].deadline_s = deadline_s;
     s_table[i].retries = retries;
+    /* A (re)armed obligation is a FRESH obligation -- fix round 2: the
+     * unreachable streak and its one-shot alert restart with it, exactly
+     * like `retries` already does two lines up. */
+    s_deferred_streak[i] = 0;
+    s_deferred_alerted[i] = false;
 }
 
 static void table_remove(int dev_idx)
@@ -93,6 +117,8 @@ static void table_remove(int dev_idx)
     s_table[i].close_action = 0;
     s_table[i].deadline_s = 0;
     s_table[i].retries = 0;
+    s_deferred_streak[i] = 0;
+    s_deferred_alerted[i] = false;
 }
 
 static void table_reset(void)
@@ -102,6 +128,8 @@ static void table_reset(void)
         s_table[i].close_action = 0;
         s_table[i].deadline_s = 0;
         s_table[i].retries = 0;
+        s_deferred_streak[i] = 0;
+        s_deferred_alerted[i] = false;
     }
 }
 
@@ -174,11 +202,36 @@ pending_close_step_t pending_close_step(int dev_idx, uint32_t now_s, bool device
          * (fix round 1, finding 2's first ruling). */
         s_table[i].deadline_s = now_s + PENDING_CLOSE_UNKNOWN_RECHECK_S;
         if (out) *out = s_table[i];
+
+        /* Fix round 2: fix round 1's own ruling above, combined with
+         * EXHAUSTED never firing for a device that is never rediscovered,
+         * reproduced exactly the silence the exhaustion alert exists to
+         * prevent -- "the hub isn't ready yet" and "this device is gone
+         * for good" are indistinguishable from here, so a permanently
+         * unreachable device stayed silent forever. Break it once, without
+         * touching the retry budget or the file: count consecutive
+         * DEFERRED outcomes (saturating, not wrapping, so a change to
+         * PENDING_CLOSE_DEFERRED_ALERT_STREAK stays safe either way), and
+         * on the FIRST check at or past the threshold, signal the caller
+         * to alert -- then latch s_deferred_alerted so every later check
+         * in the SAME streak returns ordinary DEFERRED again. The streak
+         * (and the latch) reset to 0 on table_upsert() (a fresh arm) and
+         * on PENDING_CLOSE_STEP_REQUEST below (the device WAS reached), so
+         * this is "once per continuous unreachable streak", never a
+         * repeating alarm that could churn the 8-entry alert ring. */
+        if (s_deferred_streak[i] < 0xFFu) s_deferred_streak[i]++;
+        if (!s_deferred_alerted[i] && s_deferred_streak[i] >= PENDING_CLOSE_DEFERRED_ALERT_STREAK) {
+            s_deferred_alerted[i] = true;
+            return PENDING_CLOSE_STEP_DEFERRED_TIMEOUT;
+        }
         return PENDING_CLOSE_STEP_DEFERRED;
     }
 
     s_table[i].retries++;
     s_table[i].deadline_s = now_s + backoff_s(s_table[i].retries);
+    s_deferred_streak[i] = 0;    /* the device WAS reached -- the silence this
+                                   * guards against is over for this streak */
+    s_deferred_alerted[i] = false;
     if (out) *out = s_table[i];
     return PENDING_CLOSE_STEP_REQUEST;
 }
@@ -418,6 +471,16 @@ void pending_close_service(void)
              * clear the record (fix round 1, finding 2): the file already
              * holds this obligation, and it stays there for the next boot. */
             alert_post(EVENT_LEVEL_CRITICAL, ALERT_CODE_CLOSE_UNCONFIRMED,
+                       out.dev_idx, out.close_action, out.retries);
+            break;
+        case PENDING_CLOSE_STEP_DEFERRED_TIMEOUT:
+            /* Fix round 2: never been able to try at all, for
+             * PENDING_CLOSE_DEFERRED_ALERT_S -- a weaker claim than
+             * EXHAUSTED's "tried and the device refused", so ALERT rather
+             * than CRITICAL. pending_close_step() has already latched this
+             * as one-shot for the current unreachable streak; nothing else
+             * to do here but post it. */
+            alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_CLOSE_DEVICE_UNREACHABLE,
                        out.dev_idx, out.close_action, out.retries);
             break;
         case PENDING_CLOSE_STEP_DEFERRED:

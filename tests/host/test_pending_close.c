@@ -276,6 +276,109 @@ static void test_step_no_record_returns_none(void) {
     assert(pending_close_step(42, 0, true, &out) == PENDING_CLOSE_STEP_NONE);
 }
 
+/* Fix round 2: fix round 1's own combination of rulings -- never spend the
+ * retry budget on an unreachable device, never alert until the budget is
+ * spent -- reproduced exactly the silence the exhaustion alert exists to
+ * prevent. A device that is NEVER rediscovered must still break that
+ * silence once, without ever spending the retry budget, clearing, or
+ * exhausting. */
+static void test_step_deferred_timeout_alerts_once_keeps_obligation_never_exhausts(void) {
+    pending_close_init();
+    pending_close_arm(1, ACT_SWITCH_OFF, 100);
+    uint32_t now = 100;
+    pending_close_t out;
+    uint32_t threshold = PENDING_CLOSE_DEFERRED_ALERT_S / PENDING_CLOSE_UNKNOWN_RECHECK_S;
+
+    /* Every check before the threshold is ordinary DEFERRED. */
+    for (uint32_t i = 0; i + 1 < threshold; i++) {
+        assert(pending_close_due(now, &out) == 1);
+        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        assert(out.retries == 0);
+        now = out.deadline_s;
+    }
+
+    /* The threshold-th consecutive DEFERRED fires the alert exactly once. */
+    assert(pending_close_due(now, &out) == 1);
+    assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED_TIMEOUT);
+    assert(out.retries == 0); /* still never spent */
+    now = out.deadline_s;
+
+    /* Every check after that, for as long as it stays unreachable, is
+     * ordinary DEFERRED again -- once per streak, never a repeating alarm
+     * (an 8-entry alert ring would churn under one). */
+    for (int i = 0; i < 50; i++) {
+        assert(pending_close_due(now, &out) == 1);
+        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        assert(out.retries == 0);
+        now = out.deadline_s;
+    }
+
+    /* Still one obligation, still due, still never exhausted or cleared. */
+    assert(pending_close_active_count() == 1);
+    assert(pending_close_due(now, &out) == 1);
+    assert(out.dev_idx == 1 && out.retries == 0);
+}
+
+/* The streak (and its one-shot latch) must be a property of the CURRENT
+ * unreachable run, not of the device's whole lifetime: once a real attempt
+ * happens, a later unreachable run must be able to alert again. */
+static void test_step_deferred_timeout_resets_when_device_becomes_known(void) {
+    pending_close_init();
+    pending_close_arm(1, ACT_SWITCH_OFF, 0);
+    uint32_t now = 0;
+    pending_close_t out;
+    uint32_t threshold = PENDING_CLOSE_DEFERRED_ALERT_S / PENDING_CLOSE_UNKNOWN_RECHECK_S;
+
+    for (uint32_t i = 0; i + 1 < threshold; i++) {
+        assert(pending_close_due(now, &out) == 1);
+        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        now = out.deadline_s;
+    }
+
+    /* One check short of the alert, the device is finally reached -- a
+     * real attempt, which resets the streak (pending_close_step()'s own
+     * doc comment on PENDING_CLOSE_STEP_REQUEST). */
+    assert(pending_close_due(now, &out) == 1);
+    assert(pending_close_step(1, now, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+    now = out.deadline_s;
+
+    /* If it goes unreachable again afterwards, the FULL threshold must be
+     * crossed again before it alerts -- proving the reset was real, not
+     * merely "the same countdown, delayed by one". */
+    for (uint32_t i = 0; i + 1 < threshold; i++) {
+        assert(pending_close_due(now, &out) == 1);
+        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        now = out.deadline_s;
+    }
+    assert(pending_close_due(now, &out) == 1);
+    assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED_TIMEOUT);
+}
+
+/* A device that reopens (a fresh arm) gets a fresh streak too -- the same
+ * "fresh obligation, fresh everything" rule test_rearm_replaces_and_resets_retries
+ * already pins for `retries`. */
+static void test_step_deferred_timeout_resets_on_rearm(void) {
+    pending_close_init();
+    pending_close_arm(1, ACT_SWITCH_OFF, 0);
+    uint32_t now = 0;
+    pending_close_t out;
+    uint32_t threshold = PENDING_CLOSE_DEFERRED_ALERT_S / PENDING_CLOSE_UNKNOWN_RECHECK_S;
+
+    for (uint32_t i = 0; i + 1 < threshold; i++) {
+        assert(pending_close_due(now, &out) == 1);
+        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        now = out.deadline_s;
+    }
+    assert(pending_close_due(now, &out) == 1);
+    assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED_TIMEOUT);
+    now = out.deadline_s;
+
+    /* Device opens again: a brand new obligation. */
+    pending_close_arm(1, ACT_SWITCH_OFF, now);
+    assert(pending_close_due(now, &out) == 1);
+    assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+}
+
 /* ---------------------------------------------------------------------
  * pending_close_needed(): fix round 1, finding 6 -- the arm decision moved
  * out of ble_collector.c's GATT completion path into pure, testable code.
@@ -366,6 +469,9 @@ int main(void) {
     test_step_unknown_device_does_not_consume_retry();
     test_step_exhaustion_follows_final_backoff_not_synchronous();
     test_step_no_record_returns_none();
+    test_step_deferred_timeout_alerts_once_keeps_obligation_never_exhausts();
+    test_step_deferred_timeout_resets_when_device_becomes_known();
+    test_step_deferred_timeout_resets_on_rearm();
     test_needed_true_for_timed_action_without_device_local();
     test_needed_false_when_device_local_flag_set();
     test_needed_false_for_parameterless_action();

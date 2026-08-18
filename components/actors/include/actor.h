@@ -329,6 +329,43 @@ void actor_service(void);
                                                        * does NOT count
                                                        * against the retry
                                                        * budget above */
+#define PENDING_CLOSE_DEFERRED_ALERT_S  120u          /* fix round 2: how long
+                                                       * a record may stay
+                                                       * continuously DEFERRED
+                                                       * (never once reaching
+                                                       * a known device) before
+                                                       * it is loud about it --
+                                                       * see pending_close_step()'s
+                                                       * PENDING_CLOSE_STEP_DEFERRED_TIMEOUT.
+                                                       * 120 s = 24 recheck
+                                                       * cycles at
+                                                       * PENDING_CLOSE_UNKNOWN_RECHECK_S:
+                                                       * comfortably longer than
+                                                       * any plausible
+                                                       * rediscovery (BLE
+                                                       * advertisement/scan
+                                                       * intervals in this
+                                                       * codebase are
+                                                       * sub-second to a few
+                                                       * seconds; even the
+                                                       * boot-time "device not
+                                                       * scanned yet" window is
+                                                       * bounded by
+                                                       * CONFIG_PLANTHUB_BLE_SCAN_ITVL/WINDOW,
+                                                       * milliseconds), short
+                                                       * enough that an
+                                                       * operator who left a
+                                                       * valve open next to an
+                                                       * unreachable device
+                                                       * finds out within two
+                                                       * minutes rather than
+                                                       * discovering it only
+                                                       * at PENDING_CLOSE_MAX_RETRIES'
+                                                       * exhaustion -- which,
+                                                       * per this ruling, never
+                                                       * even happens for a
+                                                       * device that stays
+                                                       * unreachable. */
 
 typedef struct {
     int8_t   dev_idx;
@@ -386,6 +423,41 @@ int    pending_close_due(uint32_t now_s, pending_close_t *out);
  *                                    PENDING_CLOSE_UNKNOWN_RECHECK_S
  *                                    ahead; `retries` is UNCHANGED --
  *                                    this does not spend the budget below.
+ *                                    The unreachable-streak counter behind
+ *                                    this (see fix round 2 below) advances.
+ *
+ *   PENDING_CLOSE_STEP_DEFERRED_TIMEOUT -- fix round 2: identical to
+ *                                    PENDING_CLOSE_STEP_DEFERRED (same
+ *                                    reschedule, `retries` still unchanged)
+ *                                    EXCEPT this is the FIRST due-check at
+ *                                    or past PENDING_CLOSE_DEFERRED_ALERT_S
+ *                                    of continuous, unbroken DEFERRED
+ *                                    outcomes for this record since it was
+ *                                    (re)armed or boot-loaded. Fix round 1's
+ *                                    own ruling (never spend the retry
+ *                                    budget on "hub not ready") combined
+ *                                    with the exhaustion ruling (never
+ *                                    alert until retries are spent)
+ *                                    produced exactly the silence both
+ *                                    rulings existed to prevent: a device
+ *                                    that never comes back stayed DEFERRED
+ *                                    forever and NEVER alerted. This breaks
+ *                                    that silence without touching either
+ *                                    ruling: the retry budget is still
+ *                                    untouched, the obligation still never
+ *                                    exhausts or clears on its own -- the
+ *                                    CALLER must alert EVENT_LEVEL_ALERT
+ *                                    (not CRITICAL: "never been able to try"
+ *                                    is a weaker claim than "tried and the
+ *                                    device refused") for *out, exactly
+ *                                    ONCE per continuous unreachable streak
+ *                                    -- this function returns ordinary
+ *                                    DEFERRED for every check after this one
+ *                                    until the streak is broken (a REQUEST,
+ *                                    or a fresh arm) and, if it never is,
+ *                                    resumes again. Never touches the file
+ *                                    or the retry budget; this function
+ *                                    never calls alert_post() itself.
  *
  *   PENDING_CLOSE_STEP_REQUEST   -- device_known is true and retries are
  *                                    still under PENDING_CLOSE_MAX_RETRIES:
@@ -394,7 +466,11 @@ int    pending_close_due(uint32_t now_s, pending_close_t *out);
  *                                    exponential backoff. The CALLER must
  *                                    now call actor_request() for *out --
  *                                    this function never does (it has no
- *                                    ESP-IDF dependency).
+ *                                    ESP-IDF dependency). The unreachable
+ *                                    streak resets to 0 -- the device was
+ *                                    reached, so the silence this guards
+ *                                    against is over (a real refusal from
+ *                                    here on is EXHAUSTED's job, below).
  *
  *   PENDING_CLOSE_STEP_EXHAUSTED -- retries were ALREADY at
  *                                    PENDING_CLOSE_MAX_RETRIES on entry, so
@@ -417,15 +493,15 @@ int    pending_close_due(uint32_t now_s, pending_close_t *out);
  *                                    *out; this function never calls
  *                                    alert_post() itself.
  *
- * A device that is never rediscovered for the rest of this boot session
- * therefore keeps returning DEFERRED forever, at PENDING_CLOSE_UNKNOWN_RECHECK_S
- * intervals, and never reaches EXHAUSTED or alerts -- recorded as a known
- * consequence of the ruling above, not a bug: "not yet ready" and "gone for
- * good" are indistinguishable from here, and the ruling picks the reading
- * that does not waste a bounded retry budget on hub startup timing. */
+ * Fix round 1's own note that a device never rediscovered "stays DEFERRED
+ * forever ... and never alerts" is now stale: it still stays DEFERRED
+ * forever (the retry budget is still never spent on it, and it still never
+ * exhausts or clears), but PENDING_CLOSE_STEP_DEFERRED_TIMEOUT fires once,
+ * comfortably before an operator would otherwise have no way to know. */
 typedef enum {
     PENDING_CLOSE_STEP_NONE = 0,
     PENDING_CLOSE_STEP_DEFERRED,
+    PENDING_CLOSE_STEP_DEFERRED_TIMEOUT,
     PENDING_CLOSE_STEP_REQUEST,
     PENDING_CLOSE_STEP_EXHAUSTED,
 } pending_close_step_t;
@@ -497,8 +573,12 @@ size_t pending_close_deserialize(const uint8_t *buf, size_t len, pending_close_t
  * on PENDING_CLOSE_STEP_REQUEST calls actor_request(..., ACTOR_SRC_SAFETY,
  * ...) -- the same door, exempt from every rate-shaping guard
  * (actor_table.h) -- or on PENDING_CLOSE_STEP_EXHAUSTED posts
- * EVENT_LEVEL_CRITICAL/ALERT_CODE_CLOSE_UNCONFIRMED. Never clears on
- * exhaustion (see pending_close_step()'s doc comment). */
+ * EVENT_LEVEL_CRITICAL/ALERT_CODE_CLOSE_UNCONFIRMED, or (fix round 2) on
+ * PENDING_CLOSE_STEP_DEFERRED_TIMEOUT posts
+ * EVENT_LEVEL_ALERT/ALERT_CODE_CLOSE_DEVICE_UNREACHABLE. Never clears on
+ * exhaustion, and PENDING_CLOSE_STEP_DEFERRED_TIMEOUT never touches the
+ * record beyond what ordinary DEFERRED already does (see
+ * pending_close_step()'s doc comment). */
 void   pending_close_init(void);
 void   pending_close_service(void);
 

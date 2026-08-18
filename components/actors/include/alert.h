@@ -48,6 +48,14 @@ typedef enum {
                                      * enum's own comment. A command that COMPLETED
                                      * UNCONFIRMED is not this: that is an outcome with
                                      * its own policy (spec section 4.4), not a failure. */
+    ALERT_CODE_CLOSE_DEVICE_UNREACHABLE, /* a pending close (M5b Task 9) has never once
+                                     * been able to reach its device -- not "we tried and
+                                     * it refused" (that is ALERT_CODE_CLOSE_UNCONFIRMED,
+                                     * and CRITICAL), this is the weaker "we have not been
+                                     * able to try at all", posted at EVENT_LEVEL_ALERT,
+                                     * exactly once per continuous unreachable streak, so
+                                     * an actuator that opened next to a hub that can't
+                                     * yet see it doesn't stay open in total silence. */
 } alert_code_t;
 
 #define ALERT_RING_LEN 8
