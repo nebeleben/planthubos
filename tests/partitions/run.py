@@ -52,8 +52,12 @@ def check(name, flash_size, expected_end):
 
     dump = subprocess.run([sys.executable, GEN, out], capture_output=True, text=True)
     if dump.returncode != 0:
+        if os.path.exists(out):
+            os.remove(out)
         return "FAIL %s: generated table could not be read back" % name
 
+    # Parse partitions in order, checking for gaps and final boundary
+    partitions = []
     end = 0
     for line in dump.stdout.splitlines():
         if line.startswith("#") or not line.strip():
@@ -61,8 +65,24 @@ def check(name, flash_size, expected_end):
         fields = line.split(",")
         if len(fields) < 5:
             continue
-        end = max(end, int(fields[3], 0) + size_to_bytes(fields[4]))
-    os.remove(out)
+        part_name = fields[0].strip()
+        part_offset = int(fields[3], 0)
+        part_size = size_to_bytes(fields[4])
+        part_end = part_offset + part_size
+        partitions.append((part_name, part_offset, part_size, part_end))
+        end = max(end, part_end)
+
+    if os.path.exists(out):
+        os.remove(out)
+
+    # Check for gaps between consecutive partitions (allow up to 64K for alignment)
+    for i in range(1, len(partitions)):
+        prev_name, prev_offset, prev_size, prev_end = partitions[i-1]
+        curr_name, curr_offset, curr_size, curr_end = partitions[i]
+        gap = curr_offset - prev_end
+        if gap > 0x10000:  # Larger than 64K alignment boundary
+            return "FAIL %s: gap between %s and %s — %s ends at %#x, %s starts at %#x" % (
+                name, prev_name, curr_name, prev_name, prev_end, curr_name, curr_offset)
 
     if end != expected_end:
         return "FAIL %s: table ends at %#x, expected exactly %#x (%s)" % (
