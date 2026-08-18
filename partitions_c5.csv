@@ -1,12 +1,20 @@
-# ESP32-C5 layout (V2): bigger app slots, smaller storage.
-# The C5 image will carry the Zigbee stack and already carries dual-band
-# WiFi blobs -- 1600K slots left only 2% headroom at v1.0.0. 0x20000 +
-# 2*0x1C0000 + 0x60000 ends exactly at the 4MB boundary. esp32/esp32c3
-# keep partitions.csv (V1 layout) so deployed V1 devices can web-OTA into
-# V2 images.
-# NOT Zigbee-ready yet: the stack needs dedicated zb_storage/zb_fct data
-# partitions this table does not have, so M6 must re-layout (not append --
-# the table already ends at 4MB). Ground truth: the coex spike findings,
+# ESP32-C5 layout (V2): bigger app slots, smaller storage. 4 MB part.
+# This table already carries dual-band WiFi blobs -- 1600K slots left only
+# 2% headroom at v1.0.0. 0x20000 + 2*0x1C0000 + 0x60000 ends exactly at the
+# 4MB boundary.
+#
+# M6a: this is now the ONLY 4 MB layout left. esp32 and esp32c3 were dropped
+# and partitions.csv (the V1 layout) was deleted with them; esp32c6 and every
+# later target use partitions_16m.csv. This table survives solely to keep the
+# C5 building as a CI leg until its 16 MB part arrives, at which point
+# sdkconfig.defaults.esp32c5's two override lines are deleted and the C5
+# inherits partitions_16m.csv like everything else.
+#
+# This table can NOT carry Zigbee. The stack needs dedicated zb_storage/
+# zb_fct data partitions this layout does not have, and it already ends at
+# 4MB, so there is nowhere to append them -- which is exactly why M6a moved
+# the hub to 16 MB rather than re-laying-out here. partitions_16m.csv
+# provisions both. Ground truth: the coex spike findings,
 # docs/superpowers/specs/2026-08-15-c5-coex-findings.md.
 # Name,    Type, SubType,  Offset,   Size
 nvs,       data, nvs,      0x9000,   24K

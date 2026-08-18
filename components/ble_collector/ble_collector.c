@@ -1506,8 +1506,9 @@ esp_err_t ble_collector_start(void)
     /* M3 Task 5: wire the arena's loader to the real flash reader before
      * anything can call wrapper_arena_get() (adv_decoder_task, once
      * created, below), then reset it to empty. Static
-     * CONFIG_PLANTHUB_WRAPPER_ARENA bytes (2048 on esp32c3, 4096 on
-     * esp32c5, spec §7). s_wrapper_memo (32 B static, M3 review fix 4 --
+     * CONFIG_PLANTHUB_WRAPPER_ARENA bytes (4096 on esp32c5 and esp32c6;
+     * 2048 is Kconfig's terminal default, spec §7). s_wrapper_memo (32 B
+     * static, M3 review fix 4 --
      * see its own declaration comment) starts all WRAPPER_MEMO_NONE --
      * memset(0xFF) is still correct at the new uint16_t width (every byte
      * of WRAPPER_MEMO_NONE=0xFFFFu is 0xFF, so filling byte-wise still
