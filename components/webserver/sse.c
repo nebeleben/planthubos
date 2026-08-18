@@ -93,6 +93,24 @@ void sse_push_event(const char *json)
 #define EVENTS_POLL_MAX 50
 static event_t s_events_poll[EVENTS_POLL_MAX];
 
+/* M5b Task 5 added EVENT_LEVEL_ALERT (2) and EVENT_LEVEL_CRITICAL (3), but
+ * this render stayed a `level == 1 ? "notify" : "log"` binary choice, so
+ * every actuator alert and every critical rendered as "log" -- an alert
+ * feed that labels a critical as "log" defeats its own purpose (M5b Task
+ * 11 carry-forward from Task 5). No `default`: a future EVENT_LEVEL_* this
+ * switch doesn't handle trips -Werror=switch here, same defensive shape as
+ * actor.c's verdict_alert(). */
+static const char *event_level_str(uint8_t level)
+{
+    switch (level) {
+    case EVENT_LEVEL_LOG:      return "log";
+    case EVENT_LEVEL_NOTIFY:   return "notify";
+    case EVENT_LEVEL_ALERT:    return "alert";
+    case EVENT_LEVEL_CRITICAL: return "critical";
+    }
+    return "log";
+}
+
 static esp_err_t events_json_get(httpd_req_t *req, uint32_t after)
 {
     size_t n = event_log_read(after, s_events_poll, EVENTS_POLL_MAX);
@@ -103,7 +121,7 @@ static esp_err_t events_json_get(httpd_req_t *req, uint32_t after)
         cJSON_AddNumberToObject(o, "seq", s_events_poll[i].seq);
         cJSON_AddNumberToObject(o, "ts", s_events_poll[i].ts);
         cJSON_AddNumberToObject(o, "rule_id", s_events_poll[i].rule_id);
-        cJSON_AddStringToObject(o, "level", s_events_poll[i].level == 1 ? "notify" : "log");
+        cJSON_AddStringToObject(o, "level", event_level_str(s_events_poll[i].level));
         cJSON_AddStringToObject(o, "msg", s_events_poll[i].msg);
         cJSON_AddItemToArray(arr, o);
     }

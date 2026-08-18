@@ -227,6 +227,19 @@ uint32_t actor_full_drops(void);
  * needs a hub-scheduled close at all. */
 bool     actor_action_flags(int dev_idx, uint8_t action_id, uint8_t *flags_out);
 
+/* Lock-taking wrappers around actor_table_pair_state()/actor_table_lockout()
+ * (actor_table.h -- M5b Task 11) -- the READ side this list was missing
+ * (see this comment's own top note: three mutating wrappers, no read
+ * accessor, because nothing needed one before the HTTP API did). The
+ * httpd task (GET /api/v1/devices' actions[], Task 11) is the intended
+ * caller; both take the identical mutex actor_request()/actor_service()
+ * use, so a read here can never race a concurrent actor_table_check()/
+ * actor_table_record() and observe a half-written slot. See
+ * actor_table_pair_state()'s doc comment for exactly what each field of
+ * actor_pair_state_t means. */
+bool     actor_pair_state(int dev_idx, uint8_t action_id, actor_pair_state_t *out);
+bool     actor_lockout(int dev_idx, bool *out);
+
 /* The single door onto an actuator (spec section 3). Calls
  * actor_request_decide() under lock; on refusal (guard OR a full queue),
  * posts a named alert and returns false. On success -- including when

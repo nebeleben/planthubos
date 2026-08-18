@@ -198,3 +198,78 @@ uint32_t actor_table_full_drops(const actor_table_t *t);
  * pair is not declared, exactly like actor_table_set_guards()'s contract. */
 bool actor_table_action_flags(const actor_table_t *t, int dev_idx, uint8_t action_id,
                                uint8_t *flags_out);
+
+/* ---------------------------------------------------------------------
+ * M5b Task 11: read-only accessors for the HTTP API. Task 7 fix round 1
+ * (finding 4) deliberately removed the one thing that would have made
+ * these trivial -- a raw actor_table_get() pointer -- because handing the
+ * httpd task an unlocked pointer let it race the actor task inside
+ * actor_table_check() (a torn read of a slot mid-actor_table_record()
+ * write). These stay read-only and are always called through actor.c's
+ * lock-taking wrappers (actor_pair_state()/actor_lockout()), the same
+ * discipline actor_declare()/actor_configure_guards()/actor_set_lockout()
+ * already hold callers to.
+ * --------------------------------------------------------------------- */
+
+/* Everything the API's per-action JSON needs about one declared pair, in
+ * one snapshot so a single lock/unlock produces a consistent read (rather
+ * than the caller re-taking the lock once per field and possibly
+ * observing a guard change land in between).
+ *
+ *   param_max              the EFFECTIVE bound (actor_table_add()'s own
+ *                           min(wrapper, firmware) contract) -- what
+ *                           actor_table_check() actually enforces, not
+ *                           action.h's raw ceiling.
+ *   activations_this_hour  window_count iff the current hourly window is
+ *                           still open (window_still_open(), actor_table.c
+ *                           -- the exact same test actor_table_check()'s
+ *                           own rate guard uses, so the two can never
+ *                           disagree about whether a count is stale), 0
+ *                           otherwise.
+ *   has_fired/last_fire_s  whether this pair has EVER recorded a fire (not
+ *                           just within the current window) and, iff so,
+ *                           when -- window_count > 0 doubles for "ever
+ *                           fired" exactly as actor_table_check()'s own
+ *                           cooldown check already relies on.
+ *   live_verdict           what actor_table_check() would return RIGHT
+ *                           NOW for a MANUAL invocation of this pair,
+ *                           computed using this slot's own param_max as
+ *                           the synthetic parameter -- action_param_ok()
+ *                           always accepts a slot's own effective bound
+ *                           (0 when the action takes no parameter, the
+ *                           bound itself otherwise), so BOUND can never
+ *                           spuriously appear here. Lockout never appears
+ *                           either: it refuses RULE only (actor_table.h's
+ *                           module contract) and permits MANUAL, which is
+ *                           exactly what this reports -- the JSON's
+ *                           separate "lockout" field is what tells an
+ *                           operator a device is stopped; this field
+ *                           tells them whether THEIR press would go
+ *                           through right now. Only ACTOR_OK,
+ *                           ACTOR_REFUSED_COOLDOWN or ACTOR_REFUSED_RATE
+ *                           are possible outcomes. */
+typedef struct {
+    uint16_t        param_max;
+    uint16_t        cooldown_s;
+    uint8_t         max_per_hour;
+    uint8_t         activations_this_hour;
+    bool            has_fired;
+    uint32_t        last_fire_s;
+    actor_verdict_t live_verdict;
+} actor_pair_state_t;
+
+/* Returns false (leaves *out untouched) when dev_idx is negative or the
+ * pair is not declared -- same not-declared contract as
+ * actor_table_action_flags(). `t` is const: this never writes, unlike
+ * actor_table_check() (which takes a mutable pointer only because its
+ * find_row()/find_slot() helpers are shared with the mutating calls in
+ * this file). */
+bool actor_table_pair_state(const actor_table_t *t, int dev_idx, uint8_t action_id,
+                             uint32_t now_s, actor_pair_state_t *out);
+
+/* Read-only device-level lockout (the operator's stop button,
+ * actor_table_check()'s own comment) for the HTTP API. Returns false
+ * (leaves *out untouched) when dev_idx is negative or the device has no
+ * declared actions at all -- same not-declared contract as every other
+ * accessor here. */
+bool actor_table_lockout(const actor_table_t *t, int dev_idx, bool *out);

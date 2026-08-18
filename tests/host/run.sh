@@ -207,3 +207,8 @@ $CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/a
     test_pending_close.c ../../components/actors/pending_close.c \
     ../../components/actions/action.c -o test_pending_close
 ./test_pending_close
+
+# The pure ring/collapsing decision behind alert_post() (M5b Task 11).
+$CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/actions/include \
+    test_alert_ring.c ../../components/actors/alert_ring.c -o test_alert_ring
+./test_alert_ring

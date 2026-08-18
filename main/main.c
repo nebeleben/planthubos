@@ -49,6 +49,24 @@ extern void mqtt_pub_event(const char *json);
  * single event. Rule name comes from rules_list() keyed by the event's
  * rule_id; a rule deleted after logging (or, defensively, rule_id 0) falls
  * back to "rule <id>" rather than dropping the push. */
+/* M5b Task 5 added EVENT_LEVEL_ALERT (2) and EVENT_LEVEL_CRITICAL (3), but
+ * this render stayed a `level == 1 ? "notify" : "log"` binary choice, so
+ * every actuator alert and every critical rendered as "log" over SSE/MQTT
+ * -- an alert feed that labels a critical as "log" defeats its own purpose
+ * (M5b Task 11 carry-forward from Task 5). Kept in lock-step with
+ * sse.c's identical event_level_str() (duplicated rather than shared: the
+ * two live in different components and this is five lines). */
+static const char *event_level_str(uint8_t level)
+{
+    switch (level) {
+    case EVENT_LEVEL_LOG:      return "log";
+    case EVENT_LEVEL_NOTIFY:   return "notify";
+    case EVENT_LEVEL_ALERT:    return "alert";
+    case EVENT_LEVEL_CRITICAL: return "critical";
+    }
+    return "log";
+}
+
 static void on_event_logged(const event_t *e)
 {
     rule_info_t infos[RULES_MAX];
@@ -67,7 +85,7 @@ static void on_event_logged(const event_t *e)
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "ts", (double)e->ts);
     cJSON_AddStringToObject(root, "rule", name);
-    cJSON_AddStringToObject(root, "level", e->level == 1 ? "notify" : "log");
+    cJSON_AddStringToObject(root, "level", event_level_str(e->level));
     cJSON_AddStringToObject(root, "msg", e->msg);
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);

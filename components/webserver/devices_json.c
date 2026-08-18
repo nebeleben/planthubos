@@ -8,6 +8,8 @@
 #include "ble_collector.h"
 #include "gatt_sched.h"
 #include "gatt_engine.h"
+#include "actor.h"
+#include "action.h"
 #include <stdio.h>
 
 /* now_uptime_s - last_seen_s, both esp_timer uptime seconds off the same
@@ -32,6 +34,35 @@ static void via_node_mac_str(char *buf, size_t buflen, const uint8_t mac[6])
 {
     snprintf(buf, buflen, "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+/* action.h's action_param_t, rendered the same way device_kind_str() above
+ * renders device_kind_t -- a string the UI can switch on directly rather
+ * than re-deriving meaning from a bare 0/1. */
+static const char *action_param_str(action_param_t p)
+{
+    switch (p) {
+    case ACTION_PARAM_NONE:       return "none";
+    case ACTION_PARAM_DURATION_S: return "duration_s";
+    }
+    return "none";
+}
+
+/* actor_table.h's actor_verdict_t, as it can appear in
+ * actor_pair_state_t.live_verdict -- see that struct's own doc comment for
+ * why only these three values are reachable here (BOUND and LOCKOUT
+ * cannot: this is always evaluated as if for a MANUAL request). */
+static const char *live_verdict_str(actor_verdict_t v)
+{
+    switch (v) {
+    case ACTOR_OK:               return "ok";
+    case ACTOR_REFUSED_UNKNOWN:  return "unknown";
+    case ACTOR_REFUSED_BOUND:    return "bound";
+    case ACTOR_REFUSED_LOCKOUT:  return "lockout";
+    case ACTOR_REFUSED_COOLDOWN: return "cooldown";
+    case ACTOR_REFUSED_RATE:     return "rate";
+    }
+    return "unknown";
 }
 
 /* Every plant that currently binds ANY capability of `id` (plants_table.h's
@@ -161,6 +192,55 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
          * that third state shows a stale last_read_s AND a last_error that
          * explains why, rather than looking contradictory. */
         cJSON_AddStringToObject(g, "last_error", gatt_engine_last_error(dev_idx));
+    }
+
+    /* M5b Task 11: the actor state and guard surface, added ONLY for a
+     * device the actor table actually declares actions for -- an ordinary
+     * sensor gets no "actions" key at all, matching "gatt" above's
+     * conditional-key convention. dev_idx < 0 (no data_core row -- see the
+     * "gatt" block above) can never resolve an actor pair either, so the
+     * loop below simply finds nothing and skips the whole key.
+     *
+     * Reads the actor table's RAM state ONLY, through actor_pair_state()/
+     * actor_lockout() (actor.h/actor_table.h, both new in this task) --
+     * never the wrapper arena. This function runs on the httpd task AND
+     * the SSE event-loop task (this file's own devices_json.h comment);
+     * M5a's whole-branch review found exactly this defect here once
+     * already (an arena eviction's memmove() racing a running
+     * psvm_run()), which is why the actor table is owned in RAM
+     * precisely so this route can read scalars instead. ACTION_COUNT (4,
+     * action.h) is the whole firmware's action vocabulary -- small enough
+     * to probe every id rather than needing a separate "which actions are
+     * declared" enumeration accessor. */
+    cJSON *actions = NULL;
+    bool lockout = false;
+    for (uint8_t aid = 0; aid < ACTION_COUNT; aid++) {
+        actor_pair_state_t ps;
+        if (!actor_pair_state(dev_idx, aid, &ps)) continue;
+        if (!actions) {
+            actions = cJSON_AddArrayToObject(o, "actions");
+            /* Device-level (actor_table.h: lockout is the operator's stop
+             * button for the WHOLE device, not per action) -- read once,
+             * the same value rendered on every entry below. */
+            actor_lockout(dev_idx, &lockout);
+        }
+        const action_t *a = action_get(aid);
+        cJSON *ao = cJSON_CreateObject();
+        cJSON_AddNumberToObject(ao, "id", aid);
+        cJSON_AddStringToObject(ao, "name", a ? a->name : "?");
+        cJSON_AddStringToObject(ao, "param", action_param_str(a ? a->param : ACTION_PARAM_NONE));
+        cJSON_AddNumberToObject(ao, "param_max", ps.param_max);
+        cJSON_AddNumberToObject(ao, "cooldown_s", ps.cooldown_s);
+        cJSON_AddNumberToObject(ao, "max_per_hour", ps.max_per_hour);
+        cJSON_AddNumberToObject(ao, "activations_this_hour", ps.activations_this_hour);
+        cJSON_AddBoolToObject(ao, "lockout", lockout);
+        if (ps.has_fired) {
+            cJSON_AddNumberToObject(ao, "last_fired_s", age_s(now_uptime_s, ps.last_fire_s));
+        } else {
+            cJSON_AddNullToObject(ao, "last_fired_s");
+        }
+        cJSON_AddStringToObject(ao, "last_result", live_verdict_str(ps.live_verdict));
+        cJSON_AddItemToArray(actions, ao);
     }
 
     return o;

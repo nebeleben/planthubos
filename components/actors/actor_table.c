@@ -30,6 +30,21 @@ static actor_slot_t *find_free_slot(actor_device_t *row)
     return find_slot(row, ACTION_NONE);
 }
 
+/* True iff `slot`'s current hourly window (opened at window_start_s) is
+ * still within ACTOR_WINDOW_S of `now_s` -- extracted (Task 11) so
+ * actor_table_check()'s own rate guard and actor_table_pair_state()'s
+ * `activations_this_hour` (below) share one answer to "is this count
+ * stale" and can never disagree. Same backward-clock-safe reasoning as
+ * the cooldown check just above its one call site: now_s < window_start_s
+ * reads as still current, not elapsed. window_count == 0 (never fired) is
+ * never "current" either way, since actor_table_record() always leaves it
+ * >= 1 once anything has fired. */
+static bool window_still_open(const actor_slot_t *slot, uint32_t now_s)
+{
+    return slot->window_count > 0 &&
+           (now_s < slot->window_start_s || (now_s - slot->window_start_s) < ACTOR_WINDOW_S);
+}
+
 void actor_table_init(actor_table_t *t)
 {
     t->full_drops = 0;
@@ -156,13 +171,7 @@ actor_verdict_t actor_table_check(actor_table_t *t, int dev_idx, uint8_t action_
         return ACTOR_REFUSED_COOLDOWN;
 
     if (slot->max_per_hour > 0) {
-        /* Same backward-clock reasoning as the cooldown check above:
-         * now_s < window_start_s is treated as still the current window,
-         * not as a freshly elapsed one. */
-        bool same_window = slot->window_count > 0 &&
-                            (now_s < slot->window_start_s ||
-                             (now_s - slot->window_start_s) < ACTOR_WINDOW_S);
-        uint8_t count = same_window ? slot->window_count : 0;
+        uint8_t count = window_still_open(slot, now_s) ? slot->window_count : 0;
         if (count >= slot->max_per_hour) return ACTOR_REFUSED_RATE;
     }
 
@@ -274,4 +283,62 @@ bool actor_table_action_flags(const actor_table_t *t, int dev_idx, uint8_t actio
         }
     }
     return false;
+}
+
+/* Const scan, shared by actor_table_pair_state()/actor_table_lockout()
+ * below -- same reasoning as actor_table_action_flags()'s own comment. */
+static const actor_device_t *find_row_const(const actor_table_t *t, int dev_idx)
+{
+    for (int i = 0; i < ACTOR_MAX_DEVICES; i++)
+        if (t->devices[i].dev_idx == dev_idx) return &t->devices[i];
+    return NULL;
+}
+
+bool actor_table_pair_state(const actor_table_t *t, int dev_idx, uint8_t action_id,
+                             uint32_t now_s, actor_pair_state_t *out)
+{
+    if (dev_idx < 0) return false;
+
+    const actor_device_t *row = find_row_const(t, dev_idx);
+    if (!row) return false;
+
+    const actor_slot_t *slot = NULL;
+    for (int i = 0; i < ACTOR_MAX_ACTIONS; i++) {
+        if (row->actions[i].action_id == action_id) { slot = &row->actions[i]; break; }
+    }
+    if (!slot) return false;
+
+    out->param_max = slot->param_max;
+    out->cooldown_s = slot->cooldown_s;
+    out->max_per_hour = slot->max_per_hour;
+    out->has_fired = slot->window_count > 0;
+    out->last_fire_s = slot->last_fire_s;
+
+    bool win_open = window_still_open(slot, now_s);
+    out->activations_this_hour = win_open ? slot->window_count : 0;
+
+    /* Mirrors actor_table_check()'s own MANUAL-source tail exactly (see
+     * this struct's doc comment in actor_table.h for why BOUND and LOCKOUT
+     * can never appear here). Order matches actor_table_check(): cooldown
+     * before rate. */
+    if (slot->cooldown_s > 0 && slot->window_count > 0 &&
+        (now_s < slot->last_fire_s || (now_s - slot->last_fire_s) < slot->cooldown_s)) {
+        out->live_verdict = ACTOR_REFUSED_COOLDOWN;
+    } else if (slot->max_per_hour > 0 && win_open && slot->window_count >= slot->max_per_hour) {
+        out->live_verdict = ACTOR_REFUSED_RATE;
+    } else {
+        out->live_verdict = ACTOR_OK;
+    }
+    return true;
+}
+
+bool actor_table_lockout(const actor_table_t *t, int dev_idx, bool *out)
+{
+    if (dev_idx < 0) return false;
+
+    const actor_device_t *row = find_row_const(t, dev_idx);
+    if (!row) return false;
+
+    if (out) *out = row->lockout;
+    return true;
 }

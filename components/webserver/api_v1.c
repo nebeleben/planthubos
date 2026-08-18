@@ -21,6 +21,8 @@
 #include "unknown_capture.h"
 #include "bthome.h"
 #include "psvm.h"
+#include "actor.h"
+#include "action.h"
 #include "cJSON.h"
 #include "mbedtls/base64.h"
 #include "esp_littlefs.h"
@@ -3297,6 +3299,288 @@ static esp_err_t unknown_get(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* actor_verdict_t rendered for the HTTP API -- the SAME vocabulary
+ * devices_json.c's live_verdict_str() uses for GET /api/v1/devices'
+ * "last_result" (a different translation unit, so duplicated rather than
+ * shared: five lines, same "duplicated rather than shared" call as
+ * main.c's event_level_str()). Kept here for devices_action_post()'s 409
+ * body and devices_guards_put() has no need of it. */
+static const char *verdict_reason_str(actor_verdict_t v)
+{
+    switch (v) {
+    case ACTOR_OK:               return "ok";
+    case ACTOR_REFUSED_UNKNOWN:  return "unknown";
+    case ACTOR_REFUSED_BOUND:    return "bound";
+    case ACTOR_REFUSED_LOCKOUT:  return "lockout";
+    case ACTOR_REFUSED_COOLDOWN: return "cooldown";
+    case ACTOR_REFUSED_RATE:     return "rate";
+    }
+    return "unknown";
+}
+
+/* Determines WHY a manual actor_request() was just refused, for the 409
+ * body -- actor_request() itself (actor.h: the ONE door onto an actuator)
+ * only returns bool; it has already posted the AUTHORITATIVE named alert
+ * for this exact refusal (the real record, in the alert feed), so this is
+ * a best-effort synchronous echo of the same reason, not a second source
+ * of truth. UNKNOWN and BOUND are exact and race-free: UNKNOWN is
+ * "dev_idx has no declared pair for this action", checked the same way
+ * actor_table_check() itself does; BOUND compares THIS request's own
+ * `param` (action_param_ok() plus the pair's real effective param_max),
+ * unlike actor_pair_state()'s live_verdict field, which is deliberately
+ * synthetic (actor_table.h: computed against the pair's OWN param_max, so
+ * it can never report BOUND). COOLDOWN/RATE fall back to that same
+ * live_verdict, queried a moment after the refusal it is reporting on
+ * (which cannot itself have changed anything -- only a successful request
+ * calls actor_table_record()) -- narrowly racy only if some OTHER source
+ * fires the same pair in between, the same order-of-magnitude caveat
+ * actor_service_step()'s own dispatch-time re-check documents. LOCKOUT is
+ * unreachable here by construction: it refuses RULE only, never MANUAL
+ * (actor_table.h's module contract), so a manual refusal can only ever be
+ * UNKNOWN, BOUND, COOLDOWN or RATE. */
+static const char *manual_refusal_reason(int dev_idx, uint8_t action_id, uint16_t param)
+{
+    actor_pair_state_t ps;
+    if (dev_idx < 0 || !actor_pair_state(dev_idx, action_id, &ps)) return "unknown";
+    if (!action_param_ok(action_id, param) || param > ps.param_max) return "bound";
+    return verdict_reason_str(ps.live_verdict); /* ok, cooldown or rate */
+}
+
+/* Manual invocation's deadline offset (actor_now_s()-scale, actor.h): the
+ * same order of magnitude as rules_engine.c's ACTOR_RULE_TTL_S -- generous
+ * over actor_service()'s poll cadence while still bounding how stale a
+ * manually-pressed command can be by the time it actually reaches the
+ * radio. A manual press faces the identical door and the identical TTL
+ * reasoning a rule's CALL_ACTION does; there is no reason for the two to
+ * differ. */
+#define ACTOR_MANUAL_TTL_S 30u
+
+/* Parses "{id}/actions/{action}" (`want_guards_suffix` false, POST manual
+ * invocation) or "{id}/actions/{action}/guards" (`want_guards_suffix`
+ * true, PUT guard config) out of `tail` (already advanced past
+ * "/api/v1/devices/"). A query string is stripped first, same as
+ * devices_post_dispatch()'s existing "/key" suffix parsing just below.
+ * Returns false (nothing else touched) when `tail` doesn't match this
+ * shape at all -- including an action segment containing a further '/'
+ * when `want_guards_suffix` is false, which is what would happen if a
+ * ".../guards" PUT-only URL were POSTed instead; true, with *idbuf/
+ * *action_buf filled in and NUL-terminated, when it does. Device-id and
+ * action-name VALIDITY (device_id_parse()/action_by_name()) is the
+ * caller's job, same split devices_post_dispatch()'s "/key" path already
+ * uses between shape-matching here and content-parsing there. */
+static bool parse_device_action_path(const char *tail, bool want_guards_suffix,
+                                      char *idbuf, size_t idbuf_cap,
+                                      char *action_buf, size_t action_buf_cap)
+{
+    size_t taillen = strcspn(tail, "?");
+    char scratch[80];
+    if (taillen == 0 || taillen >= sizeof(scratch)) return false;
+    memcpy(scratch, tail, taillen);
+    scratch[taillen] = '\0';
+
+    static const char marker[] = "/actions/";
+    char *mpos = strstr(scratch, marker);
+    if (!mpos) return false;
+    size_t idlen = (size_t)(mpos - scratch);
+    if (idlen == 0 || idlen >= idbuf_cap) return false;
+
+    char *action_start = mpos + (sizeof(marker) - 1);
+    char *action_end;
+    if (want_guards_suffix) {
+        static const char gsuffix[] = "/guards";
+        size_t glen = sizeof(gsuffix) - 1;
+        size_t alen_total = strlen(action_start);
+        if (alen_total <= glen || strcmp(action_start + alen_total - glen, gsuffix) != 0) return false;
+        action_end = action_start + (alen_total - glen);
+    } else {
+        if (strchr(action_start, '/') != NULL) return false;
+        action_end = action_start + strlen(action_start);
+    }
+    size_t action_len = (size_t)(action_end - action_start);
+    if (action_len == 0 || action_len >= action_buf_cap) return false;
+
+    memcpy(idbuf, scratch, idlen);
+    idbuf[idlen] = '\0';
+    memcpy(action_buf, action_start, action_len);
+    action_buf[action_len] = '\0';
+    return true;
+}
+
+/* POST /api/v1/devices/{id}/actions/{action} {"param":N} -- manual
+ * invocation (M5b Task 11, design spec §7). Goes through actor_request()
+ * and NOTHING else (actor.h: the ONE door onto an actuator) -- a manual
+ * press faces the identical guards a rule or a safety close does, and a
+ * refusal already posts its own named alert there; this handler never
+ * re-checks a guard itself. 202 Accepted on success (the command is
+ * QUEUED, not necessarily dispatched yet -- the radio may still be busy
+ * with a scheduled GATT read); 409 Conflict on refusal, naming the guard
+ * (manual_refusal_reason(), above). `param` defaults to 0 when the body
+ * omits it or is empty -- the correct value for a parameterless action; a
+ * parameterised one that actually needs a positive duration is simply
+ * refused as "bound" by actor_request(), not by this handler
+ * second-guessing it. Auth checked by devices_post_dispatch() before this
+ * is ever reached. */
+static esp_err_t devices_action_post(httpd_req_t *req, const char *idbuf, const char *action_name)
+{
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+    int dev_idx = data_core_find_index(&dev);
+
+    const action_t *a = action_by_name(action_name);
+    if (!a) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown action");
+        return ESP_OK;
+    }
+
+    uint16_t param = 0;
+    if (req->content_len > 0) {
+        char body[64];
+        if (req->content_len > sizeof(body) - 1) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+            return ESP_OK;
+        }
+        size_t received = 0;
+        while (received < req->content_len) {
+            int r = httpd_req_recv(req, body + received, req->content_len - received);
+            if (r <= 0) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+                return ESP_OK;
+            }
+            received += (size_t)r;
+        }
+        body[received] = '\0';
+
+        cJSON *json = cJSON_Parse(body);
+        const cJSON *param_j = json ? cJSON_GetObjectItem(json, "param") : NULL;
+        if (param_j && (!cJSON_IsNumber(param_j) || param_j->valuedouble < 0 ||
+                        param_j->valuedouble > 65535)) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad param");
+            return ESP_OK;
+        }
+        if (param_j) param = (uint16_t)param_j->valuedouble;
+        cJSON_Delete(json);
+    }
+
+    bool queued = actor_request(dev_idx, a->id, param, ACTOR_SRC_MANUAL,
+                                 actor_now_s() + ACTOR_MANUAL_TTL_S);
+    if (!queued) {
+        const char *why = manual_refusal_reason(dev_idx, a->id, param);
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        char resp[64];
+        snprintf(resp, sizeof(resp), "{\"error\":\"%s\"}", why);
+        httpd_resp_sendstr(req, resp);
+        return ESP_OK;
+    }
+
+    httpd_resp_set_status(req, "202 Accepted");
+    httpd_resp_set_type(req, "application/json");
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"action\":\"%s\",\"param\":%u}",
+             a->name, (unsigned)param);
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+/* PUT /api/v1/devices/{id}/actions/{action}/guards {"cooldown_s":N,
+ * "max_per_hour":N,"lockout":bool} -- guard configuration (M5b Task 11,
+ * design spec §7). Every field is OPTIONAL and independently omittable: an
+ * absent field leaves that guard UNCHANGED (a partial update, not a
+ * reset-to-defaults), by reading the pair's current cooldown_s/
+ * max_per_hour back via actor_pair_state() first and only overriding what
+ * the body actually supplies. `lockout` is device-level (actor_table.h:
+ * the operator's stop button governs the whole device, not one action) --
+ * actor_set_lockout() is called with dev_idx regardless of which action
+ * this URL named, exactly like GET /api/v1/devices' "actions[].lockout"
+ * reads the same device-level value into every one of a device's action
+ * entries. Auth like every other mutating route in this file. */
+static esp_err_t devices_guards_put(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/devices/");
+    char idbuf[40], action_buf[24];
+    if (!parse_device_action_path(tail, true, idbuf, sizeof(idbuf), action_buf, sizeof(action_buf))) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+        return ESP_OK;
+    }
+
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+    int dev_idx = data_core_find_index(&dev);
+
+    const action_t *a = action_by_name(action_buf);
+    if (!a) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown action");
+        return ESP_OK;
+    }
+
+    actor_pair_state_t ps;
+    if (dev_idx < 0 || !actor_pair_state(dev_idx, a->id, &ps)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "action not declared for this device");
+        return ESP_OK;
+    }
+
+    char body[128];
+    if (req->content_len == 0 || req->content_len > sizeof(body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(body);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return ESP_OK;
+    }
+    const cJSON *cooldown_j = cJSON_GetObjectItem(json, "cooldown_s");
+    const cJSON *maxph_j = cJSON_GetObjectItem(json, "max_per_hour");
+    const cJSON *lockout_j = cJSON_GetObjectItem(json, "lockout");
+
+    bool bad = (cooldown_j && (!cJSON_IsNumber(cooldown_j) || cooldown_j->valuedouble < 0 ||
+                                cooldown_j->valuedouble > 65535)) ||
+               (maxph_j && (!cJSON_IsNumber(maxph_j) || maxph_j->valuedouble < 0 ||
+                            maxph_j->valuedouble > 255)) ||
+               (lockout_j && !cJSON_IsBool(lockout_j));
+    if (bad) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad guard values");
+        return ESP_OK;
+    }
+
+    uint16_t cooldown_s = cooldown_j ? (uint16_t)cooldown_j->valuedouble : ps.cooldown_s;
+    uint8_t max_per_hour = maxph_j ? (uint8_t)maxph_j->valuedouble : ps.max_per_hour;
+    bool set_lockout = lockout_j != NULL;
+    bool lockout_on = set_lockout && cJSON_IsTrue(lockout_j);
+    cJSON_Delete(json);
+
+    if (!actor_configure_guards(dev_idx, a->id, cooldown_s, max_per_hour)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to configure guards");
+        return ESP_OK;
+    }
+    if (set_lockout) actor_set_lockout(dev_idx, lockout_on);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 /* POST /api/v1/devices/{id}/key {"key":"<32 hex chars>"|null} -- bind-key
  * set/clear (spec §4, auth). Only the "/api/v1/devices" wildcard route (POST)
  * has -- unlike plants/nodes/rules there is nothing else to dispatch on
@@ -3307,12 +3591,24 @@ static esp_err_t unknown_get(httpd_req_t *req)
  * Keys are WRITE-ONLY (bthome.h's bindkey_get()/bindkey_has() contract,
  * spec §4: "Keys are never returned by any GET") -- this handler only ever
  * calls bindkey_set(), never bindkey_get(), and the 200 response never
- * echoes key material back. */
+ * echoes key material back.
+ *
+ * Also dispatches POST .../actions/{action} (manual invocation, Task 11)
+ * to devices_action_post() above -- tried FIRST, since "/actions/{action}"
+ * and "/key" are mutually exclusive suffix shapes on this one wildcard
+ * route and a device id can never itself contain "/actions/". */
 static esp_err_t devices_post_dispatch(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
 
     const char *tail = req->uri + strlen("/api/v1/devices/");
+
+    char action_idbuf[40], action_buf[24];
+    if (parse_device_action_path(tail, false, action_idbuf, sizeof(action_idbuf),
+                                  action_buf, sizeof(action_buf))) {
+        return devices_action_post(req, action_idbuf, action_buf);
+    }
+
     size_t taillen = strcspn(tail, "?");
     static const char key_suffix[] = "/key";
     size_t suflen = sizeof(key_suffix) - 1;
@@ -3527,4 +3823,12 @@ void api_v1_register(httpd_handle_t server)
      * in this file already relies on (e.g. "/api/v1/nodes" exact vs wildcard). */
     httpd_uri_t devices_post = { .uri = "/api/v1/devices/*", .method = HTTP_POST, .handler = devices_post_dispatch };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &devices_post));
+
+    /* PUT .../actions/{action}/guards (M5b Task 11): a distinct HTTP
+     * method on the same wildcard URI template as devices_post above, so
+     * it does not collide with it (ESP-IDF's httpd_uri_match_wildcard()
+     * duplicate check is per-(uri, method) pair -- see node_post_dispatch's
+     * own comment on the wildcard-collision rule this relies on). */
+    httpd_uri_t devices_guards = { .uri = "/api/v1/devices/*", .method = HTTP_PUT, .handler = devices_guards_put };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &devices_guards));
 }

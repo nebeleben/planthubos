@@ -302,6 +302,22 @@ bool actor_action_flags(int dev_idx, uint8_t action_id, uint8_t *flags_out)
     return ok;
 }
 
+bool actor_pair_state(int dev_idx, uint8_t action_id, actor_pair_state_t *out)
+{
+    actor_lock();
+    bool ok = actor_table_pair_state(&s_table, dev_idx, action_id, actor_now_s(), out);
+    actor_unlock();
+    return ok;
+}
+
+bool actor_lockout(int dev_idx, bool *out)
+{
+    actor_lock();
+    bool ok = actor_table_lockout(&s_table, dev_idx, out);
+    actor_unlock();
+    return ok;
+}
+
 static bool request_common(int dev_idx, uint8_t action_id, uint16_t param,
                             actor_source_t source, uint32_t deadline_s, bool retried)
 {

@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 #include "action.h"
 
@@ -60,6 +61,20 @@ typedef enum {
 
 #define ALERT_RING_LEN 8
 
+/* `repeat` (M5b Task 11, carrying Task 10's Ruling T10-alertchurn): because
+ * an activation is recorded at DISPATCH rather than enqueue (Task 7 fix
+ * round 2), four rule commands against a max_per_hour=1 pair emit THREE
+ * refusal alerts in a burst -- and ALERT_RING_LEN is only 8, the operator's
+ * entire visibility surface, so a burst like that can evict everything else
+ * in the ring. alert_ring_push() (alert_ring.c, pure) answers this by
+ * collapsing CONSECUTIVE pushes whose (code, dev_idx, action_id) match the
+ * ring's most-recently-pushed entry into that ONE entry, incrementing
+ * `repeat` instead of consuming a new slot -- source-agnostic (a mashed
+ * manual button collapses exactly the same way) and needs no guard state.
+ * 1 on a genuinely new entry (not "0 more than itself" -- see
+ * alert_ring_push()), N on one that collapsed N-1 further identical pushes.
+ * level/param always reflect the MOST RECENT push in the run, not the
+ * first -- see alert_ring_push()'s own doc comment. */
 typedef struct {
     uint8_t  level;
     uint8_t  code;         /* alert_code_t */
@@ -67,7 +82,37 @@ typedef struct {
     uint8_t  action_id;    /* ACTION_NONE (0xFF) when this alert is not about
                              * a specific action -- see alert_post()'s comment */
     uint16_t param;
+    uint16_t repeat;
 } alert_rec_t;
+
+/* ---------------------------------------------------------------------
+ * Pure ring (M5b Task 11) -- no FreeRTOS, directly host-tested by
+ * tests/host/test_alert_ring.c, the same pure/impure split this component
+ * already uses for actor_table.c/actor.c and event_ring.c/event_log.c.
+ * alert.c's alert_post()/alert_drain() are the impure front door: take the
+ * spinlock, call these, release it.
+ * --------------------------------------------------------------------- */
+
+typedef struct {
+    alert_rec_t recs[ALERT_RING_LEN];
+    uint8_t     head;      /* next slot to write */
+    uint8_t     count;     /* valid records queued, 0..ALERT_RING_LEN */
+    uint32_t    dropped;   /* oldest-dropped-on-overflow, since last drain */
+} alert_ring_t;
+
+void alert_ring_init(alert_ring_t *r);
+
+/* Pushes `in` into `r`. When `r` is non-empty AND its most-recently-pushed
+ * entry has the same (code, dev_idx, action_id) as `in`, this COLLAPSES
+ * the push into that entry instead of consuming a new slot: `repeat`
+ * increments (saturating at UINT16_MAX, never wrapping) and level/param
+ * are overwritten with `in`'s -- the latest occurrence's own severity and
+ * parameter are what "how bad is this right now" wants to show, not the
+ * first one's. Otherwise behaves exactly like the ring did before this
+ * field existed: appends a new record (repeat starts at 1, not 0 -- a
+ * fresh alert already happened once), evicting the oldest and counting it
+ * in `dropped` once the ring is full. `in->repeat` is ignored on input. */
+void alert_ring_push(alert_ring_t *r, const alert_rec_t *in);
 
 /* Producers -- the NimBLE host task, an esp_timer callback, the httpd task
  * -- only append a fixed-size record. Cheap and shallow: nothing that

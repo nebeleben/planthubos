@@ -3,20 +3,17 @@
 #include "event_log.h"
 #include "freertos/FreeRTOS.h"
 #include <stdio.h>
+#include <string.h>
 
 /* Fixed RAM ring of ALERT_RING_LEN (8) records (see alert.h's header
  * comment for why this exists as a separate, shallow front door in front
  * of event_log_append()). s_mux is a spinlock, not a mutex, for the same
  * reason ble_collector.c's s_adv_mux is one: a producer here can be an
  * esp_timer callback, which must never block, and a critical section
- * around a single struct-copy push is a few instructions. */
-typedef struct {
-    alert_rec_t recs[ALERT_RING_LEN];
-    uint8_t     head;      /* next slot to write */
-    uint8_t     count;     /* valid records queued, 0..ALERT_RING_LEN */
-    uint32_t    dropped;   /* oldest-dropped-on-overflow, since last drain */
-} alert_ring_t;
-
+ * around a single struct-copy push is a few instructions. alert_ring_t and
+ * alert_ring_push() (alert.h/alert_ring.c) are the pure collapsing/
+ * eviction decision -- this file only ever takes the spinlock, calls one
+ * of them, and releases it. */
 static alert_ring_t s_ring;
 static portMUX_TYPE  s_mux = portMUX_INITIALIZER_UNLOCKED;
 static alert_wake_fn_t s_wake_hook;
@@ -34,19 +31,10 @@ void alert_post(uint8_t level, uint8_t code, int dev_idx, uint8_t action_id, uin
     rec.dev_idx = (int8_t)dev_idx;
     rec.action_id = action_id;
     rec.param = param;
+    rec.repeat = 0; /* alert_ring_push() ignores this on input and sets it itself */
 
     portENTER_CRITICAL(&s_mux);
-    /* Ring is full: writing at head overwrites the oldest record (head
-     * already equals the current oldest slot once count == ALERT_RING_LEN)
-     * -- the newest alert is the one that matters, so we drop the oldest
-     * and count it rather than refuse the newest. */
-    if (s_ring.count == ALERT_RING_LEN) {
-        s_ring.dropped++;
-    } else {
-        s_ring.count++;
-    }
-    s_ring.recs[s_ring.head] = rec;
-    s_ring.head = (uint8_t)((s_ring.head + 1) % ALERT_RING_LEN);
+    alert_ring_push(&s_ring, &rec);
     portEXIT_CRITICAL(&s_mux);
 
     /* Wake the rules engine task immediately rather than waiting for its
@@ -94,7 +82,13 @@ void alert_drain(void)
         char msg[EVENT_MSG_MAX + 1];
         /* ACTION_NONE means this alert is not about a specific action (see
          * alert_post()'s comment in alert.h) -- omit the clause entirely
-         * rather than print a name for an action that was never involved. */
+         * rather than print a name for an action that was never involved.
+         * repeat > 1 (alert_ring_push()'s collapsing, Task 11) appends
+         * " (x<N>)" so the count reaches GET /api/v1/events through the
+         * SAME "msg" text every other alert already carries -- no new event
+         * field, no event_t format bump, and the UI can render it (as
+         * plain text, or a highlighted "xN" badge) directly off this
+         * string. */
         if (r->action_id == ACTION_NONE) {
             snprintf(msg, sizeof(msg), "alert code=%u dev=%d param=%u",
                      (unsigned)r->code, (int)r->dev_idx, (unsigned)r->param);
@@ -103,6 +97,10 @@ void alert_drain(void)
             snprintf(msg, sizeof(msg), "alert code=%u dev=%d action=%s param=%u",
                      (unsigned)r->code, (int)r->dev_idx, a ? a->name : "?",
                      (unsigned)r->param);
+        }
+        if (r->repeat > 1) {
+            size_t len = strlen(msg);
+            snprintf(msg + len, sizeof(msg) - len, " (x%u)", (unsigned)r->repeat);
         }
         event_log_append(r->level, 0, msg);
     }

@@ -286,6 +286,109 @@ static void test_action_flags_undeclared_pair_or_device(void) {
     assert(!actor_table_action_flags(&T, -1, ACT_IRRIGATION_OPEN, &flags)); /* negative dev_idx */
 }
 
+/* ---- M5b Task 11: actor_table_pair_state()/actor_table_lockout() ---- */
+
+/* Fresh pair: never fired, no guards configured, MANUAL would succeed
+ * right now. Also pins param_max as the EFFECTIVE (wrapper-tightened)
+ * bound, not action.h's raw 300 ceiling. */
+static void test_pair_state_fresh_pair(void) {
+    actor_table_init(&T);
+    assert(actor_table_add(&T, 3, ACT_IRRIGATION_OPEN, 60, 0x01)); /* firmware max is 300 */
+    actor_pair_state_t s;
+    assert(actor_table_pair_state(&T, 3, ACT_IRRIGATION_OPEN, 100, &s));
+    assert(s.param_max == 60);
+    assert(s.cooldown_s == 0);
+    assert(s.max_per_hour == 0);
+    assert(s.activations_this_hour == 0);
+    assert(!s.has_fired);
+    assert(s.live_verdict == ACTOR_OK);
+}
+
+/* Undeclared pair, undeclared device, negative dev_idx: all false, same
+ * not-declared contract as actor_table_action_flags(). */
+static void test_pair_state_undeclared(void) {
+    setup();
+    actor_pair_state_t s;
+    assert(!actor_table_pair_state(&T, 3, ACT_PUMP_RUN, 100, &s));
+    assert(!actor_table_pair_state(&T, 7, ACT_IRRIGATION_OPEN, 100, &s));
+    assert(!actor_table_pair_state(&T, -1, ACT_IRRIGATION_OPEN, 100, &s));
+}
+
+/* After a fire: has_fired/last_fire_s report it, activations_this_hour
+ * counts it within the window, and a configured cooldown shows up as the
+ * live verdict -- exactly matching what actor_table_check() itself would
+ * say for a MANUAL request right now. */
+static void test_pair_state_after_fire_cooldown(void) {
+    setup();
+    actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, /*cooldown_s*/ 600, /*max_per_hour*/ 10);
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 100);
+    actor_pair_state_t s;
+    assert(actor_table_pair_state(&T, 3, ACT_IRRIGATION_OPEN, 150, &s));
+    assert(s.has_fired);
+    assert(s.last_fire_s == 100);
+    assert(s.activations_this_hour == 1);
+    assert(s.live_verdict == ACTOR_REFUSED_COOLDOWN);
+    /* Matches actor_table_check() itself at the same instant. */
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_MANUAL, 150) == ACTOR_REFUSED_COOLDOWN);
+
+    /* Past the cooldown: OK again, and matches actor_table_check(). */
+    assert(actor_table_pair_state(&T, 3, ACT_IRRIGATION_OPEN, 700, &s));
+    assert(s.live_verdict == ACTOR_OK);
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_MANUAL, 700) == ACTOR_OK);
+}
+
+/* Rate cap reached: live_verdict reports RATE, and activations_this_hour
+ * reads back the count actually spent -- then a new window resets both. */
+static void test_pair_state_rate_and_window_reset(void) {
+    setup();
+    actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, 0, /*max_per_hour*/ 2);
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 100);
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 200);
+    actor_pair_state_t s;
+    assert(actor_table_pair_state(&T, 3, ACT_IRRIGATION_OPEN, 300, &s));
+    assert(s.activations_this_hour == 2);
+    assert(s.live_verdict == ACTOR_REFUSED_RATE);
+
+    /* A new window (3600 s after the window START) reports 0 spent again,
+     * even though window_count itself is not reset until the next
+     * actor_table_record() -- activations_this_hour must reflect "is the
+     * window still open", not the raw stored counter. */
+    assert(actor_table_pair_state(&T, 3, ACT_IRRIGATION_OPEN, 3700, &s));
+    assert(s.activations_this_hour == 0);
+    assert(s.live_verdict == ACTOR_OK);
+}
+
+/* Lockout refuses RULE but never MANUAL (actor_table_check()'s own module
+ * contract), so live_verdict must stay ACTOR_OK under lockout -- the
+ * JSON's separate "lockout" boolean is what reports the stop button, not
+ * this field. */
+static void test_pair_state_lockout_does_not_appear_as_live_verdict(void) {
+    setup();
+    actor_table_set_lockout(&T, 3, true);
+    actor_pair_state_t s;
+    assert(actor_table_pair_state(&T, 3, ACT_IRRIGATION_OPEN, 100, &s));
+    assert(s.live_verdict == ACTOR_OK);
+}
+
+static void test_lockout_read_back(void) {
+    setup();
+    bool on = true;
+    assert(actor_table_lockout(&T, 3, &on));
+    assert(!on);
+
+    actor_table_set_lockout(&T, 3, true);
+    on = false;
+    assert(actor_table_lockout(&T, 3, &on));
+    assert(on);
+}
+
+static void test_lockout_undeclared(void) {
+    setup();
+    bool on;
+    assert(!actor_table_lockout(&T, 7, &on));   /* undeclared device */
+    assert(!actor_table_lockout(&T, -1, &on));  /* negative dev_idx */
+}
+
 int main(void) {
     test_bound_enforced(); test_wrapper_bound_tightens(); test_cooldown();
     test_rate_limit_fixed_window(); test_one_budget_across_sources(); test_lockout();
@@ -301,6 +404,13 @@ int main(void) {
     test_remove_frees_capacity();
     test_action_flags_read_back();
     test_action_flags_undeclared_pair_or_device();
+    test_pair_state_fresh_pair();
+    test_pair_state_undeclared();
+    test_pair_state_after_fire_cooldown();
+    test_pair_state_rate_and_window_reset();
+    test_pair_state_lockout_does_not_appear_as_live_verdict();
+    test_lockout_read_back();
+    test_lockout_undeclared();
     printf("test_actor_table: OK\n");
     return 0;
 }
