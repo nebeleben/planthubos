@@ -1,0 +1,32 @@
+# ESP32-C6 / 16 MB layout (V2, M6a). Offsets are explicit rather than
+# blank so this table can be diffed against a flash dump byte for byte.
+#
+# Sized to end the 4 MB era, not to postpone it: a Zigbee coordinator was
+# measured at 413 KB marginal (M6a spec section 1) against 1600K app slots
+# that the C6 image already overflows. 4096K slots leave ~2.45 MB free with
+# Zigbee in, so M6b, M7 and M8 do not re-open this file.
+#
+# zb_storage/zb_fct are provisioned EMPTY and unused until M6b. They are
+# here now because partitions_c5.csv's own comment records the trap: that
+# table "already ends at 4MB", so adding Zigbee later forces a re-layout
+# rather than an append -- and a re-layout after devices ship is the
+# expensive kind. Sizes match IDF's esp_zigbee_gateway example; zb_fct is
+# 4K rather than its 1K because 4K is the flash erase-sector size.
+#
+# coredump is new and was never affordable before. This project's recurring
+# failure mode is memory; 60K turns a mystery reboot into a backtrace. Its
+# size is 60K rather than 64K precisely so app0 lands on 0x30000 and meets
+# the 64 KB app-partition alignment rule with no padding gap.
+#
+# The table ends exactly at 0x1000000. tests/partitions/run.py enforces
+# that, and enforces it for partitions_c5.csv too.
+# Name,      Type, SubType,  Offset,    Size
+nvs,         data, nvs,      0x9000,    64K
+otadata,     data, ota,      0x19000,   8K
+phy_init,    data, phy,      0x1B000,   4K
+zb_storage,  data, fat,      0x1C000,   16K
+zb_fct,      data, fat,      0x20000,   4K
+coredump,    data, coredump, 0x21000,   60K
+app0,        app,  ota_0,    0x30000,   4096K
+app1,        app,  ota_1,    0x430000,  4096K
+storage,     data, spiffs,   0x830000,  8000K
