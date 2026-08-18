@@ -66,23 +66,32 @@ def check(name, flash_size, expected_end):
         if len(fields) < 5:
             continue
         part_name = fields[0].strip()
+        part_type = fields[1].strip()
         part_offset = int(fields[3], 0)
         part_size = size_to_bytes(fields[4])
         part_end = part_offset + part_size
-        partitions.append((part_name, part_offset, part_size, part_end))
+        partitions.append((part_name, part_type, part_offset, part_size, part_end))
         end = max(end, part_end)
 
     if os.path.exists(out):
         os.remove(out)
 
-    # Check for gaps between consecutive partitions (allow up to 64K for alignment)
+    # Check for gaps between consecutive partitions using partition-type-specific rules
     for i in range(1, len(partitions)):
-        prev_name, prev_offset, prev_size, prev_end = partitions[i-1]
-        curr_name, curr_offset, curr_size, curr_end = partitions[i]
-        gap = curr_offset - prev_end
-        if gap > 0x10000:  # Larger than 64K alignment boundary
-            return "FAIL %s: gap between %s and %s — %s ends at %#x, %s starts at %#x" % (
-                name, prev_name, curr_name, prev_name, prev_end, curr_name, curr_offset)
+        prev_name, prev_type, prev_offset, prev_size, prev_end = partitions[i-1]
+        curr_name, curr_type, curr_offset, curr_size, curr_end = partitions[i]
+
+        if curr_type == "app":
+            # App partitions must start on a 64K boundary
+            expected_offset = (prev_end + 0xFFFF) & ~0xFFFF
+            if curr_offset != expected_offset:
+                return "FAIL %s: %s starts at %#x, expected %#x (app partition, first 64K boundary at or after %s's end %#x)" % (
+                    name, curr_name, curr_offset, expected_offset, prev_name, prev_end)
+        else:
+            # Data partitions must start immediately after previous partition
+            if curr_offset != prev_end:
+                return "FAIL %s: %s starts at %#x, expected %#x (data partition must start where %s ends)" % (
+                    name, curr_name, curr_offset, prev_end, prev_name)
 
     if end != expected_end:
         return "FAIL %s: table ends at %#x, expected exactly %#x (%s)" % (
