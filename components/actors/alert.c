@@ -19,6 +19,12 @@ typedef struct {
 
 static alert_ring_t s_ring;
 static portMUX_TYPE  s_mux = portMUX_INITIALIZER_UNLOCKED;
+static alert_wake_fn_t s_wake_hook;
+
+void alert_set_wake_hook(alert_wake_fn_t fn)
+{
+    s_wake_hook = fn;
+}
 
 void alert_post(uint8_t level, uint8_t code, int dev_idx, uint8_t action_id, uint16_t param)
 {
@@ -42,6 +48,17 @@ void alert_post(uint8_t level, uint8_t code, int dev_idx, uint8_t action_id, uin
     s_ring.recs[s_ring.head] = rec;
     s_ring.head = (uint8_t)((s_ring.head + 1) % ALERT_RING_LEN);
     portEXIT_CRITICAL(&s_mux);
+
+    /* Wake the rules engine task immediately rather than waiting for its
+     * next natural wake -- see alert_wake_fn_t's comment in alert.h. Called
+     * AFTER releasing the spinlock above: xEventGroupSetBits() can unblock
+     * a task and yield, which must never happen while s_mux is held. A NULL
+     * hook (no rules_init() yet, or rules_init() itself failed) is a safe
+     * no-op -- the record is already queued above, and the drop counter
+     * still reports an eventual overflow if the ring is never drained; a
+     * hub whose rules_init() failed is already a logged broken-hub state
+     * that this hook is not trying to rescue. */
+    if (s_wake_hook) s_wake_hook();
 }
 
 void alert_drain(void)
@@ -74,11 +91,19 @@ void alert_drain(void)
 
     for (uint8_t i = 0; i < n; i++) {
         const alert_rec_t *r = &local[i];
-        const action_t *a = action_get(r->action_id);
         char msg[EVENT_MSG_MAX + 1];
-        snprintf(msg, sizeof(msg), "alert code=%u dev=%d action=%s param=%u",
-                 (unsigned)r->code, (int)r->dev_idx, a ? a->name : "?",
-                 (unsigned)r->param);
+        /* ACTION_NONE means this alert is not about a specific action (see
+         * alert_post()'s comment in alert.h) -- omit the clause entirely
+         * rather than print a name for an action that was never involved. */
+        if (r->action_id == ACTION_NONE) {
+            snprintf(msg, sizeof(msg), "alert code=%u dev=%d param=%u",
+                     (unsigned)r->code, (int)r->dev_idx, (unsigned)r->param);
+        } else {
+            const action_t *a = action_get(r->action_id);
+            snprintf(msg, sizeof(msg), "alert code=%u dev=%d action=%s param=%u",
+                     (unsigned)r->code, (int)r->dev_idx, a ? a->name : "?",
+                     (unsigned)r->param);
+        }
         event_log_append(r->level, 0, msg);
     }
 }

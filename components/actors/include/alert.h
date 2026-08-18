@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "action.h"
 
 /* The safety core's report path (M5b Task 5). Actuator alerts -- a close
  * that could not be confirmed, a guard refusal, a command dropped for
@@ -47,13 +48,20 @@ typedef struct {
     uint8_t  level;
     uint8_t  code;         /* alert_code_t */
     int8_t   dev_idx;
-    uint8_t  action_id;
+    uint8_t  action_id;    /* ACTION_NONE (0xFF) when this alert is not about
+                             * a specific action -- see alert_post()'s comment */
     uint16_t param;
 } alert_rec_t;
 
 /* Producers -- the NimBLE host task, an esp_timer callback, the httpd task
  * -- only append a fixed-size record. Cheap and shallow: nothing that
  * touches the radio may touch flash.
+ *
+ * Pass ACTION_NONE (0xFF, action.h) for `action_id` when the alert is not
+ * about a specific action (e.g. a device-level fault) -- action_id 0 is a
+ * real action (ACT_SWITCH_ON) and would render as one in the drained
+ * message, a wrong, plausible-looking detail in a safety alert.
+ * alert_drain() omits the action clause entirely when it sees ACTION_NONE.
  *
  * alert_drain() is called by the rules engine task, which is the ONLY task
  * with the stack for event_log_append's LittleFS + SSE + MQTT chain (8192
@@ -63,3 +71,13 @@ typedef struct {
  * the heap budget could not afford anyway. */
 void alert_post(uint8_t level, uint8_t code, int dev_idx, uint8_t action_id, uint16_t param);
 void alert_drain(void);
+
+/* Registered once by the rules engine at rules_init() so alert_post() can
+ * wake that task immediately, instead of waiting for its next natural wake
+ * (a sensor value update or a periodic `every` timer) -- a hub that just
+ * raised a safety alert may have neither pending. NULL until registered
+ * (or if rules_init() never ran, or itself failed): alert_post() must
+ * treat that as a safe no-op, not an error -- see alert_post()'s
+ * implementation. */
+typedef void (*alert_wake_fn_t)(void);
+void alert_set_wake_hook(alert_wake_fn_t fn);

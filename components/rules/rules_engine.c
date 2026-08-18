@@ -51,6 +51,13 @@ static const char *TAG = "rules_engine";
 
 #define VALUE_UPDATE_BIT (1u << 0)
 #define PERIODIC_BIT     (1u << 1)
+/* M5b Task 5 fix round 1: alert_post() sets this (via alert_set_wake_hook,
+ * registered below) so a queued alert wakes this task on its own, rather
+ * than only draining on the next sensor update or `every` timer -- a hub
+ * that just raised a safety alert may have neither (sensors stopped
+ * reporting, no periodic rule configured), which is exactly when alerts
+ * matter most. */
+#define ALERT_BIT        (1u << 2)
 
 static EventGroupHandle_t s_events;
 /* Serializes one evaluate-a-rule pass (resolve + psvm_run, which together
@@ -401,12 +408,18 @@ static void engine_task(void *arg)
      * into a visible warning first. */
     static UBaseType_t lowest_free = (UBaseType_t)-1;
     for (;;) {
-        EventBits_t bits = xEventGroupWaitBits(s_events, VALUE_UPDATE_BIT | PERIODIC_BIT,
+        EventBits_t bits = xEventGroupWaitBits(s_events,
+                                               VALUE_UPDATE_BIT | PERIODIC_BIT | ALERT_BIT,
                                                pdTRUE, pdFALSE, portMAX_DELAY);
         /* Drain the alert ring before evaluating: this task is the only one
          * sized for event_log_append's LittleFS + SSE/MQTT chain (see
          * alert.h and this file's header comment), so it is the only safe
-         * place to turn a queued alert_post() into a persisted event. */
+         * place to turn a queued alert_post() into a persisted event.
+         * Unconditional (not gated on `bits & ALERT_BIT`): a wake caused by
+         * VALUE_UPDATE_BIT or PERIODIC_BIT should still drain whatever is
+         * sitting in the ring, same as before ALERT_BIT existed. ALERT_BIT
+         * itself carries no other work -- it exists purely to reach this
+         * line promptly (see its definition above). */
         alert_drain();
         if (bits & VALUE_UPDATE_BIT) {
             /* Debounce (brief step 3): collapse a burst of sensor updates
@@ -429,6 +442,21 @@ static void engine_task(void *arg)
     }
 }
 
+/* alert_set_wake_hook() target (registered below): wakes engine_task the
+ * instant an alert is posted, instead of waiting for its next natural wake
+ * (see ALERT_BIT's comment above). Guarded exactly like
+ * rules_notify_value_update() below: alert_post() can run before
+ * rules_init() creates s_events, or after rules_init() bailed out
+ * (s_initialized left false) -- either way this must be a safe no-op, not
+ * a NULL-handle crash. A hub in that state has already logged why rules
+ * (and therefore alert draining) are not running; this hook is not trying
+ * to rescue it, only to not crash on it. */
+static void rules_engine_alert_wake(void)
+{
+    if (!s_initialized || !s_events) return;
+    xEventGroupSetBits(s_events, ALERT_BIT);
+}
+
 void rules_init(void)
 {
     rules_store_load_all();
@@ -440,6 +468,7 @@ void rules_init(void)
         return;
     }
     s_initialized = true;
+    alert_set_wake_hook(rules_engine_alert_wake);
 
     if (xTaskCreate(engine_task, "rules_engine", ENGINE_TASK_STACK, NULL, ENGINE_TASK_PRIO, NULL) != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(rules_engine) failed; rules will not evaluate");

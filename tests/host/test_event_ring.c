@@ -33,7 +33,7 @@ int main(void)
     assert(out[0].seq == 2);
     assert(out[1].seq == 3);
 
-    /* msg longer than 118 truncated NUL-terminated */
+    /* msg longer than EVENT_MSG_MAX truncated NUL-terminated */
     char long_msg[300];
     memset(long_msg, 'x', sizeof(long_msg) - 1);
     long_msg[sizeof(long_msg) - 1] = '\0';
@@ -82,8 +82,8 @@ int main(void)
     /* event_ring_sanitize: a torn write can leave a slot with garbage --
      * including a bogus seq that event_ring_init would otherwise trust
      * and use to desync the whole ring's numbering. A slot failing
-     * validity (level > 1, or no NUL at msg[EVENT_MSG_MAX]) must be
-     * zeroed; valid slots must survive untouched. */
+     * validity (level > EVENT_LEVEL_MAX, no NUL at msg[EVENT_MSG_MAX], or a
+     * crc mismatch) must be zeroed; valid slots must survive untouched. */
     event_t torn[EVENT_SLOTS];
     memset(torn, 0, sizeof(torn));
 

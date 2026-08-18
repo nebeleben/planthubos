@@ -41,23 +41,41 @@ void event_log_init(void)
 
     memset(s_slots, 0, sizeof(s_slots));
     FILE *f = fopen(EVENTS_PATH, "rb");
-    bool format_ok = false;
+    /* need_reset: (re)write a fresh current-format header -- either the
+     * file is genuinely absent (ENOENT) or it exists but carries an
+     * old-format (or corrupt) header, both of which are a deliberate
+     * discard (see EVENT_LOG_FORMAT_MAGIC above), not data loss. A fopen
+     * failure for any OTHER reason (a transient VFS error) is explicitly
+     * NOT this: the on-disk records may be perfectly fine and simply
+     * unreadable this boot, so rewriting the file here would destroy
+     * durable history for a transient failure -- the exact mistake
+     * event_log_append() below already avoids for its own non-ENOENT fopen
+     * failures (see its comment). That path just runs this boot on an
+     * empty in-RAM ring (s_slots is already zeroed above); a later append
+     * still opens and writes the existing file positionally, untouched by
+     * this boot's failure to read it. */
+    bool need_reset = false;
     if (f) {
         uint32_t magic = 0;
         if (fread(&magic, sizeof(magic), 1, f) == 1 && magic == EVENT_LOG_FORMAT_MAGIC) {
             /* A short read here just leaves the tail zeroed (empty slots,
              * seq 0) -- fread returning short is not an error. */
             fread(s_slots, sizeof(event_t), EVENT_SLOTS, f);
-            format_ok = true;
+        } else {
+            ESP_LOGW(TAG, "%s: format changed, discarding old records", EVENTS_PATH);
+            need_reset = true;
         }
         fclose(f);
+    } else if (errno == ENOENT) {
+        need_reset = true;
+    } else {
+        ESP_LOGW(TAG, "%s: open for read failed (errno=%d), leaving file untouched; "
+                       "running with an empty ring this boot", EVENTS_PATH, errno);
     }
-    if (!format_ok) {
-        /* Missing, unreadable, or an old-format file (see
-         * EVENT_LOG_FORMAT_MAGIC above) -- start empty and rewrite the
-         * header now so every later event_log_append() (which assumes the
-         * header is already there) finds a current-format file. */
-        if (f) ESP_LOGW(TAG, "%s: format changed, discarding old records", EVENTS_PATH);
+    if (need_reset) {
+        /* Rewrite the header now so every later event_log_append() (which
+         * assumes the header is already there) finds a current-format
+         * file. */
         FILE *wf = fopen(EVENTS_PATH, "wb");
         if (wf) {
             uint32_t magic = EVENT_LOG_FORMAT_MAGIC;
