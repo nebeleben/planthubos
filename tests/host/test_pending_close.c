@@ -443,6 +443,44 @@ static void test_needed_false_for_unknown_action_id(void) {
     assert(!pending_close_needed(0xFEu, 0x00));
 }
 
+/* ---------------------------------------------------------------------
+ * pending_close_arm_on_dispatch(): whole-branch review, Critical 1 +
+ * Important 2 (ruling FINAL-arm). The obligation is armed BEFORE the
+ * command reaches the radio, so a write that lands and then fails its
+ * confirm -- or a link that drops after the write -- still leaves one.
+ * --------------------------------------------------------------------- */
+
+static void test_arm_on_dispatch_true_for_hub_owned_open(void) {
+    /* The case the whole finding is about: a timed open the device will
+     * NOT close itself, from a rule and from a manual press alike. */
+    assert(pending_close_arm_on_dispatch(ACTOR_SRC_RULE, ACT_IRRIGATION_OPEN, 0x00));
+    assert(pending_close_arm_on_dispatch(ACTOR_SRC_MANUAL, ACT_IRRIGATION_OPEN, 0x00));
+    assert(pending_close_arm_on_dispatch(ACTOR_SRC_RULE, ACT_PUMP_RUN, 0x00));
+}
+
+static void test_arm_on_dispatch_false_for_safety_source(void) {
+    /* A close must never arm its own close, whatever the action looks
+     * like -- otherwise a retried safety close would recreate the very
+     * obligation it exists to discharge. */
+    assert(!pending_close_arm_on_dispatch(ACTOR_SRC_SAFETY, ACT_SWITCH_OFF, 0x00));
+    assert(!pending_close_arm_on_dispatch(ACTOR_SRC_SAFETY, ACT_IRRIGATION_OPEN, 0x00));
+}
+
+static void test_arm_on_dispatch_false_when_device_closes_itself(void) {
+    /* Spec section 4.3's preferred path: the device owns the close, so the
+     * hub must not schedule one (pending_close_arm()'s own contract). */
+    assert(!pending_close_arm_on_dispatch(ACTOR_SRC_RULE, ACT_IRRIGATION_OPEN,
+                                          ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF));
+    assert(!pending_close_arm_on_dispatch(ACTOR_SRC_MANUAL, ACT_PUMP_RUN,
+                                          ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF));
+}
+
+static void test_arm_on_dispatch_false_for_parameterless_or_unknown(void) {
+    assert(!pending_close_arm_on_dispatch(ACTOR_SRC_MANUAL, ACT_SWITCH_ON, 0x00));
+    assert(!pending_close_arm_on_dispatch(ACTOR_SRC_MANUAL, ACT_SWITCH_OFF, 0x00));
+    assert(!pending_close_arm_on_dispatch(ACTOR_SRC_RULE, 0xFEu, 0x00));
+}
+
 static void test_boot_load_ignores_stored_deadline(void) {
     pending_close_init();
     pending_close_t recs[1] = {
@@ -519,6 +557,10 @@ int main(void) {
     test_needed_false_when_device_local_flag_set();
     test_needed_false_for_parameterless_action();
     test_needed_false_for_unknown_action_id();
+    test_arm_on_dispatch_true_for_hub_owned_open();
+    test_arm_on_dispatch_false_for_safety_source();
+    test_arm_on_dispatch_false_when_device_closes_itself();
+    test_arm_on_dispatch_false_for_parameterless_or_unknown();
     test_boot_load_ignores_stored_deadline();
     test_boot_load_skips_invalid_records();
     test_is_boot_due_true_for_device_zero();

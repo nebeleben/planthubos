@@ -556,15 +556,44 @@ size_t pending_close_active_count(void);
  * body, which cannot itself be host-tested (LittleFS). */
 size_t pending_close_persist_snapshot(pending_close_t *out, size_t cap);
 
-/* Pure predicate (fix round 1, finding 6): does a just-landed open of
- * `action_id` need the hub to schedule its own close? True iff the action
- * takes a duration (action.h's ACTION_PARAM_DURATION_S) AND `flags` --
- * whatever actor_action_flags() reported for the declared pair -- does NOT
- * carry ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF (actor_table.h: the device
- * closes itself). False for an unknown action_id. A caller that could not
- * resolve the pair at all (actor_action_flags() itself returned false)
- * must not call this -- see ble_collector.c's on_gatt_cmd_done(). */
+/* Pure predicate (fix round 1, finding 6): does an open of `action_id` need
+ * the hub to schedule its own close? True iff the action takes a duration
+ * (action.h's ACTION_PARAM_DURATION_S) AND `flags` -- whatever
+ * actor_action_flags() reported for the declared pair -- does NOT carry
+ * ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF (actor_table.h: the device closes
+ * itself). False for an unknown action_id. A caller that could not resolve
+ * the pair at all (actor_action_flags() itself returned false) must not
+ * call this. */
 bool   pending_close_needed(uint8_t action_id, uint8_t flags);
+
+/* Pure predicate, whole-branch review (Critical 1 + Important 2, ruling
+ * FINAL-arm): should the obligation be armed for THIS command, at the
+ * moment it is handed to the radio?
+ *
+ * The obligation used to be armed from the GATT completion hook, and only
+ * on the branch where the whole attempt reached GS_DONE. But the state
+ * machine WRITES FIRST and CONFIRMS SECOND, so the write is already on the
+ * device when the confirm's `require` is unsatisfied (GF_CONFIRM_FAILED),
+ * when the confirm read is shorter than the compared field (GF_SHORT_READ),
+ * and when an error/timeout/disconnect arrives in GS_READING. Every one of
+ * those reports ok == false, so the valve was open with NO obligation
+ * recorded anywhere -- while command_finish() still submitted the confirm
+ * read's value, so switch.state read 0 and the dashboard, MQTT, Home
+ * Assistant and InfluxDB all reported it closed. Even on the success path
+ * the arm was deferred to a later decoder tick, so a brownout in that
+ * window lost it -- the exact gap spec section 4.5 exists to close.
+ *
+ * So the obligation is now armed BEFORE dispatch instead. Any post-write
+ * failure therefore already has one, and the crash window shrinks to
+ * before the valve physically moves. The cost is a spurious obligation
+ * when a command never reaches the radio at all, which discharges by
+ * closing an already-closed valve -- harmless in the only direction that
+ * matters.
+ *
+ * True iff `source` is not ACTOR_SRC_SAFETY (a close does not arm its own
+ * close) and pending_close_needed() holds for the pair. */
+bool   pending_close_arm_on_dispatch(actor_source_t source, uint8_t action_id,
+                                     uint8_t flags);
 
 /* On-disk format: `{ u8 fmt=1; u8 count; u16 crc }` followed by `count`
  * fixed 7-byte records (dev_idx, close_action, deadline_s LE32, retries).

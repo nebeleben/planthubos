@@ -296,6 +296,17 @@ bool pending_close_needed(uint8_t action_id, uint8_t flags)
            !(flags & ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF);
 }
 
+/* See actor.h for the full reasoning. Kept a separate named predicate
+ * rather than folded into the dispatch site so the whole arm-before-
+ * dispatch DECISION is on the pure, host-tested side of this component --
+ * the fifth time in this milestone that logic left in the impure adapter
+ * turned out to be the thing that was wrong. */
+bool pending_close_arm_on_dispatch(actor_source_t source, uint8_t action_id, uint8_t flags)
+{
+    if (source == ACTOR_SRC_SAFETY) return false;
+    return pending_close_needed(action_id, flags);
+}
+
 /* ---------------------------------------------------------------------
  * Serialisation: pure, wire format `{ u8 fmt=1; u8 count; u16 crc }` then
  * `count` x 7-byte records (dev_idx, close_action, deadline_s LE32,

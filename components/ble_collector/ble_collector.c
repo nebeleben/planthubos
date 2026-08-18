@@ -223,8 +223,8 @@ static actor_cmd_t s_requeue;          /* the command to put back, valid iff pen
 static volatile bool s_requeue_pending;
 
 /* M5b Task 9 fix round 1 (Critical finding 1): on_gatt_cmd_done() runs on
- * the NimBLE host task, and pending_close_arm()/pending_close_clear() (via
- * pending_close_note_result()) both touch LittleFS -- a blocking, flash-
+ * the NimBLE host task, and pending_close_clear() (via
+ * pending_close_note_result()) touches LittleFS -- a blocking, flash-
  * erasing write that must never happen on that task (this file's own
  * comment on the switch.state write, just above, states the same
  * invariant; gatt_engine.c repeats it for adv_decoder_task being the only
@@ -238,16 +238,21 @@ static volatile bool s_requeue_pending;
  * table now happens only on adv_decoder_task, both here and from
  * pending_close_service().
  *
- * Fix round 3, finding 3: the six statics below sum to 15 B (enum 4 +
- * int 4 + uint8_t 1 + uint32_t 4 + bool 1 + bool 1) -- separate statics,
- * not one packed struct, so the linker may add a few bytes of alignment
- * padding between them; 15 B is the field-size sum, not a guaranteed
- * total object size. */
-typedef enum { PC_DEFER_NONE = 0, PC_DEFER_ARM, PC_DEFER_NOTE_RESULT } pc_defer_kind_t;
+ * Whole-branch review, ruling FINAL-arm: this deferral now carries ONLY a
+ * close's outcome. The ARM half is gone from here entirely -- an open's
+ * obligation is armed in on_actor_dispatch(), on adv_decoder_task, before
+ * the command is handed to the radio, which is both a task where flash is
+ * already legal and the only point early enough to survive a post-write
+ * failure or a brownout.
+ *
+ * Fix round 3, finding 3 (byte count updated for that removal): the four
+ * statics below sum to 10 B (enum 4 + int 4 + bool 1 + bool 1), down from
+ * six statics summing to 15 B -- separate statics, not one packed struct,
+ * so the linker may add a few bytes of alignment padding between them;
+ * 10 B is the field-size sum, not a guaranteed total object size. */
+typedef enum { PC_DEFER_NONE = 0, PC_DEFER_NOTE_RESULT } pc_defer_kind_t;
 static volatile pc_defer_kind_t s_pc_defer_kind;
 static int      s_pc_defer_dev_idx;
-static uint8_t  s_pc_defer_close_action;   /* PC_DEFER_ARM only */
-static uint32_t s_pc_defer_deadline_s;     /* PC_DEFER_ARM only */
 static bool     s_pc_defer_ok;             /* PC_DEFER_NOTE_RESULT only */
 static bool     s_pc_defer_confirmed;      /* PC_DEFER_NOTE_RESULT only */
 
@@ -553,6 +558,31 @@ static void on_actor_dispatch(const actor_cmd_t *cmd)
         return;
     }
 
+    /* Whole-branch review, Critical 1 + Important 2 (ruling FINAL-arm):
+     * ARM THE OBLIGATION HERE, before the command is handed to the radio --
+     * not from the completion hook, and not only on the branch where the
+     * whole attempt succeeded. pending_close_arm_on_dispatch()'s own doc
+     * comment in actor.h has the full reasoning; in short, the FSM writes
+     * first and confirms second, so a failed require, a short confirm read
+     * or a link drop in GS_READING all leave the valve OPEN while
+     * reporting ok == false -- and the old arm ran only when ok was true.
+     *
+     * Flash is legal here: this function runs on adv_decoder_task, the only
+     * task in this file allowed to touch LittleFS (the invariant the
+     * s_pc_defer_* block above and gatt_engine.c both document). That is
+     * also why the arm can be immediate rather than deferred a tick, which
+     * is what closes Important 2's brownout window.
+     *
+     * Deliberately AFTER the three pre-radio refusals above: a command with
+     * no connection address, no matched wrapper or no such action in the
+     * wrapper cannot open anything, so it owes no close. Everything past
+     * this point can. */
+    uint8_t pc_flags = 0;
+    if (actor_action_flags(idx, cmd->action_id, &pc_flags) &&
+        pending_close_arm_on_dispatch((actor_source_t)cmd->source, cmd->action_id, pc_flags)) {
+        pending_close_arm(idx, ACT_SWITCH_OFF, actor_now_s() + cmd->param);
+    }
+
     gatt_engine_request_command(idx, entry, n, cmd->param, conn->mac, conn->addr_type);
 }
 
@@ -597,12 +627,18 @@ static void on_gatt_cmd_done(int dev_idx, bool ok, bool confirmed, const char *e
              confirmed ? "confirmed" : "completed UNCONFIRMED",
              dev_idx, (unsigned)s_cmd_inflight.action_id, (unsigned)s_cmd_inflight.param);
 
-    /* M5b Task 9: the write landed. Two distinct things follow, depending
-     * on which side of a pending-close obligation this command was on --
-     * both only LATCH what was learned; the actual flash-touching call
-     * (pending_close_arm()/pending_close_note_result()) happens on
-     * adv_decoder_task (see s_pc_defer_kind's own comment: fix round 1,
-     * finding 1 -- this task must never touch LittleFS). */
+    /* M5b Task 9: the write landed. Only ONE thing follows now -- reporting
+     * a CLOSE's outcome. The other half (arming an open's obligation) moved
+     * to on_actor_dispatch(), BEFORE the radio, by the whole-branch
+     * review's ruling FINAL-arm: arming from here could only ever happen on
+     * the success branch, and the state machine writes before it confirms,
+     * so every post-write failure left an open valve with no obligation.
+     * See pending_close_arm_on_dispatch()'s doc comment in actor.h.
+     *
+     * This still only LATCHES what was learned; the flash-touching call
+     * (pending_close_note_result()) happens on adv_decoder_task (see
+     * s_pc_defer_kind's own comment: fix round 1, finding 1 -- this task
+     * must never touch LittleFS). */
     if (s_cmd_inflight.source == ACTOR_SRC_SAFETY) {
         /* This WAS a scheduled (or retried) close: tell the safety core the
          * outcome so it can stop retrying once the close is actually
@@ -613,21 +649,6 @@ static void on_gatt_cmd_done(int dev_idx, bool ok, bool confirmed, const char *e
         s_pc_defer_ok = ok;
         s_pc_defer_confirmed = confirmed;
         s_pc_defer_kind = PC_DEFER_NOTE_RESULT; /* set LAST, like every cross-task flag here */
-    } else {
-        /* An ordinary open landed. actor_action_flags() is safe to call
-         * from this task (actor_table_t is genuinely cross-task and locked
-         * in actor.c, unlike pending_close.c's own table) -- only the
-         * DECISION runs here; pending_close_needed() is the pure predicate
-         * (fix round 1, finding 6) that decides whether the hub now owns
-         * the close. */
-        uint8_t flags = 0;
-        if (actor_action_flags(dev_idx, s_cmd_inflight.action_id, &flags) &&
-            pending_close_needed(s_cmd_inflight.action_id, flags)) {
-            s_pc_defer_dev_idx = dev_idx;
-            s_pc_defer_close_action = ACT_SWITCH_OFF;
-            s_pc_defer_deadline_s = actor_now_s() + s_cmd_inflight.param;
-            s_pc_defer_kind = PC_DEFER_ARM; /* set LAST, like every cross-task flag here */
-        }
     }
 }
 
@@ -663,10 +684,12 @@ static void service_command_requeue(void)
 
 /* M5b Task 9 fix round 1 (finding 1): the decoder-task half of
  * on_gatt_cmd_done()'s pending-close deferral -- see s_pc_defer_kind's own
- * comment. This is where pending_close_arm()/pending_close_note_result()
- * actually run, and so where the LittleFS write they may trigger actually
- * happens -- adv_decoder_task, same as every other flash access in this
- * file.
+ * comment. This is where pending_close_note_result() actually runs, and so
+ * where the LittleFS write it may trigger actually happens --
+ * adv_decoder_task, same as every other flash access in this file. (The
+ * arm half no longer passes through here at all: the whole-branch review's
+ * ruling FINAL-arm moved it to on_actor_dispatch(), which already runs on
+ * this task.)
  *
  * Fix round 3, finding 2 (comment correction -- the code was always
  * correct, the reasoning written next to it was not): a SECOND outcome
@@ -689,12 +712,6 @@ static void service_pending_close_defer(void)
 
     int dev_idx = s_pc_defer_dev_idx;
     switch (kind) {
-    case PC_DEFER_ARM: {
-        uint8_t close_action = s_pc_defer_close_action;
-        uint32_t deadline_s = s_pc_defer_deadline_s;
-        pending_close_arm(dev_idx, close_action, deadline_s);
-        break;
-    }
     case PC_DEFER_NOTE_RESULT: {
         bool ok = s_pc_defer_ok;
         bool confirmed = s_pc_defer_confirmed;
@@ -1185,12 +1202,15 @@ static void adv_decoder_task(void *arg)
          * advertisement could start another read in front of it. It is
          * also true because of our own pending command, which would make
          * this gate partly self-referential. */
-        /* M5b Task 9: pending-close due-check, and the deferred arm/
+        /* M5b Task 9: pending-close due-check, and the deferred
          * note_result drain that feeds it (fix round 1, finding 1) --
          * drained FIRST so a close just confirmed (PC_DEFER_NOTE_RESULT)
-         * clears its obligation before this pass can re-attempt it, and an
-         * open that just landed (PC_DEFER_ARM) is armed before the very
-         * first due-check can run against it. Deliberately OUTSIDE the
+         * clears its obligation before this pass can re-attempt it. An
+         * open's obligation needs no drain at all now: it is armed
+         * synchronously in on_actor_dispatch(), on this same task, before
+         * the command ever reaches the radio (ruling FINAL-arm), so it is
+         * always already present by the time any due-check could see it.
+         * Deliberately OUTSIDE the
          * s_actors_wired gate below and unconditional on role: unlike
          * actor_service(), pending_close_service() never touches the radio
          * itself -- it only decides whether an obligation is due and, if
