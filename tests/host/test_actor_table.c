@@ -20,10 +20,13 @@ static void test_bound_enforced(void) {
 }
 
 /* A wrapper that declared a LOWER max than the firmware's is the effective
- * bound -- tightening is always allowed. */
+ * bound -- tightening is always allowed. Asserts BOTH sides: at the
+ * tightened max it must still be OK (an off-by-one that tightened too far
+ * would pass a refusal-only test), and just past it must be refused. */
 static void test_wrapper_bound_tightens(void) {
     actor_table_init(&T);
     assert(actor_table_add(&T, 3, ACT_IRRIGATION_OPEN, 60, 0x01));
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 60, ACTOR_SRC_RULE, 100) == ACTOR_OK);
     assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 61, ACTOR_SRC_RULE, 100) == ACTOR_REFUSED_BOUND);
 }
 
@@ -36,10 +39,14 @@ static void test_cooldown(void) {
 }
 
 /* Fixed hourly window (spec section 4.2). The boundary behaviour is a
- * documented trade, so it is asserted rather than left to chance. */
+ * documented trade, so it is asserted rather than left to chance. Also
+ * asserts the FIRST fire is permitted (a too-strict off-by-one like
+ * `count >= max_per_hour - 1` would still fail the refusal-only checks
+ * below but pass a suite that never checked the positive case). */
 static void test_rate_limit_fixed_window(void) {
     setup();
     actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, 0, 2);
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 100) == ACTOR_OK);
     actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 100);
     actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 200);
     assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 300) == ACTOR_REFUSED_RATE);
@@ -141,6 +148,63 @@ static void test_window_count_saturates_not_wraps(void) {
     assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 399) == ACTOR_REFUSED_RATE);
 }
 
+/* Review round 1, finding 1 (CRITICAL): re-declaring an already-tracked
+ * pair -- a wrapper re-parse, a re-discovery pass, an API-driven wrapper
+ * update -- must not erase an hourly budget already spent or reset the
+ * operator's cooldown. Traces the reviewer's own repro: a cooldown earned
+ * by two recorded fires must still be in force after an identical re-add. */
+static void test_readd_preserves_guards_and_window(void) {
+    actor_table_init(&T);
+    assert(actor_table_add(&T, 3, ACT_IRRIGATION_OPEN, 300, 0x01));
+    actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, /*cooldown_s*/ 600, /*max_per_hour*/ 2);
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 100);
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 200);
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 300) == ACTOR_REFUSED_COOLDOWN);
+    /* Re-declare the identical pair. */
+    assert(actor_table_add(&T, 3, ACT_IRRIGATION_OPEN, 300, 0x01));
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 300) == ACTOR_REFUSED_COOLDOWN);
+}
+
+/* Review round 1, finding 2 (Important): ACTOR_SRC_SAFETY is exempt from
+ * cooldown -- a close-retry storm (spec section 4.3/4.5) must not be
+ * refused by a guard that exists to rate-shape rules and manual presses,
+ * not to block the one source whose job is closing something already
+ * open. */
+static void test_safety_exempt_from_cooldown(void) {
+    setup();
+    actor_table_set_guards(&T, 3, ACT_SWITCH_OFF, /*cooldown_s*/ 600, /*max_per_hour*/ 0);
+    actor_table_record(&T, 3, ACT_SWITCH_OFF, 100);
+    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 0, ACTOR_SRC_RULE, 150) == ACTOR_REFUSED_COOLDOWN);
+    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 0, ACTOR_SRC_SAFETY, 150) == ACTOR_OK);
+}
+
+/* Same finding, the rate axis: a user-configured hourly cap on switch.off
+ * must not be able to strand an actuator open either. */
+static void test_safety_exempt_from_rate(void) {
+    setup();
+    actor_table_set_guards(&T, 3, ACT_SWITCH_OFF, /*cooldown_s*/ 0, /*max_per_hour*/ 1);
+    actor_table_record(&T, 3, ACT_SWITCH_OFF, 100);
+    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 0, ACTOR_SRC_RULE, 150) == ACTOR_REFUSED_RATE);
+    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 0, ACTOR_SRC_SAFETY, 150) == ACTOR_OK);
+}
+
+/* Review round 1, finding 3 (Important): -1 is find_free_row()'s own
+ * sentinel for an unused row, and also registry_find()'s canonical
+ * not-found return -- a caller that resolved a device id to "not found"
+ * must not have that treated as a legitimate device. All five entry
+ * points reject a negative dev_idx; add()'s rejection must not be counted
+ * in full_drops (that counter is for a genuinely full table, not bad
+ * input -- see finding 4 / actor_table_add()'s header comment). */
+static void test_negative_dev_idx_rejected(void) {
+    actor_table_init(&T);
+    assert(!actor_table_add(&T, -1, ACT_SWITCH_ON, 0, 0));
+    assert(actor_table_full_drops(&T) == 0);
+    assert(actor_table_check(&T, -1, ACT_SWITCH_ON, 0, ACTOR_SRC_RULE, 100) == ACTOR_REFUSED_UNKNOWN);
+    assert(!actor_table_set_guards(&T, -1, ACT_SWITCH_ON, 10, 1));
+    actor_table_record(&T, -1, ACT_SWITCH_ON, 100);          /* must not crash */
+    actor_table_set_lockout(&T, -1, true);                   /* must not crash */
+}
+
 int main(void) {
     test_bound_enforced(); test_wrapper_bound_tightens(); test_cooldown();
     test_rate_limit_fixed_window(); test_one_budget_across_sources(); test_lockout();
@@ -148,6 +212,9 @@ int main(void) {
     test_bound_wins_over_lockout(); test_cooldown_wins_over_rate();
     test_zero_guards_stay_unlimited(); test_cooldown_before_first_fire_permits();
     test_window_count_saturates_not_wraps();
+    test_readd_preserves_guards_and_window();
+    test_safety_exempt_from_cooldown(); test_safety_exempt_from_rate();
+    test_negative_dev_idx_rejected();
     printf("test_actor_table: OK\n");
     return 0;
 }

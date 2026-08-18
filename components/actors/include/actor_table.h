@@ -93,11 +93,23 @@ void actor_table_init(actor_table_t *t);
  * min(param_max, the firmware's action_get(action_id)->param_max)).
  * `flags` is opaque here -- see actor_slot_t's comment.
  *
- * Returns false, and counts the refusal in actor_table_full_drops(), when
- * `action_id` is unknown to action.h, or the table has no room: no free
- * device row for a new dev_idx, or no free action slot in dev_idx's row.
- * Calling again for a pair already declared updates it in place rather
- * than consuming a second slot. */
+ * Returns false when `dev_idx` is negative, `action_id` is unknown to
+ * action.h, or the pair cannot be added for either reason. It ALSO
+ * returns false, additionally counting the refusal in
+ * actor_table_full_drops(), specifically when the table has no room: no
+ * free device row for a new dev_idx, or no free action slot in dev_idx's
+ * row. The two false-return cases are deliberately not folded into one
+ * counter -- a caller trying to diagnose "why won't this add" needs to
+ * tell "bad input" from "the table is full" apart.
+ *
+ * Calling again for a pair already declared updates `param_max` and
+ * `flags` in place rather than consuming a second slot, and leaves that
+ * pair's cooldown, rate cap and window state untouched -- a wrapper
+ * re-parse, a re-discovery pass or an API-driven wrapper update must not
+ * reset an operator's guards or erase an hourly budget already spent.
+ * (The device row's `lockout` already survives a re-add the same way; a
+ * new row starts with lockout off, same as a genuinely new pair starts
+ * with clean guards.) */
 bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id,
                       uint16_t param_max, uint8_t flags);
 
@@ -107,11 +119,21 @@ bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id,
  *   unknown -> bound -> lockout -> cooldown -> rate
  *
  * Order matters for the alert text (see actor_verdict_t's comment) and for
- * safety: BOUND is checked before LOCKOUT so a locked-out device still
- * reports an out-of-range parameter as a bound violation, not a lockout,
- * and LOCKOUT refuses ACTOR_SRC_RULE while permitting ACTOR_SRC_MANUAL and
- * ACTOR_SRC_SAFETY -- a lockout that blocked the safety close would strand
- * an actuator open, which is the opposite of safe.
+ * safety. Per-guard, by source, this is the module's contract:
+ *
+ *   unknown  -> refuses every source (dev_idx < 0 counts as unknown)
+ *   bound    -> refuses every source, ACTOR_SRC_SAFETY included -- it is a
+ *               correctness check, not a rate limit, and a close carries
+ *               no parameter, so it never blocks a legitimate close
+ *   lockout  -> refuses ACTOR_SRC_RULE; permits MANUAL and SAFETY
+ *   cooldown -> refuses RULE and MANUAL; permits SAFETY
+ *   rate     -> refuses RULE and MANUAL; permits SAFETY
+ *
+ * The principle behind the last three: ACTOR_SRC_SAFETY is exempt from
+ * every rate-shaping guard (lockout, cooldown, rate), because its job is
+ * to close something already open -- a lockout, a close-retry storm, or a
+ * user-configured cooldown/rate cap on switch.off must never be able to
+ * strand an actuator open, which is the opposite of safe.
  *
  * Read-only: does not record a fire. Callers that decide to proceed must
  * call actor_table_record() themselves once the command is actually sent. */
@@ -119,20 +141,21 @@ actor_verdict_t actor_table_check(actor_table_t *t, int dev_idx, uint8_t action_
                                    uint16_t param, actor_source_t source, uint32_t now_s);
 
 /* Records that (dev_idx, action_id) fired at now_s: updates the cooldown
- * clock and the fixed-window rate counter. A no-op if the pair is not
- * declared. Takes no `source` -- guards are one budget shared by every
- * source, by design (see this file's top comment). */
+ * clock and the fixed-window rate counter. A no-op if dev_idx is negative
+ * or the pair is not declared. Takes no `source` -- guards are one budget
+ * shared by every source, by design (see this file's top comment). */
 void actor_table_record(actor_table_t *t, int dev_idx, uint8_t action_id, uint32_t now_s);
 
 /* Configures the cooldown and hourly cap for an already-declared pair.
- * Returns false if the pair is not declared. cooldown_s == 0 disables the
- * cooldown; max_per_hour == 0 disables the rate cap ("unlimited"). */
+ * Returns false if dev_idx is negative or the pair is not declared.
+ * cooldown_s == 0 disables the cooldown; max_per_hour == 0 disables the
+ * rate cap ("unlimited"). */
 bool actor_table_set_guards(actor_table_t *t, int dev_idx, uint8_t action_id,
                              uint16_t cooldown_s, uint8_t max_per_hour);
 
-/* Sets or clears the device-level lockout (a no-op if dev_idx is not
- * declared). See actor_table_check()'s comment for what lockout does and
- * does not refuse. */
+/* Sets or clears the device-level lockout (a no-op if dev_idx is negative
+ * or not declared). See actor_table_check()'s comment for what lockout
+ * does and does not refuse. */
 void actor_table_set_lockout(actor_table_t *t, int dev_idx, bool on);
 
 uint32_t actor_table_full_drops(const actor_table_t *t);
