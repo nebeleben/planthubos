@@ -3,16 +3,24 @@ menu "PlantHub Wrappers"
 config PLANTHUB_WRAPPER_ARENA
     int "Wrapper bytecode arena size (bytes)"
     default 4096 if IDF_TARGET_ESP32C5
+    default 4096 if IDF_TARGET_ESP32C6
     default 2048
     help
         Size of the shared LRU-evicted arena holding LOADED wrapper
         bytecode blobs (M3 spec section 2), packed by their actual size
         rather than a fixed slot each -- this is what makes the 16-wrapper,
-        2 KB-bytecode-each store affordable on the C3: the store itself is
-        a flash limit (16 * 2 KB, LittleFS), the arena is the RAM cost, and
-        the two are deliberately not the same number. A realistic wrapper
-        compiles to a few hundred bytes, so this default holds several of
-        them resident at once; only a pathological near-2 KB wrapper fills
-        it alone.
+        2 KB-bytecode-each store affordable on a small part: the store
+        itself is a flash limit (16 * 2 KB, LittleFS), the arena is the RAM
+        cost, and the two are deliberately not the same number. A realistic
+        wrapper compiles to a few hundred bytes, so this default holds
+        several of them resident at once; only a pathological near-2 KB
+        wrapper fills it alone.
+
+        Both supported targets take 4096 (the C6 has 512 KB SRAM, the C5
+        384 KB). The trailing 2048 is Kconfig's terminal default for an
+        unlisted target, and is also the value tests/host/test_wrapper_arena.c
+        exercises -- deliberately the tighter number, so packing and
+        eviction are actually stressed by the host test rather than being
+        given room to never evict.
 
 endmenu

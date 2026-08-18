@@ -8,11 +8,18 @@ config PLANTHUB_BLE_SCAN_ITVL_MS
 
 config PLANTHUB_BLE_SCAN_WINDOW_MS
     int "BLE scan window (ms)"
-    default 60 if IDF_TARGET_ESP32C3
     default 60 if IDF_TARGET_ESP32C5
     default 80
     help
-        Active listen time per interval. C3/C5 (single core, shared radio)
-        default lower to keep the web UI responsive (PlanV1 3.1).
+        Active listen time per interval. The C5 (single core, shared radio)
+        defaults lower to keep the web UI responsive (PlanV1 3.1).
+
+        The C6 deliberately has NO arm here and takes the generic 80. Its
+        correct value is a radio-coexistence question, and the C3's 60 was
+        measured on a chip whose WiFi was independently unreliable under
+        BLE load (66% packet loss, HTTP wedging under request bursts).
+        Copying that number to a different radio would be cargo cult. The
+        M6a hardware gate measures C6 coexistence explicitly; set an arm
+        here from that number, not before it.
 
 endmenu

@@ -8,7 +8,8 @@
  * wrapper_store.c), and the arena is a third, independent one: a shared
  * LRU-evicted cache of LOADED bytecode blobs, packed by their actual size
  * rather than a fixed slot each, sized by CONFIG_PLANTHUB_WRAPPER_ARENA
- * (2048 B on esp32c3, 4096 B on esp32c5-- spec section 7's budget line).
+ * (4096 B on esp32c5 and esp32c6; 2048 B is Kconfig's terminal default --
+ * M3 spec section 7's budget line).
  *
  * wrapper_arena.c is pure C99 (no ESP-IDF/FreeRTOS/file-I/O includes), same
  * discipline as wrapper_index.c, so tests/host/test_wrapper_arena.c compiles
@@ -34,7 +35,7 @@
 /* Retention is Kconfig-driven (components/wrappers/Kconfig); the host test
  * build (tests/host/run.sh, plain `cc`, no sdkconfig.h) never defines the
  * CONFIG_ symbol, so fall back to the same default as the Kconfig's own
- * (esp32c3's 2048 B) -- same pattern components/storage/include/storage.h
+ * terminal 2048 B -- same pattern components/storage/include/storage.h
  * already uses for CONFIG_PLANTHUB_HISTORY_RAW_CAP. */
 #ifndef CONFIG_PLANTHUB_WRAPPER_ARENA
 #define CONFIG_PLANTHUB_WRAPPER_ARENA 2048

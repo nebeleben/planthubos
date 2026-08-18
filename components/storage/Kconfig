@@ -11,12 +11,20 @@ config PLANTHUB_HISTORY_RAW_CAP
         this directly sizes the "storage" littlefs partition's raw-history
         footprint per plant.
 
-        The ESP32-C5 default is lower than C3's because its "storage"
-        partition is half the size (384K vs 768K -- see partitions_c5.csv,
-        which trades storage space for bigger OTA app slots and dual-band
-        WiFi/Zigbee headroom). Lower only for a custom partition table with
-        even less "storage" space; raising it risks exhausting the
-        partition once enough plants are actively sampled.
+        The ESP32-C5 default is lower because its "storage" partition is
+        only 384K (see partitions_c5.csv, which trades storage space for
+        bigger OTA app slots and dual-band WiFi headroom). Lower only for a
+        custom partition table with even less "storage" space; raising it
+        risks exhausting the partition once enough plants are actively
+        sampled.
+
+        The C6 has no arm and takes the generic 2880, even though its 16 MB
+        layout gives "storage" 8000K (partitions_16m.csv) and could hold
+        far more -- one plant's raw ring is only about 63 KB at this cap.
+        That headroom is banked on purpose (M6a spec section 5): the
+        milestone raises no capacity limit on the strength of available
+        space alone. Raise this when something actually needs deeper raw
+        history, with the reason recorded.
 
 config PLANTHUB_HISTORY_HOURLY_CAP
     int "Hourly-tier history ring capacity (samples per plant)"

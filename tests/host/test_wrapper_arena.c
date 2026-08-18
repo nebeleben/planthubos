@@ -4,8 +4,10 @@
  * exactly the "loader injected as a function pointer" design
  * task-5-brief.md's Step 1 asks for. WRAPPER_ARENA_SIZE here is the
  * fallback default (2048 B, wrapper_arena.h's #ifndef CONFIG_..., same
- * value as the esp32c3 Kconfig default) since this plain-`cc` build never
- * defines CONFIG_PLANTHUB_WRAPPER_ARENA. */
+ * value as the Kconfig's terminal default) since this plain-`cc` build
+ * never defines CONFIG_PLANTHUB_WRAPPER_ARENA. This is deliberately
+ * tighter than either shipping target's 4096 B, so the arena's packing and
+ * eviction paths are actually exercised here. */
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
