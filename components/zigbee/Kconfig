@@ -1,0 +1,24 @@
+menu "PlantHub Zigbee"
+
+config PLANTHUB_ZB_ENABLED
+    bool "Enable the Zigbee coordinator"
+    default y if IDF_TARGET_ESP32C6
+    default n
+    help
+        The Zigbee coordinator needs an 802.15.4 radio AND the
+        zb_storage/zb_fct partitions that partitions_16m.csv provides.
+        Only the esp32c6 has both, which is why this defaults off
+        everywhere else: the 4 MB esp32c5 leg has neither the partitions
+        nor the app-slot headroom (M6a spec section 2).
+
+config PLANTHUB_ZB_PERMIT_JOIN_S
+    int "Permit-join window (seconds)"
+    default 180
+    range 30 254
+    help
+        How long the network accepts new devices after the user presses
+        Pair. The window is a window, never a mode: it closes on expiry,
+        on a successful join, and on reboot. A permanently open network
+        lets any device in radio range join.
+
+endmenu

@@ -12,6 +12,7 @@
 #include "webserver.h"
 #include "data_core.h"
 #include "ble_collector.h"
+#include "zigbee.h"
 #include "timekeeper.h"
 #include "sampler.h"
 #include "ota_post.h"
@@ -432,6 +433,19 @@ void app_main(void)
      * ble_collector_start() -- controller + NimBLE host pools + host task --
      * and nothing else. ble_collector.c logs two finer milestones inside it. */
     log_heap("after ble_collector_start");
+
+    /* M6b Task 1: the Zigbee coordinator's own stack task, started after
+     * ble_collector_start() so BLE is already up first (this ordering
+     * mirrors the batt_cycle_task placement just below). zigbee_start()
+     * only creates the stack task -- it returns ESP_OK before any network
+     * exists, formation/restore happen asynchronously through the signal
+     * handler in zigbee.c -- and it is a no-op returning ESP_OK when
+     * CONFIG_PLANTHUB_ZB_ENABLED is off, so this call is unconditional.
+     * Deliberately NOT wrapped in ESP_ERROR_CHECK: a coordinator that
+     * cannot start is a degraded hub, not a boot failure -- it still
+     * collects BLE and serves its web UI (see zigbee.h). */
+    esp_err_t zb_err = zigbee_start();
+    if (zb_err != ESP_OK) ESP_LOGE(TAG, "Zigbee coordinator failed to start (%s); running without Zigbee", esp_err_to_name(zb_err));
 
     /* M7 Task 5 (spec §4): a battery-mode paired node runs its wake cycle
      * (scan -> checkin -> sleep) instead of just sitting always-on -- see

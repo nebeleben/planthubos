@@ -11,3 +11,22 @@
 # and `idf.py coredump-debug` consume directly.
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+
+# M6b Task 1: espressif__esp-zigbee-lib and espressif__esp-zboss-lib gate
+# their OWN include dirs and prebuilt libs behind their own CONFIG_ZB_ENABLED
+# (see managed_components/espressif__esp-zigbee-lib/CMakeLists.txt and
+# espressif__esp-zboss-lib/CMakeLists.txt) -- without it their include_dirs
+# is empty and esp_zigbee_core.h is not on the include path at all, before
+# it ever gets to linking. components/zigbee/Kconfig's PLANTHUB_ZB_ENABLED
+# (defaults on for this target) governs whether PlantHub's own coordinator
+# code compiles in; it cannot reach into a sibling component's Kconfig to
+# turn ZB_ENABLED on for it, so the two are set here side by side. ZCZR
+# picks the coordinator/router library variant, matching
+# ESP_ZB_DEVICE_TYPE_COORDINATOR in zigbee.c. Radio type is left off: the
+# ZB_RADIO_TYPE choice already defaults to ZB_RADIO_NATIVE when
+# SOC_IEEE802154_SUPPORTED (true for the C6), same as CONFIG_ZB_GP_ENABLED
+# defaulting on under ZB_ZCZR. This mirrors the M0 coex spike's own
+# sdkconfig.defaults (docs/superpowers/plans/2026-08-15-planthub-v2-m0-
+# groundwork.md, Task 6), which proved this exact pair of options builds.
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_ZCZR=y
