@@ -40,6 +40,7 @@ typedef enum {
     ALERT_CODE_RATE,               /* refused: over the hourly cap */
     ALERT_CODE_COMMAND_EXPIRED,    /* command dropped past its deadline */
     ALERT_CODE_CLOSE_UNCONFIRMED,  /* safety close sent but not confirmed */
+    ALERT_CODE_QUEUE_FULL,         /* actor_request() refused: command queue full */
 } alert_code_t;
 
 #define ALERT_RING_LEN 8

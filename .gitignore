@@ -41,3 +41,4 @@ tests/host/test_bindkey_core
 tests/host/test_uri_handler_budget
 tests/host/test_action
 tests/host/test_actor_table
+tests/host/test_actor_queue
