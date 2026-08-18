@@ -190,3 +190,8 @@ $CC -Wall -Wextra -Werror test_uri_handler_budget.c -o test_uri_handler_budget
 $CC -Wall -Wextra -Werror -I../../components/actions/include \
     test_action.c ../../components/actions/action.c -o test_action
 ./test_action
+
+$CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/actions/include \
+    test_actor_table.c ../../components/actors/actor_table.c ../../components/actions/action.c \
+    -o test_actor_table
+./test_actor_table
