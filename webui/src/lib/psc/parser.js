@@ -282,15 +282,22 @@ class Parser {
     const usedActionIds = new Set()
     while (this.isKeyword('action')) {
       const action = this.parseActionBlock()
-      if (usedActionIds.has(action.actionId)) {
-        throw new PSError(
-          `duplicate action '${action.name}': each action may be declared once per wrapper`,
-          action.line, action.col
-        )
-      }
+      // Count check BEFORE the duplicate check, deliberately: ACTIONS
+      // (plan-limits.js) currently defines exactly PSVM_ACTION_MAX (4)
+      // distinct actions, so a 5th action block is ALWAYS a repeat of one
+      // of the first four -- if duplicate were checked first, the
+      // count-exceeded error would be permanently unreachable (the
+      // duplicate check would fire on every attempt to prove it). Checking
+      // count first keeps both errors reachable and independently testable.
       if (actions.length >= PSVM_ACTION_MAX) {
         throw new PSError(
           `wrapper declares more than ${PSVM_ACTION_MAX} actions (PSVM_ACTION_MAX)`,
+          action.line, action.col
+        )
+      }
+      if (usedActionIds.has(action.actionId)) {
+        throw new PSError(
+          `duplicate action '${action.name}': each action may be declared once per wrapper`,
           action.line, action.col
         )
       }
@@ -340,12 +347,19 @@ class Parser {
   // action block (M5b spec section 2):
   //   action <name>(<param> max <n>)   or   action <name>()
   //     write <uuid16> = <hexbytes>[ <accessor>(<param>)]
+  //     [closes_itself]
   //     [confirm read <uuid16> as <name>
   //       require <accessor>(<name>, <offset>) <op> <int>]
   // `<name>` is a dotted action id (irrigation.open, pump.run, ...) looked up
   // in ACTION_DEFS (plan-limits.js's mirror of action.h's ACTION_COUNT
   // table). Every field here maps 1:1 onto psvm.h's PSVM_FLAG_ACTION_TABLE
   // doc comment, which is ground truth for codegen.js's byte layout.
+  //
+  // `closes_itself` (spec §4.3's device-local timed-off, psvm.h flags bit 0)
+  // is a FIXED position -- after `write`, before `confirm` -- matching the
+  // spec example's own ordering, rather than "anywhere in the block": one
+  // canonical shape is easier to read and to keep this parser simple, and
+  // nothing in the spec asks for reordering flexibility here.
   parseActionBlock() {
     const aTok = this.expectKeyword('action')
     const seg1 = this.expectIdent()
@@ -396,15 +410,38 @@ class Parser {
       )
     }
 
+    // closes_itself (spec §4.3, psvm.h flags bit 0): the PREFERRED path --
+    // "the DIY profile's mandatory behaviour and the reason the profile
+    // exists" -- vs. the weaker hub-scheduled-close fallback. Legal only on
+    // an action whose parameter is a duration: a device cannot close itself
+    // after a duration that was never written to it, so a parameterless (or
+    // non-duration-parameter) action declaring it is a compile error naming
+    // that reason. A loop (not `if`) so a second occurrence is caught as
+    // "declared once per action" rather than silently accepted.
+    let deviceLocal = false
+    while (this.isKeyword('closes_itself')) {
+      const cTok = this.advance()
+      if (deviceLocal) {
+        throw new PSError(`closes_itself may only be declared once per action`, cTok.line, cTok.col)
+      }
+      if (defn.param !== 'duration_s') {
+        throw new PSError(
+          `closes_itself requires an action with a duration parameter (${name} takes ` +
+          `${defn.param ? `'${defn.param}'` : 'no parameter'}); a device cannot close itself ` +
+          `after a duration that was never written to it`,
+          cTok.line, cTok.col
+        )
+      }
+      deviceLocal = true
+    }
+
     let confirm = null
     if (this.isKeyword('confirm')) {
       confirm = this.parseConfirmBlock()
     }
 
-    // deviceLocal (psvm.h flags bit 0, "device-local timed-off"): no wrapper
-    // grammar sets this yet, so every action compiled here is bit 0 clear.
     return {
-      actionId: defn.id, name, paramMax, deviceLocal: false, write, confirm,
+      actionId: defn.id, name, paramMax, deviceLocal, write, confirm,
       line: aTok.line, col: aTok.col,
     }
   }

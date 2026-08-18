@@ -426,3 +426,120 @@ decode
   assert.equal(r.ok, true)
   assert.equal(r.actions[0].confirm, null)
 })
+
+// ---- closes_itself (M5b spec section 4.3, fix round 1) ----
+// Device-local timed-off is the PREFERRED path (the DIY profile's mandatory
+// behaviour); the hub-scheduled close is the weaker fallback. Without a way
+// to set psvm.h flags bit 0, every timed action was stuck on the weak path.
+
+test('closes_itself sets deviceLocal (flags bit 0)', () => {
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action irrigation.open(duration_s max 300)
+  write 2AF0 = 01 u16le(duration_s)
+  closes_itself
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, true)
+  assert.equal(r.actions[0].deviceLocal, true)
+})
+
+test('an action with no closes_itself is not device-local (flags bit 0 clear)', () => {
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action irrigation.open(duration_s max 300)
+  write 2AF0 = 01 u16le(duration_s)
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, true)
+  assert.equal(r.actions[0].deviceLocal, false)
+})
+
+test('closes_itself on a parameterless action is a compile error naming the reason', () => {
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action switch.on()
+  write 2AF0 = 01
+  closes_itself
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, false)
+  assert.match(r.errors[0].message, /closes_itself requires an action with a duration parameter/)
+  assert.match(r.errors[0].message, /never written to it/)
+})
+
+test('a second closes_itself on the same action is a compile error', () => {
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action irrigation.open(duration_s max 300)
+  write 2AF0 = 01 u16le(duration_s)
+  closes_itself
+  closes_itself
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, false)
+  assert.match(r.errors[0].message, /closes_itself may only be declared once/)
+})
+
+test('the emitted per-action flags byte is 0x03 when closes_itself and confirm are both present', () => {
+  // No connect block, so the action table starts right after the code
+  // section with no consts/refs in between (constCount/refCount both 0 for
+  // this source -- asserted below so a future change to this source that
+  // silently added a const would fail loudly here instead of misreading a
+  // stale byte offset).
+  const src = `wrapper "x" match service 0x181A
+action irrigation.open(duration_s max 300)
+  write 2AF0 = 01 u16le(duration_s)
+  closes_itself
+  confirm read 2AF1 as st
+    require u8(st, 0) == 1
+decode
+  emit switch.state  u8(payload, 0)`
+  const r = compileWrapper(src)
+  assert.equal(r.ok, true)
+  const view = new DataView(r.bytecode.buffer, r.bytecode.byteOffset, r.bytecode.byteLength)
+  const constCount = view.getUint16(12, true)
+  const refCount = view.getUint16(14, true)
+  const codeLen = view.getUint16(16, true)
+  assert.equal(constCount, 0)
+  assert.equal(refCount, 0)
+  const HEADER_LEN = 18
+  const actionTableStart = HEADER_LEN + codeLen // no connect-plan section in this source
+  const flagsOffset = actionTableStart + 1 /* action_count */ + 1 /* action_id */ + 2 /* param_max */
+  assert.equal(r.bytecode[flagsOffset], 0x03)
+})
+
+// ---- duplicate action_id / PSVM_ACTION_MAX (fix round 1: these rejections
+// were implemented and correct per the brief's Step 4, but untested) ----
+
+test('a duplicate action_id in one wrapper is a compile error', () => {
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action switch.on()
+  write 2AF0 = 01
+action switch.on()
+  write 2AF0 = 01
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, false)
+  assert.match(r.errors[0].message, /duplicate action 'switch\.on'/)
+})
+
+test('more than PSVM_ACTION_MAX actions in one wrapper is a compile error', () => {
+  // ACTIONS (plan-limits.js) defines exactly PSVM_ACTION_MAX (4) distinct
+  // actions, so a 5th action block is necessarily a repeat of one of the
+  // first four -- this exercises the count-exceeded path specifically (not
+  // the duplicate-id path), which is why the count check runs first in
+  // parser.js's action-block loop.
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action switch.on()
+  write 2AF0 = 01
+action switch.off()
+  write 2AF0 = 00
+action irrigation.open(duration_s max 300)
+  write 2AF1 = 01 u16le(duration_s)
+action pump.run(duration_s max 120)
+  write 2AF2 = 01 u16le(duration_s)
+action switch.on()
+  write 2AF0 = 01
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, false)
+  assert.match(r.errors[0].message, /more than 4 actions/)
+  assert.match(r.errors[0].message, /PSVM_ACTION_MAX/)
+})

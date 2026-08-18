@@ -23,7 +23,7 @@ const KEYWORDS = new Set([
   // connect block (M5a spec section 2).
   'connect', 'read', 'write', 'as',
   // action block (M5b spec section 2).
-  'action', 'confirm', 'max',
+  'action', 'confirm', 'max', 'closes_itself',
 ])
 
 const UNIT_CHAR = /[A-Za-z%°]/
