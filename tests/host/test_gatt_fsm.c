@@ -420,14 +420,25 @@ static void test_unexpected_event_ignored(void)
  * psvm.h's PSVM_FLAG_ACTION_TABLE layout begins with, followed by that one
  * entry, byte for byte as the blob carries it (see
  * gatt_fsm_init_command()'s own doc comment for why the count byte is
- * still there when only one entry is ever executed). */
+ * still there when only one entry is ever executed).
+ *
+ * This is `action irrigation.open(duration_s max 300) / write 2AF0 = 01
+ * u16le(duration_s)` in the exact bytes the browser compiler emits for it
+ * and psvm_validate() accepts: write_len is "constant prefix + parameter
+ * width" (3), with zero PLACEHOLDER bytes reserved for the parameter, and
+ * param_offset addresses a position inside that length. Fix round 1: the
+ * fixture originally declared write_len 1 and relied on the parameter
+ * extending the payload to 3 -- a shape psvm_validate() rejects, so no
+ * wrapper could ever produce it, and the tests that used it were pinning
+ * behaviour for bytes that cannot reach this code. The extension is now a
+ * refusal (test_param_past_declared_write_len_refused below). */
 static const uint8_t ACT_OPEN_WITH_CONFIRM[] = {
     1,                          /* action_count */
     2,                          /* ACT_IRRIGATION_OPEN */
     0x2C, 0x01,                 /* param_max 300 */
     0x03,                       /* flags: device-local | has confirm */
     0xF0, 0x2A,                 /* write uuid 0x2AF0 */
-    1, 0x01,                    /* write_len 1, byte 0x01 */
+    3, 0x01, 0x00, 0x00,        /* write_len 3: opcode 01, then the u16 placeholder */
     1, 1,                       /* param_offset 1, encoding u16le */
     0xF1, 0x2A,                 /* confirm uuid 0x2AF1 */
     1,                          /* confirm_min_len */
@@ -487,29 +498,52 @@ static void test_no_confirm_completes_unconfirmed(void) {
     assert(f.confirmed == false);
 }
 
-/* The compiler (webui/src/lib/psc/codegen.js) writes write_len as
- * "constant prefix + spliced-param width" and pads the blob with zero
- * placeholder bytes for the parameter, so the REAL on-blob shape of
- * ACT_OPEN_WITH_CONFIRM's write is write_len 3 with bytes 01 00 00. It
- * must splice to exactly the same three bytes as the brief's shorter
- * form above -- otherwise every wrapper the browser actually produces
- * would take a different path through this parser than the one the tests
- * pin. */
+/* The parameter overwrites the placeholder bytes and nothing else: the
+ * payload stays exactly write_len long, and a parameter at the top of the
+ * declared range lands whole. */
 static void test_param_splice_over_placeholder_bytes(void) {
-    static const uint8_t padded[] = {
-        1,
-        2, 0x2C, 0x01, 0x03,
-        0xF0, 0x2A,
-        3, 0x01, 0x00, 0x00,     /* write_len 3, param placeholders zeroed */
-        1, 1,                     /* param_offset 1, u16le */
-        0xF1, 0x2A, 1, 0, 0, 0, 1, 0,
-    };
     gatt_fsm_t f;
-    gatt_fsm_init_command(&f, padded, sizeof padded, 300);
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 300);
     gatt_fsm_step(&f, &EV(GE_START));
     gatt_act_t w = gatt_fsm_step(&f, &EV(GE_CONNECTED));
     assert(w.kind == GA_WRITE && w.len == 3);
     assert(w.data[0] == 0x01 && w.data[1] == 0x2C && w.data[2] == 0x01);
+}
+
+/* A parameter that does not fit inside the entry's OWN declared write_len
+ * is refused, never accommodated by growing the payload (fix round 1,
+ * Critical 1). psvm_validate() rejects this shape, so accepting it here
+ * would give one on-blob format two authorities -- and it would put bytes
+ * on the air no author wrote: the second entry below declares one byte and
+ * would have produced eight, five of them invented zeros. */
+static void test_param_past_declared_write_len_refused(void) {
+    /* The exact shape the task brief's original fixture used: write_len 1
+     * with a u16le parameter at offset 1. */
+    static const uint8_t short_len[] = {
+        1, 2, 0x2C,0x01, 0x03, 0xF0,0x2A, 1,0x01, 1,1,
+        0xF1,0x2A, 1, 0,0,0, 1,0,
+    };
+    /* And the version that made it a Critical rather than a curiosity. */
+    static const uint8_t far_past[] = { 1, 2, 0x2C,0x01, 0x00, 0xF0,0x2A, 1,0x01, 6,2 };
+    gatt_fsm_t f;
+
+    gatt_fsm_init_command(&f, short_len, sizeof short_len, 8);
+    assert(f.state == GS_FAILED && f.fail == GF_BAD_ACTION);
+    assert(gatt_fsm_step(&f, &EV(GE_START)).kind == GA_NONE);
+
+    gatt_fsm_init_command(&f, far_past, sizeof far_past, 8);
+    assert(f.state == GS_FAILED && f.fail == GF_BAD_ACTION);
+    assert(gatt_fsm_step(&f, &EV(GE_START)).kind == GA_NONE);
+
+    /* The boundary is inclusive: a parameter ending exactly at write_len
+     * is the normal, compiler-produced case and must still splice. */
+    static const uint8_t exact[] = { 1, 2, 0x2C,0x01, 0x00, 0xF0,0x2A, 3,0x01,0x00,0x00, 1,1 };
+    gatt_fsm_init_command(&f, exact, sizeof exact, 8);
+    assert(f.state == GS_IDLE);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_act_t w = gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    assert(w.kind == GA_WRITE && w.len == 3);
+    assert(w.data[0] == 0x01 && w.data[1] == 0x08 && w.data[2] == 0x00);
 }
 
 /* Both other encodings, and the "no parameter" sentinel pair: a u8
@@ -584,7 +618,7 @@ static void test_truncated_entry_refused(void) {
  * survive a plan it did not validate itself). */
 static void test_hostile_entry_refused(void) {
     gatt_fsm_t f;
-    /* param_offset 250 + a u16 runs far past any write buffer */
+    /* param_offset 250 + a u16 runs past both write_len and any buffer */
     static const uint8_t far_off[] = { 1, 2, 0x2C,0x01, 0x00, 0xF0,0x2A, 1,0x01, 250, 1 };
     gatt_fsm_init_command(&f, far_off, sizeof far_off, 8);
     assert(f.state == GS_FAILED && f.fail == GF_BAD_ACTION);
@@ -792,6 +826,7 @@ int main(void)
     test_confirm_short_read_fails();
     test_no_confirm_completes_unconfirmed();
     test_param_splice_over_placeholder_bytes();
+    test_param_past_declared_write_len_refused();
     test_param_encodings();
     test_param_over_declared_max_refused();
     test_truncated_entry_refused();

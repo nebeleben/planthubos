@@ -269,6 +269,19 @@ void actor_set_lockout(int dev_idx, bool on)
     actor_unlock();
 }
 
+bool actor_undeclare(int dev_idx)
+{
+    actor_lock();
+    bool removed = actor_table_remove(&s_table, dev_idx);
+    actor_unlock();
+    /* Any command for this device still sitting in the queue is left where
+     * it is on purpose: actor_service_step() re-runs actor_table_check()
+     * before dispatching anything, so it will now be refused as
+     * ACTOR_REFUSED_UNKNOWN with a named alert rather than silently
+     * vanishing from the queue here. */
+    return removed;
+}
+
 uint32_t actor_full_drops(void)
 {
     actor_lock();

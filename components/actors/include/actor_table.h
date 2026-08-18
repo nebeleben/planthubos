@@ -158,4 +158,26 @@ bool actor_table_set_guards(actor_table_t *t, int dev_idx, uint8_t action_id,
  * does and does not refuse. */
 void actor_table_set_lockout(actor_table_t *t, int dev_idx, bool on);
 
+/* Undeclares dev_idx entirely: the row is freed, so every action it
+ * declared, their guard configuration and their spent hourly budget, and
+ * the device's lockout, are all gone. Returns false when dev_idx was not
+ * declared (nothing to remove).
+ *
+ * The inverse of actor_table_add(), and deliberately a much blunter
+ * instrument than it: add() re-declares in place precisely so a wrapper
+ * re-parse never resets an operator's guards, so removal must be something
+ * a caller asks for explicitly, on evidence, and never a routine step of
+ * re-binding. M5b Task 8 fix round 1 has the one caller and the one piece
+ * of evidence that justifies it: ble_collector.c's wrapper reindex, for a
+ * bound actuator whose wrapper NO LONGER declares any action -- the
+ * wrapper was deleted, or its action block was. Without it that device
+ * stays declared forever, every command a rule queues for it passes the
+ * guards, reaches dispatch, fails for want of a wrapper and alerts --
+ * indefinitely, for a device the operator removed.
+ *
+ * A device whose wrapper still declares actions is NOT removed and must
+ * not be: it would cost that operator their cooldown, their hourly cap and
+ * their lockout every time any unrelated wrapper was installed. */
+bool actor_table_remove(actor_table_t *t, int dev_idx);
+
 uint32_t actor_table_full_drops(const actor_table_t *t);

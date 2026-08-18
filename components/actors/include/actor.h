@@ -183,6 +183,12 @@ bool     actor_declare(int dev_idx, uint8_t action_id, uint16_t param_max, uint8
 bool     actor_configure_guards(int dev_idx, uint8_t action_id,
                                  uint16_t cooldown_s, uint8_t max_per_hour);
 void     actor_set_lockout(int dev_idx, bool on);
+/* Undeclares dev_idx entirely -- see actor_table_remove() for the full
+ * contract and for why this is deliberately blunt (the device's guards,
+ * spent budget and lockout all go with it) and must only be called on
+ * evidence that the device is no longer an actuator at all. M5b Task 8's
+ * wrapper reindex is the one caller. */
+bool     actor_undeclare(int dev_idx);
 uint32_t actor_full_drops(void);
 
 /* The single door onto an actuator (spec section 3). Calls

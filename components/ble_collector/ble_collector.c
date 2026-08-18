@@ -158,9 +158,10 @@ static uint32_t s_plan_interval_memo[REGISTRY_MAX_DEVICES];
  * itself holds four (spec section 1's "a plant hub drives a few valves, not
  * sixteen"). 4 x 8 B, against a 16-entry table's 112 B. */
 typedef struct {
-    int8_t  dev_idx;      /* -1 when free */
-    uint8_t addr_type;
-    uint8_t mac[6];       /* RAW GAP/on-air order -- what ble_gap_connect() wants */
+    int8_t   dev_idx;      /* -1 when free */
+    uint8_t  addr_type;
+    uint8_t  mac[6];       /* RAW GAP/on-air order -- what ble_gap_connect() wants */
+    uint16_t wrapper_id;   /* the wrapper whose action table bound this device */
 } actor_conn_t;
 static actor_conn_t s_actor_conn[ACTOR_MAX_DEVICES];
 
@@ -175,12 +176,42 @@ _Static_assert(REGISTRY_MAX_DEVICES <= 16, "s_actor_asked is a 16-bit index bitm
 /* The command currently in flight, remembered here because
  * gatt_cmd_done_fn_t deliberately carries only (dev_idx, ok, confirmed,
  * err) -- everything else it would have to carry is knowledge of the actor
- * layer, which is exactly what must not cross that boundary. Exactly one
- * command is ever in flight (gatt_engine_cmd_busy() is what keeps it that
- * way), written by adv_decoder_task at dispatch and read by the NimBLE host
- * task in the completion hook. */
-static uint8_t  s_cmd_action_id = ACTION_NONE;
-static uint16_t s_cmd_param;
+ * layer, which is exactly what must not cross that boundary.
+ *
+ * Written by adv_decoder_task at dispatch, read by the NimBLE host task in
+ * the completion hook, with no lock -- safe because the two can never
+ * overlap, and it is worth being exact about why rather than resting on
+ * "there is only one": the engine calls the hook from inside
+ * attempt_finish() BEFORE it clears s_active, so gatt_engine_cmd_busy() is
+ * still true for the whole duration of the hook, and the decoder loop will
+ * not dispatch the next command (and so will not touch this struct) until
+ * it goes false. */
+static actor_cmd_t s_cmd_inflight = { .dev_idx = -1, .action_id = ACTION_NONE };
+
+/* The re-queue path for a command the GATT engine refused because the OTHER
+ * owner of the hub's single outbound connection had the radio
+ * (GATT_CMD_ERR_RADIO_BUSY). By then actor_service_step() has already
+ * popped that command and charged it against its hourly budget, and nothing
+ * else would ever put it back -- an irrigation-open lost because the
+ * MiFlora poller happened to be connecting would simply be gone (fix round
+ * 1, Critical 2).
+ *
+ * Performed on adv_decoder_task, never from the completion hook itself:
+ * that hook runs on the NimBLE host task for a radio outcome, and
+ * actor_request() takes the actor mutex. Same discipline, same reason, as
+ * the switch.state write gatt_engine_service() defers to this task.
+ *
+ * ONCE per command, latched by identity in s_requeued. The retry is
+ * otherwise unbounded in a way the TTL alone does not fix: every dispatch
+ * re-runs actor_table_record(), so a command bouncing off a busy radio once
+ * per decoder tick would spend a max_per_hour budget in milliseconds. One
+ * retry costs at most one extra activation and is what a poll collision --
+ * a few seconds, at most once a minute -- actually needs. */
+static actor_cmd_t s_requeue;          /* the command to put back, valid iff pending */
+static volatile bool s_requeue_pending;
+static actor_cmd_t s_requeued;         /* identity of the command already retried once */
+static bool s_requeued_valid;
+static bool s_cmd_is_retry;            /* is the in-flight command that retry? */
 
 /* Set once both hooks are registered, which happens on the HUB only -- a
  * node's radio belongs to ESP-NOW, exactly as it does for battery polling
@@ -396,6 +427,7 @@ static void note_actor_device(int idx, uint16_t wrapper_id, const adv_item_t *it
         if (s_actor_conn[i].dev_idx == (int8_t)idx) {
             s_actor_conn[i].addr_type = item->addr_type;
             memcpy(s_actor_conn[i].mac, item->mac, 6);
+            s_actor_conn[i].wrapper_id = wrapper_id;
             return;
         }
     }
@@ -423,6 +455,7 @@ static void note_actor_device(int idx, uint16_t wrapper_id, const adv_item_t *it
     s_actor_conn[slot].dev_idx = (int8_t)idx;
     s_actor_conn[slot].addr_type = item->addr_type;
     memcpy(s_actor_conn[slot].mac, item->mac, 6);
+    s_actor_conn[slot].wrapper_id = wrapper_id;
 
     for (uint8_t i = 0; i < n; i++) {
         /* actor_declare() re-declares in place, leaving an operator's
@@ -447,12 +480,26 @@ static void note_actor_device(int idx, uint16_t wrapper_id, const adv_item_t *it
  * already been popped from the actor queue and charged against its hourly
  * budget, so there is no second chance for it and no other place its
  * disappearance would surface. */
+static bool same_command(const actor_cmd_t *a, const actor_cmd_t *b)
+{
+    /* deadline_s is part of the identity and is what makes this reliable: a
+     * re-queued command carries its ORIGINAL absolute deadline (that is the
+     * point -- the TTL keeps running), while a genuinely new command from a
+     * rule or a button computes a fresh one. */
+    return a->dev_idx == b->dev_idx && a->action_id == b->action_id &&
+           a->param == b->param && a->source == b->source &&
+           a->deadline_s == b->deadline_s;
+}
+
 static void on_actor_dispatch(const actor_cmd_t *cmd)
 {
     int idx = cmd->dev_idx;
 
-    s_cmd_action_id = cmd->action_id;
-    s_cmd_param = cmd->param;
+    s_cmd_inflight = *cmd;
+    /* Is this the one command we already put back once? If so it gets no
+     * second retry, and the latch is consumed either way. */
+    s_cmd_is_retry = s_requeued_valid && same_command(&s_requeued, cmd);
+    if (s_cmd_is_retry) s_requeued_valid = false;
 
     const actor_conn_t *conn = NULL;
     for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
@@ -500,15 +547,65 @@ static void on_actor_dispatch(const actor_cmd_t *cmd)
 static void on_gatt_cmd_done(int dev_idx, bool ok, bool confirmed, const char *err)
 {
     if (!ok) {
+        /* The one retryable reason (gatt_engine.h): the radio belonged to
+         * the battery poller at that instant. Nothing about the command or
+         * the device was wrong, so it goes back on the queue rather than
+         * being alerted and dropped -- once, and carrying its original
+         * source and deadline so the TTL still bounds it and a safety close
+         * keeps its priority. The actual actor_request() happens on
+         * adv_decoder_task; see s_requeue's declaration. */
+        if (err == GATT_CMD_ERR_RADIO_BUSY && !s_cmd_is_retry && !s_requeue_pending) {
+            s_requeue = s_cmd_inflight;
+            s_requeue_pending = true;   /* set LAST, like every cross-task flag here */
+            ESP_LOGI(TAG, "command re-queued (radio was busy): dev=%d action=%u",
+                     dev_idx, (unsigned)s_cmd_inflight.action_id);
+            return;
+        }
         ESP_LOGW(TAG, "command failed: dev=%d action=%u param=%u (%s)", dev_idx,
-                 (unsigned)s_cmd_action_id, (unsigned)s_cmd_param, err ? err : "unknown");
+                 (unsigned)s_cmd_inflight.action_id, (unsigned)s_cmd_inflight.param,
+                 err ? err : "unknown");
         alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_COMMAND_FAILED, dev_idx,
-                   s_cmd_action_id, s_cmd_param);
+                   s_cmd_inflight.action_id, s_cmd_inflight.param);
         return;
     }
     ESP_LOGI(TAG, "command %s: dev=%d action=%u param=%u",
              confirmed ? "confirmed" : "completed UNCONFIRMED",
-             dev_idx, (unsigned)s_cmd_action_id, (unsigned)s_cmd_param);
+             dev_idx, (unsigned)s_cmd_inflight.action_id, (unsigned)s_cmd_inflight.param);
+}
+
+/* The decoder-task half of the re-queue above. Called from the same loop
+ * that pumps actor_service(), immediately BEFORE it, so a command put back
+ * here can be popped in the very next pass rather than waiting a tick.
+ *
+ * actor_request() re-runs the guards, which is deliberate: an operator may
+ * have hit lockout in the seconds since, and a command that was OK when it
+ * was dispatched is not assumed still OK now -- the same argument Task 7's
+ * dispatch-time re-check rests on. A refusal there posts its own named
+ * alert, and this adds the "the command is gone" one on top, because those
+ * are two different facts an operator needs. */
+static void service_command_requeue(void)
+{
+    if (!s_requeue_pending) return;
+    s_requeue_pending = false;
+
+    actor_cmd_t cmd = s_requeue;
+    /* Latched BEFORE the request, so the retry is recognised as one even if
+     * it is dispatched on the very next pass. If it never is (its TTL
+     * expires in the queue) the latch simply goes stale, and the worst that
+     * costs is one lost retry for a later command with a byte-identical
+     * identity -- including the same absolute deadline, which a freshly
+     * computed one essentially never is. */
+    s_requeued = cmd;
+    s_requeued_valid = true;
+
+    if (!actor_request(cmd.dev_idx, cmd.action_id, cmd.param,
+                       (actor_source_t)cmd.source, cmd.deadline_s)) {
+        s_requeued_valid = false;
+        ESP_LOGW(TAG, "command could not be re-queued: dev=%d action=%u",
+                 (int)cmd.dev_idx, (unsigned)cmd.action_id);
+        alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_COMMAND_FAILED, cmd.dev_idx,
+                   cmd.action_id, cmd.param);
+    }
 }
 
 /* Runs on adv_decoder_task, never on the NimBLE host task -- this is where
@@ -880,18 +977,45 @@ static void do_wrapper_reindex(void)
      * also the correct answer while nothing has matched yet. */
     memset(s_plan_interval_memo, 0, sizeof(s_plan_interval_memo));
     /* M5b: which actions a device supports comes from its wrapper, so an
-     * install/edit/delete can change that answer too. Both the "already
-     * asked" bitmap and the connection memo are cleared, so the next
+     * install/edit/delete can change that answer too. The "already asked"
+     * bitmap and the connection memo are cleared, so the next
      * advertisement from each device re-derives its binding from the new
-     * index. Already-declared actor table entries are left standing --
-     * actor_declare() re-declares in place, deliberately preserving an
-     * operator's guards and any hourly budget already spent
-     * (actor_table.h), and a command naming an action the new wrapper no
-     * longer declares is refused at dispatch with a named reason rather
-     * than executed. */
+     * index.
+     *
+     * A device whose wrapper is GONE would never re-derive anything, and
+     * before fix round 1 it also stayed declared in the actor table
+     * forever: every command a rule queued for it passed the guards,
+     * reached dispatch, failed for want of a wrapper and alerted --
+     * indefinitely, for a device the operator had removed. So each bound
+     * device is asked ONE question here, while its previous wrapper id is
+     * still known: does that wrapper still declare any action? If not, it
+     * is undeclared outright.
+     *
+     * The question is asked per bound device (at most ACTOR_MAX_DEVICES,
+     * so at most four arena loads on a reindex that already reloads the
+     * whole index and evicts the arena) rather than by undeclaring
+     * everything and re-declaring from scratch: actor_undeclare() takes
+     * the device's guards, its spent hourly budget and its LOCKOUT with
+     * it, and an operator must not lose a stop button because an
+     * unrelated wrapper was installed. */
     s_actor_asked = 0;
-    for (int i = 0; i < ACTOR_MAX_DEVICES; i++) s_actor_conn[i].dev_idx = -1;
+    /* AFTER the eviction, never before: wrapper_exec_actions_list() below
+     * loads through the arena, and a cached blob from the wrapper that was
+     * just deleted would answer "still declares actions" for a wrapper that
+     * no longer exists -- leaving the zombie this whole block removes. Past
+     * the eviction the load goes to flash, where the delete is real. */
     wrapper_arena_evict_all();
+    for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
+        if (s_actor_conn[i].dev_idx < 0) continue;
+        wrapper_action_t acts[ACTOR_MAX_ACTIONS];
+        if (wrapper_exec_actions_list(s_actor_conn[i].wrapper_id, acts, ACTOR_MAX_ACTIONS) == 0) {
+            if (actor_undeclare(s_actor_conn[i].dev_idx)) {
+                ESP_LOGI(TAG, "device %d undeclared: wrapper %u no longer declares actions",
+                         (int)s_actor_conn[i].dev_idx, (unsigned)s_actor_conn[i].wrapper_id);
+            }
+        }
+        s_actor_conn[i].dev_idx = -1;
+    }
 }
 
 static void adv_decoder_task(void *arg)
@@ -929,7 +1053,10 @@ static void adv_decoder_task(void *arg)
          * exactly one, and leaving the next command in the actor queue
          * keeps its TTL and the safety-close priority rule intact instead
          * of having it refused on arrival. */
-        if (s_actors_wired && !gatt_engine_cmd_busy()) actor_service();
+        if (s_actors_wired) {
+            service_command_requeue();
+            if (!gatt_engine_cmd_busy()) actor_service();
+        }
 
         adv_item_t item;
         portENTER_CRITICAL(&s_adv_mux);

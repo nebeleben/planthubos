@@ -266,6 +266,10 @@ static uint8_t  s_cmd_state_val;
  * line at the point of failure, where it is actually useful for diagnosis,
  * rather than into a UI field whose job is to say WHAT failed in words a
  * user can act on. */
+/* The one retryable command failure -- see gatt_engine.h, where it is
+ * declared, for the contract callers compare against by pointer. */
+const char *const GATT_CMD_ERR_RADIO_BUSY = "another connection owner has the radio";
+
 static const char *s_last_error[GATT_SCHED_MAX_DEVICES];
 static const char *s_err;          /* reason for the failure currently being processed */
 
@@ -407,10 +411,15 @@ static void resume_scan(void)
  * path through on_start_req(). It cannot loop: on_start_req() either starts
  * the command or ends it through the done hook, and both clear
  * s_cmd_pending. */
+static void kick_pending_command(void)
+{
+    if (s_cmd_pending && s_phase == TP_IDLE && !s_active) post_to_host(&s_ev_start);
+}
+
 static void resume_scan_or_retry(void)
 {
     resume_scan();
-    if (s_cmd_pending && s_phase == TP_IDLE && !s_active) post_to_host(&s_ev_start);
+    kick_pending_command();
 }
 
 /* The command half of attempt_finish(). Split out rather than braided into
@@ -1174,9 +1183,18 @@ static void start_command(void)
          * A read is dropped here and simply waits for the next
          * advertisement; a command has no next advertisement, and this
          * engine has no timer of its own free to poll for the poller
-         * finishing, so it is refused with a reason the caller can retry
-         * on (the safety core's bounded retry, spec section 4.3). */
-        command_refused("another connection owner has the radio");
+         * finishing, so it is refused with the ONE reason callers may
+         * retry on -- and ble_collector.c's hook does retry it, by putting
+         * the command back on the actor queue where its TTL and the
+         * safety-close priority still apply (fix round 1, Critical 2).
+         *
+         * Deferring it INSIDE this engine instead was considered and
+         * rejected: nothing here is woken when battery_poll.c finishes, so
+         * a held command would keep gatt_engine_busy() true -- blocking
+         * every scheduled read -- until some unrelated attempt happened to
+         * end. The queue is the right place for a command waiting on a
+         * radio this engine does not control. */
+        command_refused(GATT_CMD_ERR_RADIO_BUSY);
         return;
     }
 
@@ -1305,7 +1323,14 @@ static void on_deadline(struct ble_npl_event *ev)
     switch (s_phase) {
 
     case TP_ATTEMPT:
-        if (!s_active) { s_phase = TP_IDLE; return; }
+        /* A post that outlived the phase it was made in. The file argues
+         * above (see timer_phase_t) that a stray one-shot is never left
+         * armed, so this arm is unreachable -- kick_pending_command() makes
+         * that argument unnecessary rather than load-bearing (fix round 1,
+         * minor 4): if it IS reached with a command waiting, the command
+         * still starts instead of waiting for some unrelated attempt to
+         * end. */
+        if (!s_active) { s_phase = TP_IDLE; kick_pending_command(); return; }
         ESP_LOGW(TAG, "attempt deadline (%d ms) expired in state %d",
                  GATT_ATTEMPT_DEADLINE_MS, (int)s_fsm.state);
         s_err = "timed out";
@@ -1326,7 +1351,7 @@ static void on_deadline(struct ble_npl_event *ev)
         return;
 
     case TP_TEARDOWN:
-        if (!s_active) { s_phase = TP_IDLE; return; }
+        if (!s_active) { s_phase = TP_IDLE; kick_pending_command(); return; }
         ESP_LOGW(TAG, "teardown confirmation never arrived; forcing the attempt closed");
         force_close();
         return;

@@ -205,6 +205,63 @@ static void test_negative_dev_idx_rejected(void) {
     actor_table_set_lockout(&T, -1, true);                   /* must not crash */
 }
 
+/* M5b Task 8 fix round 1, finding 3: actor_table_remove() is the inverse of
+ * add(), for a device whose wrapper no longer declares any action at all.
+ * Everything about it goes: its actions, their guards, their spent budget
+ * and its lockout -- which is exactly why it must never be a routine step
+ * of re-binding (test_readd_preserves_guards_and_window() above pins the
+ * other half of that rule). */
+static void test_remove_undeclares_everything(void) {
+    setup();
+    actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, /*cooldown_s*/ 600, /*max_per_hour*/ 1);
+    actor_table_set_lockout(&T, 3, true);
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 100);
+
+    assert(actor_table_remove(&T, 3));
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 150)
+           == ACTOR_REFUSED_UNKNOWN);
+    /* Even a safety close, which is exempt from the guards but not from
+     * "this device declares no such action". */
+    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 0, ACTOR_SRC_SAFETY, 150)
+           == ACTOR_REFUSED_UNKNOWN);
+
+    /* Removing something that was never declared reports so rather than
+     * pretending, and a negative index is refused like everywhere else. */
+    assert(!actor_table_remove(&T, 3));
+    assert(!actor_table_remove(&T, -1));
+}
+
+/* The freed row is reused, so nothing of the removed device may survive
+ * into the next one to occupy it: an inherited last_fire_s or window_count
+ * would charge a DIFFERENT device's first command against a budget it
+ * never spent -- and, with lockout, could leave a brand-new actuator
+ * silently refusing everything. */
+static void test_removed_row_is_reusable_and_clean(void) {
+    actor_table_init(&T);
+    assert(actor_table_add(&T, 3, ACT_IRRIGATION_OPEN, 300, 0x01));
+    actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, /*cooldown_s*/ 600, /*max_per_hour*/ 1);
+    actor_table_set_lockout(&T, 3, true);
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 100);
+    assert(actor_table_remove(&T, 3));
+
+    assert(actor_table_add(&T, 7, ACT_IRRIGATION_OPEN, 300, 0x01));
+    assert(actor_table_check(&T, 7, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 150) == ACTOR_OK);
+}
+
+/* And the capacity it frees is real: a fifth actuator was refused before
+ * (test_capacity_refuses_fifth_actor), and must be accepted after a
+ * removal rather than still counting against the table. */
+static void test_remove_frees_capacity(void) {
+    actor_table_init(&T);
+    for (int d = 0; d < ACTOR_MAX_DEVICES; d++) {
+        assert(actor_table_add(&T, d, ACT_SWITCH_ON, 0, 0));
+    }
+    assert(!actor_table_add(&T, 99, ACT_SWITCH_ON, 0, 0));
+    assert(actor_table_remove(&T, 1));
+    assert(actor_table_add(&T, 99, ACT_SWITCH_ON, 0, 0));
+    assert(actor_table_check(&T, 99, ACT_SWITCH_ON, 0, ACTOR_SRC_RULE, 100) == ACTOR_OK);
+}
+
 int main(void) {
     test_bound_enforced(); test_wrapper_bound_tightens(); test_cooldown();
     test_rate_limit_fixed_window(); test_one_budget_across_sources(); test_lockout();
@@ -215,6 +272,9 @@ int main(void) {
     test_readd_preserves_guards_and_window();
     test_safety_exempt_from_cooldown(); test_safety_exempt_from_rate();
     test_negative_dev_idx_rejected();
+    test_remove_undeclares_everything();
+    test_removed_row_is_reusable_and_clean();
+    test_remove_frees_capacity();
     printf("test_actor_table: OK\n");
     return 0;
 }

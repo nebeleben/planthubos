@@ -91,6 +91,23 @@ typedef bool (*gatt_conn_busy_fn_t)(void);
  * not call back into this engine. */
 typedef void (*gatt_cmd_done_fn_t)(int dev_idx, bool ok, bool confirmed, const char *err);
 
+/* The one failure reason that means "nothing was wrong with this command,
+ * the radio was simply not ours at that moment" -- the other owner of the
+ * hub's single outbound connection (battery_poll.c) held it. Every other
+ * `err` this engine reports describes something that will not fix itself:
+ * a device that refused the write, an entry that will not parse, a
+ * parameter over its bound.
+ *
+ * Exported so the hook can tell the two apart, and compared BY POINTER
+ * rather than by strcmp(): it is the same string object the engine passed,
+ * so identity is exact and no reader has to depend on the wording of a log
+ * message. A command refused with THIS reason has already been popped from
+ * the actor queue and charged against its hourly budget, so the hook is
+ * expected to put it back on the queue rather than let it die -- see
+ * ble_collector.c, which does exactly that, once, bounded by the command's
+ * own TTL (fix round 1, Critical 2). */
+extern const char *const GATT_CMD_ERR_RADIO_BUSY;
+
 /* Largest one-entry action section gatt_engine_request_command() accepts,
  * so a caller can size its own buffer: psvm.h's PSVM_FLAG_ACTION_TABLE
  * layout is u8 action_count + action_id(1) + param_max(2) + flags(1) +

@@ -278,13 +278,21 @@ void gatt_fsm_init(gatt_fsm_t *fsm, const uint8_t *plan, size_t plan_len);
  * pointer must never be held across an attempt, see gatt_engine.c).
  *
  * Like gatt_fsm_init(), this does NOT assume psvm_validate() ran: every
- * offset is bounds-checked against `len` as it is derived. Unlike
- * gatt_fsm_init(), which yields whatever prefix of a truncated plan parsed,
- * an entry that does not parse IN FULL -- or whose parameter does not fit
- * the write buffer, or exceeds the entry's own param_max -- leaves the
- * machine terminal (GS_FAILED, with GF_BAD_ACTION or GF_PARAM_OVER_MAX)
- * and it never connects. A partial read plan still reads something useful;
- * half a command is a valve moved by bytes nobody wrote down. The caller
+ * offset is bounds-checked against `len` as it is derived, and every field
+ * that validator constrains is re-checked here against the SAME rule it
+ * applies -- never a looser one. An entry this function accepts is one
+ * psvm_validate() would also accept; there is one on-blob format and it has
+ * one meaning, whichever code is reading it.
+ *
+ * Unlike gatt_fsm_init(), which yields whatever prefix of a truncated plan
+ * parsed, an entry that does not parse IN FULL -- or whose parameter does
+ * not fit inside its own declared write_len, or exceeds the entry's own
+ * param_max -- leaves the machine terminal (GS_FAILED, with GF_BAD_ACTION
+ * or GF_PARAM_OVER_MAX) and it never connects. A partial read plan still
+ * reads something useful; half a command is a valve moved by bytes nobody
+ * wrote down. The write payload is exactly write_len bytes, always: the
+ * parameter is spliced OVER the placeholder bytes the compiler reserved
+ * for it inside that length, never appended past it. The caller
  * must check `fsm->state == GS_IDLE` before feeding GE_START -- in a
  * terminal state gatt_fsm_step() ignores it and returns GA_NONE, so a
  * caller that forgets simply never starts the attempt, but it would then

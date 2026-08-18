@@ -120,7 +120,6 @@ void gatt_fsm_init_command(gatt_fsm_t *f, const uint8_t *e, uint16_t len, uint16
     uint8_t param_encoding = e[off + 1];
     off += 2;
 
-    uint8_t payload_len = write_len;
     if (param_offset != 0xFF || param_encoding != 0xFF) {
         /* A matched pair or nothing (psvm.h's own rule). Half a pair means
          * either a parameter with no place to go or a place with no
@@ -128,12 +127,25 @@ void gatt_fsm_init_command(gatt_fsm_t *f, const uint8_t *e, uint16_t len, uint16
         if (param_offset == 0xFF || param_encoding == 0xFF) { cmd_refuse(f, GF_BAD_ACTION); return; }
         uint8_t width = enc_width(param_encoding);
         if (width == 0) { cmd_refuse(f, GF_BAD_ACTION); return; }
-        /* The bound psvm_validate() already enforced (param_offset + width
-         * <= write_len), re-derived here against the buffer that actually
-         * exists. Checked even though a validated blob cannot violate it:
-         * this parser's contract, inherited from gatt_fsm_init(), is to
-         * survive a plan it did not validate itself. */
-        if ((uint16_t)param_offset + width > GATT_FSM_WRITE_MAX) {
+        /* The bound psvm_validate() already enforced, re-derived here
+         * against the buffer that actually exists. Checked even though a
+         * validated blob cannot violate it: this parser's contract,
+         * inherited from gatt_fsm_init(), is to survive a plan it did not
+         * validate itself.
+         *
+         * REFUSED, not accommodated (fix round 1, Critical 1). An earlier
+         * cut grew the payload to param_offset + width when a hand-posted
+         * entry declared a write_len that stopped short of its own
+         * parameter. It was memory-safe (write_len is already bounded to
+         * GATT_FSM_WRITE_MAX and cmd_write is that size), but it meant this
+         * parser ACCEPTED an entry psvm_validate() rejects -- one on-blob
+         * format with two authorities disagreeing about it, which is the
+         * exact shape M5a's gate defects grew from -- and it put bytes on
+         * the air that no author wrote: write_len 1 with a u16be at offset
+         * 6 became an 8-byte write, five of them invented zeros. The
+         * payload is exactly write_len bytes; the splice writes inside it
+         * or the command does not run. */
+        if ((uint16_t)param_offset + width > write_len) {
             cmd_refuse(f, GF_BAD_ACTION);
             return;
         }
@@ -146,20 +158,9 @@ void gatt_fsm_init_command(gatt_fsm_t *f, const uint8_t *e, uint16_t len, uint16
         if (param > param_max) { cmd_refuse(f, GF_PARAM_OVER_MAX); return; }
 
         /* The compiler emits write_len as "constant prefix + parameter
-         * width", with zero placeholder bytes for the parameter, so
-         * param_offset + width == write_len for every wrapper the browser
-         * produces. A hand-posted entry can still declare a write_len that
-         * stops short of its own parameter; extending the payload (rather
-         * than truncating the parameter) is the only reading that cannot
-         * put a HALF parameter on the air -- an 8-second irrigation
-         * arriving as its low byte alone. The gap between the declared
-         * bytes and the parameter is zero-filled, never left as whatever
-         * memset() happened to leave, because those bytes go to the
-         * device too. */
-        if ((uint16_t)param_offset + width > payload_len) {
-            payload_len = (uint8_t)(param_offset + width);
-        }
-
+         * width", with zero placeholder bytes standing in for the
+         * parameter (webui/src/lib/psc/codegen.js), so this overwrites
+         * those placeholders in place. */
         switch (param_encoding) {
         case 0:  f->cmd_write[param_offset] = (uint8_t)param; break;
         case 1:  f->cmd_write[param_offset]     = (uint8_t)(param & 0xFF);
@@ -177,7 +178,7 @@ void gatt_fsm_init_command(gatt_fsm_t *f, const uint8_t *e, uint16_t len, uint16
      * payload out of cmd_write. */
     f->write_count = 1;
     f->write[0].uuid16 = write_uuid;
-    f->write[0].len = payload_len;
+    f->write[0].len = write_len;
     f->write[0].data = NULL;
     f->cmd_action_id = action_id;
 

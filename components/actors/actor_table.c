@@ -219,6 +219,35 @@ void actor_table_set_lockout(actor_table_t *t, int dev_idx, bool on)
     if (row) row->lockout = on;
 }
 
+bool actor_table_remove(actor_table_t *t, int dev_idx)
+{
+    if (dev_idx < 0) return false;
+
+    actor_device_t *row = find_row(t, dev_idx);
+    if (!row) return false;
+
+    /* Every field reset to exactly what actor_table_init() leaves, not just
+     * dev_idx: a freed row is reused by the next actor_table_add(), and a
+     * surviving window_count or last_fire_s would silently charge a
+     * DIFFERENT device's first command against the removed one's spent
+     * budget. full_drops is cumulative since the table was populated and is
+     * deliberately not touched. */
+    row->dev_idx = -1;
+    row->lockout = false;
+    for (int j = 0; j < ACTOR_MAX_ACTIONS; j++) {
+        actor_slot_t *s = &row->actions[j];
+        s->action_id = ACTION_NONE;
+        s->flags = 0;
+        s->param_max = 0;
+        s->cooldown_s = 0;
+        s->max_per_hour = 0;
+        s->window_count = 0;
+        s->last_fire_s = 0;
+        s->window_start_s = 0;
+    }
+    return true;
+}
+
 uint32_t actor_table_full_drops(const actor_table_t *t)
 {
     return t->full_drops;
