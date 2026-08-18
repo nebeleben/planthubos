@@ -239,7 +239,22 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
         } else {
             cJSON_AddNullToObject(ao, "last_fired_s");
         }
-        cJSON_AddStringToObject(ao, "last_result", live_verdict_str(ps.live_verdict));
+        /* NOT the outcome of the last command that actually fired -- see
+         * live_verdict_str()'s own comment and actor_table.h's live_verdict
+         * doc (actor_table_check()'s "reachable" list there: OK, COOLDOWN or
+         * RATE only). This is a PRE-CHECK of a hypothetical MANUAL press
+         * made RIGHT NOW, recomputed fresh on every read. Named
+         * "would_refuse_now" rather than the "last_result" this shipped
+         * under in Task 11 (webui review, Task 12 fix round 1) precisely
+         * because a name implying "what happened" invites exactly the
+         * misread that name caused: a command that just fired dispatches
+         * INTO its own fresh cooldown, so at the instant after a genuinely
+         * successful dispatch this reads "cooldown", not "ok" -- and a
+         * command that failed at the GATT layer with no cooldown configured
+         * reads "ok", not "failed". A real outcome needs last_fired_s
+         * advancing (dispatch) and/or a capability confirm read landing
+         * (confirmation), not this field. */
+        cJSON_AddStringToObject(ao, "would_refuse_now", live_verdict_str(ps.live_verdict));
         cJSON_AddItemToArray(actions, ao);
     }
 

@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   fmtRemainingCooldown, fmtBudget, levelLabel, verdictLabel, alertCodeLabel,
-  parseAlertMessage, switchStateLabel,
+  parseAlertMessage, switchStateLabel, resolveActionSend, validateDuration,
 } from '../../actuators.js'
 
 // fmtRemainingCooldown(guard, nowS) -- guard: { cooldownS, lastFiredAtS }.
@@ -52,7 +52,7 @@ test('levelLabel: an unrecognised level falls back to itself rather than throwin
   assert.equal(levelLabel('mystery'), 'mystery')
 })
 
-test('verdictLabel: maps devices_json.c\'s last_result vocabulary to operator text', () => {
+test('verdictLabel: maps devices_json.c\'s would_refuse_now vocabulary to operator text', () => {
   assert.equal(verdictLabel('ok'), 'OK')
   assert.equal(verdictLabel('lockout'), 'blocked — locked out')
   assert.equal(verdictLabel('cooldown'), 'cooling down')
@@ -118,4 +118,129 @@ test('switchStateLabel: on/off/unknown are three distinct states', () => {
   assert.equal(switchStateLabel(NaN), 'unknown')
   assert.equal(switchStateLabel(null), 'unknown')
   assert.equal(switchStateLabel(undefined), 'unknown')
+})
+
+// resolveActionSend(state) -- Task 12 fix round 1, CRITICAL finding 1.
+// devices_json.c's `would_refuse_now` (né `last_result`) is a live pre-check
+// of a HYPOTHETICAL manual press evaluated right now, not the outcome of the
+// command a row just sent -- only ACTOR_OK/COOLDOWN/RATE are even reachable
+// there (actor_table.h), so a genuinely successful dispatch reads "cooldown"
+// the instant it lands in its own fresh cooldown window, and a genuinely
+// failed dispatch (no cooldown configured) reads "ok". This resolver takes
+// NO verdict/would_refuse_now input at all -- by construction it cannot
+// reproduce that misreport -- and instead answers strictly from two real
+// signals: last_fired_s advancing past the baseline captured at send time
+// (dispatch reached the radio -- actor_table_record() runs at dispatch,
+// after the guard re-check passed) and the switch.state capability's own
+// confirmed-at timestamp advancing past ITS baseline (the confirm read
+// landed on the same connection).
+const TIMEOUT_S = 30
+
+test('resolveActionSend: nothing advanced yet, still inside the window -> pending', () => {
+  assert.equal(resolveActionSend({
+    dispatchBaselineS: 100, dispatchNowS: 100,
+    confirmBaselineS: 50, confirmNowS: 50,
+    sentAtS: 100, nowS: 110, timeoutS: TIMEOUT_S,
+  }), 'pending')
+})
+
+test('resolveActionSend: dispatch advanced but confirm has not, still inside the window -> still pending (confirm may yet arrive)', () => {
+  assert.equal(resolveActionSend({
+    dispatchBaselineS: 100, dispatchNowS: 105,
+    confirmBaselineS: 50, confirmNowS: 50,
+    sentAtS: 100, nowS: 110, timeoutS: TIMEOUT_S,
+  }), 'pending')
+})
+
+test('resolveActionSend: dispatch advanced, confirm never available (no confirm block declared) -> dispatched once the window closes', () => {
+  assert.equal(resolveActionSend({
+    dispatchBaselineS: 100, dispatchNowS: 105,
+    confirmBaselineS: null, confirmNowS: null,
+    sentAtS: 100, nowS: 131, timeoutS: TIMEOUT_S,
+  }), 'dispatched')
+})
+
+test('resolveActionSend: dispatch AND confirm both advanced -> confirmed, even if reported before the window closes', () => {
+  assert.equal(resolveActionSend({
+    dispatchBaselineS: 100, dispatchNowS: 105,
+    confirmBaselineS: 50, confirmNowS: 106,
+    sentAtS: 100, nowS: 108, timeoutS: TIMEOUT_S,
+  }), 'confirmed')
+})
+
+test('resolveActionSend: confirmed is reported even after the window has closed', () => {
+  assert.equal(resolveActionSend({
+    dispatchBaselineS: 100, dispatchNowS: 105,
+    confirmBaselineS: 50, confirmNowS: 106,
+    sentAtS: 100, nowS: 200, timeoutS: TIMEOUT_S,
+  }), 'confirmed')
+})
+
+test('resolveActionSend: neither advanced and the window has closed -> timeout', () => {
+  assert.equal(resolveActionSend({
+    dispatchBaselineS: 100, dispatchNowS: 100,
+    confirmBaselineS: 50, confirmNowS: 50,
+    sentAtS: 100, nowS: 131, timeoutS: TIMEOUT_S,
+  }), 'timeout')
+})
+
+test('resolveActionSend: a null baseline (device never fired/confirmed before) treats any observed value as new', () => {
+  assert.equal(resolveActionSend({
+    dispatchBaselineS: null, dispatchNowS: 105,
+    confirmBaselineS: null, confirmNowS: 106,
+    sentAtS: 100, nowS: 108, timeoutS: TIMEOUT_S,
+  }), 'confirmed')
+})
+
+// The actual regression: the old design read devices_json.c's verdict field
+// to decide "refused after queueing" vs "confirmed" -- a command dispatched
+// straight into its own fresh cooldown would have shown as refused even
+// though it succeeded. resolveActionSend has no verdict parameter to read,
+// so the identical dispatch-then-cooldown scenario (dispatch advanced,
+// confirm not yet in, still inside the window) can only ever come back
+// 'pending' here -- never a refusal -- regardless of what would_refuse_now
+// says at that same instant.
+test('resolveActionSend: a fresh cooldown right after a successful dispatch is never read as a refusal', () => {
+  assert.equal(resolveActionSend({
+    dispatchBaselineS: 100, dispatchNowS: 101,   // just fired -- now inside its own cooldown
+    confirmBaselineS: 50, confirmNowS: 50,       // confirm hasn't landed yet
+    sentAtS: 100, nowS: 102, timeoutS: TIMEOUT_S,
+  }), 'pending')
+})
+
+// validateDuration(paramStr, paramMax) -- Task 12 fix round 1, finding 2.
+// An over-max value used to be silently clamped to paramMax at send time
+// with no feedback; this must refuse instead, the same principle already
+// applied to a blank/invalid value.
+test('validateDuration: blank input is refused, not defaulted', () => {
+  const r = validateDuration('', 300)
+  assert.equal(r.valid, false)
+  assert.equal(r.param, null)
+})
+
+test('validateDuration: exactly at the max is valid (inclusive bound)', () => {
+  const r = validateDuration('300', 300)
+  assert.equal(r.valid, true)
+  assert.equal(r.param, 300)
+})
+
+test('validateDuration: one over the max is refused, not silently clamped', () => {
+  const r = validateDuration('301', 300)
+  assert.equal(r.valid, false)
+  assert.equal(r.param, null)
+  assert.match(r.reason, /300/)
+})
+
+test('validateDuration: zero is refused (a zero-second command is not a real one)', () => {
+  assert.equal(validateDuration('0', 300).valid, false)
+})
+
+test('validateDuration: non-numeric input is refused', () => {
+  assert.equal(validateDuration('abc', 300).valid, false)
+})
+
+test('validateDuration: exactly 1 (the minimum) is valid', () => {
+  const r = validateDuration('1', 120)
+  assert.equal(r.valid, true)
+  assert.equal(r.param, 1)
 })

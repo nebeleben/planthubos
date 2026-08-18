@@ -3301,8 +3301,8 @@ static esp_err_t unknown_get(httpd_req_t *req)
 
 /* actor_verdict_t rendered for the HTTP API -- the SAME vocabulary
  * devices_json.c's live_verdict_str() uses for GET /api/v1/devices'
- * "last_result" (a different translation unit, so duplicated rather than
- * shared: five lines, same "duplicated rather than shared" call as
+ * "would_refuse_now" (a different translation unit, so duplicated rather
+ * than shared: five lines, same "duplicated rather than shared" call as
  * main.c's event_level_str()). Kept here for devices_action_post()'s 409
  * body and devices_guards_put() has no need of it. */
 static const char *verdict_reason_str(actor_verdict_t v)

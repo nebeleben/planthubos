@@ -44,9 +44,12 @@ export function levelLabel(level) {
 }
 
 // devices_json.c's live_verdict_str() / api_v1.c's verdict_reason_str() --
-// the same six-value "last_result" vocabulary a device's actions[] entries
-// and a 409 refusal body both use, translated into operator-facing text
-// instead of a wire keyword.
+// the same six-value vocabulary a device's actions[] "would_refuse_now"
+// entry (né "last_result" -- renamed in Task 12 fix round 1, see that
+// field's own doc comment in devices_json.c: it is a live pre-check of a
+// HYPOTHETICAL manual press, not a record of anything that happened) and a
+// 409 refusal body's synchronous "error" both use, translated into
+// operator-facing text instead of a wire keyword.
 const VERDICT_LABELS = {
   ok: 'OK',
   unknown: 'unknown device or action',
@@ -110,4 +113,72 @@ export function parseAlertMessage(msg) {
 export function switchStateLabel(value) {
   if (value == null || Number.isNaN(value)) return 'unknown'
   return value ? 'ON' : 'OFF'
+}
+
+// Resolves what a just-sent manual command's row should show (Task 12 fix
+// round 1, CRITICAL finding 1). devices_json.c's "would_refuse_now" is a
+// live pre-check of a HYPOTHETICAL press evaluated right now -- NOT the
+// outcome of the command this row actually sent (only ACTOR_OK/COOLDOWN/
+// RATE are even reachable there, actor_table.h) -- so it must never be used
+// to decide whether a just-sent command succeeded: a genuinely successful
+// dispatch reads back "cooldown" the instant it lands in its own fresh
+// cooldown window, and a genuinely failed dispatch (no cooldown configured)
+// reads back "ok". This function therefore takes no verdict input at all;
+// it answers strictly from two real signals, both ABSOLUTE epoch seconds
+// (the same fetchedAtS-derived shape fmtRemainingCooldown's `lastFiredAtS`
+// uses) captured as a BASELINE at send time and compared against the
+// latest poll:
+//
+//   dispatchBaselineS/dispatchNowS -- the action's last_fired_s. Advancing
+//     past the baseline means the command reached the radio:
+//     actor_table_record() runs at dispatch, after the guard re-check
+//     passed, so this can only ever be true once dispatch actually
+//     happened.
+//   confirmBaselineS/confirmNowS -- the device's switch.state capability's
+//     confirmed-at time. Advancing past the baseline means a confirm read
+//     landed on the same connection.
+//
+// Four outcomes, a strict partition:
+//   'confirmed'  -- both advanced. Reported the instant this is true, even
+//                   before `timeoutS` has elapsed -- good news doesn't wait.
+//   'pending'    -- still inside the window and not yet confirmed (whether
+//                   or not dispatch has been observed yet: confirm may
+//                   still arrive on a later poll).
+//   'dispatched' -- the window has closed, dispatch was observed, but
+//                   confirm never arrived. The honest ceiling for an action
+//                   whose wrapper declares no confirm block at all
+//                   (confirmNowS stays null forever, so `confirmed` can
+//                   never become true for it) -- reported as dispatched,
+//                   never guessed at as confirmed.
+//   'timeout'    -- the window has closed and dispatch was never observed
+//                   either -- no evidence the command reached the radio.
+export function resolveActionSend({
+  dispatchBaselineS, dispatchNowS, confirmBaselineS, confirmNowS, sentAtS, nowS, timeoutS,
+}) {
+  const dispatched = dispatchNowS != null && (dispatchBaselineS == null || dispatchNowS > dispatchBaselineS)
+  const confirmed = dispatched && confirmNowS != null && (confirmBaselineS == null || confirmNowS > confirmBaselineS)
+  if (confirmed) return 'confirmed'
+  if (nowS - sentAtS <= timeoutS) return 'pending'
+  return dispatched ? 'dispatched' : 'timeout'
+}
+
+// Validates a duration_s action's typed input against `param_max` (the
+// EFFECTIVE bound GET /api/v1/devices reports) -- Task 12 fix round 1,
+// finding 2. Must REFUSE an out-of-range value, not silently clamp it: the
+// UI previously clamped an over-max value down to param_max at send time
+// with no feedback, so typing 500 into a 300s field silently fired a
+// 300-second command -- irrigation.open/pump.run are not reversible once
+// dispatched, so a value the operator never actually chose must never reach
+// the radio. Returns { valid, param, reason }: `param` is only set (and
+// only ever a value action_param_ok() itself would accept, action.c) when
+// `valid` is true; `reason` is operator-facing text naming why, including
+// the actual bound, so a refusal is exactly as predictable as the brief's
+// cooldown/budget text asks for elsewhere.
+export function validateDuration(paramStr, paramMax) {
+  const trimmed = (paramStr ?? '').trim()
+  if (trimmed === '') return { valid: false, param: null, reason: 'enter a duration' }
+  const n = Math.trunc(Number(trimmed))
+  if (!Number.isFinite(n) || n < 1) return { valid: false, param: null, reason: `enter 1–${paramMax}s` }
+  if (n > paramMax) return { valid: false, param: null, reason: `must be ${paramMax}s or less` }
+  return { valid: true, param: n, reason: null }
 }

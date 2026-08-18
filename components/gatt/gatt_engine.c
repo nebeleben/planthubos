@@ -431,7 +431,9 @@ static void resume_scan_or_retry(void)
  * that never happened). s_last_error is likewise left alone: it is the read
  * path's visibility surface (gatt_engine_last_error(), rendered per device
  * in the Devices tab), and a command failure belongs in the alert feed and
- * in the actor table's own last_result, which is what the done hook is for. */
+ * in the actor table's own live_verdict (rendered over the API as
+ * "would_refuse_now" -- a pre-check, not a record of this outcome; see
+ * devices_json.c), which is what the done hook is for. */
 static void command_finish(void)
 {
     bool ok = (s_fsm.state == GS_DONE);

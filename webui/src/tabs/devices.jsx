@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 import { loadCaps, capLabel, fmtCap } from '../lib/caps.js'
 import { hasAiKey } from '../lib/ai/settings.js'
-import { fmtRemainingCooldown, fmtBudget, verdictLabel, switchStateLabel } from '../lib/actuators.js'
+import {
+  fmtRemainingCooldown, fmtBudget, verdictLabel, switchStateLabel, resolveActionSend, validateDuration,
+} from '../lib/actuators.js'
 
 function fmtAge(ageS) {
   if (ageS == null) return 'never'
@@ -158,29 +160,27 @@ const ACTION_CONFIRM_TIMEOUT_S = 30
 // "the command is QUEUED, not necessarily dispatched yet"), not a
 // confirmation that the actuator moved. This row stays in an explicit
 // "sent — awaiting confirmation" state, distinguishable from both "idle"
-// and "done", until the next device poll shows a NEW firing (last_fired_s
-// advanced past the moment this row sent its request) or
-// ACTION_CONFIRM_TIMEOUT_S elapses with nothing to show for it -- silently
-// reverting to a pressable idle button the instant the POST returns would
-// make an irreversible actuator command look like a toggle that either did
-// nothing or can be safely re-pressed.
-function ActionControl({ deviceId, action, fetchedAtS, nowS }) {
+// and "done", resolved ONLY by resolveActionSend() (lib/actuators.js) --
+// last_fired_s advancing (dispatch reached the radio) and switch.state's
+// own confirmed-at time advancing (a confirm read landed), never by
+// `action.would_refuse_now`. That field is a live pre-check of a
+// HYPOTHETICAL press evaluated right now, not this command's outcome (Task
+// 12 fix round 1, CRITICAL finding 1: the previous design read it to decide
+// "confirmed" vs "refused after queueing", which misreports in both
+// directions -- see resolveActionSend()'s own doc comment for exactly how).
+function ActionControl({ deviceId, action, fetchedAtS, nowS, switchConfirmedAtS }) {
   const isDuration = action.param === 'duration_s'
   const [paramStr, setParamStr] = useState('')
-  // idle | sending | pending | confirmed | refused | refused-late | timeout | unauth | error
+  // idle | sending | pending | dispatched | confirmed | refused | timeout | unauth | error
   const [sendState, setSendState] = useState('idle')
   const [sendMsg, setSendMsg] = useState('')
   const pendingSinceRef = useRef(0)
-  // The firing timestamp this row already knew about at the MOMENT it sent
-  // the request -- not the wall clock. A wall-clock compare (lastFiredAtS
-  // >= sendTimeS) can false-positive: last_fired_s is only as fresh as the
-  // last 10s poll, so a genuinely OLD firing that happened to land in the
-  // same integer second as both that poll and this press would already
-  // satisfy ">= sendTimeS" before the real dispatch ever occurs. Comparing
-  // against the baseline this row observed right before sending asks the
-  // question this UI actually needs answered -- "has a NEW firing shown up
-  // since I pressed the button" -- and can never fire early.
-  const baselineFiredAtRef = useRef(null)
+  // Baselines captured at the MOMENT this row sends its request -- not
+  // compared against the wall clock (see resolveActionSend()'s doc comment
+  // for why a wall-clock compare can false-positive on stale data), but
+  // against the LATEST poll, to see whether either has since advanced.
+  const dispatchBaselineRef = useRef(null)
+  const confirmBaselineRef = useRef(null)
 
   const lastFiredAtS = action.last_fired_s == null ? null : fetchedAtS - action.last_fired_s
   const cooldownGuard = { cooldownS: action.cooldown_s, lastFiredAtS }
@@ -188,52 +188,57 @@ function ActionControl({ deviceId, action, fetchedAtS, nowS }) {
   const remaining = fmtRemainingCooldown(cooldownGuard, nowS)
   const budgetExhausted = action.max_per_hour > 0 && action.activations_this_hour >= action.max_per_hour
 
-  // Resolves a 'pending' row against each fresh poll of `action` (devices.jsx's
-  // 10s refresh) and the live `nowS` ticker: a firing strictly NEWER than
-  // the baseline captured at send time is this request landing,
-  // successfully or not -- last_result at that point says which. No
-  // request id travels with the command, so this is the same
+  // Re-resolves on every fresh poll of `action`/`switchConfirmedAtS`
+  // (devices.jsx's 10s refresh) and the live `nowS` ticker, while this row
+  // is still watching (pending, or dispatched-but-hoping-for-a-late-confirm).
+  // No request id travels with the command, so this is the same
   // "watch the state, not a promise" approach the confirm-read GATT layer
   // itself uses one level down.
   useEffect(() => {
-    if (sendState !== 'pending') return
-    const baseline = baselineFiredAtRef.current
-    if (lastFiredAtS != null && (baseline == null || lastFiredAtS > baseline)) {
-      setSendState(action.last_result === 'ok' ? 'confirmed' : 'refused-late')
-      setSendMsg(verdictLabel(action.last_result))
-      return
-    }
-    if (nowS - pendingSinceRef.current > ACTION_CONFIRM_TIMEOUT_S) {
-      setSendState('timeout')
-    }
-  }, [sendState, action.last_result, lastFiredAtS, nowS])
+    if (sendState !== 'pending' && sendState !== 'dispatched') return
+    const outcome = resolveActionSend({
+      dispatchBaselineS: dispatchBaselineRef.current,
+      dispatchNowS: lastFiredAtS,
+      confirmBaselineS: confirmBaselineRef.current,
+      confirmNowS: switchConfirmedAtS,
+      sentAtS: pendingSinceRef.current,
+      nowS,
+      timeoutS: ACTION_CONFIRM_TIMEOUT_S,
+    })
+    if (outcome !== sendState) setSendState(outcome)
+  }, [sendState, lastFiredAtS, switchConfirmedAtS, nowS])
 
-  // A blank/invalid duration must refuse to fire rather than silently
-  // defaulting to some duration the operator never typed -- irrigation.open
-  // and pump.run are not reversible once dispatched, so "pressed Run with
-  // an empty box" must not become a surprise 1-second (or, worse, a
-  // truncated garbage-input) actuation.
-  const paramNum = Number(paramStr)
-  const paramValid = !isDuration || (paramStr.trim() !== '' && Number.isFinite(paramNum) && paramNum >= 1)
+  // An out-of-range duration (blank, non-numeric, zero or over param_max)
+  // must refuse to fire rather than silently defaulting or clamping --
+  // irrigation.open/pump.run are not reversible once dispatched, so a value
+  // the operator never actually chose must never reach the radio (Task 12
+  // fix round 1, finding 2: an over-max value used to be silently clamped
+  // down to param_max with no feedback).
+  const validation = isDuration ? validateDuration(paramStr, action.param_max) : { valid: true, param: 0, reason: null }
 
   async function fire() {
-    if (!paramValid) return
-    const param = isDuration ? Math.min(Math.trunc(paramNum), action.param_max) : 0
+    if (!validation.valid) return
     setSendState('sending')
     setSendMsg('')
     try {
       const res = await fetch(`/api/v1/devices/${deviceId}/actions/${action.name}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ param }),
+        body: JSON.stringify({ param: validation.param }),
       })
       if (res.status === 202) {
-        baselineFiredAtRef.current = lastFiredAtS
+        dispatchBaselineRef.current = lastFiredAtS
+        confirmBaselineRef.current = switchConfirmedAtS
         pendingSinceRef.current = nowS
         setSendState('pending')
       } else if (res.status === 401) {
         setSendState('unauth')
       } else if (res.status === 409) {
+        // This is a DIFFERENT, real-time signal from would_refuse_now above
+        // -- the server's own synchronous refusal of THIS specific attempt
+        // (api_v1.c's manual_refusal_reason()), not a polled pre-check --
+        // so using it here is not the bug the resolver above exists to
+        // avoid.
         const body = await res.json().catch(() => ({}))
         setSendState('refused')
         setSendMsg(verdictLabel(body.error || 'unknown'))
@@ -246,7 +251,7 @@ function ActionControl({ deviceId, action, fetchedAtS, nowS }) {
   }
 
   const busy = sendState === 'sending' || sendState === 'pending'
-  const disabled = busy || remaining != null || budgetExhausted || !paramValid
+  const disabled = busy || remaining != null || budgetExhausted || !validation.valid
 
   return (
     <div class="node-card-row action-row">
@@ -260,12 +265,13 @@ function ActionControl({ deviceId, action, fetchedAtS, nowS }) {
         {sendState === 'sending' ? '…' : sendState === 'pending' ? 'Sent — awaiting confirmation…' : 'Run'}
       </button>
       <span class="hint">
-        last: {verdictLabel(action.last_result)}
+        right now: {verdictLabel(action.would_refuse_now)}
         {remaining ? ` · cooldown ${remaining} left` : ''}
         {' · '}{fmtBudget(budgetGuard)}
       </span>
-      {sendState === 'confirmed' && <span class="hint">✓ confirmed — {sendMsg}</span>}
-      {sendState === 'refused-late' && <span class="error">refused after queueing — {sendMsg}</span>}
+      {isDuration && paramStr.trim() !== '' && !validation.valid && <span class="error">{validation.reason}</span>}
+      {sendState === 'confirmed' && <span class="hint">✓ dispatched and confirmed</span>}
+      {sendState === 'dispatched' && <span class="hint">dispatched — no confirmation received (check the Alerts tab)</span>}
       {sendState === 'refused' && <span class="error">refused — {sendMsg}</span>}
       {sendState === 'timeout' && <span class="error">no confirmation yet — check the Alerts tab</span>}
       {sendState === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
@@ -293,6 +299,15 @@ function ActionsSection({ d, nowS, fetchedAtS, onLockoutChanged }) {
   // warn against elsewhere. switchStateLabel(undefined) already renders
   // 'unknown' for exactly this case.
   const hasSwitch = switchCap || d.actions.some((a) => a.name === 'switch.on' || a.name === 'switch.off')
+  // Absolute epoch second of the switch.state capability's last confirmed
+  // read -- the SAME fetchedAtS-derived shape action.last_fired_s uses
+  // (see ActionControl), so resolveActionSend() can compare it against a
+  // baseline the same way. null when the capability has never been
+  // confirmed at all (switchCap absent, or its age_s itself null) -- which
+  // is exactly "this action's dispatch can never resolve past 'dispatched'"
+  // for a wrapper with no confirm block, resolveActionSend()'s own
+  // documented ceiling for that case.
+  const switchConfirmedAtS = switchCap && switchCap.age_s != null ? fetchedAtS - switchCap.age_s : null
 
   return (
     <div class="actions-section">
@@ -308,7 +323,8 @@ function ActionsSection({ d, nowS, fetchedAtS, onLockoutChanged }) {
       <LockoutControl deviceId={d.id} firstActionName={d.actions[0].name} lockout={lockout}
                        onChanged={(newLockout) => onLockoutChanged(d.id, newLockout)} />
       {d.actions.map((a) => (
-        <ActionControl key={a.id} deviceId={d.id} action={a} fetchedAtS={fetchedAtS} nowS={nowS} />
+        <ActionControl key={a.id} deviceId={d.id} action={a} fetchedAtS={fetchedAtS} nowS={nowS}
+                        switchConfirmedAtS={switchConfirmedAtS} />
       ))}
     </div>
   )
