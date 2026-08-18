@@ -114,11 +114,14 @@ uint32_t actor_queue_expired(const actor_queue_t *q)
 
 actor_request_result_t actor_request_decide(actor_table_t *t, actor_queue_t *q,
     int dev_idx, uint8_t action_id, uint16_t param, actor_source_t source,
-    uint32_t deadline_s, uint32_t now_s)
+    uint32_t deadline_s, uint32_t now_s, bool retried)
 {
     actor_request_result_t r;
     memset(&r, 0, sizeof(r));
 
+    /* The guards run BEFORE the retry bit is looked at, and the bit is not
+     * consulted here at all: a retry is checked exactly like a first
+     * attempt (see actor_request_retry()). */
     r.verdict = actor_table_check(t, dev_idx, action_id, param, source, now_s);
     if (r.verdict != ACTOR_OK) return r;
 
@@ -126,6 +129,7 @@ actor_request_result_t actor_request_decide(actor_table_t *t, actor_queue_t *q,
     cmd.dev_idx = (int8_t)dev_idx;
     cmd.action_id = action_id;
     cmd.source = (uint8_t)source;
+    cmd.retried = retried ? 1u : 0u;
     cmd.param = param;
     cmd.deadline_s = deadline_s;
 
@@ -290,14 +294,14 @@ uint32_t actor_full_drops(void)
     return n;
 }
 
-bool actor_request(int dev_idx, uint8_t action_id, uint16_t param,
-                    actor_source_t source, uint32_t deadline_s)
+static bool request_common(int dev_idx, uint8_t action_id, uint16_t param,
+                            actor_source_t source, uint32_t deadline_s, bool retried)
 {
     uint32_t now_s = actor_now_s();
 
     actor_lock();
     actor_request_result_t r = actor_request_decide(&s_table, &s_queue, dev_idx, action_id,
-                                                      param, source, deadline_s, now_s);
+                                                      param, source, deadline_s, now_s, retried);
     actor_unlock();
 
     if (r.verdict != ACTOR_OK) {
@@ -333,6 +337,22 @@ bool actor_request(int dev_idx, uint8_t action_id, uint16_t param,
     }
 
     return r.queued;
+}
+
+bool actor_request(int dev_idx, uint8_t action_id, uint16_t param,
+                    actor_source_t source, uint32_t deadline_s)
+{
+    return request_common(dev_idx, action_id, param, source, deadline_s, false);
+}
+
+bool actor_request_retry(int dev_idx, uint8_t action_id, uint16_t param,
+                          actor_source_t source, uint32_t deadline_s)
+{
+    /* Deliberately the same body as actor_request() with one argument
+     * different -- the guards, the alerts and the queue are identical, so
+     * this is one door with a flag, not a second door (see actor.h's top
+     * comment on why there is only ever one). */
+    return request_common(dev_idx, action_id, param, source, deadline_s, true);
 }
 
 void actor_service(void)

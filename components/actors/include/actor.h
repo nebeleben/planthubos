@@ -39,6 +39,24 @@ typedef struct {
     int8_t   dev_idx;
     uint8_t  action_id;
     uint8_t  source;       /* actor_source_t, see actor_table.h */
+    /* Set only by actor_request_retry(): this command was already
+     * dispatched once and never reached the radio (M5b Task 8 -- the other
+     * owner of the hub's single outbound connection had it), so it may be
+     * put back on this queue exactly once more.
+     *
+     * The bit lives ON THE COMMAND rather than in a side table at the
+     * dispatcher, and fix round 2 is why: a single-slot "which command did
+     * I already retry" latch is defeated by two commands in flight (one
+     * rule opening two valves, or a safety close alongside a rule
+     * command). A requeues, the latch holds A; B is popped, does not
+     * match, requeues, and destroys A's latch; A is popped and is no
+     * longer recognised as a retry, so it requeues again -- ping-ponging at
+     * decoder-tick rate and re-charging actor_table_record() every pass,
+     * which is exactly the budget burn the latch existed to prevent.
+     * Travelling with the command makes that unreachable by construction,
+     * for any number of commands in flight, and needs no identity matching.
+     * Free in memory: it fills padding actor_cmd_t already had. */
+    uint8_t  retried;
     uint16_t param;
     uint32_t deadline_s;   /* absolute actor_now_s()-scale seconds -- see
                              * actor_queue_pop(). NOT a duration and
@@ -49,6 +67,11 @@ typedef struct {
                              * that wants no practical deadline must pass
                              * one far enough in the future. */
 } actor_cmd_t;
+/* The retry bit above cost nothing: it fills the hole that already sat
+ * between `source` and the 2-byte-aligned `param`. Pinned, because
+ * ACTOR_QUEUE_MAX of these is a line in spec section 8's static budget and
+ * a future field added in the wrong place would silently cost 4 B x 4. */
+_Static_assert(sizeof(actor_cmd_t) == 12, "spec section 8 budgets 12 B per queued command");
 
 /* A small, capacity-ACTOR_QUEUE_MAX (4) command queue (spec section 8's
  * static budget). A compacting array, not a ring buffer with wraparound
@@ -122,10 +145,17 @@ typedef struct {
  * Checks the table, and on ACTOR_OK pushes onto the queue (which may
  * evict, see actor_queue_t's comment). Does NOT call actor_table_record()
  * -- recording happens at dispatch time, in actor_service_step(), per
- * review finding 2 below. */
+ * review finding 2 below.
+ *
+ * `retried` is stamped onto the queued command (actor_cmd_t.retried) and
+ * is false for every ordinary request; only actor_request_retry() passes
+ * true. It changes NOTHING about the decision -- a retry faces exactly the
+ * same guards, in the same order, as any other command -- it only travels
+ * with the command so the dispatcher can tell a first attempt from a
+ * second one. */
 actor_request_result_t actor_request_decide(actor_table_t *t, actor_queue_t *q,
     int dev_idx, uint8_t action_id, uint16_t param, actor_source_t source,
-    uint32_t deadline_s, uint32_t now_s);
+    uint32_t deadline_s, uint32_t now_s, bool retried);
 
 typedef struct {
     bool            dispatched;         /* true iff cmd should be sent */
@@ -198,6 +228,25 @@ uint32_t actor_full_drops(void);
  * its own alert. Never a silent failure. */
 bool actor_request(int dev_idx, uint8_t action_id, uint16_t param,
                     actor_source_t source, uint32_t deadline_s);
+
+/* The same door, for a command that was already dispatched once and never
+ * reached the actuator because the radio belonged to something else at
+ * that instant (M5b Task 8; ble_collector.c is the only caller). NOT a
+ * second way onto an actuator: it runs the identical actor_request_decide()
+ * with the identical guards -- lockout, cooldown, rate and bound all still
+ * apply -- and differs only in stamping actor_cmd_t.retried, so this
+ * command cannot be put back a third time.
+ *
+ * Pass the ORIGINAL source and deadline_s. The deadline is what keeps a
+ * retry honest: it is absolute, so a command that has been bouncing around
+ * long enough to become a hazard expires in the queue instead of being
+ * executed late (spec section 4.1).
+ *
+ * Callers other than a dispatcher that has just been told "the radio was
+ * busy" want actor_request(); a device that refused the write is not a
+ * retryable condition and must not be laundered into one. */
+bool actor_request_retry(int dev_idx, uint8_t action_id, uint16_t param,
+                          actor_source_t source, uint32_t deadline_s);
 
 /* Registered by whichever module actually owns the radio (the GATT
  * command engine, Task 8); actor_service() calls this once per dispatched

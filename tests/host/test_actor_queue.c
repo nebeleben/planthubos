@@ -210,10 +210,10 @@ static void test_dispatch_recheck_catches_rate_cap_raced_at_enqueue(void) {
     actor_queue_t q; actor_queue_init(&q);
 
     actor_request_result_t r1 = actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 10,
-                                                       ACTOR_SRC_RULE, 9999, 100);
+                                                       ACTOR_SRC_RULE, 9999, 100, false);
     assert(r1.verdict == ACTOR_OK && r1.queued);
     actor_request_result_t r2 = actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 10,
-                                                       ACTOR_SRC_MANUAL, 9999, 101);
+                                                       ACTOR_SRC_MANUAL, 9999, 101, false);
     assert(r2.verdict == ACTOR_OK && r2.queued); /* neither has recorded yet */
 
     actor_service_result_t s1 = actor_service_step(&t, &q, 102);
@@ -234,7 +234,7 @@ static void test_dispatch_recheck_catches_lockout_set_after_enqueue(void) {
     actor_queue_t q; actor_queue_init(&q);
 
     actor_request_result_t r = actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 10,
-                                                      ACTOR_SRC_RULE, 9999, 100);
+                                                      ACTOR_SRC_RULE, 9999, 100, false);
     assert(r.verdict == ACTOR_OK && r.queued);
 
     actor_table_set_lockout(&t, 3, true); /* operator hits stop before dispatch */
@@ -252,12 +252,75 @@ static void test_dispatch_recheck_permits_unchanged_guard_state(void) {
     actor_queue_t q; actor_queue_init(&q);
 
     actor_request_result_t r = actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 10,
-                                                      ACTOR_SRC_RULE, 9999, 100);
+                                                      ACTOR_SRC_RULE, 9999, 100, false);
     assert(r.verdict == ACTOR_OK && r.queued);
 
     actor_service_result_t s = actor_service_step(&t, &q, 101);
     assert(s.dispatched && !s.redecline);
     assert(s.cmd.dev_idx == 3 && s.cmd.param == 10);
+}
+
+/* M5b Task 8 fix round 2: the retry bit must travel WITH each command, so
+ * that two commands in flight cannot launder each other's retry state.
+ *
+ * This is the exact sequence that defeated the single-slot latch it
+ * replaced: A is put back (latch = A), then B is popped and does not match,
+ * so B is put back too and overwrites the latch (latch = B), and when A
+ * comes round again it is no longer recognised as a retry -- so it is put
+ * back a second time, and a third, once per decoder tick for as long as the
+ * radio stays busy, re-charging actor_table_record() on every pass. One
+ * rule opening two valves, or a safety close alongside a rule command, is
+ * all it takes. */
+static void test_retry_bit_travels_with_each_command(void) {
+    actor_table_t t; actor_table_init(&t);
+    assert(actor_table_add(&t, 3, ACT_IRRIGATION_OPEN, 300, 0));
+    assert(actor_table_add(&t, 4, ACT_IRRIGATION_OPEN, 300, 0));
+    actor_queue_t q; actor_queue_init(&q);
+
+    /* A and B, two devices, both queued before either is serviced. */
+    assert(actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 10,
+                                 ACTOR_SRC_RULE, 9999, 100, false).queued);
+    assert(actor_request_decide(&t, &q, 4, ACT_IRRIGATION_OPEN, 20,
+                                 ACTOR_SRC_RULE, 9999, 100, false).queued);
+
+    /* A dispatches, the radio turns out to be busy, A goes back marked. */
+    actor_service_result_t a1 = actor_service_step(&t, &q, 101);
+    assert(a1.dispatched && a1.cmd.dev_idx == 3 && !a1.cmd.retried);
+    assert(actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 10,
+                                 ACTOR_SRC_RULE, 9999, 101, true).queued);
+
+    /* B dispatches next and is its own command: still a first attempt. */
+    actor_service_result_t b1 = actor_service_step(&t, &q, 102);
+    assert(b1.dispatched && b1.cmd.dev_idx == 4 && !b1.cmd.retried);
+    assert(actor_request_decide(&t, &q, 4, ACT_IRRIGATION_OPEN, 20,
+                                 ACTOR_SRC_RULE, 9999, 102, true).queued);
+
+    /* A comes round again and MUST still know it is a retry -- B's own
+     * re-queue in between cannot have erased that. Same for B. */
+    actor_service_result_t a2 = actor_service_step(&t, &q, 103);
+    assert(a2.dispatched && a2.cmd.dev_idx == 3 && a2.cmd.retried);
+    actor_service_result_t b2 = actor_service_step(&t, &q, 104);
+    assert(b2.dispatched && b2.cmd.dev_idx == 4 && b2.cmd.retried);
+}
+
+/* The bit is carried, not consulted: a retry faces every guard a first
+ * attempt does, in the same order. A retried command must still be stopped
+ * by an operator's lockout -- "the operator pressed stop" outranks "this
+ * command deserves another go". */
+static void test_retry_is_not_a_guard_exemption(void) {
+    actor_table_t t; actor_table_init(&t);
+    assert(actor_table_add(&t, 3, ACT_IRRIGATION_OPEN, 300, 0));
+    actor_queue_t q; actor_queue_init(&q);
+
+    actor_table_set_lockout(&t, 3, true);
+    actor_request_result_t r = actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 10,
+                                                     ACTOR_SRC_RULE, 9999, 100, true);
+    assert(r.verdict == ACTOR_REFUSED_LOCKOUT && !r.queued);
+
+    /* And the bound still applies to a retry's parameter. */
+    actor_table_set_lockout(&t, 3, false);
+    r = actor_request_decide(&t, &q, 3, ACT_IRRIGATION_OPEN, 301, ACTOR_SRC_RULE, 9999, 100, true);
+    assert(r.verdict == ACTOR_REFUSED_BOUND && !r.queued);
 }
 
 int main(void) {
@@ -278,6 +341,8 @@ int main(void) {
     test_dispatch_recheck_catches_rate_cap_raced_at_enqueue();
     test_dispatch_recheck_catches_lockout_set_after_enqueue();
     test_dispatch_recheck_permits_unchanged_guard_state();
+    test_retry_bit_travels_with_each_command();
+    test_retry_is_not_a_guard_exemption();
     printf("test_actor_queue: OK\n");
     return 0;
 }

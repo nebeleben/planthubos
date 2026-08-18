@@ -196,22 +196,31 @@ static actor_cmd_t s_cmd_inflight = { .dev_idx = -1, .action_id = ACTION_NONE };
  * MiFlora poller happened to be connecting would simply be gone (fix round
  * 1, Critical 2).
  *
+ * This is now the BACKSTOP rather than the main defence (fix round 2): the
+ * decoder loop no longer pops a command at all while battery_poll_busy()
+ * says the radio is taken, so the collision this recovers from has shrunk
+ * to the microseconds between that test and the engine's own check inside
+ * start_command(). Rare instead of deterministic -- which matters, because
+ * a re-queued command faces the guards again with its own activation
+ * already charged, so on a pair with a cooldown the retry is refused by
+ * that cooldown. Narrowing the window is what makes that residual
+ * acceptable; it is not a reason to remove the backstop, since the window
+ * is real.
+ *
  * Performed on adv_decoder_task, never from the completion hook itself:
  * that hook runs on the NimBLE host task for a radio outcome, and
- * actor_request() takes the actor mutex. Same discipline, same reason, as
- * the switch.state write gatt_engine_service() defers to this task.
+ * actor_request_retry() takes the actor mutex. Same discipline, same
+ * reason, as the switch.state write gatt_engine_service() defers to this
+ * task.
  *
- * ONCE per command, latched by identity in s_requeued. The retry is
- * otherwise unbounded in a way the TTL alone does not fix: every dispatch
- * re-runs actor_table_record(), so a command bouncing off a busy radio once
- * per decoder tick would spend a max_per_hour budget in milliseconds. One
- * retry costs at most one extra activation and is what a poll collision --
- * a few seconds, at most once a minute -- actually needs. */
+ * ONCE per command -- carried by actor_cmd_t.retried, which travels WITH
+ * the command through the queue (see its own doc comment for why a
+ * single-slot latch here was wrong). Unbounded retries are not bounded by
+ * the TTL alone: every dispatch re-runs actor_table_record(), so a command
+ * bouncing off a busy radio once per decoder tick would spend a
+ * max_per_hour budget in milliseconds. */
 static actor_cmd_t s_requeue;          /* the command to put back, valid iff pending */
 static volatile bool s_requeue_pending;
-static actor_cmd_t s_requeued;         /* identity of the command already retried once */
-static bool s_requeued_valid;
-static bool s_cmd_is_retry;            /* is the in-flight command that retry? */
 
 /* Set once both hooks are registered, which happens on the HUB only -- a
  * node's radio belongs to ESP-NOW, exactly as it does for battery polling
@@ -480,26 +489,13 @@ static void note_actor_device(int idx, uint16_t wrapper_id, const adv_item_t *it
  * already been popped from the actor queue and charged against its hourly
  * budget, so there is no second chance for it and no other place its
  * disappearance would surface. */
-static bool same_command(const actor_cmd_t *a, const actor_cmd_t *b)
-{
-    /* deadline_s is part of the identity and is what makes this reliable: a
-     * re-queued command carries its ORIGINAL absolute deadline (that is the
-     * point -- the TTL keeps running), while a genuinely new command from a
-     * rule or a button computes a fresh one. */
-    return a->dev_idx == b->dev_idx && a->action_id == b->action_id &&
-           a->param == b->param && a->source == b->source &&
-           a->deadline_s == b->deadline_s;
-}
-
 static void on_actor_dispatch(const actor_cmd_t *cmd)
 {
     int idx = cmd->dev_idx;
 
+    /* The whole command, retry bit included -- whether this one may be put
+     * back is carried BY it, not tracked here (fix round 2). */
     s_cmd_inflight = *cmd;
-    /* Is this the one command we already put back once? If so it gets no
-     * second retry, and the latch is consumed either way. */
-    s_cmd_is_retry = s_requeued_valid && same_command(&s_requeued, cmd);
-    if (s_cmd_is_retry) s_requeued_valid = false;
 
     const actor_conn_t *conn = NULL;
     for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
@@ -554,7 +550,7 @@ static void on_gatt_cmd_done(int dev_idx, bool ok, bool confirmed, const char *e
          * source and deadline so the TTL still bounds it and a safety close
          * keeps its priority. The actual actor_request() happens on
          * adv_decoder_task; see s_requeue's declaration. */
-        if (err == GATT_CMD_ERR_RADIO_BUSY && !s_cmd_is_retry && !s_requeue_pending) {
+        if (err == GATT_CMD_ERR_RADIO_BUSY && !s_cmd_inflight.retried && !s_requeue_pending) {
             s_requeue = s_cmd_inflight;
             s_requeue_pending = true;   /* set LAST, like every cross-task flag here */
             ESP_LOGI(TAG, "command re-queued (radio was busy): dev=%d action=%u",
@@ -589,18 +585,13 @@ static void service_command_requeue(void)
     s_requeue_pending = false;
 
     actor_cmd_t cmd = s_requeue;
-    /* Latched BEFORE the request, so the retry is recognised as one even if
-     * it is dispatched on the very next pass. If it never is (its TTL
-     * expires in the queue) the latch simply goes stale, and the worst that
-     * costs is one lost retry for a later command with a byte-identical
-     * identity -- including the same absolute deadline, which a freshly
-     * computed one essentially never is. */
-    s_requeued = cmd;
-    s_requeued_valid = true;
 
-    if (!actor_request(cmd.dev_idx, cmd.action_id, cmd.param,
-                       (actor_source_t)cmd.source, cmd.deadline_s)) {
-        s_requeued_valid = false;
+    /* actor_request_retry(), not actor_request(): same door, same guards,
+     * but it stamps the command so this one can never be put back again --
+     * for any number of commands in flight, since the bit rides in the
+     * queue entry itself. */
+    if (!actor_request_retry(cmd.dev_idx, cmd.action_id, cmd.param,
+                             (actor_source_t)cmd.source, cmd.deadline_s)) {
         ESP_LOGW(TAG, "command could not be re-queued: dev=%d action=%u",
                  (int)cmd.dev_idx, (unsigned)cmd.action_id);
         alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_COMMAND_FAILED, cmd.dev_idx,
@@ -1048,14 +1039,47 @@ static void adv_decoder_task(void *arg)
         /* M5b Task 8: the actor queue's pump. Here, on this task, because
          * the dispatch hook it calls resolves the wrapper's action entry
          * out of the arena -- flash, so decoder-task only, exactly like
-         * gatt_engine_request() above it. Skipped while a command is
-         * already waiting for the radio or executing: this engine holds
-         * exactly one, and leaving the next command in the actor queue
-         * keeps its TTL and the safety-close priority rule intact instead
-         * of having it refused on arrival. */
+         * gatt_engine_request() above it.
+         *
+         * The two predicates gating it are chosen precisely, because
+         * popping a command is what CHARGES it: actor_service_step()
+         * records the activation against the hourly budget and hands the
+         * command on, and there is no un-charging it afterwards. So the
+         * queue is pumped only when the command it pops can actually be
+         * executed. Anything left unpopped keeps its TTL, its position and
+         * a safety close's priority, and costs nothing but a tick.
+         *
+         *   gatt_engine_cmd_busy() -- OUR command is waiting for the radio
+         *     or executing. The engine holds exactly one; a second popped
+         *     on top of it would be refused on arrival. Cleared when that
+         *     attempt ends.
+         *
+         *   battery_poll_busy() -- the OTHER owner of the hub's single
+         *     outbound connection has it (fix round 2). Without this, a
+         *     command popped during a poll was charged, refused by the
+         *     engine, re-queued, and then refused AGAIN at the door by the
+         *     cooldown its own dispatch had just started -- two alerts,
+         *     both naming "cooldown" for what was really a busy radio, and
+         *     deterministic for anyone who configured a cooldown at all.
+         *     Not popping it is the whole fix: it dispatches a few hundred
+         *     milliseconds later, uncharged and unrefused. This is the
+         *     mirror image of the check battery_poll.c's handle_tick()
+         *     already makes against gatt_engine_busy() before starting a
+         *     poll, and it is bounded the same way -- a stuck poll is ended
+         *     by that file's own POLL_WATCHDOG_S.
+         *
+         * gatt_engine_busy() is deliberately NOT among them. It is true
+         * while a scheduled READ is in flight, and a command MUST be handed
+         * to the engine during a read: that is what makes the engine hold
+         * it, start it the instant the read ends, and refuse new reads
+         * ahead of it (spec section 3's priority rule). Waiting for it
+         * would leave the command in the queue where the next
+         * advertisement could start another read in front of it. It is
+         * also true because of our own pending command, which would make
+         * this gate partly self-referential. */
         if (s_actors_wired) {
             service_command_requeue();
-            if (!gatt_engine_cmd_busy()) actor_service();
+            if (!gatt_engine_cmd_busy() && !battery_poll_busy()) actor_service();
         }
 
         adv_item_t item;
