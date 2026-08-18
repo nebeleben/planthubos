@@ -188,6 +188,56 @@ static void test_safety_exempt_from_rate(void) {
     assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 0, ACTOR_SRC_SAFETY, 150) == ACTOR_OK);
 }
 
+/* M5b whole-branch review, finding 6 (deferred minor from Task 6, promoted
+ * to must-fix): the OTHER half of the source table -- SAFETY is exempt from
+ * the three RATE-SHAPING guards (the two tests above) and is emphatically
+ * NOT exempt from the two correctness ones. That distinction only holds
+ * because unknown and bound are evaluated BEFORE actor_table_check()'s
+ * `if (source == ACTOR_SRC_SAFETY) return ACTOR_OK` short-circuit; move
+ * that line up by two checks and the parameter bound silently stops
+ * binding on a safety close, with nothing failing. This pins the ordering
+ * so that reorder is a test failure instead.
+ *
+ * BOUND on a safety source is reachable in practice: pending_close arms
+ * ACT_SWITCH_OFF, and a hand-posted wrapper (or a future close carrying a
+ * parameter) reaching this door with an out-of-range value must be refused
+ * exactly as a rule would be -- it is a correctness check, not a rate
+ * limit. */
+static void test_bound_and_unknown_still_refuse_safety(void) {
+    setup();
+
+    /* UNKNOWN: a device that declares nothing, and a declared device asked
+     * for an action it never declared. Neither becomes commandable just
+     * because the caller is the safety core. */
+    assert(actor_table_check(&T, 9, ACT_SWITCH_OFF, 0, ACTOR_SRC_SAFETY, 100)
+           == ACTOR_REFUSED_UNKNOWN);
+    assert(actor_table_check(&T, 3, ACT_PUMP_RUN, 0, ACTOR_SRC_SAFETY, 100)
+           == ACTOR_REFUSED_UNKNOWN);
+    assert(actor_table_check(&T, -1, ACT_SWITCH_OFF, 0, ACTOR_SRC_SAFETY, 100)
+           == ACTOR_REFUSED_UNKNOWN);
+
+    /* BOUND: over the effective ceiling, and non-zero on a parameterless
+     * action (action_param_ok()'s own rule) -- both refuse SAFETY. */
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 301, ACTOR_SRC_SAFETY, 100)
+           == ACTOR_REFUSED_BOUND);
+    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 1, ACTOR_SRC_SAFETY, 100)
+           == ACTOR_REFUSED_BOUND);
+
+    /* And the real close -- parameterless, param 0 -- still passes, so the
+     * assertions above are about the bound and not about SAFETY being
+     * refused generally. */
+    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 0, ACTOR_SRC_SAFETY, 100) == ACTOR_OK);
+
+    /* The ordering itself: with a lockout set AND an out-of-range
+     * parameter, a safety close reports BOUND -- proving bound is
+     * evaluated before the SAFETY short-circuit, not merely that it is
+     * evaluated at all. */
+    actor_table_set_lockout(&T, 3, true);
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 301, ACTOR_SRC_SAFETY, 100)
+           == ACTOR_REFUSED_BOUND);
+    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 0, ACTOR_SRC_SAFETY, 100) == ACTOR_OK);
+}
+
 /* Review round 1, finding 3 (Important): -1 is find_free_row()'s own
  * sentinel for an unused row, and also registry_find()'s canonical
  * not-found return -- a caller that resolved a device id to "not found"
@@ -398,6 +448,7 @@ int main(void) {
     test_window_count_saturates_not_wraps();
     test_readd_preserves_guards_and_window();
     test_safety_exempt_from_cooldown(); test_safety_exempt_from_rate();
+    test_bound_and_unknown_still_refuse_safety();
     test_negative_dev_idx_rejected();
     test_remove_undeclares_everything();
     test_removed_row_is_reusable_and_clean();

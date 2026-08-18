@@ -373,12 +373,20 @@ action irrigation.open(duration_s max 300)
   confirm read 2AF1 as st
     require u8(st, 0) == 1
 
+action switch.off()
+  write 2AF0 = 00
+
 connect every 5min
   read 2AF1 as st
 decode
   emit switch.state  u8(st, 0)`)
   assert.equal(r.ok, true)
-  assert.equal(r.actions.length, 1)
+  // switch.off is present because irrigation.open here has no
+  // closes_itself, so the hub owes the close and the compiler now requires
+  // something to close it with (whole-branch review, finding 3). The
+  // assertions below are all about actions[0], the open, and are unchanged.
+  assert.equal(r.actions.length, 2)
+  assert.equal(r.actions[1].name, 'switch.off')
   assert.equal(r.actions[0].actionId, 2)
   assert.equal(r.actions[0].paramMax, 300)
   assert.deepEqual(r.actions[0].write.bytes, [0x01])
@@ -447,10 +455,45 @@ test('an action with no closes_itself is not device-local (flags bit 0 clear)', 
   const r = compileWrapper(`wrapper "x" match service 0x181A
 action irrigation.open(duration_s max 300)
   write 2AF0 = 01 u16le(duration_s)
+action switch.off()
+  write 2AF0 = 00
 decode
   emit switch.state  0`)
   assert.equal(r.ok, true)
   assert.equal(r.actions[0].deviceLocal, false)
+})
+
+// ---- the hub-owed close must be declarable (whole-branch review, finding 3;
+// mirrors psvm_validate()'s own rejection, which is the enforcement point) ----
+
+test('a duration action with no closes_itself and no switch.off is a compile error naming the reason', () => {
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action irrigation.open(duration_s max 300)
+  write 2AF0 = 01 u16le(duration_s)
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, false)
+  assert.match(r.errors[0].message, /the hub owes its close/)
+  assert.match(r.errors[0].message, /switch\.off/)
+})
+
+test('closes_itself alone satisfies the hub-owed-close rule (no switch.off needed)', () => {
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action irrigation.open(duration_s max 300)
+  write 2AF0 = 01 u16le(duration_s)
+  closes_itself
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, true)
+})
+
+test('a parameterless action alone needs no switch.off', () => {
+  const r = compileWrapper(`wrapper "x" match service 0x181A
+action switch.on()
+  write 2AF0 = 01
+decode
+  emit switch.state  0`)
+  assert.equal(r.ok, true)
 })
 
 test('closes_itself on a parameterless action is a compile error naming the reason', () => {

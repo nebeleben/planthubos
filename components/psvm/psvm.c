@@ -281,6 +281,13 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
          * tiny fixed array, no allocation. */
         uint8_t seen_ids[PSVM_ACTION_MAX];
 
+        /* M5b whole-branch review, finding 3: set by any duration action
+         * that does NOT carry the device-local timed-off flag, i.e. one
+         * whose close is the HUB's obligation. Checked against the same
+         * table's own action ids once the loop has seen them all -- see
+         * the check just past it. */
+        bool needs_hub_close = false;
+
         for (uint8_t i = 0; i < count; i++) {
             /* Fixed part up to and including write_len: id(1) param_max(2)
              * flags(1) write_uuid16(2) write_len(1) = 7 bytes. */
@@ -300,12 +307,33 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
              * may tighten the firmware's hard param_max and may never
              * loosen it. */
             if (param_max > spec_a->param_max) return PSVM_ERR_LIMITS;
+            /* M5b whole-branch review, finding 5 (deferred minor from Task
+             * 6, promoted to must-fix): the bound above is only an upper
+             * one, so a hand-posted blob -- no compiler involved, which is
+             * the whole reason this validator exists -- could declare a
+             * duration action with an EFFECTIVE bound of zero.
+             * action_param_ok() refuses 0 for a parameterised action ("a
+             * zero-second open is not an open"), and actor_table_check()
+             * additionally refuses anything above slot->param_max, so such
+             * a pair is refused as ACTOR_REFUSED_BOUND for every parameter
+             * value forever. It fails safe but silently, which is exactly
+             * what an install-time rejection is for: the compiler already
+             * rejects `max 0` (parser.js), and this is the same rule on
+             * the security boundary that does not trust it. */
+            if (spec_a->param == ACTION_PARAM_DURATION_S && param_max == 0)
+                return PSVM_ERR_LIMITS;
             if (wlen < 1 || wlen > PSVM_PLAN_WRITE_MAX) return PSVM_ERR_LIMITS;
             /* Entry-level forward-compat gate, same reasoning as the
              * header flags word's own unknown-bits check above: only bits
              * 0-1 are defined, so anything else is refused now rather than
              * silently ignored by an old validator reading a newer blob. */
             if (aflags & ~(uint8_t)0x03) return PSVM_ERR_LIMITS;
+            /* Finding 3, first half: a duration action WITHOUT bit 0
+             * (device-local timed-off) is one the hub itself has to close
+             * -- see the post-loop check for what that then obliges this
+             * wrapper to declare. */
+            if (spec_a->param == ACTION_PARAM_DURATION_S && !(aflags & 0x01u))
+                needs_hub_close = true;
             ao += 7;
 
             if (ao + (size_t)wlen > len) return PSVM_ERR_TRUNCATED;
@@ -336,6 +364,33 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
                 if (cmin < 1 || cmin > PSVM_PLAN_SLOT) return PSVM_ERR_LIMITS;
                 ao += 8;
             }
+        }
+
+        /* M5b whole-branch review, finding 3: an action the hub must close
+         * itself is only safe if this same wrapper gives the hub something
+         * to close it WITH. The hub's only close is ACT_SWITCH_OFF
+         * (pending_close_arm()'s close_action, ble_collector.c), so a
+         * wrapper that declares e.g. `irrigation.open(duration_s max 60)`
+         * with no `closes_itself` and no `switch.off` block produces an
+         * obligation that can never be discharged: pending_close_service()
+         * sees actor_action_flags(dev, ACT_SWITCH_OFF) is false forever,
+         * returns DEFERRED on every pass, spends no retry budget (so
+         * EXHAUSTED/CRITICAL never fires) and raises one
+         * ALERT_CODE_CLOSE_DEVICE_UNREACHABLE at 120 s that MISDESCRIBES
+         * the cause -- the device is right there, it simply has no close.
+         * The valve stays open.
+         *
+         * Rejected at INSTALL time, here, rather than left to the compiler:
+         * spec section 1.2's whole argument is that M4 lets an AI write
+         * wrapper source, so a safety rule that only the compiler enforces
+         * is a safety rule a hand-posted blob does not have. The browser
+         * compiler mirrors this with a message naming the reason. */
+        if (needs_hub_close) {
+            bool declares_off = false;
+            for (uint8_t j = 0; j < count; j++) {
+                if (seen_ids[j] == (uint8_t)ACT_SWITCH_OFF) { declares_off = true; break; }
+            }
+            if (!declares_off) return PSVM_ERR_LIMITS;
         }
 
         act_ptr = blob + act_off;

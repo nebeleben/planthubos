@@ -3414,12 +3414,13 @@ static bool parse_device_action_path(const char *tail, bool want_guards_suffix,
  * re-checks a guard itself. 202 Accepted on success (the command is
  * QUEUED, not necessarily dispatched yet -- the radio may still be busy
  * with a scheduled GATT read); 409 Conflict on refusal, naming the guard
- * (manual_refusal_reason(), above). `param` defaults to 0 when the body
- * omits it or is empty -- the correct value for a parameterless action; a
- * parameterised one that actually needs a positive duration is simply
+ * (manual_refusal_reason(), above). `param` defaults to 0 when the body is
+ * EMPTY or omits the field -- the correct value for a parameterless action;
+ * a parameterised one that actually needs a positive duration is simply
  * refused as "bound" by actor_request(), not by this handler
- * second-guessing it. Auth checked by devices_post_dispatch() before this
- * is ever reached. */
+ * second-guessing it. A body that is present but does NOT parse is a 400,
+ * never that default (whole-branch review, finding 7). Auth checked by
+ * devices_post_dispatch() before this is ever reached. */
 static esp_err_t devices_action_post(httpd_req_t *req, const char *idbuf, const char *action_name)
 {
     device_id_t dev;
@@ -3454,7 +3455,18 @@ static esp_err_t devices_action_post(httpd_req_t *req, const char *idbuf, const 
         body[received] = '\0';
 
         cJSON *json = cJSON_Parse(body);
-        const cJSON *param_j = json ? cJSON_GetObjectItem(json, "param") : NULL;
+        /* M5b whole-branch review, finding 7 (deferred minor from Task 11,
+         * promoted to must-fix): a body that will not parse used to fall
+         * through as param = 0. For a PARAMETERLESS action 0 is the valid
+         * value, so a garbled request did not fail safe -- it EXECUTED
+         * switch.on. 400, consistently with devices_guards_put()'s
+         * "invalid json" in this same file: a request we cannot read is
+         * not a request to actuate. */
+        if (!json) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+            return ESP_OK;
+        }
+        const cJSON *param_j = cJSON_GetObjectItem(json, "param");
         if (param_j && (!cJSON_IsNumber(param_j) || param_j->valuedouble < 0 ||
                         param_j->valuedouble > 65535)) {
             cJSON_Delete(json);

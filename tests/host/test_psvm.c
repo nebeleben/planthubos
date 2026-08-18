@@ -925,6 +925,98 @@ static void test_action_reserved_flag_bits_rejected(void) {
     assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
 }
 
+/* --- M5b whole-branch review, findings 3 and 5 --- */
+
+/* A parameterless entry (switch.on/switch.off): param_max 0 and the
+ * 0xFF/0xFF "no parameter" sentinel pair, which is exactly what the
+ * browser compiler emits for an action block with an empty parameter
+ * list (the controller's cross-language harness, ledger Task 4). */
+static size_t append_action_entry_noparam(uint8_t *b, size_t o, uint8_t action_id) {
+    b[o++] = action_id;
+    b[o++] = 0; b[o++] = 0;         /* param_max 0 */
+    b[o++] = 0x00;                  /* flags: no device-local, no confirm */
+    b[o++] = 0xF0; b[o++] = 0x2A;   /* write uuid16 0x2AF0 */
+    b[o++] = 1;                     /* write_len */
+    b[o++] = 0x00;                  /* the close opcode byte */
+    b[o++] = 0xFF;                  /* param_offset: no parameter */
+    b[o++] = 0xFF;                  /* param_encoding: no parameter */
+    return o;
+}
+
+/* A wrapper whose action table holds one duration action with a
+ * caller-chosen flags byte and, optionally, a switch.off entry beside it.
+ * This is the exact pair finding 3 is about: whether the hub has anything
+ * to discharge the obligation the duration action creates. */
+static size_t build_wrapper_actions_duration_and_off(uint8_t *b, size_t bufsz,
+                                                     uint16_t param_max, uint8_t aflags,
+                                                     bool with_switch_off) {
+    (void)bufsz;
+    uint8_t code[1] = { 0xFF };   /* HALT */
+    size_t o = emit_header_d(b, PSVM_DIALECT_WRAPPERS, 0, 0, 0, (uint16_t)sizeof code);
+    memcpy(b + o, code, sizeof code);
+    o += sizeof code;
+
+    uint16_t hflags = PSVM_FLAG_ACTION_TABLE;
+    memcpy(b + 6, &hflags, 2);
+
+    b[o++] = with_switch_off ? 2 : 1;   /* action_count */
+    o = append_one_action_entry(b, o, ACT_IRRIGATION_OPEN, param_max, aflags);
+    if (with_switch_off) o = append_action_entry_noparam(b, o, ACT_SWITCH_OFF);
+    return o;
+}
+
+/* Finding 3: a duration action the DEVICE does not close itself is the
+ * hub's obligation, and pending_close can only discharge it through
+ * ACT_SWITCH_OFF. A wrapper declaring the open without the close installs
+ * an obligation nothing can ever satisfy -- the valve stays open, the
+ * retry budget is never spent so EXHAUSTED/CRITICAL never fires, and the
+ * one alert that does fire names the wrong cause. Rejected at install. */
+static void test_action_hub_closed_duration_requires_switch_off(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+
+    /* No closes_itself, no switch.off -> refused. */
+    size_t n = build_wrapper_actions_duration_and_off(blob, sizeof blob, 60, 0x00, false);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+
+    /* Same action, plus switch.off -> the obligation is dischargeable. */
+    n = build_wrapper_actions_duration_and_off(blob, sizeof blob, 60, 0x00, true);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+
+    /* closes_itself set -> the hub owes no close, so switch.off is not
+     * required (spec section 4.3's preferred path). */
+    n = build_wrapper_actions_duration_and_off(blob, sizeof blob, 60, 0x01, false);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+
+    /* A confirm block changes nothing about the obligation: bit 1 without
+     * bit 0 is still the hub's close. */
+    n = build_wrapper_actions_duration_and_off(blob, sizeof blob, 60, 0x02, false);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) != PSVM_OK);
+}
+
+/* Finding 5: param_max 0 on a duration action is refused by
+ * actor_table_check() for every parameter value forever (action_param_ok()
+ * refuses 0, and anything above 0 is over the effective bound), so it is a
+ * pair that can never fire. Silent failure at run time becomes a named
+ * failure at install time. */
+static void test_action_duration_param_max_zero_rejected(void) {
+    uint8_t blob[160]; psvm_prog_t p;
+
+    size_t n = build_wrapper_with_action(blob, sizeof blob, ACT_IRRIGATION_OPEN, 0, 0x01);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
+
+    /* 1 is the smallest bound that can ever admit a command, and is
+     * accepted -- the rejection above is about zero specifically, not
+     * about "small". */
+    n = build_wrapper_with_action(blob, sizeof blob, ACT_IRRIGATION_OPEN, 1, 0x01);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+
+    /* A PARAMETERLESS action still requires param_max 0 (the pre-existing
+     * upper-bound check, since action.h gives switch.off param_max 0) --
+     * the new rule must not have inverted that. */
+    n = build_wrapper_actions_duration_and_off(blob, sizeof blob, 60, 0x01, true);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_OK);
+}
+
 /* --- M5b Task 10: CALL_ACTION (0x52), rules dialect action path --- */
 
 typedef struct {
@@ -1589,6 +1681,8 @@ int main(void) {
     test_action_section_after_connect_plan();
     test_action_duplicate_id_rejected();
     test_action_reserved_flag_bits_rejected();
+    test_action_hub_closed_duration_requires_switch_off();
+    test_action_duration_param_max_zero_rejected();
 
     /* M5b Task 10: CALL_ACTION (0x52), rules dialect action path */
     test_call_action_sink();

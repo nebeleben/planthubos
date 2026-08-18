@@ -305,6 +305,27 @@ class Parser {
       actions.push(action)
     }
 
+    // M5b whole-branch review, finding 3 -- mirrors psvm_validate()'s own
+    // rejection (psvm.c, the same rule on the firmware's security
+    // boundary; spec §1.2 means this compiler is convenience, never the
+    // enforcement point). A duration action WITHOUT `closes_itself` is a
+    // close the HUB owes, and the hub's only close is `switch.off`. Declare
+    // the open without it and the firmware arms an obligation nothing can
+    // discharge: the valve stays open, the retry budget is never spent so
+    // the critical "gave up" alert never fires, and the one alert that does
+    // fire blames an unreachable device that is in fact right there.
+    const openWithoutSelfClose = actions.find(
+      (a) => ACTION_DEFS[a.name].param === 'duration_s' && !a.deviceLocal
+    )
+    if (openWithoutSelfClose && !actions.some((a) => a.name === 'switch.off')) {
+      throw new PSError(
+        `${openWithoutSelfClose.name} has no closes_itself, so the hub owes its close — ` +
+        `this wrapper must also declare a 'switch.off' action for the hub to close it with, ` +
+        `or add closes_itself if the device closes itself after the duration`,
+        openWithoutSelfClose.line, openWithoutSelfClose.col
+      )
+    }
+
     // connect block (M5a spec section 2): optional, between the header and
     // `decode`. Builds the name -> slot-offset table `decode` resolves
     // buffer identifiers against (expectBufferIdent()).

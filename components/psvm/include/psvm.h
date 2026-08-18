@@ -108,7 +108,20 @@ _Static_assert(PSVM_PLAN_MAX_READS * PSVM_PLAN_SLOT == PSVM_PAYLOAD_MAX,
  * established here rather than left for code that has not been written
  * yet. Any other combination (a real encoding with offset==0xFF or vice
  * versa, an offset that would run past write_len, an encoding outside
- * 0/1/2/0xFF) is PSVM_ERR_LIMITS. */
+ * 0/1/2/0xFF) is PSVM_ERR_LIMITS.
+ *
+ * Two whole-table rules, both PSVM_ERR_LIMITS and both added by the M5b
+ * whole-branch review:
+ *
+ *   - a duration action must declare param_max >= 1. Zero is refused by
+ *     action_param_ok() and by actor_table_check()'s effective bound alike,
+ *     so a pair declared with it can never fire -- a silent permanent
+ *     refusal where an install-time rejection belongs.
+ *   - a duration action WITHOUT flags bit 0 is a close the HUB owes (spec
+ *     section 4.3), and the hub's only close is ACT_SWITCH_OFF. Such a
+ *     table must therefore ALSO declare switch.off, or the obligation
+ *     pending_close arms can never be discharged and the actuator stays
+ *     open. Checked across the whole table once every entry is parsed. */
 #define PSVM_FLAG_ACTION_TABLE 0x0002u
 #define PSVM_ACTION_MAX        4
 
