@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'preact/hooks'
+import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 import { loadCaps, capLabel, fmtCap } from '../lib/caps.js'
 import { hasAiKey } from '../lib/ai/settings.js'
+import { fmtRemainingCooldown, fmtBudget, verdictLabel, switchStateLabel } from '../lib/actuators.js'
 
 function fmtAge(ageS) {
   if (ageS == null) return 'never'
@@ -92,9 +93,230 @@ function mac12FromBleId(id) {
   return i < 0 ? id : id.slice(i + 1)
 }
 
+// Device-level stop button (M5b Task 12, spec §7 design points: "Lockout
+// sits next to the device it governs"). PUT .../actions/{action}/guards
+// only accepts a body keyed by ONE action's URL, but actor_set_lockout()
+// applies it to the whole device regardless of which action named the URL
+// (api_v1.c's devices_guards_put() comment) -- callers just need any one of
+// the device's declared actions, so this always uses the first.
+//
+// Deliberately does NOT disable the manual controls below when lockout is
+// on: actor_table.h's own contract is "lockout refuses ACTOR_SRC_RULE;
+// permits MANUAL and SAFETY" -- a manual press bypasses lockout by design
+// (the operator's own hand on the button is not the automation lockout
+// exists to stop). Rendering this as if it blocked manual presses too would
+// be exactly the "control ambiguous about whether it just fired" defect the
+// brief warns about, so the hint text says what lockout actually does.
+function LockoutControl({ deviceId, firstActionName, lockout, onChanged }) {
+  const [busy, setBusy] = useState(false)
+  const [state, setState] = useState('idle') // idle | error | unauth
+
+  async function toggle() {
+    setBusy(true)
+    try {
+      const res = await fetch(`/api/v1/devices/${deviceId}/actions/${firstActionName}/guards`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ lockout: !lockout }),
+      })
+      if (res.ok) { setState('idle'); onChanged(!lockout) }
+      else setState(res.status === 401 ? 'unauth' : 'error')
+    } catch {
+      setState('error')
+    }
+    setBusy(false)
+  }
+
+  return (
+    <div class="node-card-row lockout-row">
+      <button type="button" class={lockout ? 'btn-destructive' : 'btn-secondary'}
+              onClick={toggle} disabled={busy}>
+        {busy ? '…' : lockout ? 'Locked out — release' : 'Lockout this device'}
+      </button>
+      <span class="hint">
+        {lockout
+          ? 'Rule-triggered commands are blocked. Manual controls below and safety closes still work.'
+          : 'Stops the rules engine from firing this device automatically. Manual controls and safety closes are never blocked.'}
+      </span>
+      {state === 'error' && <span class="error">failed to update lockout</span>}
+      {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
+    </div>
+  )
+}
+
+// How long a manual command is given to show up confirmed before this row
+// stops waiting and tells the operator nothing came back -- generous over
+// the connect+write+confirm round trip a GATT actuator needs (actor.h's own
+// ACTOR_MANUAL_TTL_S queue deadline is 30s; this is the UI-side twin of
+// that budget, not a guess).
+const ACTION_CONFIRM_TIMEOUT_S = 30
+
+// One action's control: a button (parameterless) or a bounded duration
+// input plus a button, the guard text a refusal would otherwise surprise
+// the operator with, and the send/confirm lifecycle for the round trip the
+// brief calls out -- POSTing gets a 202 (QUEUED, api_v1.c's own comment:
+// "the command is QUEUED, not necessarily dispatched yet"), not a
+// confirmation that the actuator moved. This row stays in an explicit
+// "sent — awaiting confirmation" state, distinguishable from both "idle"
+// and "done", until the next device poll shows a NEW firing (last_fired_s
+// advanced past the moment this row sent its request) or
+// ACTION_CONFIRM_TIMEOUT_S elapses with nothing to show for it -- silently
+// reverting to a pressable idle button the instant the POST returns would
+// make an irreversible actuator command look like a toggle that either did
+// nothing or can be safely re-pressed.
+function ActionControl({ deviceId, action, fetchedAtS, nowS }) {
+  const isDuration = action.param === 'duration_s'
+  const [paramStr, setParamStr] = useState('')
+  // idle | sending | pending | confirmed | refused | refused-late | timeout | unauth | error
+  const [sendState, setSendState] = useState('idle')
+  const [sendMsg, setSendMsg] = useState('')
+  const pendingSinceRef = useRef(0)
+  // The firing timestamp this row already knew about at the MOMENT it sent
+  // the request -- not the wall clock. A wall-clock compare (lastFiredAtS
+  // >= sendTimeS) can false-positive: last_fired_s is only as fresh as the
+  // last 10s poll, so a genuinely OLD firing that happened to land in the
+  // same integer second as both that poll and this press would already
+  // satisfy ">= sendTimeS" before the real dispatch ever occurs. Comparing
+  // against the baseline this row observed right before sending asks the
+  // question this UI actually needs answered -- "has a NEW firing shown up
+  // since I pressed the button" -- and can never fire early.
+  const baselineFiredAtRef = useRef(null)
+
+  const lastFiredAtS = action.last_fired_s == null ? null : fetchedAtS - action.last_fired_s
+  const cooldownGuard = { cooldownS: action.cooldown_s, lastFiredAtS }
+  const budgetGuard = { activationsThisHour: action.activations_this_hour, maxPerHour: action.max_per_hour }
+  const remaining = fmtRemainingCooldown(cooldownGuard, nowS)
+  const budgetExhausted = action.max_per_hour > 0 && action.activations_this_hour >= action.max_per_hour
+
+  // Resolves a 'pending' row against each fresh poll of `action` (devices.jsx's
+  // 10s refresh) and the live `nowS` ticker: a firing strictly NEWER than
+  // the baseline captured at send time is this request landing,
+  // successfully or not -- last_result at that point says which. No
+  // request id travels with the command, so this is the same
+  // "watch the state, not a promise" approach the confirm-read GATT layer
+  // itself uses one level down.
+  useEffect(() => {
+    if (sendState !== 'pending') return
+    const baseline = baselineFiredAtRef.current
+    if (lastFiredAtS != null && (baseline == null || lastFiredAtS > baseline)) {
+      setSendState(action.last_result === 'ok' ? 'confirmed' : 'refused-late')
+      setSendMsg(verdictLabel(action.last_result))
+      return
+    }
+    if (nowS - pendingSinceRef.current > ACTION_CONFIRM_TIMEOUT_S) {
+      setSendState('timeout')
+    }
+  }, [sendState, action.last_result, lastFiredAtS, nowS])
+
+  // A blank/invalid duration must refuse to fire rather than silently
+  // defaulting to some duration the operator never typed -- irrigation.open
+  // and pump.run are not reversible once dispatched, so "pressed Run with
+  // an empty box" must not become a surprise 1-second (or, worse, a
+  // truncated garbage-input) actuation.
+  const paramNum = Number(paramStr)
+  const paramValid = !isDuration || (paramStr.trim() !== '' && Number.isFinite(paramNum) && paramNum >= 1)
+
+  async function fire() {
+    if (!paramValid) return
+    const param = isDuration ? Math.min(Math.trunc(paramNum), action.param_max) : 0
+    setSendState('sending')
+    setSendMsg('')
+    try {
+      const res = await fetch(`/api/v1/devices/${deviceId}/actions/${action.name}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ param }),
+      })
+      if (res.status === 202) {
+        baselineFiredAtRef.current = lastFiredAtS
+        pendingSinceRef.current = nowS
+        setSendState('pending')
+      } else if (res.status === 401) {
+        setSendState('unauth')
+      } else if (res.status === 409) {
+        const body = await res.json().catch(() => ({}))
+        setSendState('refused')
+        setSendMsg(verdictLabel(body.error || 'unknown'))
+      } else {
+        setSendState('error')
+      }
+    } catch {
+      setSendState('error')
+    }
+  }
+
+  const busy = sendState === 'sending' || sendState === 'pending'
+  const disabled = busy || remaining != null || budgetExhausted || !paramValid
+
+  return (
+    <div class="node-card-row action-row">
+      <span class="mono">{action.name}</span>
+      {isDuration && (
+        <input type="number" min="1" max={action.param_max} step="1"
+               placeholder={`1–${action.param_max}s`} value={paramStr}
+               onInput={(e) => setParamStr(e.currentTarget.value)} disabled={busy} />
+      )}
+      <button type="button" class="btn-primary" onClick={fire} disabled={disabled}>
+        {sendState === 'sending' ? '…' : sendState === 'pending' ? 'Sent — awaiting confirmation…' : 'Run'}
+      </button>
+      <span class="hint">
+        last: {verdictLabel(action.last_result)}
+        {remaining ? ` · cooldown ${remaining} left` : ''}
+        {' · '}{fmtBudget(budgetGuard)}
+      </span>
+      {sendState === 'confirmed' && <span class="hint">✓ confirmed — {sendMsg}</span>}
+      {sendState === 'refused-late' && <span class="error">refused after queueing — {sendMsg}</span>}
+      {sendState === 'refused' && <span class="error">refused — {sendMsg}</span>}
+      {sendState === 'timeout' && <span class="error">no confirmation yet — check the Alerts tab</span>}
+      {sendState === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
+      {sendState === 'error' && <span class="error">request failed</span>}
+    </div>
+  )
+}
+
+// The actuator surface for one device (M5b Task 12): only rendered when
+// devices_json.c added an "actions" key at all (an ordinary sensor gets
+// none). switch.state (capability, not an action) is looked up by name out
+// of the same d.caps every other capability renders from -- shown here,
+// next to the controls that change it, rather than only in the generic
+// capabilities table below, so the operator sees the confirmed state right
+// beside the button that moves it.
+function ActionsSection({ d, nowS, fetchedAtS, onLockoutChanged }) {
+  const switchCap = d.caps.find((c) => c.name === 'switch.state')
+  const lockout = d.actions[0].lockout
+  // Rendered whenever this device declares switch.on/switch.off, not only
+  // once the capability has been confirmed at least once: on a brand-new
+  // pairing the capability is absent from d.caps entirely (device_json.c
+  // only lists a capability once e->caps[c].valid), and a silently missing
+  // line there could read as "this device has no switch state" instead of
+  // "not confirmed yet" -- the same ambiguity the brief's design points
+  // warn against elsewhere. switchStateLabel(undefined) already renders
+  // 'unknown' for exactly this case.
+  const hasSwitch = switchCap || d.actions.some((a) => a.name === 'switch.on' || a.name === 'switch.off')
+
+  return (
+    <div class="actions-section">
+      <div class="node-card-row">
+        <span class="hint">Actuator controls</span>
+        {hasSwitch && (
+          <span class="hint">
+            Switch: <strong>{switchStateLabel(switchCap && switchCap.value)}</strong>
+            {switchCap ? ` (confirmed ${fmtAge(switchCap.age_s)})` : ' (not confirmed yet)'}
+          </span>
+        )}
+      </div>
+      <LockoutControl deviceId={d.id} firstActionName={d.actions[0].name} lockout={lockout}
+                       onChanged={(newLockout) => onLockoutChanged(d.id, newLockout)} />
+      {d.actions.map((a) => (
+        <ActionControl key={a.id} deviceId={d.id} action={a} fetchedAtS={fetchedAtS} nowS={nowS} />
+      ))}
+    </div>
+  )
+}
+
 // Same collapsible-card shape as nodes.jsx's NodeCard / rules.jsx's
 // RuleCard: name/id + last-seen while collapsed, details in the body.
-function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed }) {
+function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, fetchedAtS, onLockoutChanged }) {
   const isBle = d.kind === 'ble'
   const [name, setName] = useState(d.name || '')
   const [state, setState] = useState('idle') // idle | saving | saved | error | unauth
@@ -172,6 +394,9 @@ function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed }) {
             </span>
             {d.gatt.last_error && <span class="error">{d.gatt.last_error}</span>}
           </div>
+        )}
+        {d.actions && d.actions.length > 0 && (
+          <ActionsSection d={d} nowS={nowS} fetchedAtS={fetchedAtS} onLockoutChanged={onLockoutChanged} />
         )}
         {isBle && (
           <div class="node-card-row">
@@ -332,10 +557,30 @@ export function DevicesTab({ onAddWrapper, onGenerateWrapper }) {
   const [plants, setPlants] = useState(null)
   const [error, setError] = useState(false)
   const [openMap, setOpenMap] = useState({})
+  // The instant GET /api/v1/devices' `actions[].last_fired_s` (an AGE, not
+  // an absolute time) was read -- lets ActionControl convert that age into
+  // an absolute epoch second exactly once per poll, then tick a cooldown
+  // countdown against the live `nowS` below between polls, rather than the
+  // countdown only updating once every 10s refresh.
+  const [fetchedAtS, setFetchedAtS] = useState(() => Math.floor(Date.now() / 1000))
+
+  // Live clock for the cooldown countdown (fmtRemainingCooldown's `nowS`)
+  // and the manual-command confirmation timeout -- both need to progress
+  // between the 10s device-list poll below, or a countdown would visibly
+  // freeze for seconds at a time.
+  const [nowS, setNowS] = useState(() => Math.floor(Date.now() / 1000))
+  useEffect(() => {
+    const id = setInterval(() => setNowS(Math.floor(Date.now() / 1000)), 1000)
+    return () => clearInterval(id)
+  }, [])
 
   function refresh(signal) {
+    const fetchedAt = Math.floor(Date.now() / 1000)
     return Promise.all([
-      fetch('/api/v1/devices', { signal }).then((r) => r.json()).then((d) => setDevices(d.devices)),
+      fetch('/api/v1/devices', { signal }).then((r) => r.json()).then((d) => {
+        setDevices(d.devices)
+        setFetchedAtS(fetchedAt)
+      }),
       fetch('/api/v1/plants', { signal }).then((r) => r.json()).then((d) => setPlants(d.plants)),
     ])
   }
@@ -367,6 +612,17 @@ export function DevicesTab({ onAddWrapper, onGenerateWrapper }) {
     setDevices((prev) => prev.map((d) => (d.id === id ? { ...d, name } : d)))
   }
 
+  // Optimistic: PUT .../guards already confirmed the write (LockoutControl
+  // only calls this on a 2xx), so reflecting it immediately here matches
+  // what the very next 10s poll would show anyway -- and lockout is exactly
+  // the "must feel responsive" control the brief's stop-button framing
+  // cares about, not something to leave stale for up to 10s.
+  function onLockoutChanged(id, lockout) {
+    setDevices((prev) => prev.map((d) => (
+      d.id === id ? { ...d, actions: d.actions.map((a) => ({ ...a, lockout })) } : d
+    )))
+  }
+
   if (error) return <p class="error">Hub not reachable.</p>
   if (!devices || !plants || !caps) return <p class="placeholder">Loading…</p>
 
@@ -390,7 +646,8 @@ export function DevicesTab({ onAddWrapper, onGenerateWrapper }) {
               <div class="node-cards">
                 {byKind.get(k).map((d) => (
                   <DeviceCard key={d.id} d={d} caps={caps} plantNameById={plantNameById}
-                              open={!!openMap[d.id]} onToggle={() => toggleDevice(d.id)} onRenamed={onRenamed} />
+                              open={!!openMap[d.id]} onToggle={() => toggleDevice(d.id)} onRenamed={onRenamed}
+                              nowS={nowS} fetchedAtS={fetchedAtS} onLockoutChanged={onLockoutChanged} />
                 ))}
               </div>
             </div>

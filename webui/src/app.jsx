@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks'
+import { AlertsTab } from './tabs/alerts.jsx'
 import { ConfigTab } from './tabs/config.jsx'
 import { DashboardTab } from './tabs/dashboard.jsx'
 import { DevicesTab } from './tabs/devices.jsx'
@@ -17,17 +18,21 @@ import { getStoredTheme, setStoredTheme, systemPrefersDark } from './lib/theme.j
 // across every radio (devices.jsx, M2 Task 8: renamed from "Probes" now
 // that it lists every device kind's live capabilities, not just MiFlora
 // probes -- binding itself moved onto the Plants tab with the M2
-// capability model, so this tab is read-only plus rename). Rules (M1 VM)
-// sits after History, ahead of Nodes -- both mirror the same "operate the
-// fleet" grouping the tab order already implies. Wrappers (M3 Task 8)
-// follows Rules for the same reason -- another "write PlantScript, compile,
-// save" surface, immediately after its closest sibling.
-const ALL_TABS = ['Dashboard', 'Plants', 'Devices', 'History', 'Rules', 'Wrappers', 'Nodes', 'Config', 'Network']
+// capability model, so this tab is read-only plus rename). Alerts (M5b
+// Task 12) sits right after Devices -- the actuator controls that Devices
+// tab now carries are the thing an operator watching Alerts most wants a
+// short hop back to, and vice versa. Rules (M1 VM) sits after History,
+// ahead of Nodes -- both mirror the same "operate the fleet" grouping the
+// tab order already implies. Wrappers (M3 Task 8) follows Rules for the
+// same reason -- another "write PlantScript, compile, save" surface,
+// immediately after its closest sibling.
+const ALL_TABS = ['Dashboard', 'Plants', 'Devices', 'Alerts', 'History', 'Rules', 'Wrappers', 'Nodes', 'Config', 'Network']
 
-// localStorage key the Rules tab's own event feed (rules.jsx) writes on
-// every fetch while mounted -- reading it here is how the tab bar knows
-// whether unseen rule events exist without duplicating an SSE connection
-// just for a badge (the hub's SSE endpoint caps at 2 clients total).
+// localStorage key the Rules tab's own event feed (rules.jsx) and the
+// Alerts tab's event feed (alerts.jsx) both write on every fetch while
+// mounted -- reading it here is how the tab bar knows whether unseen events
+// exist without duplicating an SSE connection just for a badge (the hub's
+// SSE endpoint caps at 2 clients total).
 const EVENTS_SEEN_KEY = 'planthub_events_seen'
 
 function Placeholder({ name }) {
@@ -109,13 +114,31 @@ export function App() {
   const [wrapperPrefill, setWrapperPrefill] = useState(null)
 
   useEffect(() => {
-    if (role === 'node' || role === 'unset') return   // no Rules tab there at all -- see TABS below
+    if (role === 'node' || role === 'unset') return   // no Rules/Alerts tabs there at all -- see TABS below
     const controller = new AbortController()
     function poll() {
       const seen = Number(localStorage.getItem(EVENTS_SEEN_KEY) || '0')
       fetch(`/api/v1/events?after=${seen}`, { signal: controller.signal })
         .then((r) => r.json())
-        .then((d) => setRulesUnseen((d.last_seq || 0) > seen))
+        .then((d) => {
+          const lastSeq = d.last_seq || 0
+          // M5b Task 5 changed the event log's on-disk format, restarting
+          // next_seq at 1 -- a browser holding a much larger "seen"
+          // bookmark from before that bump (e.g. 412) would otherwise read
+          // `lastSeq > seen` as false forever, and the unread dot would
+          // never come back. seen > lastSeq can only happen when the hub's
+          // counter reset under an existing bookmark (seq is monotonic
+          // otherwise), so treat that as "everything is unread" and drop
+          // the stale bookmark, rather than trying to guess how far back it
+          // reset -- the next Rules or Alerts tab mount re-establishes a
+          // fresh one via its own markSeen() regardless.
+          if (seen > lastSeq) {
+            localStorage.removeItem(EVENTS_SEEN_KEY)
+            setRulesUnseen(lastSeq > 0)
+            return
+          }
+          setRulesUnseen(lastSeq > seen)
+        })
         .catch(() => {})
     }
     poll()
@@ -197,7 +220,13 @@ export function App() {
   // plant/device registry, never on a paired node. Wrappers is hub-only for
   // the identical reason: the wrapper store/decoder/registry all live on
   // the hub, never on a paired node.
-  const TABS = role === 'node' ? ALL_TABS.filter((t) => t !== 'Nodes' && t !== 'Rules' && t !== 'Wrappers') : ALL_TABS
+  // Alerts joins Rules/Wrappers/Nodes here for the identical reason: its
+  // whole event feed is event_log_init()/rules_init() (main.c, inside the
+  // `role != SWARM_ROLE_NODE` block) -- neither ever runs on a paired node,
+  // so GET /api/v1/events has nothing meaningful to serve there either.
+  const TABS = role === 'node'
+    ? ALL_TABS.filter((t) => t !== 'Nodes' && t !== 'Rules' && t !== 'Wrappers' && t !== 'Alerts')
+    : ALL_TABS
 
   return (
     <div class="app">
@@ -208,9 +237,9 @@ export function App() {
         <nav>
           {TABS.map((t) => (
             <button key={t} class={'tab-btn' + (t === tab ? ' active' : '')}
-                    onClick={() => { setTab(t); if (t === 'Rules') setRulesUnseen(false) }}>
+                    onClick={() => { setTab(t); if (t === 'Rules' || t === 'Alerts') setRulesUnseen(false) }}>
               {t}
-              {t === 'Rules' && rulesUnseen && <span class="tab-dot" aria-hidden="true" />}
+              {(t === 'Rules' || t === 'Alerts') && rulesUnseen && <span class="tab-dot" aria-hidden="true" />}
             </button>
           ))}
         </nav>
@@ -226,6 +255,7 @@ export function App() {
            <DevicesTab onAddWrapper={(device) => goToWrapperEditor(device, false)}
                        onGenerateWrapper={(device) => goToWrapperEditor(device, true)} />
          ) :
+         tab === 'Alerts' ? <AlertsTab /> :
          tab === 'History' ? <HistoryTab /> :
          tab === 'Rules' ? <RulesTab /> :
          tab === 'Wrappers' ? (

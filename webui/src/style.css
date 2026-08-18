@@ -664,7 +664,11 @@ button + .hint, .btn-primary + .hint { margin-left: 14px; }
 }
 .filebtn input[type='file'] { display: none; }
 
-/* Rules tab event feed: level badge (log/notify -- spec §5's event_t.level). */
+/* Event feed level badge (event_t.level -- log/notify predate M5b Task 5,
+   alert/critical are that task's safety-core addition). Shared by the Rules
+   tab's inline feed and the Alerts tab (M5b Task 12): both key off the same
+   `level-${e.level}` class, so the alert/critical treatment below applies
+   everywhere a level badge renders, not just the new tab. */
 .level-badge {
   display: inline-block;
   padding: 2px 8px;
@@ -678,6 +682,61 @@ button + .hint, .btn-primary + .hint { margin-left: 14px; }
 }
 .level-badge.level-notify {
   background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+}
+/* alert (level 2): the same muted-danger treatment .error text already
+   uses elsewhere in this file, so a refusal reads as trouble at a glance
+   without yet being the loudest thing on the page. */
+.level-badge.level-alert {
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
+  color: var(--danger);
+  font-weight: 600;
+}
+/* critical (level 3): solid danger fill, not just an outline -- the brief's
+   own design point is "the alert feed's job is to make a critical
+   unmissable", so this is deliberately the loudest badge on the page
+   rather than one more variant of the same outlined pill. */
+.level-badge.level-critical {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--accent-contrast);
+  font-weight: 700;
+}
+/* Whole-row tint for a critical event (alerts.jsx's <tr class="level-critical-row">)
+   -- makes a critical stand out even scanning past the Level column. */
+.level-critical-row {
+  background: var(--danger-bg);
+}
+
+/* M5b Task 12: actor controls (devices.jsx) and the level filter (alerts.jsx). */
+.actions-section {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.7rem;
+  margin: 0.4rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  background: var(--bg-alt);
+}
+.action-row, .lockout-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.action-row input[type='number'] {
+  width: 6.5rem;
+}
+.level-filter button {
+  min-height: 32px;
+  padding: 6px 12px;
+  border-radius: 999px;
+}
+.level-filter button.active {
+  background: var(--accent);
   border-color: var(--accent);
   color: var(--accent-contrast);
 }
