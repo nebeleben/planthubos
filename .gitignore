@@ -44,3 +44,4 @@ tests/host/test_actor_table
 tests/host/test_actor_queue
 tests/host/test_pending_close
 tests/host/test_alert_ring
+tests/host/test_actor_persist
