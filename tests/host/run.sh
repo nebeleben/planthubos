@@ -201,3 +201,8 @@ $CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/a
     test_actor_queue.c ../../components/actors/actor.c ../../components/actors/actor_table.c \
     ../../components/actions/action.c -o test_actor_queue
 ./test_actor_queue
+
+$CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/actions/include \
+    -I../../components/event_log/include \
+    test_pending_close.c ../../components/actors/pending_close.c -o test_pending_close
+./test_pending_close

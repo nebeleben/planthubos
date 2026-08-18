@@ -48,6 +48,15 @@ typedef enum {
  * boundary -- up to 2N in one 60-minute span -- and the cooldown is what
  * bounds how tightly. This is a documented trade, not a bug to "fix" into
  * a sliding window. */
+/* M5b Task 9: named bit for actor_slot_t.flags bit 0 -- this table stores
+ * the bit opaquely (it is carried straight through from the wrapper's
+ * action-table flags byte, psvm.h's PSVM_FLAG_ACTION_TABLE layout), but
+ * Task 9 is the first reader that has to ACT on it: an action with this bit
+ * set closes itself on the device after its duration elapses, so the hub
+ * must not (and, per pending_close_arm()'s contract, must not) schedule a
+ * close for it. An action without it is the hub's obligation. */
+#define ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF 0x01u
+
 typedef struct {
     uint8_t  action_id;        /* ACTION_NONE (from action.h) when free */
     uint8_t  flags;            /* bit 0 device-local timed-off, bit 1 has
@@ -181,3 +190,11 @@ void actor_table_set_lockout(actor_table_t *t, int dev_idx, bool on);
 bool actor_table_remove(actor_table_t *t, int dev_idx);
 
 uint32_t actor_table_full_drops(const actor_table_t *t);
+
+/* M5b Task 9: read-only accessor for a declared pair's stored `flags` (see
+ * ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF above) -- the one thing pending_close
+ * needs from this table and the only reason it looks here at all. Returns
+ * false (and leaves *flags_out untouched) when dev_idx is negative or the
+ * pair is not declared, exactly like actor_table_set_guards()'s contract. */
+bool actor_table_action_flags(const actor_table_t *t, int dev_idx, uint8_t action_id,
+                               uint8_t *flags_out);

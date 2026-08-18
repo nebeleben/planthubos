@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "actor_table.h"
 
@@ -220,6 +221,11 @@ void     actor_set_lockout(int dev_idx, bool on);
  * wrapper reindex is the one caller. */
 bool     actor_undeclare(int dev_idx);
 uint32_t actor_full_drops(void);
+/* Lock-taking wrapper around actor_table_action_flags() -- M5b Task 9's one
+ * reader of a declared pair's flags (ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF, see
+ * actor_table.h), used to decide whether a dispatched timed-open action
+ * needs a hub-scheduled close at all. */
+bool     actor_action_flags(int dev_idx, uint8_t action_id, uint8_t *flags_out);
 
 /* The single door onto an actuator (spec section 3). Calls
  * actor_request_decide() under lock; on refusal (guard OR a full queue),
@@ -260,3 +266,148 @@ void actor_set_dispatch_hook(actor_dispatch_fn_t fn);
  * re-check refusal, and finally hands a dispatched command to the
  * dispatch hook. Call periodically from a task that can own the radio. */
 void actor_service(void);
+
+/* ---------------------------------------------------------------------
+ * Pending close: persistence and boot replay (M5b Task 9, spec section 4.5).
+ *
+ * Some actuators close themselves a fixed duration after being opened --
+ * ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF (actor_table.h), the DIY profile's
+ * preferred and mandatory path (spec section 4.3). For everyone else, the
+ * HUB owns the close: it must send ACT_SWITCH_OFF itself once the
+ * parameter (a duration, action.h's ACTION_PARAM_DURATION_S) elapses, and
+ * that obligation must survive a reboot between the open and the close --
+ * a hub that opened a valve, crashed, and rebooted with no memory of it
+ * would leave that valve open indefinitely. This is the module that closes
+ * that gap: pending_close_arm() records the obligation (RAM + one small
+ * flash write); an esp_timer-driven pump (pending_close_service(), the
+ * impure half, in pending_close.c) attempts the close, retries with bounded
+ * backoff, and alerts CRITICAL (ALERT_CODE_CLOSE_UNCONFIRMED) on exhaustion;
+ * pending_close_clear() removes the obligation once the close is CONFIRMED
+ * (not merely dispatched -- spec section 4.4 treats a write that landed but
+ * was not confirmed as still open) and rewrites/deletes the file.
+ *
+ * Split, like the rest of this component: everything below down to
+ * pending_close_deserialize() is pure C99 (a small RAM table, no ESP-IDF),
+ * directly host-tested by tests/host/test_pending_close.c. Only
+ * pending_close_init()/pending_close_service() (LittleFS, esp_timer,
+ * actor_request(), alert_post()) are impure, gated `#ifdef ESP_PLATFORM`
+ * exactly like actor_request()/actor_service() above -- see pending_close.c.
+ *
+ * Deliberately NOT written back to flash on every retry (spec section 8's
+ * flash-wear budget): a fresh arm() is the only write while a close is
+ * outstanding; retries/backoff live in RAM only, so a reboot mid-retry
+ * simply restarts the retry count -- harmless, since boot replay treats
+ * every surviving record as due immediately regardless. */
+
+#define PENDING_CLOSE_MAX         ACTOR_MAX_DEVICES /* one pending close per
+                                                       * device, and at most
+                                                       * ACTOR_MAX_DEVICES
+                                                       * devices are ever
+                                                       * actuators */
+#define PENDING_CLOSE_MAX_RETRIES 5                  /* bounded backoff
+                                                       * attempts before the
+                                                       * obligation is given
+                                                       * up as CRITICAL */
+
+typedef struct {
+    int8_t   dev_idx;
+    uint8_t  close_action;
+    uint32_t deadline_s;   /* actor_now_s()-scale: when this obligation is
+                             * next due to be attempted (NOT re-persisted on
+                             * every retry -- see this section's top comment) */
+    uint8_t  retries;
+} pending_close_t;
+
+/* Arms (or re-arms) the obligation to close `dev_idx` via `close_action` at
+ * `deadline_s` (actor_now_s()-scale). Re-arming an already-pending device
+ * REPLACES its record (one obligation per device: a device that opens
+ * again while its previous close is still pending gets the new deadline,
+ * not a second row) and resets its retry count to 0 -- a fresh open is a
+ * fresh obligation, not a continuation of a stale retry sequence. Writes
+ * the persisted file. A negative dev_idx is a no-op (nothing to arm). */
+void   pending_close_arm(int dev_idx, uint8_t close_action, uint32_t deadline_s);
+
+/* Removes dev_idx's obligation, if any (a safe no-op if none is pending),
+ * and rewrites the persisted file -- deleting it entirely once the table is
+ * empty, so an unopened hub leaves no stray file behind. The one caller
+ * that matters is a CONFIRMED close (pending_close_service()'s companion,
+ * called from the GATT completion path); calling it for any other reason
+ * abandons the obligation without having actually closed anything. */
+void   pending_close_clear(int dev_idx);
+
+/* Finds the earliest-deadline record whose deadline_s <= now_s (ties broken
+ * by table order) and copies it into *out, WITHOUT removing it -- the
+ * caller (pending_close_service()) advances or clears it explicitly via
+ * pending_close_retry()/pending_close_clear() once it knows the outcome of
+ * attempting it. Returns 1 if a due record was found, 0 otherwise. `out`
+ * may be NULL to just test whether anything is due. */
+int    pending_close_due(uint32_t now_s, pending_close_t *out);
+
+/* Records that an attempt for `dev_idx` was just made and failed (or could
+ * not be confirmed), advancing its deadline into the future by a bounded
+ * exponential backoff. Returns true (rescheduled) while retries remain
+ * below PENDING_CLOSE_MAX_RETRIES; returns false, WITHOUT mutating the
+ * record, once the bound is reached -- the caller is expected to alert
+ * CRITICAL and then call pending_close_clear() itself; this function never
+ * clears on its own; a caller that ignores a false return and keeps calling
+ * gets false again (exhaustion is a stable state, not a one-shot signal).
+ * Returns false with nothing to do if dev_idx has no pending record. */
+bool   pending_close_retry(int dev_idx, uint32_t now_s);
+
+/* On boot, every surviving record is due immediately, whatever deadline it
+ * recorded -- the hub cannot know how long it was off. True for any record
+ * with dev_idx >= 0 (a free/invalid slot, dev_idx < 0, is never boot-due). */
+bool   pending_close_is_boot_due(const pending_close_t *r);
+
+/* Populates the RAM table from `recs` (as read from the persisted file,
+ * already deserialized), treating every record for which
+ * pending_close_is_boot_due() is true as due AT ONCE (its stored deadline_s
+ * is discarded, not consulted) -- the pure half of boot replay. Does not
+ * touch the file. The impure half (pending_close_init(), in pending_close.c)
+ * reads the file, calls this, then attempts every now-due record. */
+void   pending_close_boot_load(const pending_close_t *recs, size_t n);
+
+/* Number of devices with an obligation currently pending (0..PENDING_CLOSE_MAX). */
+size_t pending_close_active_count(void);
+
+/* On-disk format: `{ u8 fmt=1; u8 count; u16 crc }` followed by `count`
+ * fixed 7-byte records (dev_idx, close_action, deadline_s LE32, retries).
+ * pending_close_serialize() returns the number of BYTES written into `buf`
+ * (0 on any failure: `n` too large to fit `cap`, or more than 255 records --
+ * count is one wire byte -- writes NOTHING rather than a truncated file).
+ * pending_close_deserialize() returns the number of RECORDS recovered into
+ * `out` (capped at `cap`), or 0 for ANY of: a short/absent header, an
+ * unrecognised fmt, a length that doesn't exactly match `4 + count*7` (a
+ * truncated OR a trailing-garbage file), a crc mismatch, or `count > cap` --
+ * a corrupt or truncated file yields NOTHING, never a plausible-looking
+ * partial list, because closing a device the hub was never told about is
+ * its own bug. */
+size_t pending_close_serialize(const pending_close_t *recs, size_t n, uint8_t *buf, size_t cap);
+size_t pending_close_deserialize(const uint8_t *buf, size_t len, pending_close_t *out, size_t cap);
+
+/* Impure half (pending_close.c, `#ifdef ESP_PLATFORM`-gated internals):
+ *
+ * pending_close_init() -- call once at boot, after actor_init(). Always
+ * resets the RAM table first (unconditionally, so it is also the test
+ * suite's reset hook -- see test_pending_close.c). On target, then reads
+ * the persisted file, calls pending_close_boot_load(), and immediately
+ * attempts every now-due record (pending_close_service()).
+ *
+ * pending_close_service() -- call periodically (ble_collector.c's decoder
+ * loop, unconditionally: it costs nothing but a table scan when nothing is
+ * due). Attempts every currently-due record via actor_request(..., ...,
+ * ACTOR_SRC_SAFETY, ...) -- the same door, exempt from every rate-shaping
+ * guard (actor_table.h) -- then calls pending_close_retry(); on exhaustion,
+ * alerts EVENT_LEVEL_CRITICAL/ALERT_CODE_CLOSE_UNCONFIRMED and clears. */
+void   pending_close_init(void);
+void   pending_close_service(void);
+
+/* Called by whichever module learns a dispatched command's real outcome
+ * (ble_collector.c's GATT completion hook, for a command whose source was
+ * ACTOR_SRC_SAFETY) once ok=true and confirmed=true -- see gatt_engine.h's
+ * gatt_cmd_done_fn_t doc comment for what those mean. Any other outcome
+ * (ok=false, or ok=true/confirmed=false -- "completed unconfirmed", spec
+ * section 4.4) is deliberately NOT reported here: the obligation stays
+ * pending and pending_close_service()'s own retry/backoff picks it up on
+ * the next pass, with no separate failure path to keep in sync. */
+void   pending_close_note_result(int dev_idx, bool ok, bool confirmed);

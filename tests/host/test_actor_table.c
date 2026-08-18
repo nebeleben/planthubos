@@ -262,6 +262,30 @@ static void test_remove_frees_capacity(void) {
     assert(actor_table_check(&T, 99, ACT_SWITCH_ON, 0, ACTOR_SRC_RULE, 100) == ACTOR_OK);
 }
 
+/* M5b Task 9: actor_table_action_flags() is the one thing pending_close
+ * reads from this table -- whether ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF (bit
+ * 0) is set for a declared pair, which decides whether the hub owes that
+ * device a scheduled close at all. */
+static void test_action_flags_read_back(void) {
+    setup(); /* dev 3: ACT_IRRIGATION_OPEN flags=0x01, ACT_SWITCH_OFF flags=0x00 */
+    uint8_t flags = 0xAA; /* poisoned, so a false "success" leaving it
+                            * untouched would be caught */
+    assert(actor_table_action_flags(&T, 3, ACT_IRRIGATION_OPEN, &flags));
+    assert(flags == ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF);
+
+    flags = 0xAA;
+    assert(actor_table_action_flags(&T, 3, ACT_SWITCH_OFF, &flags));
+    assert(flags == 0x00);
+}
+
+static void test_action_flags_undeclared_pair_or_device(void) {
+    setup();
+    uint8_t flags = 0;
+    assert(!actor_table_action_flags(&T, 3, ACT_PUMP_RUN, &flags));   /* declared device, undeclared action */
+    assert(!actor_table_action_flags(&T, 7, ACT_IRRIGATION_OPEN, &flags)); /* undeclared device */
+    assert(!actor_table_action_flags(&T, -1, ACT_IRRIGATION_OPEN, &flags)); /* negative dev_idx */
+}
+
 int main(void) {
     test_bound_enforced(); test_wrapper_bound_tightens(); test_cooldown();
     test_rate_limit_fixed_window(); test_one_budget_across_sources(); test_lockout();
@@ -275,6 +299,8 @@ int main(void) {
     test_remove_undeclares_everything();
     test_removed_row_is_reusable_and_clean();
     test_remove_frees_capacity();
+    test_action_flags_read_back();
+    test_action_flags_undeclared_pair_or_device();
     printf("test_actor_table: OK\n");
     return 0;
 }

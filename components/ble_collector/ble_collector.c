@@ -567,6 +567,30 @@ static void on_gatt_cmd_done(int dev_idx, bool ok, bool confirmed, const char *e
     ESP_LOGI(TAG, "command %s: dev=%d action=%u param=%u",
              confirmed ? "confirmed" : "completed UNCONFIRMED",
              dev_idx, (unsigned)s_cmd_inflight.action_id, (unsigned)s_cmd_inflight.param);
+
+    /* M5b Task 9: the write landed. Two distinct things follow, depending
+     * on which side of a pending-close obligation this command was on. */
+    if (s_cmd_inflight.source == ACTOR_SRC_SAFETY) {
+        /* This WAS a scheduled (or retried) close: tell the safety core the
+         * outcome so it can stop retrying once the close is actually
+         * confirmed -- pending_close_note_result() itself treats "landed
+         * but unconfirmed" (spec section 4.4) as still open and does
+         * nothing, exactly like a genuine failure would. */
+        pending_close_note_result(dev_idx, ok, confirmed);
+    } else {
+        /* An ordinary open landed. If it is a timed action (a duration
+         * parameter, action.h's ACTION_PARAM_DURATION_S) and this device's
+         * declared action does NOT carry ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF
+         * (actor_table.h -- the device closes itself), the hub now owns
+         * the close: arm it for now + the duration that was just sent. */
+        const action_t *a = action_get(s_cmd_inflight.action_id);
+        uint8_t flags = 0;
+        if (a && a->param == ACTION_PARAM_DURATION_S &&
+            actor_action_flags(dev_idx, s_cmd_inflight.action_id, &flags) &&
+            !(flags & ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF)) {
+            pending_close_arm(dev_idx, ACT_SWITCH_OFF, actor_now_s() + s_cmd_inflight.param);
+        }
+    }
 }
 
 /* The decoder-task half of the re-queue above. Called from the same loop
@@ -1077,6 +1101,22 @@ static void adv_decoder_task(void *arg)
          * advertisement could start another read in front of it. It is
          * also true because of our own pending command, which would make
          * this gate partly self-referential. */
+        /* M5b Task 9: pending-close due-check. Deliberately OUTSIDE the
+         * s_actors_wired gate below and unconditional on role: unlike
+         * actor_service(), this never touches the radio itself -- it only
+         * decides whether an obligation is due and, if so, calls
+         * actor_request() to enqueue the close, so it needs none of the two
+         * busy gates that protect the pop-and-charge step, and it must keep
+         * running even where s_actors_wired never becomes true (a node, or
+         * the brief window on a hub before the GATT hooks are registered)
+         * so that a stale obligation still retries, backs off and -- on a
+         * node, which has no GATT radio to close anything with at all --
+         * eventually exhausts into a CRITICAL alert instead of sitting in
+         * RAM forever, silently, because nothing ever called it again. Costs
+         * a no-op table scan (PENDING_CLOSE_MAX == 4 rows) when nothing is
+         * due. */
+        pending_close_service();
+
         if (s_actors_wired) {
             service_command_requeue();
             if (!gatt_engine_cmd_busy() && !battery_poll_busy()) actor_service();
@@ -1266,6 +1306,16 @@ esp_err_t ble_collector_start(void)
      * real registry index. */
     actor_init();
     for (int i = 0; i < ACTOR_MAX_DEVICES; i++) s_actor_conn[i].dev_idx = -1;
+    /* M5b Task 9: pending-close persistence and boot replay. After
+     * actor_init() (the table pending_close_service()'s actor_request()
+     * calls check against must already be initialised, even though it is
+     * still empty here -- no device is declared as an actuator until its
+     * first advertisement is decoded, below). Reads the persisted file (if
+     * any) and immediately attempts every surviving obligation; a device
+     * not yet re-declared simply fails that attempt and is retried with
+     * backoff (pending_close_service(), pumped from the decoder loop
+     * below) until it is rediscovered or the retry budget is exhausted. */
+    pending_close_init();
     /* M3 Task 6 (spec §5): reset the unknown-device capture to empty before
      * adv_decoder_task (below) can run decode_adv_item() and start filling
      * it. Static 768 B (see unknown_capture.c's top comment). */

@@ -42,3 +42,4 @@ tests/host/test_uri_handler_budget
 tests/host/test_action
 tests/host/test_actor_table
 tests/host/test_actor_queue
+tests/host/test_pending_close

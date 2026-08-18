@@ -252,3 +252,26 @@ uint32_t actor_table_full_drops(const actor_table_t *t)
 {
     return t->full_drops;
 }
+
+bool actor_table_action_flags(const actor_table_t *t, int dev_idx, uint8_t action_id,
+                               uint8_t *flags_out)
+{
+    if (dev_idx < 0) return false;
+
+    /* A genuinely const scan (find_row()/find_slot() above take a mutable
+     * pointer, for callers that go on to write through it) -- this
+     * accessor never writes, so it does not borrow them. */
+    const actor_device_t *row = NULL;
+    for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
+        if (t->devices[i].dev_idx == dev_idx) { row = &t->devices[i]; break; }
+    }
+    if (!row) return false;
+
+    for (int i = 0; i < ACTOR_MAX_ACTIONS; i++) {
+        if (row->actions[i].action_id == action_id) {
+            if (flags_out) *flags_out = row->actions[i].flags;
+            return true;
+        }
+    }
+    return false;
+}

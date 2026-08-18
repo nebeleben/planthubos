@@ -294,6 +294,14 @@ uint32_t actor_full_drops(void)
     return n;
 }
 
+bool actor_action_flags(int dev_idx, uint8_t action_id, uint8_t *flags_out)
+{
+    actor_lock();
+    bool ok = actor_table_action_flags(&s_table, dev_idx, action_id, flags_out);
+    actor_unlock();
+    return ok;
+}
+
 static bool request_common(int dev_idx, uint8_t action_id, uint16_t param,
                             actor_source_t source, uint32_t deadline_s, bool retried)
 {
