@@ -1,4 +1,12 @@
 # Auto-applied on top of sdkconfig.defaults when IDF_TARGET=esp32c5
 # (idf.py appends "<defaults-file>.<target>" for every listed defaults
-# file). Selects the C5-specific partition layout -- see partitions_c5.csv.
+# file).
+#
+# Both lines below are a TEMPORARY override of the base defaults, which
+# now ship the 16 MB layout (M6a). The C5 part on hand is 4 MB, so it
+# stays on partitions_c5.csv and cannot carry the Zigbee stack M6b adds --
+# it is a build-only CI leg that keeps C5 source compatibility from
+# rotting. When the 16 MB C5 arrives, DELETE these two lines (and this
+# comment) and the C5 inherits partitions_16m.csv like every other target.
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_c5.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

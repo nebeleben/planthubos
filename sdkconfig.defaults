@@ -1,6 +1,6 @@
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16m.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
@@ -32,21 +32,28 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 # and the daily battery poll all behave exactly as before.
 #
 # Do NOT reduce anything on the advertisement-RECEIVE path to save more
-# memory: BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM (100), the discardable HCI
+# memory: BT_LE_ADV_REPORT_FLOW_CTRL_NUM (100), the discardable HCI
 # event pool (BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT) and MSYS_1 are
 # deliberately left at their defaults for that reason.
-
-# Controller activity instances, 828 bytes each (see the C3 controller's own
-# Kconfig help). Default 6. This device needs exactly two at any instant --
-# one scan, one connection -- so 3 keeps a full spare instance.
-CONFIG_BT_CTRL_BLE_MAX_ACT=3
 
 # Controller-side duplicate-advertisement filter list. ble_collector.c always
 # passes filter_duplicates=0 (it WANTS every repeat frame; data_core dedups
 # in RAM instead), and it is the only ble_gap_disc() caller in the tree, so
-# this list is allocated and then never consulted. 10 is the Kconfig minimum;
-# the feature stays compiled in so a future caller can still ask for it.
-CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=10
+# this list is allocated and then never consulted. 5 is the Kconfig minimum
+# (the default is 20); the feature itself stays compiled in -- BT_LE_SCAN_DUPL
+# is left at y -- so a future caller can still ask for it.
+#
+# M6a: this line replaces CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=10, and a
+# sibling CONFIG_BT_CTRL_BLE_MAX_ACT=3 was dropped outright rather than
+# translated. BT_CTRL_* is the controller Kconfig family of the esp32c3 and
+# the classic esp32 ONLY, and both targets were removed in M6a. On the C5 and
+# the C6 those two lines produced "unknown kconfig symbol" warnings and did
+# nothing at all -- so the saving this block describes was real on the C3 and
+# only ever on the C3. BT_CTRL_BLE_MAX_ACT has no C6 counterpart worth
+# setting: the nearest symbol, BT_LE_MAX_CONNECTIONS, carries
+# "depends on !BT_NIMBLE_ENABLED" and is inert in this build, because
+# CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1 above already governs.
+CONFIG_BT_LE_LL_DUP_SCAN_LIST_COUNT=5
 
 # Host-side HCI ACL receive pool: count x (BT_NIMBLE_TRANSPORT_ACL_SIZE 255 +
 # ~40 B mbuf overhead) ~= 300 B per buffer. Default 24 buffers (~7.2 KB) is
