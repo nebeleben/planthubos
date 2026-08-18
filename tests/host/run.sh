@@ -102,6 +102,13 @@ $CC -Wall -Wextra -Werror -I../../components/event_log/include \
     test_event_integrity.c ../../components/event_log/event_ring.c -o test_event_integrity
 ./test_event_integrity
 
+# The pure escaper behind events_json_get()'s streamed /api/v1/events?after=
+# response (sse.c), split out specifically so it's host-testable without
+# esp_http_server -- see events_json_escape.h's own comment.
+$CC -Wall -Wextra -Werror -I../../components/webserver/include -I../../components/event_log/include \
+    test_events_json_escape.c ../../components/webserver/events_json_escape.c -o test_events_json_escape
+./test_events_json_escape
+
 $CC -Wall -Wextra -Werror -I../../components/capability/include \
     test_capability.c ../../components/capability/capability.c -o test_capability -lm
 ./test_capability

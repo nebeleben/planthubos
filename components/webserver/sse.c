@@ -2,6 +2,7 @@
 #include "data_core.h"
 #include "devices_json.h"
 #include "event_log.h"
+#include "events_json_escape.h"
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -10,6 +11,7 @@
 #include "lwip/sockets.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 static const char *TAG = "sse";
 #define SSE_MAX_CLIENTS 2
@@ -111,32 +113,69 @@ static const char *event_level_str(uint8_t level)
     return "log";
 }
 
+/* Fixed JSON scaffolding around one escaped msg, worst case: leading comma
+ * (1) + `{"seq":` (7) + a uint32_t's longest decimal form, 10 digits
+ * ("4294967295") + `,"ts":` (6) + 10 digits + `,"rule_id":` (11) + 10
+ * digits + `,"level":"` (10) + "critical" (8, the longest event_level_str()
+ * result) + `","msg":"` (9) + `"}` (2) + NUL (1) = 85 bytes. 96 leaves
+ * headroom without tracking that arithmetic exactly. */
+#define EVT_LINE_OVERHEAD 96
+#define EVT_LINE_MAX (EVENTS_JSON_ESC_MAX + EVT_LINE_OVERHEAD)   /* 793 */
+
+/* GET /api/v1/events?after=<seq> body, on the httpd task. Was a cJSON tree
+ * serialised in one shot by cJSON_PrintUnformatted() into a single
+ * contiguous heap allocation; under this hub's normal heap fragmentation
+ * that allocation returns NULL for a full ~24-event backlog (measured on
+ * hardware: 500 "oom" at after=0, 10188 B free / 7680 B largest block),
+ * taking out the safety core's only visibility surface (spec §4.6) exactly
+ * when it has the most to report. Streamed instead: no cJSON tree, no
+ * single large allocation -- each event is formatted into one small stack
+ * buffer (EVT_LINE_MAX, see above) and sent as its own chunk via
+ * httpd_resp_send_chunk(). JSON shape, field names/order/types, and the
+ * `after`/EVENTS_POLL_MAX semantics are all unchanged from the cJSON
+ * version above; only how the bytes reach the socket changed. */
 static esp_err_t events_json_get(httpd_req_t *req, uint32_t after)
 {
     size_t n = event_log_read(after, s_events_poll, EVENTS_POLL_MAX);
-    cJSON *root = cJSON_CreateObject();
-    cJSON *arr = cJSON_AddArrayToObject(root, "events");
-    for (size_t i = 0; i < n; i++) {
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddNumberToObject(o, "seq", s_events_poll[i].seq);
-        cJSON_AddNumberToObject(o, "ts", s_events_poll[i].ts);
-        cJSON_AddNumberToObject(o, "rule_id", s_events_poll[i].rule_id);
-        cJSON_AddStringToObject(o, "level", event_level_str(s_events_poll[i].level));
-        cJSON_AddStringToObject(o, "msg", s_events_poll[i].msg);
-        cJSON_AddItemToArray(arr, o);
-    }
-    cJSON_AddNumberToObject(root, "last_seq", event_log_last_seq());
-    char *body = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
-    esp_err_t err;
-    if (body) {
-        err = httpd_resp_sendstr(req, body);
-        free(body);
-    } else {
-        err = httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+
+    esp_err_t err = httpd_resp_send_chunk(req, "{\"events\":[", 11);
+    if (err != ESP_OK) return err;
+
+    for (size_t i = 0; i < n; i++) {
+        const event_t *e = &s_events_poll[i];
+        char line[EVT_LINE_MAX];
+        int w = snprintf(line, sizeof line,
+                          "%s{\"seq\":%u,\"ts\":%u,\"rule_id\":%u,\"level\":\"%s\",\"msg\":\"",
+                          i == 0 ? "" : ",",
+                          (unsigned)e->seq, (unsigned)e->ts, (unsigned)e->rule_id,
+                          event_level_str(e->level));
+        if (w < 0 || (size_t)w >= sizeof line) return ESP_FAIL;   /* cannot happen, see EVT_LINE_OVERHEAD */
+        size_t pos = (size_t)w;
+
+        /* Remaining room is EVT_LINE_MAX - w >= EVENTS_JSON_ESC_MAX (the
+         * scaffold above never gets close to using up EVT_LINE_OVERHEAD),
+         * so msg's worst-case escape always fits without truncating. */
+        events_json_escape(e->msg, line + pos, sizeof(line) - pos);
+        pos += strlen(line + pos);
+
+        int w2 = snprintf(line + pos, sizeof(line) - pos, "\"}");
+        if (w2 < 0 || (size_t)w2 >= sizeof(line) - pos) return ESP_FAIL;   /* cannot happen, same margin */
+        pos += (size_t)w2;
+
+        err = httpd_resp_send_chunk(req, line, pos);
+        if (err != ESP_OK) return err;
     }
-    return err;
+
+    char tail[48];
+    int tn = snprintf(tail, sizeof tail, "],\"last_seq\":%u}", (unsigned)event_log_last_seq());
+    if (tn < 0 || (size_t)tn >= sizeof tail) return ESP_FAIL;   /* uint32_t max is 10 digits, tail is 48 */
+    err = httpd_resp_send_chunk(req, tail, (size_t)tn);
+    if (err != ESP_OK) return err;
+
+    /* ESP-IDF requires a final zero-length chunk to terminate a chunked
+     * response. */
+    return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void *data)
