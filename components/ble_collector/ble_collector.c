@@ -236,7 +236,13 @@ static volatile bool s_requeue_pending;
  * pending here at a time. This also closes fix round 1 finding 3 (the
  * pending_close RAM table race) BY CONSTRUCTION: every mutation of that
  * table now happens only on adv_decoder_task, both here and from
- * pending_close_service(). */
+ * pending_close_service().
+ *
+ * Fix round 3, finding 3: the six statics below sum to 15 B (enum 4 +
+ * int 4 + uint8_t 1 + uint32_t 4 + bool 1 + bool 1) -- separate statics,
+ * not one packed struct, so the linker may add a few bytes of alignment
+ * padding between them; 15 B is the field-size sum, not a guaranteed
+ * total object size. */
 typedef enum { PC_DEFER_NONE = 0, PC_DEFER_ARM, PC_DEFER_NOTE_RESULT } pc_defer_kind_t;
 static volatile pc_defer_kind_t s_pc_defer_kind;
 static int      s_pc_defer_dev_idx;
@@ -660,9 +666,21 @@ static void service_command_requeue(void)
  * comment. This is where pending_close_arm()/pending_close_note_result()
  * actually run, and so where the LittleFS write they may trigger actually
  * happens -- adv_decoder_task, same as every other flash access in this
- * file. Clears the flag BEFORE copying the latched fields out, same order
- * service_command_requeue() above uses, so a new outcome latched while this
- * runs is never silently dropped. */
+ * file.
+ *
+ * Fix round 3, finding 2 (comment correction -- the code was always
+ * correct, the reasoning written next to it was not): a SECOND outcome
+ * latching here while this function is mid-drain is not reachable, so the
+ * clear-then-copy order below is not defending against one. Only one
+ * command is ever in flight (s_cmd_inflight's own comment), so
+ * on_gatt_cmd_done() fires at most once per dispatched command; and this
+ * function is called (from adv_decoder_task's loop) strictly BEFORE
+ * actor_service() dispatches the next one, so s_pc_defer_kind is always
+ * PC_DEFER_NONE again by the time a new command -- and so a new possible
+ * outcome -- could exist. (Clearing before copying would, if that
+ * assumption were ever wrong, pair a STALE `kind` with a fresh payload,
+ * which is the wrong direction to defend in anyway -- so this is not a
+ * template to copy into code where the race is real.) */
 static void service_pending_close_defer(void)
 {
     if (s_pc_defer_kind == PC_DEFER_NONE) return;

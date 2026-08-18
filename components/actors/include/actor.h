@@ -527,6 +527,22 @@ void   pending_close_boot_load(const pending_close_t *recs, size_t n);
  * just not one being retried until the next boot. */
 size_t pending_close_active_count(void);
 
+/* Fix round 3, finding 1: the exact array pending_close_save() persists --
+ * every currently-pending record, with `retries` forced to 0 (capped at
+ * `cap`; returns the count written). `retries` is session-only RAM state
+ * (this section's own top comment), so what reaches disk must always be a
+ * FULL, untouched retry budget, regardless of how far the live row has
+ * actually retried or whether it has already reached
+ * PENDING_CLOSE_STEP_EXHAUSTED -- persisting the live counter would flush
+ * an exhausted row to disk (triggered by any OTHER device's arm/clear) and
+ * the next boot's first due-check would then read it as already-exhausted
+ * and post CRITICAL having made zero attempts that boot, exactly the
+ * "pre-exhausted on arrival" outcome the round-1 ruling (leave the
+ * obligation for the next boot to try again) existed to prevent. Pure and
+ * host-tested directly -- not merely inferred from pending_close_save()'s
+ * body, which cannot itself be host-tested (LittleFS). */
+size_t pending_close_persist_snapshot(pending_close_t *out, size_t cap);
+
 /* Pure predicate (fix round 1, finding 6): does a just-landed open of
  * `action_id` need the hub to schedule its own close? True iff the action
  * takes a duration (action.h's ACTION_PARAM_DURATION_S) AND `flags` --

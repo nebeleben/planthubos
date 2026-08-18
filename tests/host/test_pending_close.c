@@ -270,6 +270,48 @@ static void test_step_exhaustion_follows_final_backoff_not_synchronous(void) {
     assert(pending_close_active_count() == 1);
 }
 
+/* Fix round 3, finding 1: an exhausted (or merely partway-through) record
+ * must reach disk with a FULL retry budget -- pending_close_persist_snapshot()
+ * is the exact array pending_close_save() writes, so this proves the real
+ * path, not a simulation of it. Round-trips through serialize/deserialize
+ * too, so the whole chain -- live table -> persist snapshot -> wire bytes
+ * -> a fresh boot's table -- is covered by one test. */
+static void test_persist_snapshot_zeroes_retries_of_exhausted_record(void) {
+    pending_close_init();
+    pending_close_arm(1, ACT_SWITCH_OFF, 0);
+    uint32_t now = 0;
+    pending_close_t out;
+    for (int i = 0; i < PENDING_CLOSE_MAX_RETRIES; i++) {
+        assert(pending_close_due(now, &out) == 1);
+        assert(pending_close_step(1, now, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+        now = out.deadline_s;
+    }
+    assert(pending_close_due(now, &out) == 1);
+    assert(pending_close_step(1, now, true, &out) == PENDING_CLOSE_STEP_EXHAUSTED);
+    assert(out.retries == PENDING_CLOSE_MAX_RETRIES); /* the LIVE row really is exhausted */
+
+    pending_close_t snap[PENDING_CLOSE_MAX];
+    assert(pending_close_persist_snapshot(snap, PENDING_CLOSE_MAX) == 1);
+    assert(snap[0].dev_idx == 1 && snap[0].retries == 0); /* what disk gets: full budget */
+
+    /* The full round trip: serialize the snapshot (not the live row),
+     * deserialize it back, boot-load it, and confirm the RESTORED record
+     * is due immediately with a full budget -- not pre-exhausted. */
+    uint8_t buf[64];
+    size_t len = pending_close_serialize(snap, 1, buf, sizeof buf);
+    pending_close_t restored[4];
+    assert(pending_close_deserialize(buf, len, restored, 4) == 1);
+    assert(restored[0].retries == 0);
+
+    pending_close_init(); /* fresh boot */
+    pending_close_boot_load(restored, 1);
+    assert(pending_close_due(0, &out) == 1);
+    assert(out.dev_idx == 1 && out.retries == 0);
+    /* And it can genuinely retry again -- not re-declared EXHAUSTED on the
+     * very first check of the new boot. */
+    assert(pending_close_step(1, 0, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+}
+
 static void test_step_no_record_returns_none(void) {
     pending_close_init();
     pending_close_t out;
@@ -468,6 +510,7 @@ int main(void) {
     test_step_known_device_backs_off();
     test_step_unknown_device_does_not_consume_retry();
     test_step_exhaustion_follows_final_backoff_not_synchronous();
+    test_persist_snapshot_zeroes_retries_of_exhausted_record();
     test_step_no_record_returns_none();
     test_step_deferred_timeout_alerts_once_keeps_obligation_never_exhausts();
     test_step_deferred_timeout_resets_when_device_becomes_known();

@@ -63,7 +63,10 @@ static pending_close_t s_table[PENDING_CLOSE_MAX];
  * pure RAM/session bookkeeping, never serialized -- a reboot restarts the
  * streak at 0 exactly like it restarts `retries`, which is correct (boot
  * replay is its own fresh attempt, not a continuation of a pre-reboot
- * silence). Indexed identically to s_table; reset alongside it. */
+ * silence). Indexed identically to s_table; reset alongside it.
+ *
+ * Fix round 3, finding 3: PENDING_CLOSE_MAX (4) x (uint8_t + bool), 1 B
+ * each on every target this builds for -- 8 B of new static RAM total. */
 static uint8_t s_deferred_streak[PENDING_CLOSE_MAX];
 static bool    s_deferred_alerted[PENDING_CLOSE_MAX];
 
@@ -261,6 +264,31 @@ size_t pending_close_active_count(void)
     return n;
 }
 
+size_t pending_close_persist_snapshot(pending_close_t *out, size_t cap)
+{
+    size_t n = 0;
+    for (int i = 0; i < PENDING_CLOSE_MAX && n < cap; i++) {
+        if (s_table[i].dev_idx < 0) continue;
+        pending_close_t r = s_table[i];
+        /* Fix round 3, finding 1: `retries` is session-only RAM state
+         * (this file's own top comment, and actor.h's) -- persisting the
+         * LIVE counter would flush an exhausted or partway-through row to
+         * disk whenever any OTHER device's arm/clear triggers a save, and
+         * the NEXT boot's first due-check would then hit the
+         * `retries >= PENDING_CLOSE_MAX_RETRIES` test in
+         * pending_close_step() immediately, posting CRITICAL having made
+         * zero attempts this boot -- exactly the "pre-exhausted on
+         * arrival" outcome the round-1 ruling (leave the obligation for
+         * the next boot to try again) existed to prevent. So the copy this
+         * hands to pending_close_save() always carries a full, untouched
+         * budget, regardless of how far the LIVE row has actually gotten. */
+        r.retries = 0;
+        if (out) out[n] = r;
+        n++;
+    }
+    return n;
+}
+
 bool pending_close_needed(uint8_t action_id, uint8_t flags)
 {
     const action_t *a = action_get(action_id);
@@ -386,9 +414,10 @@ size_t pending_close_deserialize(const uint8_t *buf, size_t len, pending_close_t
 static void pending_close_save(void)
 {
     pending_close_t recs[PENDING_CLOSE_MAX];
-    size_t n = 0;
-    for (int i = 0; i < PENDING_CLOSE_MAX; i++)
-        if (s_table[i].dev_idx >= 0) recs[n++] = s_table[i];
+    /* pending_close_persist_snapshot() (pure, host-tested -- fix round 3,
+     * finding 1) is what guarantees `retries` reaches disk as 0 regardless
+     * of how far the live row has actually retried; see its own comment. */
+    size_t n = pending_close_persist_snapshot(recs, PENDING_CLOSE_MAX);
 
     if (n == 0) {
         /* remove()'s only failure mode here is ENOENT (nothing to delete),
