@@ -17,6 +17,8 @@
 #include "gatt_sched.h"
 #include "wrapper_exec.h"
 #include "psvm.h"
+#include "capability.h"
+#include "data_core.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "host/ble_hs.h"
@@ -109,6 +111,16 @@ _Static_assert(GATT_SCAN_RETRY_MS * GATT_SCAN_RETRY_MAX > GATT_CONNECT_TIMEOUT_M
  * at any time (wrapper_arena.h's FINDING 2 doc comment). */
 #define GATT_PLAN_MAX (6 + PSVM_PLAN_MAX_READS * 3 + \
                        PSVM_PLAN_MAX_WRITES * (3 + PSVM_PLAN_WRITE_MAX))
+
+/* Largest ONE-ENTRY action section psvm.h's PSVM_FLAG_ACTION_TABLE layout
+ * can produce, and the same copy-don't-point rule as GATT_PLAN_MAX above,
+ * for the same reason: u8 action_count, then action_id(1) param_max(2)
+ * flags(1) write_uuid16(2) write_len(1) + up to PSVM_PLAN_WRITE_MAX write
+ * bytes + param_offset/param_encoding(2) + the optional 8-byte confirm
+ * block. */
+#define GATT_ACTION_MAX (1 + 7 + PSVM_PLAN_WRITE_MAX + 2 + 8)
+_Static_assert(GATT_ACTION_MAX == GATT_ACTION_ENTRY_MAX,
+               "gatt_engine.h's GATT_ACTION_ENTRY_MAX must match the size derived from psvm.h");
 
 /* What the single esp_timer is currently counting down, so its one callback
  * can tell three unrelated deadlines apart. They can never overlap: the
@@ -209,6 +221,40 @@ static uint8_t  s_pending_write_len;
 static uint8_t  s_plan[GATT_PLAN_MAX];
 static uint16_t s_plan_len;
 
+/* ---- M5b command mode ----
+ *
+ * s_is_command says which KIND of attempt is open, and is read only by
+ * attempt_finish() -- for the same reason it reads s_fsm.state there: which
+ * bookkeeping an attempt owes (a read moves gatt_sched's interval gate and
+ * last_error; a command reports to the actor layer and touches neither) is
+ * the one thing the state machine cannot express. Nothing else in this file
+ * branches on it; the sequencing is all gatt_fsm.c's.
+ *
+ * The s_cmd_* request block is written by adv_decoder_task and read by the
+ * host task, exactly like the s_req_pending block above it, with the same
+ * "set the volatile flag LAST" rule making the rest visible. The difference
+ * is what happens when the engine is busy: a read request is dropped (spec
+ * section 7 -- the device will advertise again), a command is HELD and
+ * started when the radio frees up (spec section 3 -- a command deferred is
+ * a valve that did not open). */
+static bool     s_is_command;
+static volatile bool s_cmd_pending;
+static uint8_t  s_cmd_entry[GATT_ACTION_MAX];
+static uint16_t s_cmd_entry_len;
+static uint16_t s_cmd_param;
+static int      s_cmd_dev_idx = -1;
+static uint8_t  s_cmd_mac_gap[6];
+static uint8_t  s_cmd_addr_type;
+static gatt_cmd_done_fn_t s_cmd_done;
+
+/* A confirm read's state value, owed to adv_decoder_task (see
+ * gatt_engine_service()). Its own MAC copy, not s_mac_disp: by the time the
+ * decoder task services this, the host task may already have started the
+ * next attempt against a different device. */
+static volatile bool s_cmd_state_pending;
+static uint8_t  s_cmd_state_mac[6];
+static uint8_t  s_cmd_state_val;
+
 /* Why the failure reason is a const char * and not a formatted buffer:
  * spec section 6 budgets ~200 B for the whole connection manager, and 16
  * devices x even a modest fixed-size string is several times that. Every
@@ -289,7 +335,7 @@ static void post_to_host(struct ble_npl_event *ev)
  * is what the ERROR line is for. The stack-issued reattempt paths in
  * gatt_gap_event() are the other way back, and they are why those branches
  * call this function even with no attempt of ours open. */
-static void resume_scan_or_retry(void)
+static void resume_scan(void)
 {
     /* This function OWNS the deadline timer for as long as it runs, and
      * every path out of it leaves the timer in a state this function chose
@@ -349,6 +395,89 @@ static void resume_scan_or_retry(void)
     }
 }
 
+/* resume_scan() plus the one thing that must happen every time the radio
+ * comes free: start a command that has been waiting for it (see
+ * gatt_engine_request_command() -- a command is held rather than dropped).
+ * Wrapped here rather than added to each of resume_scan()'s four exits so
+ * that "every route back to TP_IDLE kicks the waiting command" is one line
+ * to check instead of four, and so resume_scan() keeps its own single
+ * responsibility (and its timer-ownership guarantee) unchanged.
+ *
+ * Posting rather than starting inline keeps every attempt start on the one
+ * path through on_start_req(). It cannot loop: on_start_req() either starts
+ * the command or ends it through the done hook, and both clear
+ * s_cmd_pending. */
+static void resume_scan_or_retry(void)
+{
+    resume_scan();
+    if (s_cmd_pending && s_phase == TP_IDLE && !s_active) post_to_host(&s_ev_start);
+}
+
+/* The command half of attempt_finish(). Split out rather than braided into
+ * the read bookkeeping below because almost none of that bookkeeping
+ * applies: a command is not a scheduled read, so gatt_sched's interval gate
+ * and backoff must NOT move (moving the gate would defer the device's next
+ * real read by a whole interval -- up to a day -- because a valve was
+ * opened, and recording a "success" would make the API show a fresh read
+ * that never happened). s_last_error is likewise left alone: it is the read
+ * path's visibility surface (gatt_engine_last_error(), rendered per device
+ * in the Devices tab), and a command failure belongs in the alert feed and
+ * in the actor table's own last_result, which is what the done hook is for. */
+static void command_finish(void)
+{
+    bool ok = (s_fsm.state == GS_DONE);
+
+    /* The failures the state machine detects rather than this file -- the
+     * same argument as the read path's "read too short" below: they never
+     * reach a callback that would have set s_err, so without this they
+     * would be reported as whatever the last unrelated string happened to
+     * be. GF_BAD_ACTION/GF_PARAM_OVER_MAX cannot arrive here (they are
+     * refused before the attempt opens, in start_command()). */
+    if (!ok && s_fsm.fail == GF_CONFIRM_FAILED) s_err = "confirm failed";
+    if (!ok && s_fsm.fail == GF_SHORT_READ)      s_err = "confirm read too short";
+
+    if (ok) {
+        ESP_LOGI(TAG, "gatt command ok: dev=%d action=%u %s", s_dev_idx,
+                 (unsigned)s_fsm.cmd_action_id,
+                 s_fsm.confirmed ? "confirmed" : "UNCONFIRMED (action declares no confirm)");
+    } else {
+        ESP_LOGW(TAG, "gatt command failed: dev=%d action=%u %s", s_dev_idx,
+                 (unsigned)s_fsm.cmd_action_id, s_err ? s_err : "unknown error");
+    }
+
+    /* The actuator's own account of its state, from the confirm read on the
+     * same connection (spec section 4.4) -- recorded whether or not the
+     * require was satisfied, since a device answering "still closed" after
+     * an open is telling the truth about its state and that truth is what
+     * the safety core, the dashboard and every export need.
+     *
+     * RANGE-CHECKED HERE, and this is not optional: capability_encode() for
+     * CAP_SWITCH_STATE is the generic int16 encoder and accepts 2.0 or -1.0
+     * quite happily (M5b Task 2 carry-forward), so a peer answering with any
+     * byte other than 0 or 1 would otherwise be stored and then rendered as
+     * fact by the dashboard, MQTT, Home Assistant and InfluxDB alike. An
+     * actuator is on or off; anything else is a device we do not understand
+     * and must not paraphrase.
+     *
+     * Handed to adv_decoder_task rather than written here: the write goes
+     * through data_core_submit_cap(), which takes the registry mutex and
+     * posts DATA_EVENT_SENSOR_UPDATE, and battery_poll.c hops its own
+     * registry write off the NimBLE host task for exactly that reason. */
+    if (s_fsm.cmd_state_valid) {
+        if (s_fsm.cmd_state <= 1) {
+            memcpy(s_cmd_state_mac, s_mac_disp, 6);
+            s_cmd_state_val = (uint8_t)s_fsm.cmd_state;
+            s_cmd_state_pending = true;   /* set LAST, like every other cross-task flag here */
+        } else {
+            ESP_LOGW(TAG, "dev=%d confirm read says state=%u, which is neither on nor off; "
+                          "switch.state left unchanged",
+                     s_dev_idx, (unsigned)s_fsm.cmd_state);
+        }
+    }
+
+    if (s_cmd_done) s_cmd_done(s_dev_idx, ok, s_fsm.confirmed, ok ? NULL : (s_err ? s_err : "unknown error"));
+}
+
 /* ---------------- the one place an attempt ends ----------------
  *
  * SUCCESS, read error, timeout, an unsolicited disconnect, a connect that
@@ -371,6 +500,15 @@ static void attempt_finish(void)
     if (!s_active) return;
     esp_timer_stop(s_deadline);
     s_phase = TP_IDLE;
+
+    if (s_is_command) {
+        command_finish();
+        s_active = false;
+        s_own_conn_proc = false;
+        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        resume_scan_or_retry();
+        return;
+    }
 
     /* The one fact only the state machine knows: which terminal state this
      * attempt reached. GS_DONE is reached solely via GE_DECODED, i.e. every
@@ -1001,9 +1139,112 @@ static int write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 
 /* ---------------- hops onto the host task ---------------- */
 
+/* Ends a command that never reached the radio. Every such refusal is
+ * REPORTED rather than dropped: by the time a command reaches this engine
+ * it has already been popped from the actor queue and charged against its
+ * hourly budget, so a silent drop is an actuator that never moved with
+ * nothing anywhere saying so -- the precise opposite of the milestone's
+ * "never a silent failure". */
+static void command_refused(const char *why)
+{
+    ESP_LOGW(TAG, "gatt command refused before the radio: dev=%d (%s)", s_cmd_dev_idx, why);
+    int dev = s_cmd_dev_idx;
+    s_cmd_pending = false;
+    if (s_cmd_done) s_cmd_done(dev, false, false, why);
+}
+
+/* Starts the waiting command, or defers it, or refuses it -- see
+ * gatt_engine_request_command() for the priority rule this implements. */
+static void start_command(void)
+{
+    /* Deferred, NOT dropped: a read attempt (or the tail of one) is in
+     * flight, and resume_scan_or_retry() will kick this again the moment
+     * the radio is free. Bounded by that attempt's own 5-second deadline. */
+    if (s_active || s_phase != TP_IDLE) return;
+
+    if (!s_resume_scan) {
+        /* Same rule as the read path's implicit one: connecting stops the
+         * scan, and with no way to restart it the hub goes deaf. Refuse
+         * rather than trade a valve for the hub's hearing. */
+        command_refused("no scan-resume hook");
+        return;
+    }
+    if (s_conn_busy && s_conn_busy()) {
+        /* The other owner of the hub's single outbound connection has it.
+         * A read is dropped here and simply waits for the next
+         * advertisement; a command has no next advertisement, and this
+         * engine has no timer of its own free to poll for the poller
+         * finishing, so it is refused with a reason the caller can retry
+         * on (the safety core's bounded retry, spec section 4.3). */
+        command_refused("another connection owner has the radio");
+        return;
+    }
+
+    gatt_fsm_init_command(&s_fsm, s_cmd_entry, s_cmd_entry_len, s_cmd_param);
+    if (s_fsm.state != GS_IDLE) {
+        /* The two refusals gatt_fsm_init_command() makes before connecting.
+         * Distinguished because they mean very different things to whoever
+         * reads the alert: one is a broken/hostile wrapper, the other is a
+         * caller asking for more than the wrapper says is safe. */
+        command_refused(s_fsm.fail == GF_PARAM_OVER_MAX
+                            ? "parameter above the action's declared maximum"
+                            : "action entry could not be parsed");
+        return;
+    }
+
+    s_dev_idx = s_cmd_dev_idx;
+    memcpy(s_mac_gap, s_cmd_mac_gap, 6);
+    for (int i = 0; i < 6; i++) s_mac_disp[i] = s_cmd_mac_gap[5 - i];
+    s_addr_type = s_cmd_addr_type;
+
+    s_is_command = true;
+    s_active = true;
+    s_own_conn_proc = false;
+    s_decode_wrote = false;
+    s_drop_without_failure = false;
+    s_err = "unknown error";
+    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+
+    esp_timer_stop(s_deadline);
+    esp_err_t terr = esp_timer_start_once(s_deadline, (uint64_t)GATT_ATTEMPT_DEADLINE_MS * 1000);
+    if (terr != ESP_OK) {
+        /* Identical rule to the read path's: an attempt with no deadline is
+         * an unbounded scanning outage. The command is refused rather than
+         * run unbounded, and s_active is unwound before reporting so the
+         * engine is idle again by the time the hook runs. */
+        ESP_LOGE(TAG, "deadline timer failed to arm (%d); refusing this command", (int)terr);
+        s_active = false;
+        s_is_command = false;
+        command_refused("deadline timer failed to arm");
+        return;
+    }
+    s_phase = TP_ATTEMPT;
+
+    /* Cleared only now that the attempt is definitely under way: while it
+     * was set, gatt_engine_busy() kept every scheduled read from starting
+     * ahead of this command (spec section 3's priority rule). */
+    s_cmd_pending = false;
+
+    ESP_LOGI(TAG, "gatt command: dev=%d action=%u param=%u", s_dev_idx,
+             (unsigned)s_fsm.cmd_action_id, (unsigned)s_cmd_param);
+    engine_feed(GE_START, 0, NULL, 0);
+}
+
 static void on_start_req(struct ble_npl_event *ev)
 {
     (void)ev;
+
+    /* A command outranks a scheduled read (spec section 3): a read deferred
+     * by one interval is invisible, a command deferred is a valve that did
+     * not open. Checked FIRST, and a read request arriving while a command
+     * waits is dropped by the same rule that drops one arriving while an
+     * attempt is in flight -- the device will advertise again. */
+    if (s_cmd_pending) {
+        s_req_pending = false;   /* dropped, never queued (spec section 7) */
+        start_command();
+        return;
+    }
+
     if (!s_req_pending) return;
     s_req_pending = false;
     /* s_active covers an attempt in flight; s_phase covers the tail of one
@@ -1032,6 +1273,7 @@ static void on_start_req(struct ble_npl_event *ev)
         return;   /* no radio touched, so nothing to unwind and no scan to resume */
     }
 
+    s_is_command = false;
     s_active = true;
     s_own_conn_proc = false;
     s_decode_wrote = false;
@@ -1152,9 +1394,66 @@ void gatt_engine_set_conn_busy_hook(gatt_conn_busy_fn_t fn)
     s_conn_busy = fn;
 }
 
+void gatt_engine_set_cmd_done_hook(gatt_cmd_done_fn_t fn)
+{
+    s_cmd_done = fn;
+}
+
 bool gatt_engine_busy(void)
 {
-    return s_active || s_req_pending || s_decode_pending || s_phase == TP_SCAN_RETRY;
+    /* s_cmd_pending included deliberately: a command waiting for the radio
+     * must not have a scheduled read started ahead of it (spec section 3's
+     * priority rule), and this predicate is what ble_collector.c's
+     * per-advertisement trigger consults. */
+    return s_active || s_req_pending || s_cmd_pending || s_decode_pending ||
+           s_phase == TP_SCAN_RETRY;
+}
+
+bool gatt_engine_cmd_busy(void)
+{
+    return s_cmd_pending || (s_active && s_is_command);
+}
+
+void gatt_engine_request_command(int dev_idx, const uint8_t *action_entry, uint16_t entry_len,
+                                 uint16_t param, const uint8_t mac[6], uint8_t addr_type)
+{
+    /* Every refusal below reports through the hook rather than returning
+     * quietly -- see command_refused()'s own comment for why a dispatched
+     * command may never just vanish. These three run before s_cmd_* is
+     * touched, so they report the caller's dev_idx directly. */
+    if (!s_cmd_done) {
+        /* Nothing to report to, which means nothing anywhere would learn
+         * that this command went nowhere. Loud, once per occurrence. */
+        ESP_LOGE(TAG, "command for dev=%d dropped: no completion hook installed", dev_idx);
+        return;
+    }
+    if (!s_inited) { s_cmd_done(dev_idx, false, false, "gatt engine not initialised"); return; }
+    if (dev_idx < 0 || dev_idx >= GATT_SCHED_MAX_DEVICES) {
+        s_cmd_done(dev_idx, false, false, "device index out of range");
+        return;
+    }
+    if (action_entry == NULL || entry_len == 0 || entry_len > sizeof s_cmd_entry) {
+        s_cmd_done(dev_idx, false, false, "action entry missing or too large");
+        return;
+    }
+    if (s_cmd_pending) {
+        /* This engine holds exactly one command. The caller is expected to
+         * check gatt_engine_cmd_busy() and leave the next one in the actor
+         * queue, where its TTL and the safety-priority rule still apply --
+         * so reaching this is a wiring bug, reported rather than hidden. */
+        s_cmd_done(dev_idx, false, false, "another command is already pending");
+        return;
+    }
+
+    memcpy(s_cmd_entry, action_entry, entry_len);
+    s_cmd_entry_len = entry_len;
+    s_cmd_param = param;
+    s_cmd_dev_idx = dev_idx;
+    memcpy(s_cmd_mac_gap, mac, 6);
+    s_cmd_addr_type = addr_type;
+
+    s_cmd_pending = true;   /* set LAST: it is what makes everything above visible to the host task */
+    post_to_host(&s_ev_start);
 }
 
 void gatt_engine_request(uint16_t wrapper_id, int dev_idx, const uint8_t mac[6],
@@ -1185,6 +1484,18 @@ void gatt_engine_request(uint16_t wrapper_id, int dev_idx, const uint8_t mac[6],
 
 void gatt_engine_service(void)
 {
+    /* A command's confirm read, landing in the registry on the task that is
+     * allowed to take the registry mutex and fan out a sensor-update event
+     * (see this function's doc comment in gatt_engine.h). Range-checked at
+     * the point it was captured, in command_finish(); by here it is 0 or 1
+     * and nothing else. Checked BEFORE the decode below, and separately:
+     * the two are independent pieces of owed work and a command attempt
+     * never produces a decode. */
+    if (s_cmd_state_pending) {
+        s_cmd_state_pending = false;
+        data_core_submit_cap(s_cmd_state_mac, CAP_SWITCH_STATE, (float)s_cmd_state_val);
+    }
+
     if (!s_decode_pending) return;
 
     /* The wrapper VM and the flash-backed arena, on the task that is

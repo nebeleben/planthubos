@@ -22,6 +22,16 @@
  *      \                (GE_TIMEOUT/GE_ERROR: GA_DISCONNECT)
  *       `------------------- (unsolicited GE_DISCONNECTED: GA_REPORT_FAIL) ---'
  *
+ * M5b's command mode (gatt_fsm_init_command()) walks the SAME states with
+ * one branch changed at each end:
+ *
+ * IDLE -> CONNECTING -> WRITING -> [READING] -> DONE
+ *
+ * -- the write is the command, the optional READING is its confirm read,
+ * and there is no DECODING at all (a command has no wrapper program to
+ * run). An unsatisfied `require` on the confirm read ends at FAILED with
+ * GF_CONFIRM_FAILED; every other failure path is M5a's, unchanged.
+ *
  * No discovery state (removed during the M5a hardware gate -- see
  * gatt_fsm_init()'s own doc comment for why: every read and write is now
  * addressed by UUID, resolved by the SERVER on each connection, so there is
@@ -101,8 +111,28 @@ typedef struct { gatt_act_kind_t kind; uint16_t uuid16; const uint8_t *data; uin
  * and the engine has no way to tell that apart from any other GA_DISCONNECT
  * -- it would report the milestone's own "entire visibility surface" as
  * "unknown error". This enum is the one fact the engine cannot otherwise
- * recover. */
-typedef enum { GF_NONE, GF_SHORT_READ } gatt_fail_t;
+ * recover.
+ *
+ * M5b appends three command-mode reasons and renumbers none of them:
+ *
+ *   GF_CONFIRM_FAILED  the confirm read landed, was long enough, and its
+ *                      `require` was NOT satisfied. Deliberately its own
+ *                      reason rather than a flavour of "unconfirmed": the
+ *                      device answered and said no, which is louder than
+ *                      never having asked (spec section 4.4).
+ *   GF_BAD_ACTION      gatt_fsm_init_command() could not parse the action
+ *                      entry it was handed (truncated, or a field
+ *                      psvm_validate() would have refused). The attempt
+ *                      never starts -- no connect, no write.
+ *   GF_PARAM_OVER_MAX  the parameter exceeds the entry's own declared
+ *                      param_max. Also refused before connecting: the
+ *                      thing being asked for is a valve held open longer
+ *                      than its wrapper says is safe, and clamping it
+ *                      silently would be this project's oldest failure
+ *                      shape applied to the one place it can flood a
+ *                      plant. */
+typedef enum { GF_NONE, GF_SHORT_READ, GF_CONFIRM_FAILED,
+               GF_BAD_ACTION, GF_PARAM_OVER_MAX } gatt_fail_t;
 
 typedef struct {
     gatt_state_t state;
@@ -141,6 +171,64 @@ typedef struct {
      * prefix (any unused trailing slots, when read_count < the max, stay
      * zeroed but are not included in len). */
     uint8_t buf[GATT_FSM_MAX_READS * GATT_FSM_SLOT];
+
+    /* ---------------- command mode (M5b Task 8) ----------------
+     *
+     * Set up by gatt_fsm_init_command() instead of gatt_fsm_init(). A
+     * command reuses the read plan's own machinery rather than adding a
+     * second set of states: the write it performs is write[0] (with its
+     * payload in cmd_write below rather than pointed at inside a plan),
+     * and its confirm read is read[0] (uuid + min_len in read_uuid[0] /
+     * read_min_len[0]). So GS_WRITING's and GS_READING's identity checks,
+     * short-read rule and failure paths apply to a command WITHOUT being
+     * written twice -- the M5a hardware gate's four defects were all in
+     * exactly this sequencing, and a parallel copy of it would be four
+     * more places for them to come back. What command mode changes is only
+     * where the sequence GOES next: after the write, either the confirm
+     * read or straight to GA_DISCONNECT; after the confirm read, the
+     * `require` evaluation below instead of GA_DECODE (a command never
+     * decodes -- there is no wrapper program to run and nothing to emit). */
+    bool     is_command;
+
+    /* Three outcomes, not two (spec section 4.4). confirmed is true ONLY
+     * when a confirm read landed and its require was satisfied; a command
+     * whose entry declares no confirm block reaches GS_DONE with confirmed
+     * false (completed, unconfirmed), and an unsatisfied require reaches
+     * GS_FAILED with GF_CONFIRM_FAILED. You cannot get confirmation you
+     * did not ask for. */
+    bool     confirmed;
+
+    /* The action id from the entry, carried through purely so the engine
+     * can name it in a log line -- nothing in this module branches on it. */
+    uint8_t  cmd_action_id;
+
+    /* The confirm block's `require`: value at cmd_confirm_offset in
+     * cmd_confirm_encoding (0 u8, 1 u16le, 2 u16be), compared with
+     * cmd_confirm_op (0 ==, 1 !=) against cmd_confirm_value. Meaningful
+     * only while is_command && read_count == 1. */
+    uint8_t  cmd_confirm_offset;
+    uint8_t  cmd_confirm_encoding;
+    uint8_t  cmd_confirm_op;
+    uint16_t cmd_confirm_value;
+
+    /* The confirm read's decoded value, i.e. the actuator's own account of
+     * its state, which the engine stores into switch.state. Set whether or
+     * not the require was satisfied: a device answering "still closed"
+     * after an open is telling the truth about its state, and that truth
+     * is the more important half of the report. cmd_state_valid stays
+     * false when no confirm read landed or it was too short to decode --
+     * the engine must never store a state it did not actually read. */
+    bool     cmd_state_valid;
+    uint16_t cmd_state;
+
+    /* The write payload, spliced at init: the entry's constant bytes with
+     * the parameter written over them at param_offset in the declared
+     * encoding. Held here rather than pointed at inside the entry bytes
+     * because the parameter only exists at actuation time -- and because
+     * this keeps a command's payload alive for the whole attempt without
+     * depending on the caller's buffer, the same hazard
+     * gatt_engine.c copies the connect plan to avoid. */
+    uint8_t  cmd_write[GATT_FSM_WRITE_MAX];
 } gatt_fsm_t;
 
 /* Parses the trailing PSBC connect-plan section (psvm.h's
@@ -172,6 +260,37 @@ typedef struct {
  * buffer); a previous connection's leftovers can never leak into a new
  * one this way. */
 void gatt_fsm_init(gatt_fsm_t *fsm, const uint8_t *plan, size_t plan_len);
+
+/* M5b Task 8: sets the machine up to execute ONE actuator command --
+ * connect, write, optionally read back and evaluate `require`, disconnect
+ * -- instead of a connect plan's read sequence. `param` is the command's
+ * runtime parameter (a duration, a level); it is ignored by an entry that
+ * declares none.
+ *
+ * (action_entry, len) is a ONE-ENTRY action section: psvm.h's
+ * PSVM_FLAG_ACTION_TABLE layout starting at its u8 action_count, with that
+ * count naming the single entry to execute. Keeping the count byte means
+ * the bytes handed here are byte-for-byte the on-blob layout rather than a
+ * second, subtly different one that would have to be kept in step with it
+ * by hand; entries past the first are ignored, because the caller has
+ * already decided WHICH action this is (actor_table_check() bounded it, and
+ * the engine copies the matching entry out of the wrapper arena -- an arena
+ * pointer must never be held across an attempt, see gatt_engine.c).
+ *
+ * Like gatt_fsm_init(), this does NOT assume psvm_validate() ran: every
+ * offset is bounds-checked against `len` as it is derived. Unlike
+ * gatt_fsm_init(), which yields whatever prefix of a truncated plan parsed,
+ * an entry that does not parse IN FULL -- or whose parameter does not fit
+ * the write buffer, or exceeds the entry's own param_max -- leaves the
+ * machine terminal (GS_FAILED, with GF_BAD_ACTION or GF_PARAM_OVER_MAX)
+ * and it never connects. A partial read plan still reads something useful;
+ * half a command is a valve moved by bytes nobody wrote down. The caller
+ * must check `fsm->state == GS_IDLE` before feeding GE_START -- in a
+ * terminal state gatt_fsm_step() ignores it and returns GA_NONE, so a
+ * caller that forgets simply never starts the attempt, but it would then
+ * report no reason for the command going nowhere. */
+void gatt_fsm_init_command(gatt_fsm_t *fsm, const uint8_t *action_entry,
+                            uint16_t len, uint16_t param);
 
 /* Advances the state machine by exactly one event, returning exactly one
  * action.

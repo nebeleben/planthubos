@@ -69,6 +69,39 @@ typedef bool (*gatt_scan_resume_fn_t)(void);
  * gatt_engine_set_conn_busy_hook(). */
 typedef bool (*gatt_conn_busy_fn_t)(void);
 
+/* How a command attempt ended (M5b Task 8) -- see
+ * gatt_engine_set_cmd_done_hook().
+ *
+ *   ok=true,  confirmed=true   the write landed AND the confirm read's
+ *                              require was satisfied.
+ *   ok=true,  confirmed=false  the write landed and the action declared no
+ *                              confirm block: COMPLETED UNCONFIRMED, which
+ *                              spec section 4.4 treats as its own outcome,
+ *                              not as a success.
+ *   ok=false                   the command failed; err names the reason
+ *                              (never NULL on this path, always a string
+ *                              literal, same discipline as
+ *                              gatt_engine_last_error()). A confirm read
+ *                              whose require was NOT satisfied lands here
+ *                              -- the device answered and said no, which is
+ *                              louder than unconfirmed.
+ *
+ * Runs on the NimBLE host task, inside the same call that ends the attempt
+ * and restarts scanning. It must not block, must not touch flash, and must
+ * not call back into this engine. */
+typedef void (*gatt_cmd_done_fn_t)(int dev_idx, bool ok, bool confirmed, const char *err);
+
+/* Largest one-entry action section gatt_engine_request_command() accepts,
+ * so a caller can size its own buffer: psvm.h's PSVM_FLAG_ACTION_TABLE
+ * layout is u8 action_count + action_id(1) + param_max(2) + flags(1) +
+ * write_uuid16(2) + write_len(1) + up to PSVM_PLAN_WRITE_MAX (8) write
+ * bytes + param_offset/param_encoding(2) + an optional 8-byte confirm
+ * block. Spelled out rather than derived from psvm.h here for the same
+ * reason gatt_fsm.h duplicates the plan limits (this header must be
+ * includable without a psvm dependency); gatt_engine.c carries the
+ * _Static_assert that keeps the two in step. */
+#define GATT_ACTION_ENTRY_MAX 26
+
 /* Creates the per-attempt deadline timer and the ble_npl events used to
  * hop onto the NimBLE host task. MUST be called after nimble_port_init()
  * (the npl function table this uses does not exist before it). Until it has
@@ -137,10 +170,74 @@ bool gatt_engine_busy(void);
 void gatt_engine_request(uint16_t wrapper_id, int dev_idx, const uint8_t mac[6],
                          uint8_t addr_type);
 
+/* Installs the completion callback for gatt_engine_request_command().
+ *
+ * A hook, not a direct call into components/actors, and deliberately: the
+ * actor layer calls INTO this engine and this engine must report back, so a
+ * REQUIRES in both directions would be an ESP-IDF component cycle and a
+ * hard build failure. Same shape, same reason, as the two hooks above --
+ * the component that owns the composition (ble_collector_start()) registers
+ * both halves. A NULL hook is a safe no-op, but it means a command's
+ * outcome goes nowhere, so the wiring is not optional in a real build.
+ *
+ * The engine takes plain scalars plus the raw action-entry bytes for the
+ * same reason: an actor_cmd_t across this boundary would need the header
+ * that defines it. */
+void gatt_engine_set_cmd_done_hook(gatt_cmd_done_fn_t fn);
+
+/* M5b Task 8: executes ONE actuator command against dev_idx -- connect,
+ * write, optionally read back and evaluate `require`, disconnect. Called
+ * from adv_decoder_task ONLY (like gatt_engine_request(): resolving the
+ * action entry reads the wrapper arena, which is flash-backed).
+ *
+ * (action_entry, entry_len) is the one-entry action section
+ * gatt_fsm_init_command() parses -- wrapper_exec_action_get() produces
+ * exactly it. The bytes are COPIED here, so the caller's buffer need not
+ * outlive the call (and must not be an arena pointer held across the
+ * attempt). mac/addr_type are the RAW GAP address, exactly as
+ * gatt_engine_request() takes them.
+ *
+ * A COMMAND TAKES PRIORITY OVER A SCHEDULED READ (spec section 3): a read
+ * deferred by one interval is invisible, a command deferred is a valve that
+ * did not open. So, unlike gatt_engine_request(), this is NOT dropped when
+ * the engine is busy -- it is held and started the moment the radio frees
+ * up, and while it is held gatt_engine_busy() reports true so no new read
+ * can start ahead of it. It is bounded, not indefinite: the attempt it is
+ * waiting behind has M5a's 5-second deadline.
+ *
+ * Every command that cannot be executed reports through the done hook
+ * instead of vanishing -- including one refused before it ever starts (a
+ * second command still pending, the other radio owner holding the
+ * connection, an entry that does not parse). A dispatched command has
+ * already been popped from the actor queue and charged against its hourly
+ * budget, so a silent drop here would be an actuator that never moved and
+ * nothing anywhere saying so.
+ *
+ * A confirm read's decoded value is stored into the device's
+ * CAP_SWITCH_STATE slot (spec section 4.4) -- see gatt_engine_service(),
+ * which is where that write actually happens. */
+void gatt_engine_request_command(int dev_idx, const uint8_t *action_entry, uint16_t entry_len,
+                                 uint16_t param, const uint8_t mac[6], uint8_t addr_type);
+
+/* True while a command is waiting for the radio or executing. The caller
+ * that pumps the actor queue (ble_collector.c's decoder loop) checks this
+ * before dispatching the next command: this engine holds exactly ONE
+ * command, and a second dispatched on top of it would have to be refused --
+ * whereas leaving it in the actor queue keeps its TTL and the safety
+ * priority rule intact until the radio can actually take it. */
+bool gatt_engine_cmd_busy(void);
+
 /* Runs the decoder-task half of an attempt: the wrapper decode a GA_DECODE
  * asked for. Call it from adv_decoder_task's loop, at the same safe point
  * the wrapper reindex is performed at (never mid-decode of an
- * advertisement). Cheap and a no-op when there is nothing owed. */
+ * advertisement). Cheap and a no-op when there is nothing owed.
+ *
+ * It also performs the OTHER piece of work an attempt can owe this task: a
+ * command's confirm read updates the device's CAP_SWITCH_STATE, and that
+ * write goes through data_core_submit_cap(), which takes the registry mutex
+ * and posts DATA_EVENT_SENSOR_UPDATE (whose subscribers are sized for this
+ * task's stack, not the NimBLE host task's). battery_poll.c hops its own
+ * registry write off the host task for exactly this reason. */
 void gatt_engine_service(void);
 
 /* The last failure reason recorded for dev_idx, "" when there is none

@@ -131,3 +131,31 @@ bool wrapper_exec_run_buffer(uint16_t id, const uint8_t mac[6],
  * must only be called from a task where that is allowed. */
 uint16_t wrapper_exec_plan_get(uint16_t id, uint8_t *out, uint16_t cap,
                                uint32_t *interval_s_out);
+
+/* M5b Task 8: the same two questions about the ACTION table
+ * (PSVM_FLAG_ACTION_TABLE) that wrapper_exec_plan_get() answers about the
+ * connect plan -- "does this wrapper declare actuator actions" and "give me
+ * the bytes of one". Both COPY out of the arena for the reason stated
+ * above: an arena pointer can be evicted by any later wrapper_arena_get()
+ * from any caller, and a command's bytes are held across a whole connection
+ * attempt on another task. Both load through the arena, so like
+ * wrapper_exec_run() they may read flash and must only be called from a
+ * task where that is allowed. */
+typedef struct {
+    uint8_t  action_id;   /* < ACTION_COUNT (psvm_validate() enforced it) */
+    uint16_t param_max;   /* the wrapper's own bound, never above the firmware's */
+    uint8_t  flags;       /* bit 0 device-local timed-off, bit 1 has confirm */
+} wrapper_action_t;
+
+/* Lists what wrapper `id` declares, up to `cap` entries, for the boot/
+ * discovery wiring that populates the actor table (actor_declare()).
+ * Returns the number written, 0 when the wrapper has no action table,
+ * cannot be loaded or fails validation. */
+uint8_t wrapper_exec_actions_list(uint16_t id, wrapper_action_t *out, uint8_t cap);
+
+/* Copies the ONE entry for `action_id` in the exact shape
+ * gatt_fsm_init_command() parses: a u8 action_count of 1 followed by that
+ * entry's bytes, verbatim from the blob. Returns the number of bytes
+ * written, or 0 when the wrapper declares no such action, has no action
+ * table, or the entry does not fit `cap`. */
+uint16_t wrapper_exec_action_get(uint16_t id, uint8_t action_id, uint8_t *out, uint16_t cap);

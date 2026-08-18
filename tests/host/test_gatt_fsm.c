@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "gatt_fsm.h"
 
@@ -413,6 +414,363 @@ static void test_unexpected_event_ignored(void)
     assert(f.state == GS_DONE);
 }
 
+/* ---------------- M5b Task 8: command mode ----------------
+ *
+ * The bytes below are a ONE-ENTRY action section: the u8 action_count
+ * psvm.h's PSVM_FLAG_ACTION_TABLE layout begins with, followed by that one
+ * entry, byte for byte as the blob carries it (see
+ * gatt_fsm_init_command()'s own doc comment for why the count byte is
+ * still there when only one entry is ever executed). */
+static const uint8_t ACT_OPEN_WITH_CONFIRM[] = {
+    1,                          /* action_count */
+    2,                          /* ACT_IRRIGATION_OPEN */
+    0x2C, 0x01,                 /* param_max 300 */
+    0x03,                       /* flags: device-local | has confirm */
+    0xF0, 0x2A,                 /* write uuid 0x2AF0 */
+    1, 0x01,                    /* write_len 1, byte 0x01 */
+    1, 1,                       /* param_offset 1, encoding u16le */
+    0xF1, 0x2A,                 /* confirm uuid 0x2AF1 */
+    1,                          /* confirm_min_len */
+    0, 0, 0,                    /* offset 0, encoding u8, op == */
+    1, 0,                       /* confirm_value 1 */
+};
+
+static void test_command_sequence(void) {
+    gatt_fsm_t f;
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 8);
+    assert(gatt_fsm_step(&f, &EV(GE_START)).kind == GA_CONNECT);
+    gatt_act_t w = gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    assert(w.kind == GA_WRITE && w.uuid16 == 0x2AF0);
+    /* The parameter is spliced at offset 1, little-endian: 8 -> 08 00 */
+    assert(w.len == 3 && w.data[0] == 0x01 && w.data[1] == 0x08 && w.data[2] == 0x00);
+    gatt_act_t r = gatt_fsm_step(&f, &EV_WRITE(0x2AF0));
+    assert(r.kind == GA_READ && r.uuid16 == 0x2AF1);
+    assert(gatt_fsm_step(&f, &EV_READ(0x2AF1, "\x01", 1)).kind == GA_DISCONNECT);
+    assert(f.state == GS_DONE);
+}
+
+/* A confirm read that fails `require` is FAILED, which is louder than
+ * unconfirmed -- the device answered and said no. */
+static void test_confirm_require_unsatisfied_fails(void) {
+    gatt_fsm_t f;
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 8);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    gatt_fsm_step(&f, &EV_WRITE(0x2AF0));
+    assert(gatt_fsm_step(&f, &EV_READ(0x2AF1, "\x00", 1)).kind == GA_DISCONNECT);
+    assert(f.state == GS_FAILED);
+    assert(f.fail == GF_CONFIRM_FAILED);
+}
+
+/* A confirm read shorter than confirm_min_len is a short read, reusing
+ * M5a's rule rather than inventing a second one. */
+static void test_confirm_short_read_fails(void) {
+    gatt_fsm_t f;
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 8);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    gatt_fsm_step(&f, &EV_WRITE(0x2AF0));
+    assert(gatt_fsm_step(&f, &EV_READ(0x2AF1, NULL, 0)).kind == GA_DISCONNECT);
+    assert(f.state == GS_FAILED && f.fail == GF_SHORT_READ);
+}
+
+/* No confirm block: the write alone completes the command, and it is
+ * recorded as unconfirmed rather than as a success. */
+static void test_no_confirm_completes_unconfirmed(void) {
+    static const uint8_t noconf[] = { 1, 1, 0,0, 0x00, 0xF0,0x2A, 1,0x00, 0xFF,0xFF };
+    gatt_fsm_t f;
+    gatt_fsm_init_command(&f, noconf, sizeof noconf, 0);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    assert(gatt_fsm_step(&f, &EV_WRITE(0x2AF0)).kind == GA_DISCONNECT);
+    assert(f.state == GS_DONE);
+    assert(f.confirmed == false);
+}
+
+/* The compiler (webui/src/lib/psc/codegen.js) writes write_len as
+ * "constant prefix + spliced-param width" and pads the blob with zero
+ * placeholder bytes for the parameter, so the REAL on-blob shape of
+ * ACT_OPEN_WITH_CONFIRM's write is write_len 3 with bytes 01 00 00. It
+ * must splice to exactly the same three bytes as the brief's shorter
+ * form above -- otherwise every wrapper the browser actually produces
+ * would take a different path through this parser than the one the tests
+ * pin. */
+static void test_param_splice_over_placeholder_bytes(void) {
+    static const uint8_t padded[] = {
+        1,
+        2, 0x2C, 0x01, 0x03,
+        0xF0, 0x2A,
+        3, 0x01, 0x00, 0x00,     /* write_len 3, param placeholders zeroed */
+        1, 1,                     /* param_offset 1, u16le */
+        0xF1, 0x2A, 1, 0, 0, 0, 1, 0,
+    };
+    gatt_fsm_t f;
+    gatt_fsm_init_command(&f, padded, sizeof padded, 300);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_act_t w = gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    assert(w.kind == GA_WRITE && w.len == 3);
+    assert(w.data[0] == 0x01 && w.data[1] == 0x2C && w.data[2] == 0x01);
+}
+
+/* Both other encodings, and the "no parameter" sentinel pair: a u8
+ * parameter is one byte, a u16be is the SAME value in the other byte
+ * order (getting this backwards writes a 2048-second irrigation where 8
+ * was asked for, which is precisely the class of silent wrong value this
+ * project keeps eliminating). */
+static void test_param_encodings(void) {
+    static const uint8_t u8ent[] = {
+        1, 3, 0xFF, 0x00, 0x00, 0xF0, 0x2A, 2, 0x0A, 0x00, 1, 0,
+    };
+    static const uint8_t bent[] = {
+        1, 2, 0x2C, 0x01, 0x00, 0xF0, 0x2A, 3, 0x0A, 0x00, 0x00, 1, 2,
+    };
+    gatt_fsm_t f;
+
+    gatt_fsm_init_command(&f, u8ent, sizeof u8ent, 0x42);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_act_t w = gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    assert(w.kind == GA_WRITE && w.len == 2 && w.data[0] == 0x0A && w.data[1] == 0x42);
+
+    gatt_fsm_init_command(&f, bent, sizeof bent, 8);
+    gatt_fsm_step(&f, &EV(GE_START));
+    w = gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    assert(w.kind == GA_WRITE && w.len == 3);
+    assert(w.data[0] == 0x0A && w.data[1] == 0x00 && w.data[2] == 0x08);
+}
+
+/* A parameter above the entry's own declared bound is REFUSED, not
+ * clamped and not spliced. actor_table_check() already bounds it at the
+ * queue's door, so reaching here means something upstream is wrong -- and
+ * the thing being asked for is a valve held open longer than its wrapper
+ * says is safe. */
+static void test_param_over_declared_max_refused(void) {
+    gatt_fsm_t f;
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 301);
+    assert(f.state == GS_FAILED && f.fail == GF_PARAM_OVER_MAX);
+    assert(gatt_fsm_step(&f, &EV(GE_START)).kind == GA_NONE);
+    assert(f.state == GS_FAILED);
+
+    /* The bound itself is inclusive. */
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 300);
+    assert(f.state == GS_IDLE);
+}
+
+/* Every truncation of a valid entry must refuse the command outright --
+ * never connect, never write a half-parsed payload -- and must never read
+ * past the buffer it was given (run this under a sanitizer to see the
+ * second half of that claim). */
+static void test_truncated_entry_refused(void) {
+    gatt_fsm_t f;
+    for (size_t cut = 1; cut < sizeof ACT_OPEN_WITH_CONFIRM; cut++) {
+        /* An exact-size heap copy, not a shorter length over the full
+         * static array: reading one byte past a static array is invisible
+         * to every tool, while reading one byte past a malloc'd block of
+         * exactly `cut` bytes is what a sanitizer run can actually catch. */
+        uint8_t *cut_copy = malloc(cut);
+        assert(cut_copy != NULL);
+        memcpy(cut_copy, ACT_OPEN_WITH_CONFIRM, cut);
+        gatt_fsm_init_command(&f, cut_copy, (uint16_t)cut, 8);
+        assert(f.state == GS_FAILED);
+        assert(f.fail == GF_BAD_ACTION);
+        assert(gatt_fsm_step(&f, &EV(GE_START)).kind == GA_NONE);
+        free(cut_copy);
+    }
+    gatt_fsm_init_command(&f, NULL, 0, 0);
+    assert(f.state == GS_FAILED && f.fail == GF_BAD_ACTION);
+}
+
+/* Hostile entries psvm_validate() would have refused, reaching this
+ * parser anyway (its contract, inherited from gatt_fsm_init(), is to
+ * survive a plan it did not validate itself). */
+static void test_hostile_entry_refused(void) {
+    gatt_fsm_t f;
+    /* param_offset 250 + a u16 runs far past any write buffer */
+    static const uint8_t far_off[] = { 1, 2, 0x2C,0x01, 0x00, 0xF0,0x2A, 1,0x01, 250, 1 };
+    gatt_fsm_init_command(&f, far_off, sizeof far_off, 8);
+    assert(f.state == GS_FAILED && f.fail == GF_BAD_ACTION);
+
+    /* write_len 0, and write_len above GATT_FSM_WRITE_MAX */
+    static const uint8_t zero_len[] = { 1, 2, 0x2C,0x01, 0x00, 0xF0,0x2A, 0, 0xFF,0xFF };
+    gatt_fsm_init_command(&f, zero_len, sizeof zero_len, 0);
+    assert(f.state == GS_FAILED && f.fail == GF_BAD_ACTION);
+    static const uint8_t huge_len[] = { 1, 2, 0x2C,0x01, 0x00, 0xF0,0x2A, 9,
+                                        1,2,3,4,5,6,7,8,9, 0xFF,0xFF };
+    gatt_fsm_init_command(&f, huge_len, sizeof huge_len, 0);
+    assert(f.state == GS_FAILED && f.fail == GF_BAD_ACTION);
+
+    /* param_offset/param_encoding must be a MATCHED pair */
+    static const uint8_t half_pair[] = { 1, 2, 0x2C,0x01, 0x00, 0xF0,0x2A, 2,0x01,0x00, 0x00,0xFF };
+    gatt_fsm_init_command(&f, half_pair, sizeof half_pair, 8);
+    assert(f.state == GS_FAILED && f.fail == GF_BAD_ACTION);
+
+    /* an encoding outside {0,1,2} */
+    static const uint8_t bad_enc[] = { 1, 2, 0x2C,0x01, 0x00, 0xF0,0x2A, 2,0x01,0x00, 0x00,0x07 };
+    gatt_fsm_init_command(&f, bad_enc, sizeof bad_enc, 8);
+    assert(f.state == GS_FAILED && f.fail == GF_BAD_ACTION);
+
+    /* action_count 0: there is no entry to execute */
+    static const uint8_t no_entries[] = { 0 };
+    gatt_fsm_init_command(&f, no_entries, sizeof no_entries, 0);
+    assert(f.state == GS_FAILED && f.fail == GF_BAD_ACTION);
+}
+
+/* confirm_min_len says "1", but the require addresses offset 3 -- so a
+ * peer answering with one byte satisfies the declared minimum and still
+ * leaves the compared byte unread. psvm_validate() does NOT check
+ * confirm_offset against confirm_min_len, so this reaches us: comparing
+ * against the zero-padded slot would confirm (or fail) an action on a
+ * byte the device never sent. */
+static void test_confirm_offset_past_the_answer_is_a_short_read(void) {
+    static const uint8_t deep[] = {
+        1, 2, 0x2C,0x01, 0x02, 0xF0,0x2A, 1,0x01, 0xFF,0xFF,
+        0xF1, 0x2A, 1, 3, 0, 0, 0, 0,     /* confirm offset 3, u8, == 0 */
+    };
+    gatt_fsm_t f;
+    gatt_fsm_init_command(&f, deep, sizeof deep, 0);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    gatt_fsm_step(&f, &EV_WRITE(0x2AF0));
+    assert(gatt_fsm_step(&f, &EV_READ(0x2AF1, "\x00", 1)).kind == GA_DISCONNECT);
+    assert(f.state == GS_FAILED && f.fail == GF_SHORT_READ);
+    assert(f.confirmed == false);
+    assert(f.cmd_state_valid == false);
+}
+
+/* `!=` is the other confirm op. */
+static void test_confirm_op_ne(void) {
+    static const uint8_t ne[] = {
+        1, 1, 0,0, 0x02, 0xF0,0x2A, 1,0x00, 0xFF,0xFF,
+        0xF1, 0x2A, 1, 0, 0, 1, 0, 0,     /* require u8(st,0) != 0 */
+    };
+    gatt_fsm_t f;
+    gatt_fsm_init_command(&f, ne, sizeof ne, 0);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    gatt_fsm_step(&f, &EV_WRITE(0x2AF0));
+    assert(gatt_fsm_step(&f, &EV_READ(0x2AF1, "\x01", 1)).kind == GA_DISCONNECT);
+    assert(f.state == GS_DONE && f.confirmed == true);
+
+    gatt_fsm_init_command(&f, ne, sizeof ne, 0);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    gatt_fsm_step(&f, &EV_WRITE(0x2AF0));
+    gatt_fsm_step(&f, &EV_READ(0x2AF1, "\x00", 1));
+    assert(f.state == GS_FAILED && f.fail == GF_CONFIRM_FAILED);
+}
+
+/* The confirm read's decoded value is what the engine stores into
+ * switch.state, so it is carried out of the state machine WHETHER OR NOT
+ * the require was satisfied: a device that answers "still closed" after an
+ * open is telling the truth about its state, and that truth is the more
+ * important half of the report. */
+static void test_confirm_value_is_reported_either_way(void) {
+    gatt_fsm_t f;
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 8);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    gatt_fsm_step(&f, &EV_WRITE(0x2AF0));
+    gatt_fsm_step(&f, &EV_READ(0x2AF1, "\x01", 1));
+    assert(f.confirmed == true && f.cmd_state_valid == true && f.cmd_state == 1);
+
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 8);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    gatt_fsm_step(&f, &EV_WRITE(0x2AF0));
+    gatt_fsm_step(&f, &EV_READ(0x2AF1, "\x00", 1));
+    assert(f.confirmed == false && f.cmd_state_valid == true && f.cmd_state == 0);
+}
+
+/* Command mode inherits M5a's identity checks unchanged: a completion for
+ * a characteristic other than the one currently awaited is ignored, not
+ * mistaken for the next step's. For a command that matters more than for a
+ * read -- a skipped write is a valve that never moved, reported as
+ * confirmed. */
+static void test_command_wrong_uuid_completions_ignored(void) {
+    gatt_fsm_t f;
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 8);
+    gatt_fsm_step(&f, &EV(GE_START));
+    gatt_fsm_step(&f, &EV(GE_CONNECTED));
+    assert(gatt_fsm_step(&f, &EV_WRITE(0x2AF1)).kind == GA_NONE);
+    assert(f.state == GS_WRITING);
+    assert(gatt_fsm_step(&f, &EV_WRITE(0x2AF0)).kind == GA_READ);
+    /* a duplicate of the write just completed, now in GS_READING */
+    assert(gatt_fsm_step(&f, &EV_WRITE(0x2AF0)).kind == GA_NONE);
+    assert(f.state == GS_READING);
+    /* a read completion for the write characteristic */
+    assert(gatt_fsm_step(&f, &EV_READ(0x2AF0, "\x01", 1)).kind == GA_NONE);
+    assert(f.state == GS_READING);
+    assert(gatt_fsm_step(&f, &EV_READ(0x2AF1, "\x01", 1)).kind == GA_DISCONNECT);
+    assert(f.state == GS_DONE && f.confirmed == true);
+}
+
+/* The same "exactly one GA_DISCONNECT per terminal path" invariant
+ * gatt_fsm.h states, driven over the command sequence rather than the read
+ * one -- a command that ends without tearing the link down holds the radio
+ * and the hub goes deaf, exactly as M5a's own version of this test
+ * guards. */
+static void test_command_exactly_one_disconnect_per_terminal_path(void)
+{
+    gatt_fsm_t f;
+    int nd, nr;
+
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 8);
+    gatt_ev_t ok_seq[] = {
+        EV(GE_START), EV(GE_CONNECTED), EV_WRITE(0x2AF0), EV_READ(0x2AF1, "\x01", 1),
+    };
+    run_and_count(&f, ok_seq, sizeof ok_seq / sizeof ok_seq[0], &nd, &nr);
+    assert(nd == 1 && nr == 0 && f.state == GS_DONE);
+
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 8);
+    gatt_ev_t nak_seq[] = {
+        EV(GE_START), EV(GE_CONNECTED), EV_WRITE(0x2AF0), EV_READ(0x2AF1, "\x00", 1),
+    };
+    run_and_count(&f, nak_seq, sizeof nak_seq / sizeof nak_seq[0], &nd, &nr);
+    assert(nd == 1 && nr == 0 && f.state == GS_FAILED);
+
+    static const uint8_t noconf[] = { 1, 1, 0,0, 0x00, 0xF0,0x2A, 1,0x00, 0xFF,0xFF };
+    gatt_fsm_init_command(&f, noconf, sizeof noconf, 0);
+    gatt_ev_t unconf_seq[] = { EV(GE_START), EV(GE_CONNECTED), EV_WRITE(0x2AF0) };
+    run_and_count(&f, unconf_seq, sizeof unconf_seq / sizeof unconf_seq[0], &nd, &nr);
+    assert(nd == 1 && nr == 0 && f.state == GS_DONE);
+
+    /* GE_TIMEOUT and GE_ERROR in each state that has a connection open,
+     * then the unsolicited-disconnect exception (one GA_REPORT_FAIL, no
+     * GA_DISCONNECT), driven over the command path's own states. */
+    const gatt_ev_kind_t enders[] = { GE_TIMEOUT, GE_ERROR, GE_DISCONNECTED };
+    for (size_t e = 0; e < sizeof enders / sizeof enders[0]; e++) {
+        for (int depth = 0; depth < 3; depth++) {
+            gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 8);
+            gatt_fsm_step(&f, &EV(GE_START));
+            if (depth >= 1) gatt_fsm_step(&f, &EV(GE_CONNECTED));
+            if (depth >= 2) gatt_fsm_step(&f, &EV_WRITE(0x2AF0));
+            gatt_act_t a = gatt_fsm_step(&f, &EV(enders[e]));
+            assert(a.kind == (enders[e] == GE_DISCONNECTED ? GA_REPORT_FAIL : GA_DISCONNECT));
+            assert(f.state == GS_FAILED);
+            assert(f.confirmed == false);
+        }
+    }
+}
+
+/* A command never runs a wrapper decode: GA_DECODE and GS_DECODING belong
+ * to the read path alone. The engine hands GA_DECODE to the wrapper VM on
+ * another task, and a command has no decode block, no read buffer worth
+ * decoding and nothing to emit. */
+static void test_command_never_decodes(void)
+{
+    gatt_fsm_t f;
+    gatt_fsm_init_command(&f, ACT_OPEN_WITH_CONFIRM, sizeof ACT_OPEN_WITH_CONFIRM, 8);
+    gatt_ev_t seq[] = {
+        EV(GE_START), EV(GE_CONNECTED), EV_WRITE(0x2AF0), EV_READ(0x2AF1, "\x01", 1),
+    };
+    for (size_t i = 0; i < sizeof seq / sizeof seq[0]; i++) {
+        assert(gatt_fsm_step(&f, &seq[i]).kind != GA_DECODE);
+        assert(f.state != GS_DECODING);
+    }
+    /* and a stray GE_DECODED cannot revive a finished command */
+    assert(gatt_fsm_step(&f, &EV(GE_DECODED)).kind == GA_NONE);
+    assert(f.state == GS_DONE);
+}
+
 int main(void)
 {
     test_full_sequence();
@@ -428,6 +786,22 @@ int main(void)
     test_short_read_fails();
     test_empty_read_fails();
     test_exact_min_len_read_ok();
+
+    test_command_sequence();
+    test_confirm_require_unsatisfied_fails();
+    test_confirm_short_read_fails();
+    test_no_confirm_completes_unconfirmed();
+    test_param_splice_over_placeholder_bytes();
+    test_param_encodings();
+    test_param_over_declared_max_refused();
+    test_truncated_entry_refused();
+    test_hostile_entry_refused();
+    test_confirm_offset_past_the_answer_is_a_short_read();
+    test_confirm_op_ne();
+    test_confirm_value_is_reported_either_way();
+    test_command_wrong_uuid_completions_ignored();
+    test_command_exactly_one_disconnect_per_terminal_path();
+    test_command_never_decodes();
 
     printf("test_gatt_fsm: OK\n");
     return 0;

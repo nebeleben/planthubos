@@ -13,6 +13,9 @@
 #include "unknown_capture.h"
 #include "gatt_engine.h"
 #include "gatt_sched.h"
+#include "actor.h"
+#include "alert.h"
+#include "event_log.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
@@ -129,6 +132,64 @@ static uint16_t s_wrapper_memo[REGISTRY_MAX_DEVICES];
  * mixed value is still a plausible interval at worst) and self-corrects on
  * the next advertisement. */
 static uint32_t s_plan_interval_memo[REGISTRY_MAX_DEVICES];
+
+/* ---------------- M5b actuators: the composition this file owns ----------
+ *
+ * components/actors knows WHETHER a command may run (guards, TTL, queue
+ * priority) and components/gatt knows HOW to put it on the air. Neither may
+ * depend on the other -- actor.c calls into the engine and the engine must
+ * report back, and a REQUIRES in both directions is an ESP-IDF component
+ * cycle. So the two halves are joined HERE, by the component that already
+ * owns the composition, through the NULL-safe hooks each side exposes
+ * (actor_set_dispatch_hook() / gatt_engine_set_cmd_done_hook()) -- the same
+ * pattern this file already uses for gatt_engine_set_scan_resume() and that
+ * rules_engine.c uses for alert.h's wake hook.
+ *
+ * What only this file can supply is the translation between the two: an
+ * actor_cmd_t names a registry index and an action id, while a connection
+ * needs a GAP address, an address type and the wrapper's declarative action
+ * entry. The address type in particular exists NOWHERE else -- the registry
+ * stores a device id, not how to connect to it -- so it is captured from
+ * the advertisement that proved the device exists, which is also the only
+ * moment it is ever observable.
+ *
+ * Sized to ACTOR_MAX_DEVICES rather than REGISTRY_MAX_DEVICES: only a
+ * device with declared actions can ever be commanded, and the actor table
+ * itself holds four (spec section 1's "a plant hub drives a few valves, not
+ * sixteen"). 4 x 8 B, against a 16-entry table's 112 B. */
+typedef struct {
+    int8_t  dev_idx;      /* -1 when free */
+    uint8_t addr_type;
+    uint8_t mac[6];       /* RAW GAP/on-air order -- what ble_gap_connect() wants */
+} actor_conn_t;
+static actor_conn_t s_actor_conn[ACTOR_MAX_DEVICES];
+
+/* One bit per registry index: "this device's wrapper has already been asked
+ * whether it declares actions". Without it, every advertisement from every
+ * non-actuator device would pay an arena load plus a psvm_validate() to be
+ * told "no" again. Cleared with the wrapper memo on a reindex, since an
+ * installed or deleted wrapper changes the answer. */
+static uint16_t s_actor_asked;
+_Static_assert(REGISTRY_MAX_DEVICES <= 16, "s_actor_asked is a 16-bit index bitmap");
+
+/* The command currently in flight, remembered here because
+ * gatt_cmd_done_fn_t deliberately carries only (dev_idx, ok, confirmed,
+ * err) -- everything else it would have to carry is knowledge of the actor
+ * layer, which is exactly what must not cross that boundary. Exactly one
+ * command is ever in flight (gatt_engine_cmd_busy() is what keeps it that
+ * way), written by adv_decoder_task at dispatch and read by the NimBLE host
+ * task in the completion hook. */
+static uint8_t  s_cmd_action_id = ACTION_NONE;
+static uint16_t s_cmd_param;
+
+/* Set once both hooks are registered, which happens on the HUB only -- a
+ * node's radio belongs to ESP-NOW, exactly as it does for battery polling
+ * and for M5a's GATT reads. Until then (and forever on a node) no device is
+ * bound as an actuator and the queue is not pumped, so a command can never
+ * be popped, charged against its budget and then dropped for want of
+ * somewhere to send it. adv_decoder_task is created before that
+ * registration, so this closes a real window, not a theoretical one. */
+static bool s_actors_wired;
 
 /* Task 5 review FINDING 4/2, corrected by M5a Task 7 fix round 1: s_wrapper_index
  * and the arena are decoder-task-exclusive, full stop -- no reader anywhere
@@ -307,6 +368,147 @@ static void decode_bthome_item(const uint8_t *data, size_t len, const uint8_t ga
      * data_core_submit_cap() skipped) wrote nothing for the engine to react
      * to. */
     if (wrote_any) rules_notify_value_update();
+}
+
+/* ---------------- M5b actuators: binding, dispatch, completion ---------- */
+
+/* Reports a command that never reached the radio through the SAME path a
+ * radio failure takes, so "every failure is visible" holds for the half of
+ * the path that happens before the connection as well as after it. Declared
+ * here and defined with the completion hook below. */
+static void on_gatt_cmd_done(int dev_idx, bool ok, bool confirmed, const char *err);
+
+/* Binds a matched device to the actor table the first time its wrapper is
+ * seen to declare actions, and keeps its connection address fresh
+ * afterwards. Runs on adv_decoder_task (the only task allowed to touch the
+ * arena), once per advertisement of a matched device.
+ *
+ * The address refresh is not incidental: a BLE peripheral may use a
+ * resolvable random address, and the one this hub can connect to is the one
+ * it last advertised from. A command issued to an address the device has
+ * since rotated away from simply never connects. */
+static void note_actor_device(int idx, uint16_t wrapper_id, const adv_item_t *item)
+{
+    if (!s_actors_wired) return;
+    if (idx < 0 || idx >= REGISTRY_MAX_DEVICES) return;
+
+    for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
+        if (s_actor_conn[i].dev_idx == (int8_t)idx) {
+            s_actor_conn[i].addr_type = item->addr_type;
+            memcpy(s_actor_conn[i].mac, item->mac, 6);
+            return;
+        }
+    }
+
+    if (s_actor_asked & (uint16_t)(1u << idx)) return;
+    s_actor_asked |= (uint16_t)(1u << idx);
+
+    wrapper_action_t acts[ACTOR_MAX_ACTIONS];
+    uint8_t n = wrapper_exec_actions_list(wrapper_id, acts, ACTOR_MAX_ACTIONS);
+    if (n == 0) return;   /* an ordinary sensor wrapper: nothing to bind */
+
+    int slot = -1;
+    for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
+        if (s_actor_conn[i].dev_idx < 0) { slot = i; break; }
+    }
+    if (slot < 0) {
+        /* Same shape as registry_full_drops and actor_table_full_drops: a
+         * fifth actuator is refused loudly, never silently ignored. Once
+         * per device per reindex, because s_actor_asked is already set. */
+        ESP_LOGW(TAG, "device %d declares actions but the hub already tracks %d actuators; "
+                      "it cannot be commanded", idx, ACTOR_MAX_DEVICES);
+        return;
+    }
+
+    s_actor_conn[slot].dev_idx = (int8_t)idx;
+    s_actor_conn[slot].addr_type = item->addr_type;
+    memcpy(s_actor_conn[slot].mac, item->mac, 6);
+
+    for (uint8_t i = 0; i < n; i++) {
+        /* actor_declare() re-declares in place, leaving an operator's
+         * guards and any hourly budget already spent untouched
+         * (actor_table.h). param_max is the wrapper's own bound; the table
+         * intersects it with the firmware's. */
+        if (!actor_declare(idx, acts[i].action_id, acts[i].param_max, acts[i].flags)) {
+            ESP_LOGW(TAG, "device %d: action %u could not be declared",
+                     idx, (unsigned)acts[i].action_id);
+        }
+    }
+    ESP_LOGI(TAG, "device %d bound as an actuator: %u action(s) from wrapper %u",
+             idx, (unsigned)n, (unsigned)wrapper_id);
+}
+
+/* actor_service()'s dispatch hook: a command has passed every guard and the
+ * radio is the next step. Runs on adv_decoder_task, which is where it must
+ * run -- resolving the action entry reads the wrapper arena, and the arena
+ * belongs to this task alone.
+ *
+ * Every early return reports through on_gatt_cmd_done(): this command has
+ * already been popped from the actor queue and charged against its hourly
+ * budget, so there is no second chance for it and no other place its
+ * disappearance would surface. */
+static void on_actor_dispatch(const actor_cmd_t *cmd)
+{
+    int idx = cmd->dev_idx;
+
+    s_cmd_action_id = cmd->action_id;
+    s_cmd_param = cmd->param;
+
+    const actor_conn_t *conn = NULL;
+    for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
+        if (s_actor_conn[i].dev_idx == (int8_t)idx) { conn = &s_actor_conn[i]; break; }
+    }
+    if (conn == NULL) {
+        on_gatt_cmd_done(idx, false, false, "no connection address for this device yet");
+        return;
+    }
+
+    uint16_t wrapper_id = (idx >= 0 && idx < REGISTRY_MAX_DEVICES)
+                              ? s_wrapper_memo[idx] : WRAPPER_MEMO_NONE;
+    if (wrapper_id == WRAPPER_MEMO_NONE) {
+        on_gatt_cmd_done(idx, false, false, "no wrapper matched for this device");
+        return;
+    }
+
+    /* Copied out of the arena here, on this task, for the same reason the
+     * connect plan is (gatt_engine_request()): an arena pointer can be
+     * invalidated by any later eviction, and these bytes are used much
+     * later, on the NimBLE host task. */
+    uint8_t entry[GATT_ACTION_ENTRY_MAX];
+    uint16_t n = wrapper_exec_action_get(wrapper_id, cmd->action_id, entry, sizeof entry);
+    if (n == 0) {
+        on_gatt_cmd_done(idx, false, false, "the wrapper declares no such action");
+        return;
+    }
+
+    gatt_engine_request_command(idx, entry, n, cmd->param, conn->mac, conn->addr_type);
+}
+
+/* gatt_engine_set_cmd_done_hook(): how a command ended. Runs on the NimBLE
+ * host task for a radio outcome (and on adv_decoder_task for the pre-radio
+ * refusals above), so it does only what is safe from both: alert_post() is
+ * a fixed-size append under a critical section, explicitly safe from any
+ * task including this one (alert.h), and the LittleFS/SSE half of the
+ * report happens later, on the rules engine task, in alert_drain().
+ *
+ * A FAILED command alerts. An UNCONFIRMED one is logged but does not alert
+ * from here: "completed unconfirmed" is a real outcome with its own policy
+ * (spec section 4.4 -- an unconfirmed close counts as an open actuator and
+ * is retried), and that policy belongs to the safety core, not to this
+ * wiring. Alerting on it here as well would make the eventual retry read as
+ * two failures. */
+static void on_gatt_cmd_done(int dev_idx, bool ok, bool confirmed, const char *err)
+{
+    if (!ok) {
+        ESP_LOGW(TAG, "command failed: dev=%d action=%u param=%u (%s)", dev_idx,
+                 (unsigned)s_cmd_action_id, (unsigned)s_cmd_param, err ? err : "unknown");
+        alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_COMMAND_FAILED, dev_idx,
+                   s_cmd_action_id, s_cmd_param);
+        return;
+    }
+    ESP_LOGI(TAG, "command %s: dev=%d action=%u param=%u",
+             confirmed ? "confirmed" : "completed UNCONFIRMED",
+             dev_idx, (unsigned)s_cmd_action_id, (unsigned)s_cmd_param);
 }
 
 /* Runs on adv_decoder_task, never on the NimBLE host task -- this is where
@@ -491,6 +693,10 @@ static void decode_adv_item(const adv_item_t *item)
             if (midx >= 0 && midx < REGISTRY_MAX_DEVICES) {
                 s_wrapper_memo[midx] = (uint16_t)wrapper_id;
                 s_plan_interval_memo[midx] = interval_s;
+                /* M5b: the same advertisement is also the only place a
+                 * device's connection ADDRESS is observable, which is what
+                 * a command needs and the registry does not hold. */
+                note_actor_device(midx, (uint16_t)wrapper_id, item);
             }
 
             /* M3 Task 6 (spec sections 3 and 5): if this wrapper carries a
@@ -573,6 +779,11 @@ static void decode_adv_item(const adv_item_t *item)
              * otherwise editing a wrapper from connect to advert would leave
              * /api/v1/devices reporting a "gatt" object forever. */
             s_plan_interval_memo[midx] = 0;
+            /* An actuator wrapper need not carry a connect plan at all --
+             * an action table with no `connect` block is legal (psvm.h
+             * gates the two sections on separate flags), so the binding
+             * has to happen on this path too, not only on the plan one. */
+            note_actor_device(midx, (uint16_t)wrapper_id, item);
         }
         if (wrote) rules_notify_value_update();
         return;   /* a matched wrapper's key can never also be MiFlora's (distinct match kinds/keys) -- nothing further to dispatch */
@@ -668,6 +879,18 @@ static void do_wrapper_reindex(void)
      * device that no longer has a plan at all. Zero is "no plan", which is
      * also the correct answer while nothing has matched yet. */
     memset(s_plan_interval_memo, 0, sizeof(s_plan_interval_memo));
+    /* M5b: which actions a device supports comes from its wrapper, so an
+     * install/edit/delete can change that answer too. Both the "already
+     * asked" bitmap and the connection memo are cleared, so the next
+     * advertisement from each device re-derives its binding from the new
+     * index. Already-declared actor table entries are left standing --
+     * actor_declare() re-declares in place, deliberately preserving an
+     * operator's guards and any hourly budget already spent
+     * (actor_table.h), and a command naming an action the new wrapper no
+     * longer declares is refused at dispatch with a named reason rather
+     * than executed. */
+    s_actor_asked = 0;
+    for (int i = 0; i < ACTOR_MAX_DEVICES; i++) s_actor_conn[i].dev_idx = -1;
     wrapper_arena_evict_all();
 }
 
@@ -697,6 +920,16 @@ static void adv_decoder_task(void *arg)
          * never between popping an item and finishing decode_adv_item() for
          * it. A no-op when nothing is owed. */
         gatt_engine_service();
+
+        /* M5b Task 8: the actor queue's pump. Here, on this task, because
+         * the dispatch hook it calls resolves the wrapper's action entry
+         * out of the arena -- flash, so decoder-task only, exactly like
+         * gatt_engine_request() above it. Skipped while a command is
+         * already waiting for the radio or executing: this engine holds
+         * exactly one, and leaving the next command in the actor queue
+         * keeps its TTL and the safety-close priority rule intact instead
+         * of having it refused on arrival. */
+        if (s_actors_wired && !gatt_engine_cmd_busy()) actor_service();
 
         adv_item_t item;
         portENTER_CRITICAL(&s_adv_mux);
@@ -874,6 +1107,14 @@ esp_err_t ble_collector_start(void)
     wrapper_arena_set_loader(wrapper_store_read_psbc);
     wrapper_arena_init();
     memset(s_wrapper_memo, WRAPPER_MEMO_NONE, sizeof(s_wrapper_memo));
+    /* M5b: the actuator table and command queue, and the connection memo
+     * that binds a registry index to an address to connect to. Before
+     * adv_decoder_task exists, because that task both fills the memo (from
+     * every matched advertisement) and pumps the queue. dev_idx -1 marks a
+     * free slot, so this cannot be left as the default zero-init: 0 is a
+     * real registry index. */
+    actor_init();
+    for (int i = 0; i < ACTOR_MAX_DEVICES; i++) s_actor_conn[i].dev_idx = -1;
     /* M3 Task 6 (spec §5): reset the unknown-device capture to empty before
      * adv_decoder_task (below) can run decode_adv_item() and start filling
      * it. Static 768 B (see unknown_capture.c's top comment). */
@@ -918,6 +1159,19 @@ esp_err_t ble_collector_start(void)
          * battery_poll_start() so the poller exists before the engine can
          * ask it anything. */
         gatt_engine_set_conn_busy_hook(battery_poll_busy);
+        /* M5b Task 8: the two halves of the command path joined -- see this
+         * file's "M5b actuators" block for why the join lives here and not
+         * as a direct call in either component. Registered together, and
+         * the completion hook FIRST: gatt_engine_request_command() refuses
+         * outright when it has nowhere to report an outcome to, so a
+         * command dispatched in the window between the two would be
+         * dropped with only a log line. Hub-only for the same reason the
+         * engine itself is (a node's radio belongs to ESP-NOW); on a node
+         * the actor queue simply never gets pumped past its dispatch hook,
+         * which stays NULL and is a documented no-op. */
+        gatt_engine_set_cmd_done_hook(on_gatt_cmd_done);
+        actor_set_dispatch_hook(on_actor_dispatch);
+        s_actors_wired = true;   /* set LAST: it is what opens the path above */
     }
     return ESP_OK;
 }

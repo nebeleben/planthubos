@@ -282,3 +282,102 @@ uint16_t wrapper_exec_plan_get(uint16_t id, uint8_t *out, uint16_t cap,
     }
     return prog.plan_len;
 }
+
+/* ---------------- M5b action table ----------------
+ *
+ * Walks the validated action section (psvm.h's PSVM_FLAG_ACTION_TABLE doc
+ * comment has the layout) one entry at a time. psvm_validate() has already
+ * bounds-checked every field of it against the blob, so this walker's
+ * checks against actions_len are belt-and-braces -- kept anyway, and
+ * deliberately: it is the same discipline gatt_fsm_init()/
+ * gatt_fsm_init_command() hold themselves to, and the cost is a handful of
+ * comparisons on a path that runs once per command.
+ *
+ * Returns the offset just past the entry starting at `off`, or 0 when the
+ * entry does not parse in full (0 can never be a valid "next" offset: the
+ * count byte occupies offset 0). */
+static uint16_t action_entry_end(const uint8_t *a, uint16_t len, uint16_t off)
+{
+    if ((uint32_t)off + 7 > len) return 0;
+    uint8_t aflags = a[off + 3];
+    uint8_t wlen   = a[off + 6];
+    uint32_t end = (uint32_t)off + 7 + wlen + 2;      /* write bytes, param_offset/encoding */
+    if (aflags & 0x02) end += 8;                       /* the confirm block */
+    if (end > len) return 0;
+    return (uint16_t)end;
+}
+
+/* Shared front half of both accessors: validate the wrapper and hand back
+ * its action section. */
+static const uint8_t *actions_of(uint16_t id, uint16_t *len_out)
+{
+    *len_out = 0;
+
+    size_t blob_len = 0;
+    const uint8_t *blob = wrapper_arena_get(id, &blob_len);
+    if (!blob) return NULL;
+
+    psvm_prog_t prog;
+    if (psvm_validate(blob, blob_len, PSVM_DIALECT_WRAPPERS,
+                      CAPABILITY_COUNT - 1, 0, &prog) != PSVM_OK) {
+        /* Silent for the same reason wrapper_exec_plan_get() is silent:
+         * this is a query, not a run, and the run path already logs and
+         * records the failure. */
+        return NULL;
+    }
+    if (prog.actions == NULL || prog.actions_len < 1) return NULL;
+    *len_out = prog.actions_len;
+    return prog.actions;
+}
+
+uint8_t wrapper_exec_actions_list(uint16_t id, wrapper_action_t *out, uint8_t cap)
+{
+    uint16_t len = 0;
+    const uint8_t *a = actions_of(id, &len);
+    if (!a || out == NULL) return 0;
+
+    uint8_t count = a[0];
+    uint16_t off = 1;
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < count && n < cap; i++) {
+        uint16_t end = action_entry_end(a, len, off);
+        if (end == 0) break;
+        out[n].action_id = a[off];
+        out[n].param_max = (uint16_t)(a[off + 1] | ((uint16_t)a[off + 2] << 8));
+        out[n].flags     = a[off + 3];
+        n++;
+        off = end;
+    }
+    return n;
+}
+
+uint16_t wrapper_exec_action_get(uint16_t id, uint8_t action_id, uint8_t *out, uint16_t cap)
+{
+    uint16_t len = 0;
+    const uint8_t *a = actions_of(id, &len);
+    if (!a || out == NULL) return 0;
+
+    uint8_t count = a[0];
+    uint16_t off = 1;
+    for (uint8_t i = 0; i < count; i++) {
+        uint16_t end = action_entry_end(a, len, off);
+        if (end == 0) break;
+        if (a[off] == action_id) {
+            uint16_t n = (uint16_t)(end - off);
+            /* The count byte gatt_fsm_init_command() expects, then the
+             * entry itself -- one action, byte for byte as the blob
+             * carries it (see that function's doc comment for why the
+             * count byte is kept rather than stripped). */
+            if ((uint32_t)n + 1 > cap) {
+                ESP_LOGW(TAG, "wrapper %u: action %u is %u B, does not fit the caller's %u B",
+                         (unsigned)id, (unsigned)action_id, (unsigned)n, (unsigned)cap);
+                return 0;
+            }
+            out[0] = 1;
+            memcpy(out + 1, a + off, n);
+            return (uint16_t)(n + 1);
+        }
+        off = end;
+    }
+    return 0;
+}

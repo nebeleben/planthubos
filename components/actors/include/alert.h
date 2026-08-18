@@ -42,6 +42,12 @@ typedef enum {
     ALERT_CODE_CLOSE_UNCONFIRMED,  /* safety close sent but not confirmed */
     ALERT_CODE_QUEUE_FULL,         /* actor_request() refused: command queue full */
     ALERT_CODE_COMMAND_EVICTED,    /* command bumped from the queue by a safety close */
+    ALERT_CODE_COMMAND_FAILED,     /* dispatched, but never reached the actuator: the
+                                     * connection, the write or the confirm failed (M5b
+                                     * Task 8). Appended, never renumbered -- see this
+                                     * enum's own comment. A command that COMPLETED
+                                     * UNCONFIRMED is not this: that is an outcome with
+                                     * its own policy (spec section 4.4), not a failure. */
 } alert_code_t;
 
 #define ALERT_RING_LEN 8
