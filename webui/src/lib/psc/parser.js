@@ -863,19 +863,93 @@ class Parser {
   parseActions() {
     const actions = []
     for (;;) {
-      const nameTok = this.expectIdent()
-      if (!RULE_ACTIONS.has(nameTok.value)) {
-        throw new PSError(`unknown action '${nameTok.value}'`, nameTok.line, nameTok.col)
+      const t = this.peek()
+      if (t.type === 'IDENT' && (t.value === 'plant' || t.value === 'device')) {
+        actions.push(this.parseActionCall())
+      } else {
+        const nameTok = this.expectIdent()
+        if (!RULE_ACTIONS.has(nameTok.value)) {
+          throw new PSError(`unknown action '${nameTok.value}'`, nameTok.line, nameTok.col)
+        }
+        this.expectPunct('(')
+        const argTok = this.expectString()
+        const arg = buildStringAst(argTok)
+        this.expectPunct(')')
+        actions.push({ type: 'builtin_call', name: nameTok.value, arg, line: nameTok.line, col: nameTok.col })
       }
-      this.expectPunct('(')
-      const argTok = this.expectString()
-      const arg = buildStringAst(argTok)
-      this.expectPunct(')')
-      actions.push({ name: nameTok.value, arg, line: nameTok.line, col: nameTok.col })
       if (this.isPunct(';')) { this.advance(); continue }
       break
     }
     return actions
+  }
+
+  // M5b Task 10: `plant("Name").irrigation.open(8s)` / `device("id").switch.on()`
+  // in a `then` clause -- compiles to CALL_ACTION (codegen.js). Grammar
+  // deliberately mirrors parseRef() (plant/device, quoted name, dotted
+  // capability-shaped name) rather than reusing it: this resolves against
+  // ACTION_DEFS (plan-limits.js), a different vocabulary from CAPS, and
+  // its argument -- when the action takes one -- is a duration literal,
+  // never a general expression, so an out-of-bound literal can be caught
+  // here at compile time (spec's action hard bound, action.h's ground
+  // truth) rather than only at actor_request() on the device.
+  parseActionCall() {
+    const kindTok = this.advance() // 'plant' | 'device'
+    const kind = kindTok.value === 'plant' ? 0 : 1
+    this.expectPunct('(')
+    const nameTok = this.expectString()
+    const name = plainStringValue(nameTok)
+    this.expectPunct(')')
+    this.expectPunct('.')
+    const seg1 = this.expectIdent()
+    this.expectPunct('.')
+    const seg2 = this.expectIdent()
+    const actionName = `${seg1.value}.${seg2.value}`
+    const actionDef = ACTION_DEFS[actionName]
+    if (!actionDef) {
+      throw new PSError(`unknown action '${actionName}'`, seg1.line, seg1.col)
+    }
+    const openTok = this.expectPunct('(')
+    let paramSeconds = null
+    let paramTok = null
+    if (!this.isPunct(')')) {
+      paramTok = this.peek()
+      paramSeconds = this.parseDuration(actionName, 0, 65535)
+    }
+    this.expectPunct(')')
+
+    if (actionDef.param === null) {
+      if (paramSeconds !== null) {
+        throw new PSError(`${actionName} takes no parameter`, paramTok.line, paramTok.col)
+      }
+    } else {
+      if (paramSeconds === null) {
+        throw new PSError(
+          `${actionName} requires a duration parameter`,
+          openTok.line, openTok.col
+        )
+      }
+      if (paramSeconds === 0) {
+        // action.h's own invariant (ground truth, actor_request()'s
+        // parameter-bound guard): a parameterised action never accepts 0
+        // -- "a zero-second open is not an open, it is a caller bug that
+        // would otherwise look like a successful no-op." Caught here too
+        // so the author sees it at compile time, not as a silent refusal
+        // alert on the device.
+        throw new PSError(`${actionName} requires a nonzero duration`, paramTok.line, paramTok.col)
+      }
+      if (paramSeconds > actionDef.paramMax) {
+        throw new PSError(
+          `${paramSeconds} exceeds the ${actionDef.paramMax}s bound for '${actionName}'`,
+          paramTok.line, paramTok.col
+        )
+      }
+    }
+
+    return {
+      type: 'action_call', kind, name,
+      actionId: actionDef.id, actionName, paramSeconds,
+      line: kindTok.line, col: kindTok.col,
+    }
   }
 
   // ---- expressions (or -> and -> not -> cmp -> shift -> add -> mul -> unary -> primary) ----

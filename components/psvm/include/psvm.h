@@ -126,6 +126,21 @@ typedef struct { uint8_t kind; uint16_t name_const; uint8_t capability; uint8_t 
  * Rules dialect only -- a wrapper program never emits CALL_BUILTIN. */
 typedef bool (*psvm_sink_t)(void *ctx, uint8_t builtin, const char *msg);
 
+/* CALL_ACTION (0x52, M5b Task 10) sink: rules dialect only, exactly like
+ * psvm_sink_t above -- a wrapper program never emits CALL_ACTION either.
+ * kind is the ref-table convention (0 plant, 1 device); name is the
+ * resolved const-pool string (NUL-terminated, may be truncated), action_id
+ * is action.h's id, and param is the value CALL_ACTION popped off the
+ * stack, already range-checked into 0..65535 by psvm_run() itself (see its
+ * own doc comment below) -- the sink never sees a negative or truncated
+ * value. Return false to abort the run (treated as PSVM_ERR_TYPE), the
+ * same convention as psvm_sink_t; the real engine sink (rules_engine.c)
+ * never does this -- actor_request() already reports its own refusal via
+ * alert_post(), so a guard refusal must not also unwind the VM and skip
+ * whatever `then` actions follow it. */
+typedef bool (*psvm_action_sink_t)(void *ctx, uint8_t kind, const char *name,
+                                   uint8_t action_id, uint16_t param);
+
 /* Wrapper dialect (dialect=2) EMIT sink: capability id (EMIT's own u8
  * operand) and the popped numeric value. Called once per buffered emit,
  * only when the run reaches HALT successfully (spec section 3: a failed
@@ -233,9 +248,20 @@ typedef struct { bool cond; psvm_err_t err; uint32_t steps_used; } psvm_result_t
  *
  * Rules dialect (spec section 3, unchanged by M3): executes to HALT_BOOL
  * for cond; if run_actions && cond, continues to HALT calling sink for
- * builtins. resolved[] must have ref_count entries. A not-ready ref
- * touched by execution aborts with PSVM_ERR_REF (engine reports "not
- * ready"). wio is unused (pass NULL).
+ * builtins and action_sink for CALL_ACTION (M5b Task 10). resolved[] must
+ * have ref_count entries. A not-ready ref touched by execution aborts with
+ * PSVM_ERR_REF (engine reports "not ready"). wio is unused (pass NULL).
+ *
+ * CALL_ACTION (0x52) pops its parameter off the stack as a float and
+ * converts it to the uint16_t action_sink expects; a negative value, NaN,
+ * or anything above 65535 is PSVM_ERR_TYPE rather than being silently
+ * truncated (the parameter is a duration in seconds fed straight to an
+ * actuator -- turning a compiler or hand-crafted-blob bug into a 65535 s
+ * irrigation run instead of a clean rejection is exactly the failure shape
+ * this project exists to avoid). A NULL action_sink is PSVM_ERR_REF, the
+ * same shape an unready ref uses -- a rules blob can reach psvm_run() in a
+ * dry-run context where no real sink is wired at all, and that must fail
+ * cleanly rather than dereference NULL.
  *
  * Wrapper dialect (M3 spec section 3): resolved is unused (pass NULL --
  * wrapper bytecode never emits LOAD_REF, ref_count is always 0). wio
@@ -253,4 +279,6 @@ typedef struct { bool cond; psvm_err_t err; uint32_t steps_used; } psvm_result_t
  * contains HALT_BOOL). */
 psvm_result_t psvm_run(const psvm_prog_t *p, const psvm_ref_val_t *resolved,
                        const psvm_wrapper_io_t *wio,
-                       psvm_sink_t sink, void *sink_ctx, bool run_actions);
+                       psvm_sink_t sink, void *sink_ctx,
+                       psvm_action_sink_t action_sink, void *action_sink_ctx,
+                       bool run_actions);

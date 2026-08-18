@@ -177,13 +177,15 @@ static bool run_payload(uint16_t id, const uint8_t mac[6],
         .aes_ccm = NULL,
         .aes_ccm_ctx = NULL,
     };
-    /* resolved=NULL, sink=NULL/NULL, run_actions=false: none of these apply
-     * to the wrapper dialect -- see psvm_run()'s own doc comment (psvm.h).
-     * The VM's own PSVM_MAX_STEPS budget bounds this call; nothing here
-     * adds a second one (M3 Task 5 brief's "enforce M1's step budget" is
+    /* resolved=NULL, sink=NULL/NULL, action_sink=NULL/NULL, run_actions=
+     * false: none of these apply to the wrapper dialect -- see psvm_run()'s
+     * own doc comment (psvm.h). CALL_ACTION (0x52), like CALL_BUILTIN, is a
+     * rules-dialect-only opcode; wrapper bytecode never emits it. The VM's
+     * own PSVM_MAX_STEPS budget bounds this call; nothing here adds a
+     * second one (M3 Task 5 brief's "enforce M1's step budget" is
      * satisfied by simply calling psvm_run() normally -- that budget is
      * unconditional inside psvm_run() itself, not opt-in). */
-    psvm_result_t res = psvm_run(&prog, NULL, &wio, NULL, NULL, false);
+    psvm_result_t res = psvm_run(&prog, NULL, &wio, NULL, NULL, NULL, NULL, false);
     if (res.err == PSVM_ERR_REF && !aes_ccm_already_warned(id) && code_uses_aes_ccm(&prog)) {
         /* Elevated per the Task 5 review ruling: this specific, structural,
          * every-run-fails case must not be invisible at DEBUG. Checked

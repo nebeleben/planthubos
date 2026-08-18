@@ -43,8 +43,12 @@ export const OPCODES = {
   JMP: 0x41,
   BUILD_STR: 0x50,
   CALL_BUILTIN: 0x51,
+  // CALL_ACTION (M5b Task 10, rules dialect only): u8 kind, u16 name_const,
+  // u8 action_id; pops the parameter (already on the stack via PUSH_CONST)
+  // as a float. Already reserved for this task -- do not renumber.
+  CALL_ACTION: 0x52,
   // Wrapper dialect (M3 spec section 3), dialect=2. Appended after M1's
-  // table (0x00-0x51, 0xFF); do not renumber the opcodes above.
+  // table (0x00-0x52, 0xFF); do not renumber the opcodes above.
   LOAD_U8: 0x60,
   LOAD_U16LE: 0x61,
   LOAD_U16BE: 0x62,
@@ -240,11 +244,25 @@ export function emit(ast) {
   const thenBuf = new CodeBuf()
   let builtins = 0
   for (const action of ast.actions) {
-    emitStringNode(action.arg, thenBuf, ctx)
-    thenBuf.op(OPCODES.CALL_BUILTIN)
-    const bid = BUILTIN_ID[action.name]
-    thenBuf.u8(bid)
-    builtins |= (1 << bid)
+    if (action.type === 'action_call') {
+      // CALL_ACTION always pops a parameter, even for a parameterless
+      // action (parser.js already refused a param on those) -- 0 is
+      // action.h's own "no parameter" value, so pushing it here keeps the
+      // opcode's stack contract uniform regardless of which action it
+      // names. name_const is a plain const-pool string, not a ref-table
+      // entry: CALL_ACTION has no ref of its own to deduplicate through.
+      const paramIdx = consts.addNum(action.paramSeconds ?? 0)
+      thenBuf.op(OPCODES.PUSH_CONST); thenBuf.u16(paramIdx)
+      const nameConstIdx = consts.addStr(action.name)
+      thenBuf.op(OPCODES.CALL_ACTION)
+      thenBuf.u8(action.kind); thenBuf.u16(nameConstIdx); thenBuf.u8(action.actionId)
+    } else {
+      emitStringNode(action.arg, thenBuf, ctx)
+      thenBuf.op(OPCODES.CALL_BUILTIN)
+      const bid = BUILTIN_ID[action.name]
+      thenBuf.u8(bid)
+      builtins |= (1 << bid)
+    }
   }
   thenBuf.op(OPCODES.HALT)
 

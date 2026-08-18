@@ -2923,7 +2923,9 @@ static esp_err_t wrapper_run_and_reply(httpd_req_t *req, const uint8_t *psbc,
         .aes_ccm = NULL,
         .aes_ccm_ctx = NULL,
     };
-    psvm_result_t res = psvm_run(&prog, NULL, &wio, NULL, NULL, false);
+    /* action_sink=NULL/NULL: CALL_ACTION (0x52) is a rules-dialect-only
+     * opcode, like CALL_BUILTIN -- wrapper bytecode never emits it. */
+    psvm_result_t res = psvm_run(&prog, NULL, &wio, NULL, NULL, NULL, NULL, false);
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "ok", res.err == PSVM_OK);

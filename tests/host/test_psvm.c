@@ -925,6 +925,109 @@ static void test_action_reserved_flag_bits_rejected(void) {
     assert(psvm_validate(blob, n, PSVM_DIALECT_WRAPPERS, 8, 0, &p) == PSVM_ERR_LIMITS);
 }
 
+/* --- M5b Task 10: CALL_ACTION (0x52), rules dialect action path --- */
+
+typedef struct {
+    uint8_t  kind;
+    char     name[40];
+    uint8_t  action_id;
+    uint16_t param;
+    int      calls;
+} action_cap_t;
+
+static bool action_capture(void *ctx, uint8_t kind, const char *name,
+                           uint8_t action_id, uint16_t param) {
+    action_cap_t *c = ctx;
+    c->kind = kind;
+    snprintf(c->name, sizeof c->name, "%s", name);
+    c->action_id = action_id;
+    c->param = param;
+    c->calls++;
+    return true;
+}
+
+/* Rules-dialect blob: cond is trivially true (0.0 == 0.0), then code pushes
+ * `param` and calls CALL_ACTION kind, name_const=1 ("Ficus"), action_id.
+ * Const pool: [0] 0.0 (cond), [1] "Ficus" (action target name), [2] param. */
+static size_t build_call_action(uint8_t *b, uint8_t kind, uint8_t action_id, float param) {
+    uint8_t code[] = {
+        0x01, 0,0,              /* PUSH_CONST 0 (0.0) */
+        0x01, 0,0,              /* PUSH_CONST 0 (0.0) */
+        0x24,                   /* EQ -> true */
+        0x00,                   /* HALT_BOOL */
+        0x01, 2,0,              /* PUSH_CONST 2 (param) */
+        0x52, kind, 1,0, action_id, /* CALL_ACTION kind, name_const=1, action_id */
+        0xFF,
+    };
+    size_t o = emit_header(b, 0, 3, 0, sizeof code);
+    o = emit_f32(b, o, 0.0f);
+    o = emit_str(b, o, "Ficus");
+    o = emit_f32(b, o, param);
+    memcpy(b + o, code, sizeof code);
+    return o + sizeof code;
+}
+
+/* A CALL_ACTION blob calls the sink with the right operands (Task 10
+ * brief, Step 1). */
+static void test_call_action_sink(void) {
+    uint8_t blob[64]; psvm_prog_t p;
+    size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, 8.0f);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
+
+    action_cap_t cap = {0, {0}, 0, 0, 0};
+    psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, action_capture, &cap, true);
+    assert(r.err == PSVM_OK && r.cond);
+    assert(cap.calls == 1);
+    assert(cap.kind == 0);
+    assert(strcmp(cap.name, "Ficus") == 0);
+    assert(cap.action_id == ACT_IRRIGATION_OPEN);
+    assert(cap.param == 8);
+}
+
+/* A run with a NULL action sink fails cleanly (PSVM_ERR_REF, the same
+ * shape an unready ref uses) rather than crashing -- a rules blob can
+ * reach psvm_run() in a dry-run context where no sink is wired at all
+ * (Task 10 brief, Step 1/3). */
+static void test_call_action_null_sink(void) {
+    uint8_t blob[64]; psvm_prog_t p;
+    size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, 8.0f);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
+
+    psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, NULL, NULL, true);
+    assert(r.err == PSVM_ERR_REF);
+}
+
+/* The parameter comes off the stack as a float: negative, NaN and anything
+ * above 65535 are all PSVM_ERR_TYPE rather than being truncated into a
+ * plausible-looking uint16_t (Task 10 brief's design point 3 -- turning a
+ * negative duration into 65535 s of irrigation is this project's oldest
+ * failure shape aimed at its most dangerous surface). The sink must never
+ * be called on any of these three. */
+static void test_call_action_param_out_of_range_rejected(void) {
+    action_cap_t cap;
+    psvm_prog_t p;
+    uint8_t blob[64];
+
+    cap = (action_cap_t){0, {0}, 0, 0, 0};
+    { size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, -1.0f);
+      assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
+      psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, action_capture, &cap, true);
+      assert(r.err == PSVM_ERR_TYPE && cap.calls == 0); }
+
+    cap = (action_cap_t){0, {0}, 0, 0, 0};
+    { size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, 70000.0f);
+      assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
+      psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, action_capture, &cap, true);
+      assert(r.err == PSVM_ERR_TYPE && cap.calls == 0); }
+
+    cap = (action_cap_t){0, {0}, 0, 0, 0};
+    { float nanval; { uint32_t bits = 0x7FC00000u; memcpy(&nanval, &bits, 4); }
+      size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, nanval);
+      assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
+      psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, action_capture, &cap, true);
+      assert(r.err == PSVM_ERR_TYPE && cap.calls == 0); }
+}
+
 int main(void) {
     uint8_t blob[512]; psvm_prog_t p;
     size_t len = build_demo(blob);
@@ -945,22 +1048,22 @@ int main(void) {
     psvm_ref_val_t vals[1] = {{ .value = 15.5f, .age_s = 10, .ready = true }};
 
     /* cond true + actions: sink sees interpolated string, %.1f formatting */
-    psvm_result_t r = psvm_run(&p, vals, NULL, cap_sink, &cap, true);
+    psvm_result_t r = psvm_run(&p, vals, NULL, cap_sink, &cap, NULL, NULL, true);
     assert(r.err == PSVM_OK && r.cond && cap.calls == 1 && cap.last_builtin == 1);
     assert(strcmp(cap.last, "dry: 15.5%") == 0);
 
     /* run_actions=false: no sink call */
-    cap.calls = 0; r = psvm_run(&p, vals, NULL, cap_sink, &cap, false);
+    cap.calls = 0; r = psvm_run(&p, vals, NULL, cap_sink, &cap, NULL, NULL, false);
     assert(r.err == PSVM_OK && r.cond && cap.calls == 0);
 
     /* cond false: actions skipped even with run_actions */
     vals[0].value = 30.0f; cap.calls = 0;
-    r = psvm_run(&p, vals, NULL, cap_sink, &cap, true);
+    r = psvm_run(&p, vals, NULL, cap_sink, &cap, NULL, NULL, true);
     assert(r.err == PSVM_OK && !r.cond && cap.calls == 0);
 
     /* not-ready ref aborts with PSVM_ERR_REF */
     vals[0].ready = false;
-    r = psvm_run(&p, vals, NULL, cap_sink, &cap, true);
+    r = psvm_run(&p, vals, NULL, cap_sink, &cap, NULL, NULL, true);
     assert(r.err == PSVM_ERR_REF);
 
     /* DIV by zero */
@@ -968,7 +1071,7 @@ int main(void) {
         uint8_t b2[512]; psvm_prog_t p2;
         size_t l2 = build_div0(b2);
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
-        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_DIV0);
     }
 
@@ -977,7 +1080,7 @@ int main(void) {
         uint8_t b2[512]; psvm_prog_t p2;
         size_t l2 = build_jmp_oob(b2);
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
-        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_JUMP);
     }
 
@@ -986,7 +1089,7 @@ int main(void) {
         uint8_t b2[512]; psvm_prog_t p2;
         size_t l2 = build_jmp_loop(b2);
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
-        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_STEPS);
         assert(r2.steps_used == PSVM_MAX_STEPS);
     }
@@ -996,7 +1099,7 @@ int main(void) {
         uint8_t b2[512]; psvm_prog_t p2;
         size_t l2 = build_stack_overflow(b2);
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
-        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_STACK);
     }
 
@@ -1006,10 +1109,10 @@ int main(void) {
         size_t l2 = build_age(b2);
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
         psvm_ref_val_t v_old[1] = {{ .value = 0, .age_s = 61, .ready = true }};
-        psvm_result_t r2 = psvm_run(&p2, v_old, NULL, NULL, NULL, false);
+        psvm_result_t r2 = psvm_run(&p2, v_old, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && r2.cond);
         psvm_ref_val_t v_fresh[1] = {{ .value = 0, .age_s = 30, .ready = true }};
-        r2 = psvm_run(&p2, v_fresh, NULL, NULL, NULL, false);
+        r2 = psvm_run(&p2, v_fresh, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && !r2.cond);
     }
 
@@ -1026,7 +1129,7 @@ int main(void) {
                 { .value = cases[i].a, .age_s = 0, .ready = true },
                 { .value = cases[i].b, .age_s = 0, .ready = true },
             };
-            psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+            psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
             assert(r2.err == PSVM_OK && r2.cond == cases[i].expect);
         }
     }
@@ -1042,7 +1145,7 @@ int main(void) {
                 { .value = cases[i].a, .age_s = 0, .ready = true },
                 { .value = cases[i].b, .age_s = 0, .ready = true },
             };
-            psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+            psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
             assert(r2.err == PSVM_OK && r2.cond == cases[i].expect);
         }
     }
@@ -1051,10 +1154,10 @@ int main(void) {
         size_t l2 = build_bool2(b2, 0); /* NOT */
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
         psvm_ref_val_t rv_true[1] = { { .value = 1, .age_s = 0, .ready = true } };
-        psvm_result_t r2 = psvm_run(&p2, rv_true, NULL, NULL, NULL, false);
+        psvm_result_t r2 = psvm_run(&p2, rv_true, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && !r2.cond); /* NOT(true) */
         psvm_ref_val_t rv_false[1] = { { .value = -1, .age_s = 0, .ready = true } };
-        r2 = psvm_run(&p2, rv_false, NULL, NULL, NULL, false);
+        r2 = psvm_run(&p2, rv_false, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && r2.cond); /* NOT(false) */
     }
 
@@ -1063,7 +1166,7 @@ int main(void) {
         uint8_t b2[512]; psvm_prog_t p2;
         size_t l2 = build_eq_str(b2);
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
-        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_TYPE);
     }
 
@@ -1073,10 +1176,10 @@ int main(void) {
         size_t l2 = build_cmp1(b2, 0x21 /* LE */, 5.0f);
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
         psvm_ref_val_t rv[1] = { { .value = 5.0f, .age_s = 0, .ready = true } };
-        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && r2.cond); /* 5 <= 5 */
         rv[0].value = 6.0f;
-        r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+        r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && !r2.cond); /* 6 <= 5 false */
     }
     {
@@ -1084,10 +1187,10 @@ int main(void) {
         size_t l2 = build_cmp1(b2, 0x23 /* GE */, 5.0f);
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
         psvm_ref_val_t rv[1] = { { .value = 5.0f, .age_s = 0, .ready = true } };
-        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && r2.cond); /* 5 >= 5 */
         rv[0].value = 4.0f;
-        r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+        r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && !r2.cond);
     }
     {
@@ -1095,10 +1198,10 @@ int main(void) {
         size_t l2 = build_cmp1(b2, 0x25 /* NE */, 5.0f);
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
         psvm_ref_val_t rv[1] = { { .value = 5.0f, .age_s = 0, .ready = true } };
-        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && !r2.cond); /* 5 != 5 false */
         rv[0].value = 4.0f;
-        r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+        r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && r2.cond);
     }
 
@@ -1108,7 +1211,7 @@ int main(void) {
         size_t l2 = build_arith(b2, 0x10, 3.0f, 4.0f, 7.0f); /* ADD */
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
         psvm_ref_val_t rv[1] = { { .value = 3.0f, .age_s = 0, .ready = true } };
-        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && r2.cond);
     }
     {
@@ -1116,7 +1219,7 @@ int main(void) {
         size_t l2 = build_arith(b2, 0x11, 10.0f, 4.0f, 6.0f); /* SUB */
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
         psvm_ref_val_t rv[1] = { { .value = 10.0f, .age_s = 0, .ready = true } };
-        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && r2.cond);
     }
     {
@@ -1124,7 +1227,7 @@ int main(void) {
         size_t l2 = build_arith(b2, 0x12, 3.0f, 4.0f, 12.0f); /* MUL */
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
         psvm_ref_val_t rv[1] = { { .value = 3.0f, .age_s = 0, .ready = true } };
-        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && r2.cond);
     }
     {
@@ -1132,7 +1235,7 @@ int main(void) {
         size_t l2 = build_arith(b2, 0x13, 12.0f, 4.0f, 3.0f); /* DIV */
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
         psvm_ref_val_t rv[1] = { { .value = 12.0f, .age_s = 0, .ready = true } };
-        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, false);
+        psvm_result_t r2 = psvm_run(&p2, rv, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && r2.cond);
     }
 
@@ -1142,10 +1245,10 @@ int main(void) {
         size_t l2 = build_branch2(b2);
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
         psvm_ref_val_t rv_pos[1] = { { .value = 5.0f, .age_s = 0, .ready = true } };
-        psvm_result_t r2 = psvm_run(&p2, rv_pos, NULL, NULL, NULL, false);
+        psvm_result_t r2 = psvm_run(&p2, rv_pos, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && r2.cond); /* true branch: GT(1,0)=true */
         psvm_ref_val_t rv_neg[1] = { { .value = -5.0f, .age_s = 0, .ready = true } };
-        r2 = psvm_run(&p2, rv_neg, NULL, NULL, NULL, false);
+        r2 = psvm_run(&p2, rv_neg, NULL, NULL, NULL, NULL, NULL, false);
         assert(r2.err == PSVM_OK && !r2.cond); /* else branch: GT(0,1)=false */
     }
 
@@ -1155,7 +1258,7 @@ int main(void) {
         size_t l2 = build_log(b2);
         assert(psvm_validate(b2, l2, 1, 4, 0x3, &p2) == PSVM_OK);
         sink_cap_t cap2 = {{0}, 0, 0};
-        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, cap_sink, &cap2, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, cap_sink, &cap2, NULL, NULL, true);
         assert(r2.err == PSVM_OK && r2.cond && cap2.calls == 1 && cap2.last_builtin == 0);
         assert(strcmp(cap2.last, "hello") == 0);
     }
@@ -1197,7 +1300,7 @@ int main(void) {
             assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
             emit_cap_t ecap = {0};
             wio.emit = emit_capture; wio.emit_ctx = &ecap;
-            psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+            psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
             assert(r2.err == PSVM_OK);
             assert(ecap.count == 1 && ecap.items[0].cap == 0);
             assert(ecap.items[0].value == cases[i].expect);
@@ -1210,7 +1313,7 @@ int main(void) {
             assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
             emit_cap_t ecap = {0};
             wio.emit = emit_capture; wio.emit_ctx = &ecap;
-            psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+            psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
             assert(r2.err == PSVM_OK && ecap.count == 1 && ecap.items[0].value == 13.0f);
         }
         {
@@ -1219,7 +1322,7 @@ int main(void) {
             assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
             emit_cap_t ecap = {0};
             wio.emit = emit_capture; wio.emit_ctx = &ecap;
-            psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+            psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
             assert(r2.err == PSVM_OK && ecap.count == 1 && ecap.items[0].value == 251.0f);
         }
 
@@ -1230,7 +1333,7 @@ int main(void) {
             assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
             emit_cap_t ecap = {0};
             wio.emit = emit_capture; wio.emit_ctx = &ecap;
-            psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+            psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
             assert(r2.err == PSVM_OK && ecap.count == 1 && ecap.items[0].value == 20.0f);
         }
     }
@@ -1254,14 +1357,14 @@ int main(void) {
         assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
         emit_cap_t ecap = {0};
         wio.emit = emit_capture; wio.emit_ctx = &ecap;
-        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_OK && ecap.count == 1);
         assert(ecap.items[0].value == 1377.0f); /* exact, not 1377.6875 */
 
         uint8_t b3[64]; psvm_prog_t p3;
         size_t l3 = build_w_floor_neg(b3);
         assert(psvm_validate(b3, l3, PSVM_DIALECT_WRAPPERS, 7, 0, &p3) == PSVM_OK);
-        r2 = psvm_run(&p3, NULL, &wio, NULL, NULL, true);
+        r2 = psvm_run(&p3, NULL, &wio, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_TYPE);
     }
 
@@ -1276,17 +1379,17 @@ int main(void) {
         size_t l2 = build_w_load(b2, 0x60 /* LOAD_U8 */, 4); /* last valid index */
         assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
         emit_cap_t ecap = {0}; wio.emit = emit_capture; wio.emit_ctx = &ecap;
-        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_OK && ecap.count == 1 && ecap.items[0].value == 5.0f);
 
         l2 = build_w_load(b2, 0x60, 5); /* == len: PSVM_ERR_REF */
         assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
-        r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_REF);
 
         l2 = build_w_load(b2, 0x60, 6); /* one past len: PSVM_ERR_REF */
         assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
-        r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_REF);
 
         /* A multi-byte accessor whose tail runs past len is also PSVM_ERR_REF
@@ -1296,11 +1399,11 @@ int main(void) {
         l2 = build_w_load(b2, 0x61 /* LOAD_U16LE */, 3);
         assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
         emit_cap_t ecap2 = {0}; wio.emit = emit_capture; wio.emit_ctx = &ecap2;
-        r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_OK && ecap2.count == 1);
         l2 = build_w_load(b2, 0x61, 4);
         assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
-        r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_REF);
     }
 
@@ -1320,7 +1423,7 @@ int main(void) {
         assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
         emit_cap_t ecap = {0};
         wio.emit = emit_capture; wio.emit_ctx = &ecap;
-        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_OK && ecap.count == 1 && ecap.items[0].value == 0x3412);
     }
 
@@ -1333,14 +1436,14 @@ int main(void) {
         assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
         emit_cap_t ecap = {0};
         psvm_wrapper_io_t wio = {0}; wio.emit = emit_capture; wio.emit_ctx = &ecap;
-        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_OK && ecap.count == 0);
 
         l2 = build_w_require(b2, true);
         assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
         emit_cap_t ecap2 = {0};
         wio.emit = emit_capture; wio.emit_ctx = &ecap2;
-        r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_OK && ecap2.count == 2);
         assert(ecap2.items[0].cap == 7 && ecap2.items[0].value == 1.0f);
         assert(ecap2.items[1].cap == 6 && ecap2.items[1].value == 1.0f);
@@ -1377,7 +1480,7 @@ int main(void) {
         assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
         emit_cap_t ecap = {0};
         wio.emit = emit_capture; wio.emit_ctx = &ecap;
-        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, &wio, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_OK && ecap.count == 2);
         assert(ecap.items[0].cap == 0 && ecap.items[0].value == (float)(0x11 ^ 0xFF)); /* plaintext byte */
         assert(ecap.items[1].cap == 1 && ecap.items[1].value == 6.0f); /* new payload_len: 4+2 */
@@ -1385,14 +1488,14 @@ int main(void) {
         /* No aes_ccm callback wired up ("no key available"): PSVM_ERR_REF. */
         psvm_wrapper_io_t wio_nokey = {0};
         wio_nokey.payload.data = payload; wio_nokey.payload.len = 10;
-        r2 = psvm_run(&p2, NULL, &wio_nokey, NULL, NULL, true);
+        r2 = psvm_run(&p2, NULL, &wio_nokey, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_REF);
 
         /* Callback present but reports failure (bad MIC, etc.): PSVM_ERR_REF. */
         psvm_wrapper_io_t wio_fail = {0};
         wio_fail.payload.data = payload; wio_fail.payload.len = 10;
         wio_fail.aes_ccm = failing_aes_ccm;
-        r2 = psvm_run(&p2, NULL, &wio_fail, NULL, NULL, true);
+        r2 = psvm_run(&p2, NULL, &wio_fail, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_REF);
 
         /* Region that does NOT run to the end of the payload: PSVM_ERR_REF
@@ -1402,7 +1505,7 @@ int main(void) {
             uint8_t b3[64]; psvm_prog_t p3;
             size_t l3 = build_w_aes_ccm(b3, 4, 5); /* [4,9) leaves byte 9 unconsumed */
             assert(psvm_validate(b3, l3, PSVM_DIALECT_WRAPPERS, 7, 0, &p3) == PSVM_OK);
-            r2 = psvm_run(&p3, NULL, &wio, NULL, NULL, true);
+            r2 = psvm_run(&p3, NULL, &wio, NULL, NULL, NULL, NULL, true);
             assert(r2.err == PSVM_ERR_REF);
         }
     }
@@ -1457,7 +1560,7 @@ int main(void) {
         psvm_prog_t p2;
         assert(psvm_validate(b2, l2, PSVM_DIALECT_WRAPPERS, 7, 0, &p2) == PSVM_OK);
 
-        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, true);
+        psvm_result_t r2 = psvm_run(&p2, NULL, NULL, NULL, NULL, NULL, NULL, true);
         assert(r2.err == PSVM_ERR_REF);
     }
 
@@ -1486,6 +1589,11 @@ int main(void) {
     test_action_section_after_connect_plan();
     test_action_duplicate_id_rejected();
     test_action_reserved_flag_bits_rejected();
+
+    /* M5b Task 10: CALL_ACTION (0x52), rules dialect action path */
+    test_call_action_sink();
+    test_call_action_null_sink();
+    test_call_action_param_out_of_range_rejected();
 
     printf("test_psvm: all passed\n");
     return 0;

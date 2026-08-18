@@ -52,6 +52,14 @@ static void set_why(char *why, size_t whylen, const char *fmt, const char *arg)
  * evaluation-serialized task, so nothing about sharing one file-scope
  * static changes that safety argument, only halves the static footprint. */
 static registry_t s_reg_snap;
+/* Same sharing argument as s_reg_snap just above, extended to
+ * rules_resolve_action_dev() (M5b Task 10): resolve_plant() and the
+ * plant-kind half of rules_resolve_action_dev() are never simultaneously
+ * live either (both run inside one evaluate_real() call, sequentially --
+ * "when" resolves refs first via a full psvm_run, THEN, only if it fires, a
+ * second psvm_run reaches CALL_ACTION's sink), so one shared
+ * ~1.8KB-at-PLANTS_MAX(16) static buffer covers both instead of two. */
+static plants_table_t s_plants_snap;
 
 /* plant("<name>") kind: name -> plants table entry -> that capability's
  * binding -> registry value, via plants_cap_value() (plants.h), which does
@@ -72,16 +80,17 @@ static bool resolve_plant(const char *name, uint8_t capability, uint8_t field,
      * math, but keeps the parameter so both resolver kinds share one call
      * shape off rules_resolve(). */
     (void)now_uptime_s;
-    /* static: only ever touched from the caller's task (engine task, or a
-     * future rules_test() caller serialized by rules_engine.c's evaluation
-     * mutex -- see rules_engine.c) -- same "big local off a small task
-     * stack" idiom as sampler.c's sample_once(). */
-    static plants_table_t snap;
-    plants_snapshot(&snap);
+    /* s_plants_snap (file scope, see its own comment above): only ever
+     * touched from the caller's task (engine task, or a future
+     * rules_test() caller serialized by rules_engine.c's evaluation mutex
+     * -- see rules_engine.c) -- same "big buffer off a small task stack"
+     * idiom as sampler.c's sample_once(). */
+    plants_table_t *snap = &s_plants_snap;
+    plants_snapshot(snap);
 
     int idx = -1;
     for (int i = 0; i < PLANTS_MAX; i++) {
-        if (snap.p[i].in_use && strcmp(snap.p[i].name, name) == 0) { idx = i; break; }
+        if (snap->p[i].in_use && strcmp(snap->p[i].name, name) == 0) { idx = i; break; }
     }
     if (idx < 0) {
         ref_not_ready(out);
@@ -89,14 +98,14 @@ static bool resolve_plant(const char *name, uint8_t capability, uint8_t field,
         return false;
     }
 
-    if (capability >= CAPABILITY_COUNT || !snap.p[idx].cap_bound[capability]) {
+    if (capability >= CAPABILITY_COUNT || !snap->p[idx].cap_bound[capability]) {
         ref_not_ready(out);
         if (why && whylen) {
             snprintf(why, whylen, "plant \"%s\" has no %s bound", name, rules_cap_name(capability));
         }
         return false;
     }
-    uint8_t plant_id = snap.p[idx].id;
+    uint8_t plant_id = snap->p[idx].id;
 
     data_core_snapshot(&s_reg_snap);
 
@@ -113,31 +122,41 @@ static bool resolve_plant(const char *name, uint8_t capability, uint8_t field,
     return true;
 }
 
-/* device("<id>") kind: id is either a sensor display name (app_config's
- * mac-keyed name store, checked against every live BLE device in the
- * snapshot -- the only kind that store can name) or a device-id string
- * device_id_parse() accepts: the canonical "kind:HEX" form (capability.h
- * Sec.2), or M1's legacy bare "AA:BB:CC:DD:EE:FF" colon-mac literal, which
- * device_id_parse() itself maps onto DEV_KIND_BLE -- exactly what an
- * unmodified M1 device() ref (always BLE, the only kind that existed then)
- * needs to keep resolving unchanged. */
+/* Shared by resolve_device() and rules_resolve_action_dev() (M5b Task 10):
+ * turns a device() ref's/action's `id` string into a device_id_t, trying
+ * the sensor display-name store first (app_config's mac-keyed name store,
+ * checked against every live BLE device in s_reg_snap -- the only kind
+ * that store can name) then falling back to device_id_parse()'s canonical
+ * "kind:HEX" form (capability.h Sec.2) or M1's legacy bare
+ * "AA:BB:CC:DD:EE:FF" colon-mac literal, which device_id_parse() itself
+ * maps onto DEV_KIND_BLE. Caller must have already refreshed s_reg_snap
+ * (data_core_snapshot()) this pass. */
+static bool find_device_id(const char *id, device_id_t *out)
+{
+    char nm[33];
+    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
+        const device_entry_t *e = &s_reg_snap.devices[i];
+        if (!e->in_use || e->id.kind != DEV_KIND_BLE) continue;
+        if (app_config_get_sensor_name(e->id.addr, nm) && strcmp(nm, id) == 0) {
+            *out = e->id;
+            return true;
+        }
+    }
+    return device_id_parse(id, out);
+}
+
+/* device("<id>") kind: id is either a sensor display name or a
+ * device-id string -- see find_device_id()'s own doc comment for the full
+ * two-step lookup -- exactly what an unmodified M1 device() ref (always
+ * BLE, the only kind that existed then) needs to keep resolving
+ * unchanged. */
 static bool resolve_device(const char *id, uint8_t capability, uint8_t field,
                            uint32_t now_uptime_s, psvm_ref_val_t *out, char *why, size_t whylen)
 {
     data_core_snapshot(&s_reg_snap);
 
     device_id_t dev = {0};
-    bool have_dev = false;
-    char nm[33];
-    for (int i = 0; i < REGISTRY_MAX_DEVICES && !have_dev; i++) {
-        const device_entry_t *e = &s_reg_snap.devices[i];
-        if (!e->in_use || e->id.kind != DEV_KIND_BLE) continue;
-        if (app_config_get_sensor_name(e->id.addr, nm) && strcmp(nm, id) == 0) {
-            dev = e->id;
-            have_dev = true;
-        }
-    }
-    if (!have_dev) have_dev = device_id_parse(id, &dev);
+    bool have_dev = find_device_id(id, &dev);
 
     int ridx = have_dev ? registry_find(&s_reg_snap, &dev) : -1;
     if (ridx < 0 || capability >= CAPABILITY_COUNT) {
@@ -191,4 +210,45 @@ bool rules_resolve(const psvm_prog_t *prog, uint16_t ref_idx, psvm_ref_val_t *ou
     } else {
         return resolve_device(name, r.capability, r.field, now_uptime_s, out, why, whylen);
     }
+}
+
+/* CALL_ACTION (0x52, M5b Task 10) name resolution: turns a `then` action's
+ * (kind, name) into the dev_idx actor_request() needs.
+ *
+ * kind 0 (plant): `name` must be a known plant with `action_id` bound in
+ * one of its PLANT_ACTION_SLOTS (Task 2's plants_table_action_slot()) --
+ * that slot's device_id_t is then looked up in the registry, the action
+ * analogue of resolve_plant()'s own capability-binding lookup above.
+ * kind 1 (device): `name` is resolved exactly as resolve_device() does,
+ * via find_device_id().
+ *
+ * Returns -1 on ANY resolution failure -- unknown plant/device, action not
+ * bound on this plant, device never seen -- rather than a distinct error
+ * code or a `why` string: actor_table_check() already treats a negative
+ * dev_idx as ACTOR_REFUSED_UNKNOWN, and actor_request() posts that named
+ * alert itself (Task 10 brief: "do not re-check any guard yourself -- a
+ * rule must be subject to exactly the same door as a manual press"), so
+ * the real sink can always call actor_request() with whatever this
+ * returns, with no separate "not found" branch of its own. */
+int rules_resolve_action_dev(uint8_t kind, const char *name, uint8_t action_id)
+{
+    if (!name) return -1;
+    data_core_snapshot(&s_reg_snap);
+
+    device_id_t dev = {0};
+    if (kind == 0) {
+        plants_table_t *snap = &s_plants_snap;
+        plants_snapshot(snap);
+        int idx = -1;
+        for (int i = 0; i < PLANTS_MAX; i++) {
+            if (snap->p[i].in_use && strcmp(snap->p[i].name, name) == 0) { idx = i; break; }
+        }
+        if (idx < 0) return -1;
+        int slot = plants_table_action_slot(snap, snap->p[idx].id, action_id);
+        if (slot < 0) return -1;
+        dev = snap->p[idx].act_dev[slot];
+    } else {
+        if (!find_device_id(name, &dev)) return -1;
+    }
+    return registry_find(&s_reg_snap, &dev);
 }

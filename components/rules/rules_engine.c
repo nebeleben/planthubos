@@ -35,6 +35,8 @@
 #include "rules_internal.h"
 #include "event_log.h"
 #include "alert.h"
+#include "action.h"
+#include "actor.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -193,6 +195,73 @@ static bool capture_sink(void *ctx, uint8_t builtin, const char *msg)
     return true;
 }
 
+/* CALL_ACTION's (M5b Task 10) actor_request() deadline, an offset from
+ * actor_now_s() (the uptime clock actor_request()'s callers MUST derive
+ * deadline_s from -- actor.h). Same order of magnitude as pending_close.c's
+ * own PENDING_CLOSE_ATTEMPT_TTL (30 s): generous over actor_service()'s
+ * poll cadence (ble_collector.c calls it every decoder-task tick, so a
+ * queued command normally dispatches within a second or two) while still
+ * bounding how stale a rule-fired command can be by the time it actually
+ * reaches the radio. */
+#define ACTOR_RULE_TTL_S 30u
+
+/* Real firing sink for CALL_ACTION: resolves the action's (kind, name) to
+ * a dev_idx (rules_resolve_action_dev(), rules_resolver.c) and calls
+ * actor_request() -- the ONE door onto an actuator (actor.h) -- with
+ * source ACTOR_SRC_RULE, exactly as a manual press (Task 11) or a
+ * scheduled safety close (Task 9) would. Every guard (unknown, parameter
+ * bound, lockout, cooldown, hourly cap) already lives inside
+ * actor_request()/actor_table_check(), and a refusal already posts its own
+ * named alert there (naming which guard refused) -- this function must not
+ * re-check, or second-guess, any of that; an unresolved name simply
+ * becomes dev_idx -1, which actor_table_check() already treats as
+ * ACTOR_REFUSED_UNKNOWN.
+ *
+ * Always returns true regardless of actor_request()'s outcome: a guard
+ * refusal is a fact about the actuator, not a VM error, and must not abort
+ * the rest of this rule's `then` clause (e.g. a notify() after a refused
+ * action must still fire) -- the same reasoning real_sink() above never
+ * fails on either. Shares real_sink_ctx_t: this sink only needs rule_id,
+ * for the diagnostic log line, and evaluate_real()/rules_test() below pass
+ * the SAME ctx instance to both sink and action_sink on one psvm_run()
+ * call. */
+static bool real_action_sink(void *ctx, uint8_t kind, const char *name,
+                             uint8_t action_id, uint16_t param)
+{
+    const real_sink_ctx_t *c = ctx;
+    int dev_idx = rules_resolve_action_dev(kind, name, action_id);
+    bool queued = actor_request(dev_idx, action_id, param, ACTOR_SRC_RULE,
+                                actor_now_s() + ACTOR_RULE_TTL_S);
+    const action_t *a = action_get(action_id);
+    ESP_LOGI(TAG, "rule %u: %s(\"%s\").%s(%u) -> %s", (unsigned)c->rule_id,
+             kind == 0 ? "plant" : "device", name, a ? a->name : "?",
+             (unsigned)param, queued ? "queued" : "refused (see alert)");
+    return true;
+}
+
+/* rules_test()'s capture sink for CALL_ACTION: renders the would-be action
+ * (with its resolved parameter) without calling actor_request() at all --
+ * spec §6's "actions rendered but NOT executed, no state change" applies
+ * exactly as much to an actuator command as to a log/notify. Shares
+ * capture_sink_ctx_t/rules_test_action_t with capture_sink() above: both
+ * write into the SAME acts[]/nacts, so a dry run's action list comes back
+ * in true program order (whichever opcode -- CALL_BUILTIN or CALL_ACTION
+ * -- psvm_run() reaches first appends first), not grouped by kind. */
+static bool capture_action_sink(void *ctx, uint8_t kind, const char *name,
+                                uint8_t action_id, uint16_t param)
+{
+    capture_sink_ctx_t *c = ctx;
+    if (c->acts && c->nacts && *c->nacts < c->cap) {
+        rules_test_action_t *a = &c->acts[*c->nacts];
+        const action_t *ad = action_get(action_id);
+        a->builtin = 0xFF;   /* not a log/notify level -- msg is everything the /test API renders */
+        snprintf(a->msg, sizeof(a->msg), "%s(\"%s\").%s(%u)",
+                kind == 0 ? "plant" : "device", name, ad ? ad->name : "?", (unsigned)param);
+        (*c->nacts)++;
+    }
+    return true;
+}
+
 /* Result of one real evaluation, computed entirely against a SNAPSHOT
  * rule_t (a by-value copy taken under g_rules_mutex before this runs -- see
  * evaluate_all()) rather than a live g_rules[] slot. out->fsm starts as the
@@ -242,7 +311,7 @@ static void evaluate_real(const rule_t *snap, uint32_t now_uptime_s, eval_outcom
         return;
     }
 
-    psvm_result_t cres = psvm_run(&st.prog, s_resolved, NULL, NULL, NULL, false);
+    psvm_result_t cres = psvm_run(&st.prog, s_resolved, NULL, NULL, NULL, NULL, NULL, false);
     if (cres.err != PSVM_OK) {
         out->ready = false;
         out->last_err = cres.err;
@@ -257,7 +326,8 @@ static void evaluate_real(const rule_t *snap, uint32_t now_uptime_s, eval_outcom
     if (!fire) return;
 
     real_sink_ctx_t ctx = { .rule_id = snap->id };
-    psvm_result_t ares = psvm_run(&st.prog, s_resolved, NULL, real_sink, &ctx, true);
+    psvm_result_t ares = psvm_run(&st.prog, s_resolved, NULL,
+                                  real_sink, &ctx, real_action_sink, &ctx, true);
     if (ares.err != PSVM_OK) {
         /* The fire already happened (fsm state above already advanced) --
          * an error partway through the action code (e.g. a step-budget
@@ -523,10 +593,15 @@ int rules_test(uint32_t id, bool *ready, bool *cond, bool *would_fire,
 
     /* Test path never gates on mode/cooldown (spec §3: "the /test endpoint
      * passes run_actions=true when the condition holds"), always through the
-     * capturing sink -- rendered strings only, never event_log/MQTT. */
+     * capturing sinks -- rendered strings only, never event_log/MQTT/
+     * actor_request() (M5b Task 10: capture_action_sink() never enqueues,
+     * following M1's existing real/dry split for log/notify rather than a
+     * second mechanism). Both sinks share cctx and its acts[]/nacts, so the
+     * rendered list comes back in true program order. */
     capture_sink_ctx_t cctx = { .acts = acts, .nacts = nacts, .cap = acts_cap };
     psvm_result_t res = psvm_run(&st.prog, s_resolved, NULL,
-                                 (acts && nacts) ? capture_sink : NULL, &cctx, true);
+                                 (acts && nacts) ? capture_sink : NULL, &cctx,
+                                 (acts && nacts) ? capture_action_sink : NULL, &cctx, true);
     xSemaphoreGive(s_eval_mutex);
 
     if (res.err != PSVM_OK) return ESP_OK;   /* *ready stays false */

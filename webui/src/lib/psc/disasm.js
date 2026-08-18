@@ -125,6 +125,17 @@ export function disassemble(bytecode) {
         pc += 2
         break
       }
+      case OPCODES.CALL_ACTION: {
+        const kind = bytes[codeStart + pc + 1]
+        const nameConstIdx = view.getUint16(codeStart + pc + 2, true)
+        const actionId = bytes[codeStart + pc + 4]
+        const kindName = kind === 0 ? 'plant' : 'device'
+        const nm = consts.consts[nameConstIdx] ? consts.consts[nameConstIdx].value : '?'
+        const actionName = ACTION_NAME_BY_ID[actionId] !== undefined ? ACTION_NAME_BY_ID[actionId] : `action${actionId}`
+        lines.push(`${addr}: CALL_ACTION ${kindName} "${nm}" ${actionName}`)
+        pc += 5
+        break
+      }
       // ---- wrapper dialect (M3 spec section 3) ----
       case OPCODES.LOAD_U8:
       case OPCODES.LOAD_U16LE:

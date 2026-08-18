@@ -118,3 +118,10 @@ bool rules_resolve(const psvm_prog_t *prog, uint16_t ref_idx, psvm_ref_val_t *ou
  * Shared between the resolver's not-ready reasons and rules_test()'s
  * ref_desc rendering. */
 const char *rules_cap_name(uint8_t capability_id);
+
+/* CALL_ACTION (M5b Task 10) name resolution: (kind, name) -> the dev_idx
+ * actor_request() needs, or -1 on any resolution failure. See its own doc
+ * comment in rules_resolver.c for the full contract -- in particular, why
+ * -1 (not a distinct error) is enough for the real sink to just forward
+ * into actor_request() unconditionally. */
+int rules_resolve_action_dev(uint8_t kind, const char *name, uint8_t action_id);

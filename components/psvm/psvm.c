@@ -122,6 +122,8 @@ static psvm_err_t validate_emit_caps(const uint8_t *code, uint16_t code_len, uin
             width = 5; break;
         case 0x50: case 0x51:
             width = 2; break;
+        case 0x52:   /* CALL_ACTION u8 kind, u16 name_const, u8 action_id (M5b Task 10) */
+            width = 5; break;
         case 0x69:
             if ((size_t)pc + 2 > code_len) return PSVM_OK;   /* truncated -- psvm_run() catches it */
             if (code[pc + 1] > caps_max) return PSVM_ERR_REF;
@@ -398,7 +400,9 @@ typedef struct { uint8_t cap; float value; } emit_item_t;
 
 psvm_result_t psvm_run(const psvm_prog_t *p, const psvm_ref_val_t *resolved,
                        const psvm_wrapper_io_t *wio,
-                       psvm_sink_t sink, void *sink_ctx, bool run_actions) {
+                       psvm_sink_t sink, void *sink_ctx,
+                       psvm_action_sink_t action_sink, void *action_sink_ctx,
+                       bool run_actions) {
     psvm_result_t res = {false, PSVM_OK, 0};
     value_t stack[PSVM_STACK];
     int sp = 0;
@@ -584,6 +588,42 @@ psvm_result_t psvm_run(const psvm_prog_t *p, const psvm_ref_val_t *resolved,
             msgbuf[l] = '\0';
             if (sink && !sink(sink_ctx, b, msgbuf)) { res.err = PSVM_ERR_TYPE; goto done; }
             pc = (uint16_t)(pc + 2);
+            break;
+        }
+        case 0x52: { /* CALL_ACTION u8 kind, u16 name_const, u8 action_id
+                      * (M5b Task 10, rules dialect only). Pops the
+                      * parameter as a float; negative, NaN or anything
+                      * above 65535 is PSVM_ERR_TYPE rather than being
+                      * truncated (psvm.h's own doc comment on psvm_run()
+                      * has the full reasoning -- this is the VM's one
+                      * defense against a hand-crafted or buggy blob, since
+                      * the reference compiler only ever emits an
+                      * already-bounded literal here). A NULL action_sink
+                      * is PSVM_ERR_REF, the same shape an unready ref uses:
+                      * a dry-run caller with no real sink wired must fail
+                      * cleanly, not crash. */
+            if ((size_t)pc + 5 > p->code_len) { res.err = PSVM_ERR_BADOP; goto done; }
+            uint8_t kind = p->code[pc + 1];
+            uint16_t name_const = rd_u16(p->code + pc + 2);
+            uint8_t action_id = p->code[pc + 4];
+            if (sp < 1) { res.err = PSVM_ERR_STACK; goto done; }
+            value_t v = stack[--sp];
+            if (v.tag != V_NUM) { res.err = PSVM_ERR_TYPE; goto done; }
+            if (isnan(v.f) || v.f < 0.0f || v.f > 65535.0f) { res.err = PSVM_ERR_TYPE; goto done; }
+            uint16_t param = (uint16_t)v.f;
+            if (name_const >= p->const_count) { res.err = PSVM_ERR_BADOP; goto done; }
+            uint8_t ntag; const char *nstr = NULL; uint16_t nlen = 0;
+            const_entry(p, name_const, &ntag, NULL, &nstr, &nlen);
+            if (ntag != 1) { res.err = PSVM_ERR_BADOP; goto done; }
+            char namebuf[64];
+            if (nlen >= sizeof(namebuf)) nlen = sizeof(namebuf) - 1;
+            memcpy(namebuf, nstr, nlen);
+            namebuf[nlen] = '\0';
+            if (!action_sink) { res.err = PSVM_ERR_REF; goto done; }
+            if (!action_sink(action_sink_ctx, kind, namebuf, action_id, param)) {
+                res.err = PSVM_ERR_TYPE; goto done;
+            }
+            pc = (uint16_t)(pc + 5);
             break;
         }
         case 0x00: { /* HALT_BOOL */
