@@ -308,6 +308,22 @@ void actor_set_device_key(int dev_idx, const uint8_t key[ACTOR_DEVICE_KEY_LEN])
      * a save of guards that have not been restored yet. */
 }
 
+bool actor_device_key(int dev_idx, uint8_t out[ACTOR_DEVICE_KEY_LEN])
+{
+    actor_lock();
+    bool ok = actor_table_device_key(&s_table, dev_idx, out);
+    actor_unlock();
+    return ok;
+}
+
+int actor_find_by_key(const uint8_t key[ACTOR_DEVICE_KEY_LEN])
+{
+    actor_lock();
+    int idx = actor_table_find_by_key(&s_table, key);
+    actor_unlock();
+    return idx;
+}
+
 bool actor_guards_take_dirty(void)
 {
     actor_lock();

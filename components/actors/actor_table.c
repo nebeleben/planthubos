@@ -397,6 +397,23 @@ void actor_table_set_key(actor_table_t *t, int dev_idx,
     if (row) memcpy(row->key, key, ACTOR_DEVICE_KEY_LEN);
 }
 
+bool actor_table_device_key(const actor_table_t *t, int dev_idx,
+                             uint8_t out[ACTOR_DEVICE_KEY_LEN])
+{
+    if (dev_idx < 0 || out == NULL) return false;
+    const actor_device_t *row = find_row_const(t, dev_idx);
+    if (!row || !key_is_set(row->key)) return false;
+    memcpy(out, row->key, ACTOR_DEVICE_KEY_LEN);
+    return true;
+}
+
+int actor_table_find_by_key(const actor_table_t *t, const uint8_t key[ACTOR_DEVICE_KEY_LEN])
+{
+    if (key == NULL || !key_is_set(key)) return -1;
+    const actor_device_t *row = find_row_by_key(t, key);
+    return row ? row->dev_idx : -1;
+}
+
 size_t actor_table_guard_merge(const actor_table_t *t, actor_guard_row_t *rows,
                                 size_t n, size_t cap)
 {

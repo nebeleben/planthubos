@@ -252,6 +252,14 @@ bool     actor_lockout(int dev_idx, bool *out);
  * reboot. Called by whoever declares the device as an actuator. */
 void     actor_set_device_key(int dev_idx, const uint8_t key[ACTOR_DEVICE_KEY_LEN]);
 
+/* actor_table_device_key() / actor_table_find_by_key() under the lock.
+ * actor_find_by_key() returning -1 means "no DECLARED device carries this
+ * identity right now", which is exactly the condition pending_close treats
+ * as DEFERRED -- not an error, and never a licence to act on some other
+ * index. */
+bool     actor_device_key(int dev_idx, uint8_t out[ACTOR_DEVICE_KEY_LEN]);
+int      actor_find_by_key(const uint8_t key[ACTOR_DEVICE_KEY_LEN]);
+
 /* Test-and-clear: has anything the guard file records changed since the
  * last call? Set by actor_configure_guards(), actor_set_lockout(),
  * actor_undeclare() and by every dispatch that charges an activation. */
@@ -403,34 +411,68 @@ void actor_service(void);
                                                        * device that stays
                                                        * unreachable. */
 
+/* THE KEY IS THE DEVICE, NOT ITS REGISTRY INDEX (whole-branch review
+ * follow-up). This record used to carry an `int8_t dev_idx` and persist it.
+ * The registry is RAM-only (data_core.c's `static registry_t s_registry`)
+ * and claims slots in DISCOVERY ORDER, so index N after a reboot is
+ * whichever device happened to advertise Nth -- not the one that was open.
+ * The obligation then replayed against the wrong row and failed one of two
+ * ways: the device at that index has no switch.off, so the record deferred
+ * forever with the valve open and one misleading "unreachable" alert; or
+ * that index held a DIFFERENT actuator that does have switch.off, and the
+ * hub closed the wrong actuator while the real valve stayed open. The
+ * second is a physical action against a device nobody commanded, taken
+ * while the hazard it was meant to end continues.
+ *
+ * So the identity persisted is the device's own (device_id_t bytes,
+ * ACTOR_DEVICE_KEY_LEN -- the same key actor_persist.h uses, deliberately
+ * one mechanism and not two), and it is resolved back to a live index at
+ * the moment it is needed, via actor_find_by_key(). An identity that
+ * resolves to nothing is DEFERRED, which is the state this module already
+ * handles correctly, right down to the once-per-streak
+ * PENDING_CLOSE_STEP_DEFERRED_TIMEOUT alert -- so a device that is gone for
+ * good is still loud rather than silent.
+ *
+ * All-zero is the free-row / not-a-record sentinel, exactly as in
+ * actor_table.h: it is not a device_id_t this hub can address. */
+#define PENDING_CLOSE_KEY_LEN ACTOR_DEVICE_KEY_LEN
+
 typedef struct {
-    int8_t   dev_idx;
-    uint8_t  close_action;
     uint32_t deadline_s;   /* actor_now_s()-scale: when this obligation is
                              * next due to be attempted (NOT re-persisted on
                              * every retry -- see this section's top comment) */
+    uint8_t  key[PENDING_CLOSE_KEY_LEN];
+    uint8_t  close_action;
     uint8_t  retries;
 } pending_close_t;
+/* 16 B, up from the 12 B spec section 8 budgeted when this record carried a
+ * one-byte index instead of a nine-byte identity: 64 B for the whole table
+ * rather than 48. Pinned, because it is a budgeted structure and because a
+ * silent growth here is a silent growth in the file it serialises to. */
+_Static_assert(sizeof(pending_close_t) == 16,
+               "pending_close_t is 16 B once keyed on device identity (spec section 8)");
 
-/* Arms (or re-arms) the obligation to close `dev_idx` via `close_action` at
- * `deadline_s` (actor_now_s()-scale). Re-arming an already-pending device
- * REPLACES its record (one obligation per device: a device that opens
- * again while its previous close is still pending gets the new deadline,
- * not a second row) and resets its retry count to 0 -- a fresh open is a
- * fresh obligation, not a continuation of a stale retry sequence. Writes
- * the persisted file (atomically -- see pending_close.c). A negative
- * dev_idx is a no-op (nothing to arm). Callable ONLY from adv_decoder_task
- * on target (see this section's top comment); host tests call it directly. */
-void   pending_close_arm(int dev_idx, uint8_t close_action, uint32_t deadline_s);
+/* Arms (or re-arms) the obligation to close the device identified by `key`
+ * via `close_action` at `deadline_s` (actor_now_s()-scale). Re-arming an
+ * already-pending device REPLACES its record (one obligation per device: a
+ * device that opens again while its previous close is still pending gets
+ * the new deadline, not a second row) and resets its retry count to 0 -- a
+ * fresh open is a fresh obligation, not a continuation of a stale retry
+ * sequence. Writes the persisted file (atomically -- see pending_close.c).
+ * A NULL or all-zero key is a no-op (nothing identifiable to arm). Callable
+ * ONLY from adv_decoder_task on target (see this section's top comment);
+ * host tests call it directly. */
+void   pending_close_arm(const uint8_t key[PENDING_CLOSE_KEY_LEN],
+                          uint8_t close_action, uint32_t deadline_s);
 
-/* Removes dev_idx's obligation, if any (a safe no-op if none is pending),
- * and rewrites the persisted file -- deleting it entirely once the table is
- * empty, so an unopened hub leaves no stray file behind. The one caller
- * that matters is a CONFIRMED close (pending_close_note_result(), below);
- * calling it for any other reason abandons the obligation without having
- * actually closed anything. Same single-task restriction as
+/* Removes that device's obligation, if any (a safe no-op if none is
+ * pending), and rewrites the persisted file -- deleting it entirely once
+ * the table is empty, so an unopened hub leaves no stray file behind. The
+ * one caller that matters is a CONFIRMED close (pending_close_note_result(),
+ * below); calling it for any other reason abandons the obligation without
+ * having actually closed anything. Same single-task restriction as
  * pending_close_arm(). */
-void   pending_close_clear(int dev_idx);
+void   pending_close_clear(const uint8_t key[PENDING_CLOSE_KEY_LEN]);
 
 /* Finds the earliest-deadline record whose deadline_s <= now_s (ties broken
  * by table order) and copies it into *out, WITHOUT removing it -- the
@@ -441,12 +483,13 @@ void   pending_close_clear(int dev_idx);
 int    pending_close_due(uint32_t now_s, pending_close_t *out);
 
 /* The pure retry-counting and exhaustion POLICY (fix round 1, finding 6):
- * given that `dev_idx` was JUST found due by pending_close_due(), and
- * whether the caller could resolve it as a currently-declared actuator
- * (`device_known` -- see actor_action_flags()), decides what happens next
- * and mutates the record accordingly. Never touches the file.
+ * given that the record for `key` was JUST found due by
+ * pending_close_due(), and whether the caller could resolve that identity
+ * to a currently-declared actuator (`device_known` -- actor_find_by_key()
+ * followed by actor_action_flags()), decides what happens next and mutates
+ * the record accordingly. Never touches the file.
  *
- *   PENDING_CLOSE_STEP_NONE      -- dev_idx has no pending record (should
+ *   PENDING_CLOSE_STEP_NONE      -- `key` has no pending record (should
  *                                    not happen right after due() found
  *                                    it, but defensive). *out untouched.
  *
@@ -541,12 +584,13 @@ typedef enum {
     PENDING_CLOSE_STEP_REQUEST,
     PENDING_CLOSE_STEP_EXHAUSTED,
 } pending_close_step_t;
-pending_close_step_t pending_close_step(int dev_idx, uint32_t now_s, bool device_known,
+pending_close_step_t pending_close_step(const uint8_t key[PENDING_CLOSE_KEY_LEN],
+                                         uint32_t now_s, bool device_known,
                                          pending_close_t *out);
 
 /* On boot, every surviving record is due immediately, whatever deadline it
  * recorded -- the hub cannot know how long it was off. True for any record
- * with dev_idx >= 0 (a free/invalid slot, dev_idx < 0, is never boot-due). */
+ * carrying a key (a free/invalid slot, all-zero key, is never boot-due). */
 bool   pending_close_is_boot_due(const pending_close_t *r);
 
 /* Populates the RAM table from `recs` (as read from the persisted file,
@@ -618,8 +662,18 @@ bool   pending_close_needed(uint8_t action_id, uint8_t flags);
 bool   pending_close_arm_on_dispatch(actor_source_t source, uint8_t action_id,
                                      uint8_t flags);
 
-/* On-disk format: `{ u8 fmt=1; u8 count; u16 crc }` followed by `count`
- * fixed 7-byte records (dev_idx, close_action, deadline_s LE32, retries).
+/* On-disk format: `{ u8 fmt=2; u8 count; u16 crc }` followed by `count`
+ * fixed 15-byte records (key[9], close_action, deadline_s LE32, retries).
+ *
+ * FORMAT 2, and format 1 is DISCARDED rather than reinterpreted. Format 1's
+ * record began with an `int8_t dev_idx`; reading those bytes as the head of
+ * a device key is exactly the class of mistake this re-keying exists to
+ * prevent, and the cost of discarding is at most one stale obligation on
+ * the single upgrade boot -- against a wrong close, which is a physical
+ * action on a device nobody commanded. pending_close_init() deletes the
+ * unreadable file after logging it, so the warning does not repeat forever.
+ * A record whose key is the all-zero sentinel is refused too: nothing could
+ * ever resolve it.
  * pending_close_serialize() returns the number of BYTES written into `buf`
  * (0 on any failure: `n` too large to fit `cap`, or more than 255 records --
  * count is one wire byte -- writes NOTHING rather than a truncated file).
@@ -676,4 +730,5 @@ void   pending_close_service(void);
  * alone here -- the obligation stays pending and pending_close_service()'s
  * own retry/backoff picks it up on the next pass, with no separate
  * failure path to keep in sync. */
-void   pending_close_note_result(int dev_idx, bool ok, bool confirmed);
+void   pending_close_note_result(const uint8_t key[PENDING_CLOSE_KEY_LEN],
+                                  bool ok, bool confirmed);

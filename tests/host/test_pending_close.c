@@ -13,6 +13,43 @@
 #include <string.h>
 
 /* ---------------------------------------------------------------------
+ * Whole-branch review follow-up: records are keyed on the DEVICE's stable
+ * identity (device_id_t bytes), never on its registry index -- the registry
+ * is RAM-only and assigns indices in discovery order, so index N after a
+ * reboot is whichever device advertised Nth. KEY(n) fabricates distinct,
+ * realistically shaped identities (kind 1 = BLE, then a MAC); the tests
+ * below use them exactly where they used to pass a bare index, so the
+ * pre-existing coverage is preserved rather than rewritten.
+ * --------------------------------------------------------------------- */
+static uint8_t g_keys[128][PENDING_CLOSE_KEY_LEN];
+static const uint8_t *KEY(unsigned n) {
+    assert(n < 128);   /* byte 6 is 0xA0 + n, injective over this range */
+    g_keys[n][0] = 1;                      /* DEV_KIND_BLE */
+    g_keys[n][1] = 0xD0; g_keys[n][2] = 0xCF; g_keys[n][3] = 0x13;
+    g_keys[n][4] = 0xE5; g_keys[n][5] = 0xB9;
+    g_keys[n][6] = (uint8_t)(0xA0 + n);    /* the only differing byte */
+    g_keys[n][7] = 0; g_keys[n][8] = 0;
+    return g_keys[n];
+}
+static const uint8_t ZERO_KEY[PENDING_CLOSE_KEY_LEN] = { 0 };
+
+/* `.dev_idx = N` in a record initialiser becomes `.key` set from KEY(N).
+ * A small helper keeps the tests readable. */
+static pending_close_t REC(unsigned n, uint8_t close_action,
+                            uint32_t deadline_s, uint8_t retries) {
+    pending_close_t r;
+    memset(&r, 0, sizeof r);
+    memcpy(r.key, KEY(n), PENDING_CLOSE_KEY_LEN);
+    r.close_action = close_action;
+    r.deadline_s = deadline_s;
+    r.retries = retries;
+    return r;
+}
+static bool REC_IS(const pending_close_t *r, unsigned n) {
+    return memcmp(r->key, KEY(n), PENDING_CLOSE_KEY_LEN) == 0;
+}
+
+/* ---------------------------------------------------------------------
  * Brief's tests, verbatim.
  * --------------------------------------------------------------------- */
 
@@ -20,21 +57,21 @@
  * a reboot and an actuator left open. */
 static void test_round_trip(void) {
     pending_close_t in[2] = {
-        { .dev_idx = 1, .close_action = ACT_SWITCH_OFF, .deadline_s = 4242, .retries = 0 },
-        { .dev_idx = 3, .close_action = ACT_SWITCH_OFF, .deadline_s = 99,   .retries = 2 },
+        REC(1, ACT_SWITCH_OFF, 4242, 0),
+        REC(3, ACT_SWITCH_OFF, 99, 2),
     };
     uint8_t buf[64];
     size_t n = pending_close_serialize(in, 2, buf, sizeof buf);
     pending_close_t out[4];
     assert(pending_close_deserialize(buf, n, out, 4) == 2);
-    assert(out[0].dev_idx == 1 && out[0].deadline_s == 4242);
+    assert(REC_IS(&out[0], 1) && out[0].deadline_s == 4242);
     assert(out[1].retries == 2);
 }
 
 /* A truncated or corrupt file must yield NOTHING rather than a plausible
  * wrong close -- closing a device we were never told about is its own bug. */
 static void test_truncated_file_yields_nothing(void) {
-    pending_close_t in = { .dev_idx = 1, .close_action = ACT_SWITCH_OFF, .deadline_s = 10 };
+    pending_close_t in = REC(1, ACT_SWITCH_OFF, 10, 0);
     uint8_t buf[64];
     size_t n = pending_close_serialize(&in, 1, buf, sizeof buf);
     pending_close_t out[4];
@@ -47,7 +84,7 @@ static void test_truncated_file_yields_nothing(void) {
 static void test_all_due_after_boot(void) {
     pending_close_t out[4];
     uint8_t buf[64];
-    pending_close_t in = { .dev_idx = 1, .close_action = ACT_SWITCH_OFF, .deadline_s = 999999 };
+    pending_close_t in = REC(1, ACT_SWITCH_OFF, 999999, 0);
     size_t n = pending_close_serialize(&in, 1, buf, sizeof buf);
     assert(pending_close_deserialize(buf, n, out, 4) == 1);
     assert(pending_close_is_boot_due(&out[0]));
@@ -67,22 +104,167 @@ static void test_serialize_zero_records(void) {
 }
 
 static void test_serialize_buffer_too_small_writes_nothing(void) {
-    pending_close_t in = { .dev_idx = 1, .close_action = ACT_SWITCH_OFF, .deadline_s = 10 };
-    uint8_t buf[4]; /* header alone; no room for one 7-byte record */
+    pending_close_t in = REC(1, ACT_SWITCH_OFF, 10, 0);
+    uint8_t buf[4]; /* header alone; no room for one 15-byte record */
     assert(pending_close_serialize(&in, 1, buf, sizeof buf) == 0);
 }
 
 static void test_deserialize_wrong_fmt_yields_nothing(void) {
-    pending_close_t in = { .dev_idx = 1, .close_action = ACT_SWITCH_OFF, .deadline_s = 10 };
+    pending_close_t in = REC(1, ACT_SWITCH_OFF, 10, 0);
     uint8_t buf[64];
     size_t n = pending_close_serialize(&in, 1, buf, sizeof buf);
-    buf[0] = 2; /* an fmt this reader has never written */
+    buf[0] = 9; /* an fmt this reader has never written */
     pending_close_t out[4];
     assert(pending_close_deserialize(buf, n, out, 4) == 0);
 }
 
+/* Whole-branch review follow-up: a FORMAT 1 file -- the shape this firmware
+ * itself wrote until the re-keying -- must be discarded, not reinterpreted.
+ * Its 7-byte record began with an int8_t registry index; read as the head of
+ * a device key that is a wrong close waiting to happen, and the cost of
+ * discarding is one stale obligation on a single upgrade boot.
+ *
+ * Built here as literal bytes rather than through any current helper, so it
+ * stays a fixture of the OLD format even as the current one moves on. */
+static void test_format_1_file_is_discarded_not_reinterpreted(void) {
+    /* { fmt=1, count=1, crc } + { dev_idx=1, close_action=1, deadline LE32, retries=0 } */
+    uint8_t old_file[4 + 7] = {
+        1, 1, 0x00, 0x00,
+        0x01, ACT_SWITCH_OFF, 0x0A, 0x00, 0x00, 0x00, 0x00,
+    };
+    /* Give it a crc that is genuinely correct for its own format, so the
+     * rejection is proved to come from the FORMAT byte and not from a
+     * checksum that happened to fail. */
+    uint16_t crc = 0xFFFFu;
+    for (size_t i = 1; i < sizeof old_file; i++) {
+        if (i == 2 || i == 3) continue;
+        crc ^= (uint16_t)((uint16_t)old_file[i] << 8);
+        for (int b = 0; b < 8; b++)
+            crc = (uint16_t)((crc & 0x8000u) ? ((uint16_t)(crc << 1) ^ 0x1021u)
+                                              : (uint16_t)(crc << 1));
+    }
+    old_file[2] = (uint8_t)(crc & 0xFFu);
+    old_file[3] = (uint8_t)(crc >> 8);
+
+    pending_close_t out[4];
+    assert(pending_close_deserialize(old_file, sizeof old_file, out, 4) == 0);
+
+    /* And nothing of it reaches the table by any other route. */
+    pending_close_init();
+    pending_close_boot_load(out, 0);
+    assert(pending_close_active_count() == 0);
+}
+
+/* A record whose identity is the all-zero sentinel could never be resolved
+ * back to a device, so it is a corrupt row, not an obligation. */
+static void test_deserialize_keyless_record_yields_nothing(void) {
+    pending_close_t in;
+    memset(&in, 0, sizeof in);
+    in.close_action = ACT_SWITCH_OFF;
+    in.deadline_s = 10;
+    uint8_t buf[64];
+    size_t n = pending_close_serialize(&in, 1, buf, sizeof buf);
+    assert(n > 0);
+    pending_close_t out[4];
+    assert(pending_close_deserialize(buf, n, out, 4) == 0);
+}
+
+/* An identity is only ever matched WHOLE: two devices differing in a single
+ * byte must never share a record. */
+static void test_two_similar_keys_are_distinct_records(void) {
+    pending_close_init();
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 100);
+    pending_close_arm(KEY(2), ACT_SWITCH_OFF, 200);
+    assert(pending_close_active_count() == 2);
+
+    pending_close_clear(KEY(1));
+    assert(pending_close_active_count() == 1);
+    pending_close_t out;
+    assert(pending_close_due(1000, &out) == 1);
+    assert(REC_IS(&out, 2));
+
+    /* An identity never armed clears nothing, and a NULL/all-zero one is a
+     * safe no-op rather than a wildcard. */
+    pending_close_clear(KEY(5));
+    pending_close_clear(ZERO_KEY);
+    pending_close_clear(NULL);
+    assert(pending_close_active_count() == 1);
+}
+
+/* The reboot the whole re-keying exists for: a record is saved, the hub
+ * restarts, and the device comes back at a DIFFERENT registry index. The
+ * record must still be the same obligation -- and while the device has not
+ * been seen at all, it must defer rather than resolve to anything. */
+static void test_reboot_device_reappears_at_a_different_index(void) {
+    pending_close_init();
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 100);
+
+    pending_close_t snap[PENDING_CLOSE_MAX];
+    size_t n = pending_close_persist_snapshot(snap, PENDING_CLOSE_MAX);
+    assert(n == 1);
+    uint8_t buf[64];
+    size_t len = pending_close_serialize(snap, n, buf, sizeof buf);
+    assert(len > 0);
+
+    /* ---- reboot ---- */
+    pending_close_t restored[PENDING_CLOSE_MAX];
+    assert(pending_close_deserialize(buf, len, restored, PENDING_CLOSE_MAX) == 1);
+    assert(REC_IS(&restored[0], 1));   /* the IDENTITY survived, not an index */
+
+    pending_close_init();
+    pending_close_boot_load(restored, 1);
+
+    pending_close_t out;
+    assert(pending_close_due(0, &out) == 1);
+
+    /* The device is not in the registry yet -- nothing resolves it, so the
+     * caller passes device_known = false and the record DEFERS. It must not
+     * consume a retry, and above all it must not be attempted against
+     * whatever else exists. */
+    assert(pending_close_step(KEY(1), 0, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+    assert(out.retries == 0);
+    assert(pending_close_active_count() == 1);
+
+    /* It advertises later and is declared -- at index 0 this boot rather
+     * than whatever it was before, which the record never recorded and so
+     * cannot get wrong. The caller resolves it, and the obligation
+     * proceeds. */
+    uint32_t now = out.deadline_s;
+    assert(pending_close_due(now, &out) == 1);
+    assert(pending_close_step(KEY(1), now, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+    assert(out.retries == 1);
+    assert(REC_IS(&out, 1));
+
+    /* The close is confirmed and the obligation ends -- cleared by
+     * identity, which is what pending_close_note_result() passes. */
+    pending_close_clear(KEY(1));
+    assert(pending_close_active_count() == 0);
+}
+
+/* A device that never comes back must still break the silence exactly once,
+ * keyed the new way -- the DEFERRED_TIMEOUT path is what stops an
+ * unresolvable identity from being quietly forgotten. */
+static void test_unresolvable_identity_still_reaches_the_deferred_timeout(void) {
+    pending_close_init();
+    pending_close_t restored[1] = { REC(4, ACT_SWITCH_OFF, 0, 0) };
+    pending_close_boot_load(restored, 1);
+
+    uint32_t now = 0;
+    pending_close_t out;
+    uint32_t threshold = PENDING_CLOSE_DEFERRED_ALERT_S / PENDING_CLOSE_UNKNOWN_RECHECK_S;
+    for (uint32_t i = 0; i + 1 < threshold; i++) {
+        assert(pending_close_due(now, &out) == 1);
+        assert(pending_close_step(KEY(4), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        now = out.deadline_s;
+    }
+    assert(pending_close_due(now, &out) == 1);
+    assert(pending_close_step(KEY(4), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED_TIMEOUT);
+    assert(out.retries == 0);
+    assert(pending_close_active_count() == 1);
+}
+
 static void test_deserialize_bad_crc_yields_nothing(void) {
-    pending_close_t in = { .dev_idx = 1, .close_action = ACT_SWITCH_OFF, .deadline_s = 10 };
+    pending_close_t in = REC(1, ACT_SWITCH_OFF, 10, 0);
     uint8_t buf[64];
     size_t n = pending_close_serialize(&in, 1, buf, sizeof buf);
     buf[n - 1] ^= 0xFFu; /* flip a bit inside the last record's byte */
@@ -92,8 +274,8 @@ static void test_deserialize_bad_crc_yields_nothing(void) {
 
 static void test_deserialize_cap_too_small_yields_nothing(void) {
     pending_close_t in[2] = {
-        { .dev_idx = 1, .close_action = ACT_SWITCH_OFF, .deadline_s = 10 },
-        { .dev_idx = 2, .close_action = ACT_SWITCH_OFF, .deadline_s = 20 },
+        REC(1, ACT_SWITCH_OFF, 10, 0),
+        REC(2, ACT_SWITCH_OFF, 20, 0),
     };
     uint8_t buf[64];
     size_t n = pending_close_serialize(in, 2, buf, sizeof buf);
@@ -105,7 +287,7 @@ static void test_deserialize_cap_too_small_yields_nothing(void) {
 }
 
 static void test_deserialize_trailing_garbage_yields_nothing(void) {
-    pending_close_t in = { .dev_idx = 1, .close_action = ACT_SWITCH_OFF, .deadline_s = 10 };
+    pending_close_t in = REC(1, ACT_SWITCH_OFF, 10, 0);
     uint8_t buf[64];
     size_t n = pending_close_serialize(&in, 1, buf, sizeof buf);
     buf[n] = 0xAA; /* one byte past the declared record -- not truncation */
@@ -121,18 +303,18 @@ static void test_deserialize_trailing_garbage_yields_nothing(void) {
 
 static void test_arm_then_due(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 100);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 100);
     pending_close_t out;
     assert(pending_close_due(50, &out) == 0);   /* not yet */
     assert(pending_close_due(100, &out) == 1);  /* inclusive boundary */
-    assert(out.dev_idx == 1 && out.close_action == ACT_SWITCH_OFF && out.retries == 0);
+    assert(REC_IS(&out, 1) && out.close_action == ACT_SWITCH_OFF && out.retries == 0);
     assert(pending_close_due(200, &out) == 1);  /* still due once past deadline */
 }
 
 static void test_clear_removes(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 100);
-    pending_close_clear(1);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 100);
+    pending_close_clear(KEY(1));
     pending_close_t out;
     assert(pending_close_due(1000, &out) == 0);
     assert(pending_close_active_count() == 0);
@@ -140,33 +322,33 @@ static void test_clear_removes(void) {
 
 static void test_clear_unknown_device_is_a_safe_no_op(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 100);
-    pending_close_clear(2); /* never armed */
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 100);
+    pending_close_clear(KEY(2)); /* never armed */
     assert(pending_close_active_count() == 1);
 }
 
 static void test_two_devices_independent(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 100);
-    pending_close_arm(2, ACT_SWITCH_OFF, 200);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 100);
+    pending_close_arm(KEY(2), ACT_SWITCH_OFF, 200);
     assert(pending_close_active_count() == 2);
 
-    pending_close_clear(1);
+    pending_close_clear(KEY(1));
     assert(pending_close_active_count() == 1);
 
     pending_close_t out;
     /* Only device 2 can still be due; device 1's obligation is gone. */
     assert(pending_close_due(1000, &out) == 1);
-    assert(out.dev_idx == 2);
+    assert(REC_IS(&out, 2));
 }
 
 static void test_due_picks_earliest_when_multiple_due(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 200);
-    pending_close_arm(2, ACT_SWITCH_OFF, 100);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 200);
+    pending_close_arm(KEY(2), ACT_SWITCH_OFF, 100);
     pending_close_t out;
     assert(pending_close_due(1000, &out) == 1);
-    assert(out.dev_idx == 2); /* the earlier deadline, not arrival order */
+    assert(REC_IS(&out, 2)); /* the earlier deadline, not arrival order */
 }
 
 /* A device that opens again while its close is already pending must have
@@ -174,12 +356,12 @@ static void test_due_picks_earliest_when_multiple_due(void) {
  * retry count a previous, unrelated attempt had accumulated. */
 static void test_rearm_replaces_and_resets_retries(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 100);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 100);
     pending_close_t out;
-    assert(pending_close_step(1, 100, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+    assert(pending_close_step(KEY(1), 100, true, &out) == PENDING_CLOSE_STEP_REQUEST);
     assert(pending_close_due(100, &out) == 0); /* pushed into the future by step() */
 
-    pending_close_arm(1, ACT_SWITCH_OFF, 500); /* device opened again */
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 500); /* device opened again */
     assert(pending_close_active_count() == 1); /* still one row, not two */
     assert(pending_close_due(500, &out) == 1);
     assert(out.deadline_s == 500 && out.retries == 0);
@@ -191,18 +373,18 @@ static void test_rearm_replaces_and_resets_retries(void) {
 
 static void test_step_known_device_backs_off(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 100);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 100);
     pending_close_t out;
     assert(pending_close_due(100, &out) == 1);
 
-    assert(pending_close_step(1, 100, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+    assert(pending_close_step(KEY(1), 100, true, &out) == PENDING_CLOSE_STEP_REQUEST);
     assert(out.retries == 1);
     assert(pending_close_due(100, &out) == 0); /* rescheduled forward */
     assert(pending_close_due(1000, &out) == 1);
     uint32_t first_deadline = out.deadline_s;
     assert(first_deadline > 100);
 
-    assert(pending_close_step(1, first_deadline, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+    assert(pending_close_step(KEY(1), first_deadline, true, &out) == PENDING_CLOSE_STEP_REQUEST);
     assert(out.retries == 2);
     assert(pending_close_due(first_deadline, &out) == 0);
     assert(pending_close_due(100000, &out) == 1);
@@ -213,11 +395,11 @@ static void test_step_known_device_backs_off(void) {
  * hub hasn't rediscovered yet must not spend the retry budget. */
 static void test_step_unknown_device_does_not_consume_retry(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 100);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 100);
     pending_close_t out;
     assert(pending_close_due(100, &out) == 1);
 
-    assert(pending_close_step(1, 100, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+    assert(pending_close_step(KEY(1), 100, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
     assert(out.retries == 0); /* NOT spent */
     assert(pending_close_due(100, &out) == 0); /* rescheduled a short delay ahead */
     assert(pending_close_due(100 + PENDING_CLOSE_UNKNOWN_RECHECK_S, &out) == 1);
@@ -229,7 +411,7 @@ static void test_step_unknown_device_does_not_consume_retry(void) {
     uint32_t now = 100 + PENDING_CLOSE_UNKNOWN_RECHECK_S;
     for (int i = 0; i < 4 * PENDING_CLOSE_MAX_RETRIES; i++) {
         assert(pending_close_due(now, &out) == 1);
-        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        assert(pending_close_step(KEY(1), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
         assert(out.retries == 0);
         now = out.deadline_s;
     }
@@ -240,13 +422,13 @@ static void test_step_unknown_device_does_not_consume_retry(void) {
  * pass that issues that attempt, whose outcome is not yet known. */
 static void test_step_exhaustion_follows_final_backoff_not_synchronous(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 0);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 0);
     uint32_t now = 0;
     pending_close_t out;
 
     for (int i = 0; i < PENDING_CLOSE_MAX_RETRIES; i++) {
         assert(pending_close_due(now, &out) == 1);
-        pending_close_step_t st = pending_close_step(1, now, true, &out);
+        pending_close_step_t st = pending_close_step(KEY(1), now, true, &out);
         /* Every one of the MAX_RETRIES real attempts is a REQUEST, never
          * EXHAUSTED -- in particular the LAST one: the alert must not fire
          * in the same call that just launched the final attempt. */
@@ -259,7 +441,7 @@ static void test_step_exhaustion_follows_final_backoff_not_synchronous(void) {
      * record still present (so that attempt did not succeed) -- is
      * exhaustion declared. */
     assert(pending_close_due(now, &out) == 1);
-    assert(pending_close_step(1, now, true, &out) == PENDING_CLOSE_STEP_EXHAUSTED);
+    assert(pending_close_step(KEY(1), now, true, &out) == PENDING_CLOSE_STEP_EXHAUSTED);
     assert(out.retries == PENDING_CLOSE_MAX_RETRIES);
 
     /* Given up for this boot: never due again... */
@@ -278,21 +460,21 @@ static void test_step_exhaustion_follows_final_backoff_not_synchronous(void) {
  * -> a fresh boot's table -- is covered by one test. */
 static void test_persist_snapshot_zeroes_retries_of_exhausted_record(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 0);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 0);
     uint32_t now = 0;
     pending_close_t out;
     for (int i = 0; i < PENDING_CLOSE_MAX_RETRIES; i++) {
         assert(pending_close_due(now, &out) == 1);
-        assert(pending_close_step(1, now, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+        assert(pending_close_step(KEY(1), now, true, &out) == PENDING_CLOSE_STEP_REQUEST);
         now = out.deadline_s;
     }
     assert(pending_close_due(now, &out) == 1);
-    assert(pending_close_step(1, now, true, &out) == PENDING_CLOSE_STEP_EXHAUSTED);
+    assert(pending_close_step(KEY(1), now, true, &out) == PENDING_CLOSE_STEP_EXHAUSTED);
     assert(out.retries == PENDING_CLOSE_MAX_RETRIES); /* the LIVE row really is exhausted */
 
     pending_close_t snap[PENDING_CLOSE_MAX];
     assert(pending_close_persist_snapshot(snap, PENDING_CLOSE_MAX) == 1);
-    assert(snap[0].dev_idx == 1 && snap[0].retries == 0); /* what disk gets: full budget */
+    assert(REC_IS(&snap[0], 1) && snap[0].retries == 0); /* what disk gets: full budget */
 
     /* The full round trip: serialize the snapshot (not the live row),
      * deserialize it back, boot-load it, and confirm the RESTORED record
@@ -306,16 +488,16 @@ static void test_persist_snapshot_zeroes_retries_of_exhausted_record(void) {
     pending_close_init(); /* fresh boot */
     pending_close_boot_load(restored, 1);
     assert(pending_close_due(0, &out) == 1);
-    assert(out.dev_idx == 1 && out.retries == 0);
+    assert(REC_IS(&out, 1) && out.retries == 0);
     /* And it can genuinely retry again -- not re-declared EXHAUSTED on the
      * very first check of the new boot. */
-    assert(pending_close_step(1, 0, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+    assert(pending_close_step(KEY(1), 0, true, &out) == PENDING_CLOSE_STEP_REQUEST);
 }
 
 static void test_step_no_record_returns_none(void) {
     pending_close_init();
     pending_close_t out;
-    assert(pending_close_step(42, 0, true, &out) == PENDING_CLOSE_STEP_NONE);
+    assert(pending_close_step(KEY(42), 0, true, &out) == PENDING_CLOSE_STEP_NONE);
 }
 
 /* Fix round 2: fix round 1's own combination of rulings -- never spend the
@@ -326,7 +508,7 @@ static void test_step_no_record_returns_none(void) {
  * exhausting. */
 static void test_step_deferred_timeout_alerts_once_keeps_obligation_never_exhausts(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 100);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 100);
     uint32_t now = 100;
     pending_close_t out;
     uint32_t threshold = PENDING_CLOSE_DEFERRED_ALERT_S / PENDING_CLOSE_UNKNOWN_RECHECK_S;
@@ -334,14 +516,14 @@ static void test_step_deferred_timeout_alerts_once_keeps_obligation_never_exhaus
     /* Every check before the threshold is ordinary DEFERRED. */
     for (uint32_t i = 0; i + 1 < threshold; i++) {
         assert(pending_close_due(now, &out) == 1);
-        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        assert(pending_close_step(KEY(1), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
         assert(out.retries == 0);
         now = out.deadline_s;
     }
 
     /* The threshold-th consecutive DEFERRED fires the alert exactly once. */
     assert(pending_close_due(now, &out) == 1);
-    assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED_TIMEOUT);
+    assert(pending_close_step(KEY(1), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED_TIMEOUT);
     assert(out.retries == 0); /* still never spent */
     now = out.deadline_s;
 
@@ -350,7 +532,7 @@ static void test_step_deferred_timeout_alerts_once_keeps_obligation_never_exhaus
      * (an 8-entry alert ring would churn under one). */
     for (int i = 0; i < 50; i++) {
         assert(pending_close_due(now, &out) == 1);
-        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        assert(pending_close_step(KEY(1), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
         assert(out.retries == 0);
         now = out.deadline_s;
     }
@@ -358,7 +540,7 @@ static void test_step_deferred_timeout_alerts_once_keeps_obligation_never_exhaus
     /* Still one obligation, still due, still never exhausted or cleared. */
     assert(pending_close_active_count() == 1);
     assert(pending_close_due(now, &out) == 1);
-    assert(out.dev_idx == 1 && out.retries == 0);
+    assert(REC_IS(&out, 1) && out.retries == 0);
 }
 
 /* The streak (and its one-shot latch) must be a property of the CURRENT
@@ -366,14 +548,14 @@ static void test_step_deferred_timeout_alerts_once_keeps_obligation_never_exhaus
  * happens, a later unreachable run must be able to alert again. */
 static void test_step_deferred_timeout_resets_when_device_becomes_known(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 0);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 0);
     uint32_t now = 0;
     pending_close_t out;
     uint32_t threshold = PENDING_CLOSE_DEFERRED_ALERT_S / PENDING_CLOSE_UNKNOWN_RECHECK_S;
 
     for (uint32_t i = 0; i + 1 < threshold; i++) {
         assert(pending_close_due(now, &out) == 1);
-        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        assert(pending_close_step(KEY(1), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
         now = out.deadline_s;
     }
 
@@ -381,7 +563,7 @@ static void test_step_deferred_timeout_resets_when_device_becomes_known(void) {
      * real attempt, which resets the streak (pending_close_step()'s own
      * doc comment on PENDING_CLOSE_STEP_REQUEST). */
     assert(pending_close_due(now, &out) == 1);
-    assert(pending_close_step(1, now, true, &out) == PENDING_CLOSE_STEP_REQUEST);
+    assert(pending_close_step(KEY(1), now, true, &out) == PENDING_CLOSE_STEP_REQUEST);
     now = out.deadline_s;
 
     /* If it goes unreachable again afterwards, the FULL threshold must be
@@ -389,11 +571,11 @@ static void test_step_deferred_timeout_resets_when_device_becomes_known(void) {
      * merely "the same countdown, delayed by one". */
     for (uint32_t i = 0; i + 1 < threshold; i++) {
         assert(pending_close_due(now, &out) == 1);
-        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        assert(pending_close_step(KEY(1), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
         now = out.deadline_s;
     }
     assert(pending_close_due(now, &out) == 1);
-    assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED_TIMEOUT);
+    assert(pending_close_step(KEY(1), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED_TIMEOUT);
 }
 
 /* A device that reopens (a fresh arm) gets a fresh streak too -- the same
@@ -401,24 +583,24 @@ static void test_step_deferred_timeout_resets_when_device_becomes_known(void) {
  * already pins for `retries`. */
 static void test_step_deferred_timeout_resets_on_rearm(void) {
     pending_close_init();
-    pending_close_arm(1, ACT_SWITCH_OFF, 0);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, 0);
     uint32_t now = 0;
     pending_close_t out;
     uint32_t threshold = PENDING_CLOSE_DEFERRED_ALERT_S / PENDING_CLOSE_UNKNOWN_RECHECK_S;
 
     for (uint32_t i = 0; i + 1 < threshold; i++) {
         assert(pending_close_due(now, &out) == 1);
-        assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+        assert(pending_close_step(KEY(1), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
         now = out.deadline_s;
     }
     assert(pending_close_due(now, &out) == 1);
-    assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED_TIMEOUT);
+    assert(pending_close_step(KEY(1), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED_TIMEOUT);
     now = out.deadline_s;
 
     /* Device opens again: a brand new obligation. */
-    pending_close_arm(1, ACT_SWITCH_OFF, now);
+    pending_close_arm(KEY(1), ACT_SWITCH_OFF, now);
     assert(pending_close_due(now, &out) == 1);
-    assert(pending_close_step(1, now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
+    assert(pending_close_step(KEY(1), now, false, &out) == PENDING_CLOSE_STEP_DEFERRED);
 }
 
 /* ---------------------------------------------------------------------
@@ -484,32 +666,35 @@ static void test_arm_on_dispatch_false_for_parameterless_or_unknown(void) {
 static void test_boot_load_ignores_stored_deadline(void) {
     pending_close_init();
     pending_close_t recs[1] = {
-        { .dev_idx = 1, .close_action = ACT_SWITCH_OFF, .deadline_s = 999999, .retries = 3 },
+        REC(1, ACT_SWITCH_OFF, 999999, 3),
     };
     pending_close_boot_load(recs, 1);
     pending_close_t out;
     /* Due at uptime 0, not 999999 -- exactly what pending_close_is_boot_due()
      * pins in isolation; this proves boot_load() actually uses it. */
     assert(pending_close_due(0, &out) == 1);
-    assert(out.dev_idx == 1 && out.retries == 3);
+    assert(REC_IS(&out, 1) && out.retries == 3);
 }
 
 static void test_boot_load_skips_invalid_records(void) {
     pending_close_init();
-    pending_close_t recs[1] = { { .dev_idx = -1, .close_action = 0, .deadline_s = 0, .retries = 0 } };
+    pending_close_t recs[1];
+    memset(recs, 0, sizeof recs);   /* the all-zero "no identity" sentinel */
     pending_close_boot_load(recs, 1);
     assert(pending_close_active_count() == 0);
 }
 
-/* A device index 0 (a real, valid index -- the free-slot sentinel is -1)
- * must not be mistaken for "no record" anywhere in the boot-due path. */
-static void test_is_boot_due_true_for_device_zero(void) {
-    pending_close_t r = { .dev_idx = 0, .close_action = ACT_SWITCH_OFF, .deadline_s = 12345, .retries = 0 };
+/* KEY(0) is a perfectly real identity -- the sentinel is the ALL-ZERO key,
+ * not "the first device". Nothing in the boot-due path may confuse the two
+ * (the old dev_idx form had the same hazard with index 0 vs -1). */
+static void test_is_boot_due_true_for_first_key(void) {
+    pending_close_t r = REC(0, ACT_SWITCH_OFF, 12345, 0);
     assert(pending_close_is_boot_due(&r));
 }
 
 static void test_is_boot_due_false_for_free_slot(void) {
-    pending_close_t r = { .dev_idx = -1, .close_action = 0, .deadline_s = 0, .retries = 0 };
+    pending_close_t r;
+    memset(&r, 0, sizeof r);
     assert(!pending_close_is_boot_due(&r));
 }
 
@@ -518,15 +703,16 @@ static void test_is_boot_due_false_for_free_slot(void) {
  * corrupting an existing row. */
 static void test_table_full_drops_extra_without_corruption(void) {
     pending_close_init();
-    for (int i = 0; i < PENDING_CLOSE_MAX; i++) pending_close_arm(i, ACT_SWITCH_OFF, (uint32_t)(100 + i));
+    for (unsigned i = 0; i < PENDING_CLOSE_MAX; i++)
+        pending_close_arm(KEY(i), ACT_SWITCH_OFF, (uint32_t)(100 + i));
     assert(pending_close_active_count() == PENDING_CLOSE_MAX);
 
-    pending_close_arm(100, ACT_SWITCH_OFF, 5); /* one too many */
+    pending_close_arm(KEY(7), ACT_SWITCH_OFF, 5); /* one too many */
     assert(pending_close_active_count() == PENDING_CLOSE_MAX);
 
     pending_close_t out;
     assert(pending_close_due(1000, &out) == 1);
-    assert(out.dev_idx != 100); /* the dropped one never took a row */
+    assert(!REC_IS(&out, 7)); /* the dropped one never took a row */
 }
 
 int main(void) {
@@ -536,6 +722,11 @@ int main(void) {
     test_serialize_zero_records();
     test_serialize_buffer_too_small_writes_nothing();
     test_deserialize_wrong_fmt_yields_nothing();
+    test_format_1_file_is_discarded_not_reinterpreted();
+    test_deserialize_keyless_record_yields_nothing();
+    test_two_similar_keys_are_distinct_records();
+    test_reboot_device_reappears_at_a_different_index();
+    test_unresolvable_identity_still_reaches_the_deferred_timeout();
     test_deserialize_bad_crc_yields_nothing();
     test_deserialize_cap_too_small_yields_nothing();
     test_deserialize_trailing_garbage_yields_nothing();
@@ -563,7 +754,7 @@ int main(void) {
     test_arm_on_dispatch_false_for_parameterless_or_unknown();
     test_boot_load_ignores_stored_deadline();
     test_boot_load_skips_invalid_records();
-    test_is_boot_due_true_for_device_zero();
+    test_is_boot_due_true_for_first_key();
     test_is_boot_due_false_for_free_slot();
     test_table_full_drops_extra_without_corruption();
     printf("test_pending_close: OK\n");

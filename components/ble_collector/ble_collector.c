@@ -189,6 +189,20 @@ _Static_assert(REGISTRY_MAX_DEVICES <= 16, "s_actor_asked is a 16-bit index bitm
  * it goes false. */
 static actor_cmd_t s_cmd_inflight = { .dev_idx = -1, .action_id = ACTION_NONE };
 
+/* The in-flight command's device IDENTITY, captured at dispatch (whole-branch
+ * review follow-up). pending_close is keyed on this now, not on the registry
+ * index, because an index is not stable across a reboot -- see
+ * pending_close_t's doc comment in actor.h. Captured here rather than looked
+ * up again later so the obligation is always cleared against the device the
+ * hub actually commanded, even if that device were undeclared in between.
+ * Its cross-task safety is s_cmd_inflight's, verbatim: written by
+ * adv_decoder_task at dispatch, read afterwards, and the decoder loop cannot
+ * dispatch again until gatt_engine_cmd_busy() goes false. All-zero when the
+ * device carries no key, which pending_close_arm()/note_result() treat as
+ * "nothing identifiable" and ignore. 9 B. */
+static uint8_t s_cmd_inflight_key[ACTOR_DEVICE_KEY_LEN];
+static bool    s_cmd_inflight_key_ok;
+
 /* The re-queue path for a command the GATT engine refused because the OTHER
  * owner of the hub's single outbound connection had the radio
  * (GATT_CMD_ERR_RADIO_BUSY). By then actor_service_step() has already
@@ -253,7 +267,6 @@ static volatile bool s_requeue_pending;
  * 10 B is the field-size sum, not a guaranteed total object size. */
 typedef enum { PC_DEFER_NONE = 0, PC_DEFER_NOTE_RESULT } pc_defer_kind_t;
 static volatile pc_defer_kind_t s_pc_defer_kind;
-static int      s_pc_defer_dev_idx;
 static bool     s_pc_defer_ok;             /* PC_DEFER_NOTE_RESULT only */
 static bool     s_pc_defer_confirmed;      /* PC_DEFER_NOTE_RESULT only */
 
@@ -567,6 +580,8 @@ static void on_actor_dispatch(const actor_cmd_t *cmd)
     /* The whole command, retry bit included -- whether this one may be put
      * back is carried BY it, not tracked here (fix round 2). */
     s_cmd_inflight = *cmd;
+    s_cmd_inflight_key_ok = actor_device_key(idx, s_cmd_inflight_key);
+    if (!s_cmd_inflight_key_ok) memset(s_cmd_inflight_key, 0, sizeof s_cmd_inflight_key);
 
     const actor_conn_t *conn = NULL;
     for (int i = 0; i < ACTOR_MAX_DEVICES; i++) {
@@ -617,7 +632,21 @@ static void on_actor_dispatch(const actor_cmd_t *cmd)
     uint8_t pc_flags = 0;
     if (actor_action_flags(idx, cmd->action_id, &pc_flags) &&
         pending_close_arm_on_dispatch((actor_source_t)cmd->source, cmd->action_id, pc_flags)) {
-        pending_close_arm(idx, ACT_SWITCH_OFF, actor_now_s() + cmd->param);
+        /* Keyed on the device's stable identity, not on idx: this record
+         * outlives reboots, and a registry index does not. A device with no
+         * key would be unresolvable after a restart, so it is refused
+         * loudly here rather than written as an obligation nothing could
+         * ever match -- it cannot happen (note_actor_device() sets the key
+         * in the same call that declares the actions, and an undeclared
+         * pair never reaches dispatch), which is exactly why it is worth
+         * saying so if it ever does. */
+        if (s_cmd_inflight_key_ok) {
+            pending_close_arm(s_cmd_inflight_key, ACT_SWITCH_OFF,
+                               actor_now_s() + cmd->param);
+        } else {
+            ESP_LOGE(TAG, "device %d has no stable identity; its close obligation "
+                          "cannot be persisted and will not survive a reboot", idx);
+        }
     }
 
     gatt_engine_request_command(idx, entry, n, cmd->param, conn->mac, conn->addr_type);
@@ -682,7 +711,6 @@ static void on_gatt_cmd_done(int dev_idx, bool ok, bool confirmed, const char *e
          * confirmed -- pending_close_note_result() itself treats "landed
          * but unconfirmed" (spec section 4.4) as still open and does
          * nothing, exactly like a genuine failure would. */
-        s_pc_defer_dev_idx = dev_idx;
         s_pc_defer_ok = ok;
         s_pc_defer_confirmed = confirmed;
         s_pc_defer_kind = PC_DEFER_NOTE_RESULT; /* set LAST, like every cross-task flag here */
@@ -747,12 +775,14 @@ static void service_pending_close_defer(void)
     pc_defer_kind_t kind = s_pc_defer_kind;
     s_pc_defer_kind = PC_DEFER_NONE;
 
-    int dev_idx = s_pc_defer_dev_idx;
     switch (kind) {
     case PC_DEFER_NOTE_RESULT: {
         bool ok = s_pc_defer_ok;
         bool confirmed = s_pc_defer_confirmed;
-        pending_close_note_result(dev_idx, ok, confirmed);
+        /* Keyed on the identity captured at dispatch, not on the registry
+         * index the completion hook reports -- the obligation is stored
+         * under that identity. */
+        pending_close_note_result(s_cmd_inflight_key, ok, confirmed);
         break;
     }
     case PC_DEFER_NONE:

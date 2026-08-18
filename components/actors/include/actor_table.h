@@ -318,6 +318,21 @@ bool actor_table_lockout(const actor_table_t *t, int dev_idx, bool *out);
 void actor_table_set_key(actor_table_t *t, int dev_idx,
                           const uint8_t key[ACTOR_DEVICE_KEY_LEN]);
 
+/* Reads back a declared device's stable identity. False (leaving *out
+ * untouched) when dev_idx is negative, not declared, or has no key set. */
+bool actor_table_device_key(const actor_table_t *t, int dev_idx,
+                             uint8_t out[ACTOR_DEVICE_KEY_LEN]);
+
+/* The inverse: the registry index of the DECLARED device carrying `key`,
+ * or -1. This is the resolution step anything persisted must go through,
+ * and it is deliberately resolved at the moment of use rather than once at
+ * load -- a device that has not advertised yet this boot is simply not
+ * here, and "not yet" must read as -1 (defer) rather than as some other
+ * device's index. A row with no key set can never match, so the all-zero
+ * sentinel cannot alias a real device. */
+int  actor_table_find_by_key(const actor_table_t *t,
+                              const uint8_t key[ACTOR_DEVICE_KEY_LEN]);
+
 /* One persisted (device, action) pair: the guard CONFIG an operator set
  * plus the guard STATE that says how much of the budget is already spent.
  * 24 B, and ACTOR_MAX_DEVICES * ACTOR_MAX_ACTIONS (16) of them is the most

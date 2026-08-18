@@ -33,6 +33,7 @@
  * to catch a stranded actuator would erase its own evidence. */
 #include "actor.h"
 #include "alert.h"
+#include <string.h>
 #include "event_log.h" /* EVENT_LEVEL_CRITICAL, used in the gated section below --
                          * same reason actor.c includes this directly rather than
                          * relying on a transitive pull-in. */
@@ -84,24 +85,48 @@ static bool    s_deferred_alerted[PENDING_CLOSE_MAX];
 #define PENDING_CLOSE_DEFERRED_ALERT_STREAK \
     (PENDING_CLOSE_DEFERRED_ALERT_S / PENDING_CLOSE_UNKNOWN_RECHECK_S)
 
-static int table_find(int dev_idx)
+/* All-zero is the free-row sentinel and "not a real device" alike -- see
+ * pending_close_t's doc comment in actor.h. Kept local to this file rather
+ * than shared with actor_table.c's identical helper: the two modules are
+ * deliberately independent of each other's internals, and this is four
+ * lines. */
+static bool key_is_set(const uint8_t key[PENDING_CLOSE_KEY_LEN])
 {
+    if (key == NULL) return false;
+    for (int i = 0; i < PENDING_CLOSE_KEY_LEN; i++)
+        if (key[i] != 0) return true;
+    return false;
+}
+
+static int table_find(const uint8_t key[PENDING_CLOSE_KEY_LEN])
+{
+    if (!key_is_set(key)) return -1;
     for (int i = 0; i < PENDING_CLOSE_MAX; i++)
-        if (s_table[i].dev_idx == (int8_t)dev_idx) return i;
+        if (memcmp(s_table[i].key, key, PENDING_CLOSE_KEY_LEN) == 0) return i;
     return -1;
 }
 
-static void table_upsert(int dev_idx, uint8_t close_action, uint32_t deadline_s, uint8_t retries)
+static int table_find_free(void)
 {
-    int i = table_find(dev_idx);
-    if (i < 0) i = table_find(-1); /* first free row */
+    for (int i = 0; i < PENDING_CLOSE_MAX; i++)
+        if (!key_is_set(s_table[i].key)) return i;
+    return -1;
+}
+
+static void table_upsert(const uint8_t key[PENDING_CLOSE_KEY_LEN], uint8_t close_action,
+                          uint32_t deadline_s, uint8_t retries)
+{
+    if (!key_is_set(key)) return;
+
+    int i = table_find(key);
+    if (i < 0) i = table_find_free();
     if (i < 0) return;             /* table full: see actor.h's comment on
                                      * PENDING_CLOSE_MAX == ACTOR_MAX_DEVICES
                                      * -- unreachable given that cap, but a
                                      * dropped obligation must never silently
                                      * clobber an existing row */
 
-    s_table[i].dev_idx = (int8_t)dev_idx;
+    memcpy(s_table[i].key, key, PENDING_CLOSE_KEY_LEN);
     s_table[i].close_action = close_action;
     s_table[i].deadline_s = deadline_s;
     s_table[i].retries = retries;
@@ -112,11 +137,11 @@ static void table_upsert(int dev_idx, uint8_t close_action, uint32_t deadline_s,
     s_deferred_alerted[i] = false;
 }
 
-static void table_remove(int dev_idx)
+static void table_remove(const uint8_t key[PENDING_CLOSE_KEY_LEN])
 {
-    int i = table_find(dev_idx);
+    int i = table_find(key);
     if (i < 0) return;
-    s_table[i].dev_idx = -1;
+    memset(s_table[i].key, 0, PENDING_CLOSE_KEY_LEN);
     s_table[i].close_action = 0;
     s_table[i].deadline_s = 0;
     s_table[i].retries = 0;
@@ -127,7 +152,7 @@ static void table_remove(int dev_idx)
 static void table_reset(void)
 {
     for (int i = 0; i < PENDING_CLOSE_MAX; i++) {
-        s_table[i].dev_idx = -1;
+        memset(s_table[i].key, 0, PENDING_CLOSE_KEY_LEN);
         s_table[i].close_action = 0;
         s_table[i].deadline_s = 0;
         s_table[i].retries = 0;
@@ -149,19 +174,20 @@ static uint32_t backoff_s(uint8_t retries)
     return d > 300u ? 300u : d;
 }
 
-void pending_close_arm(int dev_idx, uint8_t close_action, uint32_t deadline_s)
+void pending_close_arm(const uint8_t key[PENDING_CLOSE_KEY_LEN], uint8_t close_action,
+                        uint32_t deadline_s)
 {
-    if (dev_idx < 0) return;
-    table_upsert(dev_idx, close_action, deadline_s, 0);
+    if (!key_is_set(key)) return;
+    table_upsert(key, close_action, deadline_s, 0);
 #ifdef ESP_PLATFORM
     pending_close_save();
 #endif
 }
 
-void pending_close_clear(int dev_idx)
+void pending_close_clear(const uint8_t key[PENDING_CLOSE_KEY_LEN])
 {
-    if (dev_idx < 0) return;
-    table_remove(dev_idx);
+    if (!key_is_set(key)) return;
+    table_remove(key);
 #ifdef ESP_PLATFORM
     pending_close_save();
 #endif
@@ -171,7 +197,7 @@ int pending_close_due(uint32_t now_s, pending_close_t *out)
 {
     int best = -1;
     for (int i = 0; i < PENDING_CLOSE_MAX; i++) {
-        if (s_table[i].dev_idx < 0) continue;
+        if (!key_is_set(s_table[i].key)) continue;
         if (s_table[i].deadline_s > now_s) continue;
         if (best < 0 || s_table[i].deadline_s < s_table[best].deadline_s) best = i;
     }
@@ -180,10 +206,11 @@ int pending_close_due(uint32_t now_s, pending_close_t *out)
     return 1;
 }
 
-pending_close_step_t pending_close_step(int dev_idx, uint32_t now_s, bool device_known,
+pending_close_step_t pending_close_step(const uint8_t key[PENDING_CLOSE_KEY_LEN],
+                                         uint32_t now_s, bool device_known,
                                          pending_close_t *out)
 {
-    int i = table_find(dev_idx);
+    int i = table_find(key);
     if (i < 0) return PENDING_CLOSE_STEP_NONE;
 
     /* Checked FIRST, before issuing anything new: this can only be reached
@@ -241,7 +268,7 @@ pending_close_step_t pending_close_step(int dev_idx, uint32_t now_s, bool device
 
 bool pending_close_is_boot_due(const pending_close_t *r)
 {
-    return r != NULL && r->dev_idx >= 0;
+    return r != NULL && key_is_set(r->key);
 }
 
 void pending_close_boot_load(const pending_close_t *recs, size_t n)
@@ -252,7 +279,7 @@ void pending_close_boot_load(const pending_close_t *recs, size_t n)
          * (actor.h's own doc comment on that clock), so this is due on the
          * very first pending_close_due() call regardless of what the file
          * recorded, per this module's boot-replay contract. */
-        table_upsert(recs[i].dev_idx, recs[i].close_action, 0, recs[i].retries);
+        table_upsert(recs[i].key, recs[i].close_action, 0, recs[i].retries);
     }
 }
 
@@ -260,7 +287,7 @@ size_t pending_close_active_count(void)
 {
     size_t n = 0;
     for (int i = 0; i < PENDING_CLOSE_MAX; i++)
-        if (s_table[i].dev_idx >= 0) n++;
+        if (key_is_set(s_table[i].key)) n++;
     return n;
 }
 
@@ -268,7 +295,7 @@ size_t pending_close_persist_snapshot(pending_close_t *out, size_t cap)
 {
     size_t n = 0;
     for (int i = 0; i < PENDING_CLOSE_MAX && n < cap; i++) {
-        if (s_table[i].dev_idx < 0) continue;
+        if (!key_is_set(s_table[i].key)) continue;
         pending_close_t r = s_table[i];
         /* Fix round 3, finding 1: `retries` is session-only RAM state
          * (this file's own top comment, and actor.h's) -- persisting the
@@ -308,16 +335,22 @@ bool pending_close_arm_on_dispatch(actor_source_t source, uint8_t action_id, uin
 }
 
 /* ---------------------------------------------------------------------
- * Serialisation: pure, wire format `{ u8 fmt=1; u8 count; u16 crc }` then
- * `count` x 7-byte records (dev_idx, close_action, deadline_s LE32,
+ * Serialisation: pure, wire format `{ u8 fmt=2; u8 count; u16 crc }` then
+ * `count` x 15-byte records (key[9], close_action, deadline_s LE32,
  * retries). CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF), same algorithm
  * event_ring.c's event_record_crc() uses, covering `count` and every
  * record byte (not `fmt`, not the crc field itself).
+ *
+ * FORMAT 2. Format 1 wrote a 7-byte record beginning with an `int8_t
+ * dev_idx`, and it is DISCARDED rather than reinterpreted -- reading an
+ * index as the head of a device key is precisely the class of bug the
+ * re-keying exists to prevent, and one stale obligation on a single
+ * upgrade boot is a far cheaper error than closing the wrong actuator.
  * --------------------------------------------------------------------- */
 
 #define PENDING_CLOSE_HEADER_LEN 4u
-#define PENDING_CLOSE_RECORD_LEN 7u
-#define PENDING_CLOSE_FMT        1u
+#define PENDING_CLOSE_RECORD_LEN (PENDING_CLOSE_KEY_LEN + 6u)   /* key + action + LE32 + retries */
+#define PENDING_CLOSE_FMT        2u
 
 static uint16_t crc16_update(uint16_t crc, const uint8_t *p, size_t n)
 {
@@ -346,7 +379,8 @@ size_t pending_close_serialize(const pending_close_t *recs, size_t n, uint8_t *b
 
     size_t off = PENDING_CLOSE_HEADER_LEN;
     for (size_t i = 0; i < n; i++) {
-        buf[off++] = (uint8_t)recs[i].dev_idx;
+        memcpy(buf + off, recs[i].key, PENDING_CLOSE_KEY_LEN);
+        off += PENDING_CLOSE_KEY_LEN;
         buf[off++] = recs[i].close_action;
         buf[off++] = (uint8_t)(recs[i].deadline_s & 0xFFu);
         buf[off++] = (uint8_t)((recs[i].deadline_s >> 8) & 0xFFu);
@@ -381,16 +415,26 @@ size_t pending_close_deserialize(const uint8_t *buf, size_t len, pending_close_t
     crc = crc16_update(crc, &buf[PENDING_CLOSE_HEADER_LEN], total - PENDING_CLOSE_HEADER_LEN);
     if (crc != stored_crc) return 0;
 
+    /* Decoded into a scratch record first and only committed once EVERY
+     * record has passed, so a file whose crc happens to match but whose
+     * contents are not usable yields nothing rather than the prefix that
+     * parsed -- the same discipline actor_persist_deserialize() holds. */
     size_t off = PENDING_CLOSE_HEADER_LEN;
     for (uint8_t i = 0; i < count; i++) {
         pending_close_t r;
-        r.dev_idx = (int8_t)buf[off++];
+        memset(&r, 0, sizeof r);
+        memcpy(r.key, buf + off, PENDING_CLOSE_KEY_LEN);
+        off += PENDING_CLOSE_KEY_LEN;
         r.close_action = buf[off++];
         uint32_t d = (uint32_t)buf[off] | ((uint32_t)buf[off + 1] << 8) |
                      ((uint32_t)buf[off + 2] << 16) | ((uint32_t)buf[off + 3] << 24);
         off += 4;
         r.deadline_s = d;
         r.retries = buf[off++];
+        /* An identity nothing could ever resolve is not an obligation, it
+         * is a corrupt row. */
+        if (!key_is_set(r.key)) return 0;
+        if (action_get(r.close_action) == NULL) return 0;
         if (out) out[i] = r;
     }
     return count;
@@ -490,19 +534,32 @@ void pending_close_service(void)
     uint32_t now = actor_now_s();
     pending_close_t rec;
     while (pending_close_due(now, &rec)) {
+        /* RESOLVED HERE, per due record, per pass -- never once at load.
+         * A registry index is not stable across a reboot, so the only
+         * honest question is "does any DECLARED actuator carry this
+         * identity right now". -1 means not (yet, or ever), which is
+         * `known == false`, which is DEFERRED -- the state this module
+         * already handles, including the once-per-streak
+         * PENDING_CLOSE_STEP_DEFERRED_TIMEOUT alert that keeps a
+         * permanently absent device from going silent. */
+        int dev_idx = actor_find_by_key(rec.key);
         uint8_t flags = 0;
-        bool known = actor_action_flags(rec.dev_idx, rec.close_action, &flags);
+        bool known = (dev_idx >= 0) &&
+                      actor_action_flags(dev_idx, rec.close_action, &flags);
 
         pending_close_t out;
-        pending_close_step_t st = pending_close_step(rec.dev_idx, now, known, &out);
+        pending_close_step_t st = pending_close_step(rec.key, now, known, &out);
         switch (st) {
         case PENDING_CLOSE_STEP_REQUEST:
-            /* ACTOR_SRC_SAFETY: exempt from lockout/cooldown/rate
+            /* dev_idx is >= 0 on this branch by construction: REQUEST is
+             * only returned when `known` was true, which required it.
+             *
+             * ACTOR_SRC_SAFETY: exempt from lockout/cooldown/rate
              * (actor_table.h), still bound by the parameter bound -- moot
              * here (a close carries no parameter) -- and, in principle, by
-             * "unknown device", but pending_close_step() already screened
-             * that out above via `known`. */
-            actor_request(out.dev_idx, out.close_action, 0, ACTOR_SRC_SAFETY,
+             * "unknown device", but the resolution above already screened
+             * that out. */
+            actor_request(dev_idx, out.close_action, 0, ACTOR_SRC_SAFETY,
                            now + PENDING_CLOSE_ATTEMPT_TTL);
             break;
         case PENDING_CLOSE_STEP_EXHAUSTED:
@@ -511,7 +568,7 @@ void pending_close_service(void)
              * clear the record (fix round 1, finding 2): the file already
              * holds this obligation, and it stays there for the next boot. */
             alert_post(EVENT_LEVEL_CRITICAL, ALERT_CODE_CLOSE_UNCONFIRMED,
-                       out.dev_idx, out.close_action, out.retries);
+                       dev_idx, out.close_action, out.retries);
             break;
         case PENDING_CLOSE_STEP_DEFERRED_TIMEOUT:
             /* Fix round 2: never been able to try at all, for
@@ -520,8 +577,13 @@ void pending_close_service(void)
              * than CRITICAL. pending_close_step() has already latched this
              * as one-shot for the current unreachable streak; nothing else
              * to do here but post it. */
+            /* dev_idx is -1 here by definition (nothing declared carries
+             * this identity), and that is reported honestly rather than as
+             * the stale persisted index this record used to carry -- which
+             * would have named whichever device happens to hold that slot
+             * now, i.e. the wrong one. */
             alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_CLOSE_DEVICE_UNREACHABLE,
-                       out.dev_idx, out.close_action, out.retries);
+                       dev_idx, out.close_action, out.retries);
             break;
         case PENDING_CLOSE_STEP_DEFERRED:
         case PENDING_CLOSE_STEP_NONE:
@@ -552,6 +614,20 @@ void pending_close_init(void)
             pending_close_boot_load(recs, count);
             ESP_LOGW(TAG, "%u pending close obligation(s) from before this boot; "
                           "retrying now", (unsigned)count);
+        } else if (n > 0) {
+            /* Read bytes and could make nothing of them. The expected case
+             * is the ONE upgrade boot from format 1, whose records were
+             * keyed on a registry index this firmware refuses to
+             * reinterpret (see pending_close_serialize()'s comment); a
+             * corrupt format-2 file lands here too, and is equally
+             * unrecoverable. Loud, because an obligation may have been
+             * lost, and then deleted so the warning does not repeat every
+             * boot for a file nothing will ever read. */
+            ESP_LOGW(TAG, "%s: %u byte(s) unreadable (old format, or bad length/crc); "
+                          "any obligation recorded before this boot is lost -- discarded "
+                          "rather than reinterpreted",
+                     PENDING_CLOSE_PATH, (unsigned)n);
+            remove(PENDING_CLOSE_PATH);
         }
     } else if (errno != ENOENT) {
         ESP_LOGW(TAG, "%s: open for read failed (errno=%d); any pending close "
@@ -567,7 +643,8 @@ void pending_close_init(void)
 }
 
 #ifdef ESP_PLATFORM
-void pending_close_note_result(int dev_idx, bool ok, bool confirmed)
+void pending_close_note_result(const uint8_t key[PENDING_CLOSE_KEY_LEN],
+                                bool ok, bool confirmed)
 {
     /* Only a CONFIRMED close ends the obligation -- spec section 4.4 treats
      * a write that landed but was not confirmed (ok=true, confirmed=false)
@@ -575,6 +652,6 @@ void pending_close_note_result(int dev_idx, bool ok, bool confirmed)
      * pending_close_service()'s own retry/backoff already expects and will
      * pick up on its next pass. Neither needs anything done here; only the
      * success case does. */
-    if (ok && confirmed) pending_close_clear(dev_idx);
+    if (ok && confirmed) pending_close_clear(key);
 }
 #endif /* ESP_PLATFORM */
