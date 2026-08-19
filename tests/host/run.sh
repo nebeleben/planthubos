@@ -234,3 +234,7 @@ $CC -Wall -Wextra -Werror -I../../components/zigbee/include \
     test_zb_map.c ../../components/zigbee/zb_map.c \
     ../../components/capability/capability.c -lm -o test_zb_map
 ./test_zb_map
+
+$CC -Wall -Wextra -Werror -I../../components/zigbee/include \
+    test_zb_store.c ../../components/zigbee/zb_store.c -o test_zb_store
+./test_zb_store
