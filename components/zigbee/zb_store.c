@@ -11,7 +11,10 @@
 #define ZB_STORE_MAGIC1 'H'
 #define ZB_STORE_MAGIC2 'Z'
 #define ZB_STORE_MAGIC3 'B'
-#define ZB_STORE_VERSION 1
+/* Task 13 grew the record with unmapped_count/unmapped_clusters (52 -> 65
+ * bytes, see zb_store.h) -- bumped so an old file is rejected by the
+ * version check below rather than misread against the new layout. */
+#define ZB_STORE_VERSION 2
 #define ZB_STORE_HEADER_SIZE 8
 
 void zb_store_init(zb_table_t *t) {
@@ -96,6 +99,10 @@ static uint8_t *put_record(uint8_t *p, const zb_device_t *d) {
     for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
         p = put_u8(p, d->actions[i]);
     }
+    p = put_u8(p, d->unmapped_count);
+    for (int i = 0; i < ZB_STORE_MAX_UNMAPPED; i++) {
+        p = put_u16le(p, d->unmapped_clusters[i]);
+    }
     memset(p, 0, ZB_STORE_NAME_MAX);
     size_t nlen = strnlen(d->name, ZB_STORE_NAME_MAX - 1);
     memcpy(p, d->name, nlen);
@@ -119,6 +126,10 @@ static const uint8_t *get_record(const uint8_t *p, zb_device_t *d) {
     p = get_u8(p, &d->action_count);
     for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
         p = get_u8(p, &d->actions[i]);
+    }
+    p = get_u8(p, &d->unmapped_count);
+    for (int i = 0; i < ZB_STORE_MAX_UNMAPPED; i++) {
+        p = get_u16le(p, &d->unmapped_clusters[i]);
     }
     memcpy(d->name, p, ZB_STORE_NAME_MAX);
     d->name[ZB_STORE_NAME_MAX - 1] = '\0';
@@ -180,7 +191,8 @@ bool zb_store_deserialize(zb_table_t *t, const uint8_t *buf, size_t len) {
          * whole file rather than clamp: clamping would silently alter what
          * the file said; *t stays untouched either way. */
         if (out.dev[i].cap_count > ZB_STORE_MAX_CAPS ||
-            out.dev[i].action_count > ZB_STORE_MAX_ACTIONS) {
+            out.dev[i].action_count > ZB_STORE_MAX_ACTIONS ||
+            out.dev[i].unmapped_count > ZB_STORE_MAX_UNMAPPED) {
             return false;
         }
     }

@@ -138,6 +138,23 @@ void zb_interview_on_clusters(zb_iv_t *iv, uint8_t endpoint,
                 iv->dev.cap_count++;
                 yielded = true;
             }
+        } else {
+            /* The auto-map cannot drive this cluster at all -- retain the
+             * raw id rather than discard it, so M6c's quirk work has
+             * something to start from (spec's acceptance gate; see the
+             * milestone header comment above and zb_store.h's
+             * unmapped_count/unmapped_clusters). Dedup exactly like caps
+             * above: the same undrivable cluster on two endpoints must not
+             * both consume a slot, and dedup goes in FRONT of the bound
+             * for the same reason. Excess beyond ZB_STORE_MAX_UNMAPPED is
+             * dropped silently -- a diagnostic aid, not a guarantee. */
+            bool dup = false;
+            for (uint8_t j = 0; j < iv->dev.unmapped_count; j++)
+                if (iv->dev.unmapped_clusters[j] == cluster) { dup = true; break; }
+            if (!dup && iv->dev.unmapped_count < ZB_STORE_MAX_UNMAPPED) {
+                iv->dev.unmapped_clusters[iv->dev.unmapped_count] = cluster;
+                iv->dev.unmapped_count++;
+            }
         }
 
         /* Same reasoning for actions: a second endpoint's On/Off must not

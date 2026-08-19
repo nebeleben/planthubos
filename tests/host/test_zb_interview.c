@@ -60,6 +60,10 @@ int main(void) {
     assert(iv.state == ZB_IV_DONE);
     assert(iv.dev.cap_count == 0 && iv.dev.action_count == 0);
     assert(iv.dev.interviewed == 1);        /* interviewed, just unmapped */
+    /* Task 13: the undrivable cluster is retained, not discarded -- this
+     * is M6c's input. */
+    assert(iv.dev.unmapped_count == 1);
+    assert(iv.dev.unmapped_clusters[0] == 0xEF00);
 
     /* --- a silent device times out and is still stored --- */
     zb_interview_begin(&iv, EUI, 0x1234, 400);
@@ -131,6 +135,39 @@ int main(void) {
     assert(iv.dev.cap_count == 2);
     assert(iv.dev.caps[0] == CAP_AIR_TEMPERATURE);
     assert(iv.dev.caps[1] == CAP_AIR_HUMIDITY);
+
+    /* --- Task 13: the same undrivable cluster on two endpoints is
+     * recorded once, not twice -- same dedup reasoning as caps/actions
+     * above, just for unmapped_clusters. --- */
+    zb_interview_begin(&iv, EUI, 0x1234, 700);
+    zb_interview_step(&iv, 700);
+    zb_interview_on_endpoints(&iv, eps2, 2);
+    zb_interview_step(&iv, 701);
+    uint16_t tuya_ep1[1] = { 0xEF00 };
+    zb_interview_on_clusters(&iv, 1, tuya_ep1, 1);
+    zb_interview_step(&iv, 702);
+    uint16_t tuya_ep2[1] = { 0xEF00 };
+    zb_interview_on_clusters(&iv, 2, tuya_ep2, 1);
+    assert(zb_interview_step(&iv, 703) == ZB_IV_ACT_STORE);
+    assert(iv.dev.unmapped_count == 1);
+    assert(iv.dev.unmapped_clusters[0] == 0xEF00);
+
+    /* --- Task 13: the unmapped array bound holds -- more undrivable
+     * clusters than ZB_STORE_MAX_UNMAPPED are dropped silently rather
+     * than overflowing the array. --- */
+    zb_interview_begin(&iv, EUI, 0x1234, 800);
+    zb_interview_step(&iv, 800);
+    zb_interview_on_endpoints(&iv, eps, 1);
+    zb_interview_step(&iv, 801);
+    uint16_t many[8] = {
+        0xFC00, 0xFC01, 0xFC02, 0xFC03, 0xFC04, 0xFC05, 0xFC06, 0xFC07,
+    };
+    zb_interview_on_clusters(&iv, 1, many, 8);
+    assert(zb_interview_step(&iv, 802) == ZB_IV_ACT_STORE);
+    assert(iv.dev.unmapped_count == ZB_STORE_MAX_UNMAPPED);
+    for (int i = 0; i < ZB_STORE_MAX_UNMAPPED; i++) {
+        assert(iv.dev.unmapped_clusters[i] == (uint16_t)(0xFC00 + i));
+    }
 
     printf("test_zb_interview: OK\n");
     return 0;

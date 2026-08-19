@@ -24,6 +24,7 @@
 #define ZB_STORE_MAX_CAPS    4
 #define ZB_STORE_MAX_ACTIONS 2
 #define ZB_STORE_NAME_MAX    24
+#define ZB_STORE_MAX_UNMAPPED 6
 
 typedef struct {
     uint8_t  eui64[8];
@@ -35,6 +36,14 @@ typedef struct {
     uint16_t cap_clusters[ZB_STORE_MAX_CAPS];      /* the cluster each came from */
     uint8_t  action_count;
     uint8_t  actions[ZB_STORE_MAX_ACTIONS];        /* action ids */
+    uint8_t  unmapped_count;
+    uint16_t unmapped_clusters[ZB_STORE_MAX_UNMAPPED]; /* clusters the auto-map
+                                          * could not drive at all -- M6c's
+                                          * input (Task 13). Deduplicated by
+                                          * zb_interview_on_clusters(); excess
+                                          * beyond ZB_STORE_MAX_UNMAPPED is
+                                          * dropped silently, a diagnostic aid
+                                          * rather than a guarantee. */
     char     name[ZB_STORE_NAME_MAX];
 } zb_device_t;
 
@@ -47,12 +56,20 @@ typedef struct {
  *
  * The record is written field-by-field, little-endian, and is EXACTLY:
  *   eui64 8 + short_addr 2 + endpoint 1 + interviewed 1 + cap_count 1
- *   + caps 4 + cap_clusters 8 + action_count 1 + actions 2 + name 24 = 52.
+ *   + caps 4 + cap_clusters 8 + action_count 1 + actions 2
+ *   + unmapped_count 1 + unmapped_clusters 12 + name 24 = 65.
  * Not sizeof(zb_device_t): struct padding is not a file format, and a
  * compiler or field-order change would silently invalidate every stored
  * file. zb_store_deserialize() requires len to equal the header plus
- * count * this exactly, which is what makes a truncated file detectable. */
-#define ZB_STORE_RECORD_SIZE 52
+ * count * this exactly, which is what makes a truncated file detectable.
+ *
+ * Task 13 grew this from 52 to 65 (+1 unmapped_count, +12 six uint16_t
+ * unmapped_clusters) and bumped ZB_STORE_VERSION alongside it -- an old
+ * file fails the version check in zb_store_deserialize(), *t is left
+ * untouched, and the hub starts with an empty table rather than
+ * misreading the old, shorter layout. Nothing had shipped yet, so there
+ * is no migration to write. */
+#define ZB_STORE_RECORD_SIZE 65
 #define ZB_STORE_IMAGE_MAX   (8 + ZB_STORE_MAX_DEVICES * ZB_STORE_RECORD_SIZE)
 
 void zb_store_init(zb_table_t *t);

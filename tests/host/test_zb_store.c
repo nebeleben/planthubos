@@ -55,6 +55,28 @@ int main(void) {
     assert(r.dev[1].short_addr == b.short_addr);
     assert(r.dev[0].cap_clusters[0] == 0x0402);
 
+    /* --- Task 13: unmapped_count/unmapped_clusters survive the round
+     * trip too, alongside the mapped fields above. --- */
+    {
+        zb_device_t u = mk(50, 1);
+        u.unmapped_count = 3;
+        u.unmapped_clusters[0] = 0xEF00;
+        u.unmapped_clusters[1] = 0xFC00;
+        u.unmapped_clusters[2] = 0xFC01;
+        zb_table_t ut;
+        zb_store_init(&ut);
+        assert(zb_store_upsert(&ut, &u) == 0);
+        uint8_t ubuf[ZB_STORE_IMAGE_MAX];
+        size_t un = zb_store_serialize(&ut, ubuf, sizeof ubuf);
+        assert(un > 0);
+        zb_table_t ur;
+        assert(zb_store_deserialize(&ur, ubuf, un));
+        assert(ur.dev[0].unmapped_count == 3);
+        assert(ur.dev[0].unmapped_clusters[0] == 0xEF00);
+        assert(ur.dev[0].unmapped_clusters[1] == 0xFC00);
+        assert(ur.dev[0].unmapped_clusters[2] == 0xFC01);
+    }
+
     /* --- corruption is refused, never half-loaded --- */
     zb_table_t bad;
     assert(!zb_store_deserialize(&bad, buf, n - 1));    /* truncated */
@@ -74,10 +96,12 @@ int main(void) {
     {
         /* Offsets within a ZB_STORE_RECORD_SIZE record, per zb_store.h's
          * field list: eui64 8 + short_addr 2 + endpoint 1 + interviewed 1
-         * -> cap_count @ 12; + caps 4 + cap_clusters 8 -> action_count @ 25. */
+         * -> cap_count @ 12; + caps 4 + cap_clusters 8 -> action_count @ 25;
+         * + actions 2 -> unmapped_count @ 28 (Task 13). */
         const size_t rec0 = 8;                 /* header size */
         const size_t cap_count_off = rec0 + 12;
         const size_t action_count_off = rec0 + 25;
+        const size_t unmapped_count_off = rec0 + 28;
 
         uint8_t corrupt[ZB_STORE_IMAGE_MAX];
         memcpy(corrupt, buf, n);
@@ -86,6 +110,12 @@ int main(void) {
 
         memcpy(corrupt, buf, n);
         corrupt[action_count_off] = ZB_STORE_MAX_ACTIONS + 1;
+        assert(!zb_store_deserialize(&bad, corrupt, n));
+
+        /* Task 13: an out-of-range unmapped_count is rejected the same
+         * way -- a corrupt-but-length-valid file must not be clamped. */
+        memcpy(corrupt, buf, n);
+        corrupt[unmapped_count_off] = ZB_STORE_MAX_UNMAPPED + 1;
         assert(!zb_store_deserialize(&bad, corrupt, n));
 
         /* The maximum LEGAL values must still load -- the new guard must
@@ -100,6 +130,10 @@ int main(void) {
         for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
             full.actions[i] = (uint8_t)i;
         }
+        full.unmapped_count = ZB_STORE_MAX_UNMAPPED;
+        for (int i = 0; i < ZB_STORE_MAX_UNMAPPED; i++) {
+            full.unmapped_clusters[i] = (uint16_t)(0xFC00 + i);
+        }
         zb_table_t legal;
         zb_store_init(&legal);
         assert(zb_store_upsert(&legal, &full) == 0);
@@ -110,6 +144,9 @@ int main(void) {
         assert(zb_store_deserialize(&legal_r, lbuf, ln));
         assert(legal_r.dev[0].cap_count == ZB_STORE_MAX_CAPS);
         assert(legal_r.dev[0].action_count == ZB_STORE_MAX_ACTIONS);
+        assert(legal_r.dev[0].unmapped_count == ZB_STORE_MAX_UNMAPPED);
+        assert(legal_r.dev[0].unmapped_clusters[ZB_STORE_MAX_UNMAPPED - 1] ==
+               (uint16_t)(0xFC00 + ZB_STORE_MAX_UNMAPPED - 1));
     }
 
     /* --- remove --- */

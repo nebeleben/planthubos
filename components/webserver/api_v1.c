@@ -54,11 +54,11 @@ static plants_table_t s_api_plant_snap;
 
 /* Task 9: zigbee_get()'s own copy of zigbee_device_list()'s output.
  * ZB_STORE_MAX_DEVICES (16) zb_device_t records at ZB_STORE_RECORD_SIZE-ish
- * (~52 B each) is ~832 B -- same "too big for the httpd task stack, and
- * safe as a file-static because esp_http_server serialises every handler
- * on this one task" reasoning as s_api_reg_snap/s_api_plant_snap above,
- * just for a third, unrelated subsystem, so it gets its own array rather
- * than joining that pair's comment. */
+ * (~65 B each, Task 13) is ~1040 B -- same "too big for the httpd task
+ * stack, and safe as a file-static because esp_http_server serialises
+ * every handler on this one task" reasoning as s_api_reg_snap/s_api_plant_snap
+ * above, just for a third, unrelated subsystem, so it gets its own array
+ * rather than joining that pair's comment. */
 static zb_device_t s_api_zb_snap[ZB_STORE_MAX_DEVICES];
 
 /* mqtt_pub.c: MQTT retained-topic cleanup on plant delete / capability
@@ -3732,15 +3732,12 @@ static esp_err_t devices_post_dispatch(httpd_req_t *req)
  * table"), never a raw numeric id in the response.
  *
  * "clusters" carries cap_clusters[0..cap_count) -- the cluster each mapped
- * capability came from (zb_interview.c's zb_interview_on_clusters()). It is
- * NOT a full endpoint cluster dump: a cluster the auto-map does not
- * recognise is discarded during interview and never reaches zb_device_t at
- * all (zb_map_cluster_to_cap() returning ZB_MAP_NONE short-circuits the
- * append), so a device the auto-map could not drive at all shows an empty
- * list here, not the diagnostic dump the brief for this task wants. That
- * gap is in the frozen Task 6 store/interview shape, not in this
- * rendering -- fixing it means teaching zb_interview.c to retain unmapped
- * clusters too, which is out of this task's one file. */
+ * capability came from (zb_interview.c's zb_interview_on_clusters()) --
+ * followed by unmapped_clusters[0..unmapped_count): clusters the auto-map
+ * could not drive at all, retained (deduplicated, bounded by
+ * ZB_STORE_MAX_UNMAPPED) since Task 13 so a device the auto-map cannot
+ * drive reports something here instead of an empty list -- this is M6c's
+ * input. */
 static cJSON *zb_device_json(const zb_device_t *d)
 {
     device_id_t id;
@@ -3771,6 +3768,9 @@ static cJSON *zb_device_json(const zb_device_t *d)
     cJSON *clusters = cJSON_AddArrayToObject(o, "clusters");
     for (uint8_t i = 0; i < d->cap_count; i++) {
         cJSON_AddItemToArray(clusters, cJSON_CreateNumber(d->cap_clusters[i]));
+    }
+    for (uint8_t i = 0; i < d->unmapped_count; i++) {
+        cJSON_AddItemToArray(clusters, cJSON_CreateNumber(d->unmapped_clusters[i]));
     }
     return o;
 }
