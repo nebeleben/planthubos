@@ -57,6 +57,29 @@ int main(void) {
     /* ZCL's two illuminance sentinels must NOT become readings. */
     assert(!zb_map_zcl_to_value(0x0400, 0, &v));        /* too dark to measure */
     assert(!zb_map_zcl_to_value(0x0400, 0xFFFF, &v));   /* invalid */
+
+    /* Every cluster has ZCL sentinels that must NOT become fabricated
+     * readings. A gap in a plant's history is better than a fabricated
+     * value that looks like data. Test both the sentinel and a legitimate
+     * value near each to ensure the guard is not over-broad. */
+    /* Temperature: 0x8000 is invalid in both sign-extended and unsigned form. */
+    assert(!zb_map_zcl_to_value(0x0402, 0x8000, &v));   /* sentinel 0x8000 */
+    assert(!zb_map_zcl_to_value(0x0402, -32768, &v));   /* sentinel as signed */
+    assert(zb_map_zcl_to_value(0x0402, 2500, &v) && close_to(v, 25.0f)); /* valid */
+    /* Humidity: 0xFFFF is invalid. */
+    assert(!zb_map_zcl_to_value(0x0405, 0xFFFF, &v));   /* sentinel 0xFFFF */
+    assert(zb_map_zcl_to_value(0x0405, 9998, &v) && close_to(v, 99.98f)); /* valid */
+    /* Soil Moisture: 0xFFFF is invalid. */
+    assert(!zb_map_zcl_to_value(0x0408, 0xFFFF, &v));   /* sentinel 0xFFFF */
+    assert(zb_map_zcl_to_value(0x0408, 5000, &v) && close_to(v, 50.0f)); /* valid */
+    /* Pressure: 0x8000 is invalid in both sign-extended and unsigned form. */
+    assert(!zb_map_zcl_to_value(0x0403, 0x8000, &v));   /* sentinel 0x8000 */
+    assert(!zb_map_zcl_to_value(0x0403, -32768, &v));   /* sentinel as signed */
+    assert(zb_map_zcl_to_value(0x0403, 950, &v) && close_to(v, 950.0f)); /* valid */
+    /* Battery: 0xFF is unknown. */
+    assert(!zb_map_zcl_to_value(0x0001, 0xFF, &v));     /* sentinel 0xFF */
+    assert(zb_map_zcl_to_value(0x0001, 200, &v) && close_to(v, 100.0f)); /* valid */
+
     /* An unmapped cluster yields no value. */
     assert(!zb_map_zcl_to_value(0xEF00, 1234, &v));
 

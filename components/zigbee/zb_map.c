@@ -56,17 +56,44 @@ bool zb_map_zcl_to_value(uint16_t cluster, int32_t raw, float *out) {
         return false;
     switch (cluster) {
         case CL_TEMPERATURE:                  /* int16, 0.01 C */
+            /* ZCL sentinel: 0x8000 (invalid). Reject both sign-extended
+             * (-32768) and unsigned (32768) spellings. A fabricated reading
+             * in a plant's history is worse than a gap: a gap is visibly
+             * missing while a -327.68 °C value looks like data. */
+            if (raw == 0x8000 || raw == -32768)
+                return false;
+            *out = (float)raw / 100.0f;
+            return true;
         case CL_HUMIDITY:                     /* uint16, 0.01 % */
+            /* ZCL sentinel: 0xFFFF (invalid). A fabricated 655.35 % reading
+             * in a plant's history is worse than a gap. */
+            if (raw == 0xFFFF)
+                return false;
+            *out = (float)raw / 100.0f;
+            return true;
         case CL_SOIL_MOISTURE:                /* uint16, 0.01 % */
+            /* ZCL sentinel: 0xFFFF (invalid). A fabricated 655.35 % reading
+             * in a plant's history is worse than a gap. */
+            if (raw == 0xFFFF)
+                return false;
             *out = (float)raw / 100.0f;
             return true;
         case CL_PRESSURE:
             /* ZCL MeasuredValue is 10 x pressure-in-kPa, and 1 kPa is
              * 10 hPa, so the number IS hPa -- 101.325 kPa reports as 1013,
-             * which is 1013 hPa. CAP_AIR_PRESSURE's unit is hPa. */
+             * which is 1013 hPa. CAP_AIR_PRESSURE's unit is hPa.
+             * ZCL sentinel: 0x8000 (invalid). Reject both sign-extended
+             * (-32768) and unsigned (32768) spellings. A fabricated reading
+             * in a plant's history is worse than a gap. */
+            if (raw == 0x8000 || raw == -32768)
+                return false;
             *out = (float)raw;
             return true;
         case CL_POWER_CONFIG:                 /* uint8, 0.5 % units */
+            /* ZCL sentinel: 0xFF (unknown). A fabricated 127.5 % reading
+             * in a plant's history is worse than a gap. */
+            if (raw == 0xFF)
+                return false;
             *out = (float)raw / 2.0f;
             return true;
         case CL_ON_OFF:
