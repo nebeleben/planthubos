@@ -4074,7 +4074,7 @@ void api_v1_register(httpd_handle_t server)
     /* Zigbee (Task 9, spec §8's Zigbee tab): network state + joined-device
      * list, permit-join, and per-device rename/remove. "/api/v1/zigbee"
      * (exact GET) and "/api/v1/zigbee/permit" (exact POST) do not collide
-     * with the "/api/v1/zigbee/devices/*" wildcard below -- three distinct
+     * with the "/api/v1/zigbee/devices/" wildcard below -- three distinct
      * URI templates, same non-collision every other exact+wildcard group
      * in this function already relies on. */
     httpd_uri_t zigbee_g = { .uri = "/api/v1/zigbee", .method = HTTP_GET, .handler = zigbee_get };
