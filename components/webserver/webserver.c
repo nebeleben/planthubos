@@ -72,9 +72,9 @@ static const static_asset_t ASSETS[] = {
 esp_err_t webserver_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    /* Registered total, recounted at V2 M3 Task 9: 48
+    /* Registered total, recounted at V2 M6b Task 9: 53
      *   3 static assets (ASSETS above)
-     *  43 in api_v1_register()
+     *  48 in api_v1_register()
      *   1 SSE (sse_init)
      *   1 captive-portal fallback
      * M3 Task 7 added seven wrapper/unknown/bind-key routes, which took the
@@ -86,10 +86,12 @@ esp_err_t webserver_start(void)
      * now counts the registrations against this number so the next one is
      * caught by `tests/host/run.sh` instead of by a dead board.
      *
-     * Sized with real headroom rather than to clear today's count: each slot
-     * is one pointer in the server's handler array, so the 8 spare cost 32 B
-     * of heap. */
-    cfg.max_uri_handlers = 56;
+     * M6b Task 9 added the four Zigbee routes, which took the total from 49
+     * to 53. Raised to 60, not just to 53, for the same reason as before:
+     * sized with real headroom rather than to clear today's count. Each
+     * slot is one pointer in the server's handler array, so the 7 spare
+     * cost 28 B of heap. */
+    cfg.max_uri_handlers = 60;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 8192; /* wifi_scan_get's records buffer + cJSON work no longer fit in 4K */
     /* Without this, abandoned sockets (phone walks away from the portal, tab

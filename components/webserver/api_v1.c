@@ -23,6 +23,7 @@
 #include "psvm.h"
 #include "actor.h"
 #include "action.h"
+#include "zigbee.h"
 #include "cJSON.h"
 #include "mbedtls/base64.h"
 #include "esp_littlefs.h"
@@ -50,6 +51,15 @@ static const char *TAG = "api_v1";
  * there is never a concurrent writer to race. */
 static registry_t s_api_reg_snap;
 static plants_table_t s_api_plant_snap;
+
+/* Task 9: zigbee_get()'s own copy of zigbee_device_list()'s output.
+ * ZB_STORE_MAX_DEVICES (16) zb_device_t records at ZB_STORE_RECORD_SIZE-ish
+ * (~52 B each) is ~832 B -- same "too big for the httpd task stack, and
+ * safe as a file-static because esp_http_server serialises every handler
+ * on this one task" reasoning as s_api_reg_snap/s_api_plant_snap above,
+ * just for a third, unrelated subsystem, so it gets its own array rather
+ * than joining that pair's comment. */
+static zb_device_t s_api_zb_snap[ZB_STORE_MAX_DEVICES];
 
 /* mqtt_pub.c: MQTT retained-topic cleanup on plant delete / capability
  * unbind (spec Sec.6, M2 Task 7) -- same "no header of its own" convention
@@ -3704,6 +3714,223 @@ static esp_err_t devices_post_dispatch(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---------------------------------------------------------------------
+ * Task 9: the Zigbee HTTP surface (spec §8's Zigbee tab) -- network state,
+ * permit-join, and the joined-device list with rename and remove, over
+ * zigbee.h's Task 1/6 functions. Every one of those returns a plain false
+ * (never a distinct error) for "Zigbee is disabled at build time" -- see
+ * each function's own doc comment in zigbee.h -- and this file never tells
+ * that apart from "not started yet" or "unknown device": both read the
+ * same to a caller, so this whole surface reports a quiet false/404
+ * rather than failing or refusing to exist.
+ * --------------------------------------------------------------------- */
+
+/* Renders one joined device (zb_device_t, zb_store.h) the same way
+ * GET /api/v1/devices renders capability/action ids: through
+ * capability_get()/action_get()'s name lookup (capabilities_get()'s own
+ * comment above -- "every downstream surface ... reads metadata from this
+ * table"), never a raw numeric id in the response.
+ *
+ * "clusters" carries cap_clusters[0..cap_count) -- the cluster each mapped
+ * capability came from (zb_interview.c's zb_interview_on_clusters()). It is
+ * NOT a full endpoint cluster dump: a cluster the auto-map does not
+ * recognise is discarded during interview and never reaches zb_device_t at
+ * all (zb_map_cluster_to_cap() returning ZB_MAP_NONE short-circuits the
+ * append), so a device the auto-map could not drive at all shows an empty
+ * list here, not the diagnostic dump the brief for this task wants. That
+ * gap is in the frozen Task 6 store/interview shape, not in this
+ * rendering -- fixing it means teaching zb_interview.c to retain unmapped
+ * clusters too, which is out of this task's one file. */
+static cJSON *zb_device_json(const zb_device_t *d)
+{
+    device_id_t id;
+    id.kind = (uint8_t)DEV_KIND_ZIGBEE;
+    memcpy(id.addr, d->eui64, sizeof id.addr);
+    char idbuf[24];
+    device_id_format(&id, idbuf, sizeof(idbuf));
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "id", idbuf);
+    cJSON_AddStringToObject(o, "name", d->name);
+    cJSON_AddBoolToObject(o, "interviewed", d->interviewed != 0);
+    cJSON_AddNumberToObject(o, "short_addr", d->short_addr);
+    cJSON_AddNumberToObject(o, "endpoint", d->endpoint);
+
+    cJSON *caps = cJSON_AddArrayToObject(o, "caps");
+    for (uint8_t i = 0; i < d->cap_count; i++) {
+        const capability_t *cap = capability_get(d->caps[i]);
+        cJSON_AddItemToArray(caps, cJSON_CreateString(cap ? cap->name : "?"));
+    }
+
+    cJSON *actions = cJSON_AddArrayToObject(o, "actions");
+    for (uint8_t i = 0; i < d->action_count; i++) {
+        const action_t *a = action_get(d->actions[i]);
+        cJSON_AddItemToArray(actions, cJSON_CreateString(a ? a->name : "?"));
+    }
+
+    cJSON *clusters = cJSON_AddArrayToObject(o, "clusters");
+    for (uint8_t i = 0; i < d->cap_count; i++) {
+        cJSON_AddItemToArray(clusters, cJSON_CreateNumber(d->cap_clusters[i]));
+    }
+    return o;
+}
+
+/* GET /api/v1/zigbee -- network state and the joined-device list.
+ * Unauthenticated, like every GET in this file (devices_root()'s comment
+ * above). zigbee_net_info()'s own return value becomes "enabled": true
+ * once the stack task has started, false for both a build with
+ * CONFIG_PLANTHUB_ZB_ENABLED off and one that has not called
+ * zigbee_start() yet -- see this block's header comment. Either way there
+ * is nothing to report, so channel/pan_id/formed stay at their
+ * zero-initialised defaults below rather than reading uninitialised
+ * stack. */
+static esp_err_t zigbee_get(httpd_req_t *req)
+{
+    uint8_t channel = 0;
+    uint16_t pan_id = 0;
+    bool formed = false;
+    bool enabled = zigbee_net_info(&channel, &pan_id, &formed);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "enabled", enabled);
+    cJSON_AddBoolToObject(root, "formed", formed);
+    cJSON_AddNumberToObject(root, "channel", channel);
+    cJSON_AddNumberToObject(root, "pan_id", pan_id);
+    cJSON_AddNumberToObject(root, "permit_s", zigbee_permit_join_remaining());
+
+    /* s_api_zb_snap: too big for the httpd task stack -- see its own
+     * declaration comment above (L54-ish, next to s_api_reg_snap/
+     * s_api_plant_snap). zigbee_device_list() returns 0 for a
+     * disabled/not-started build, same as an empty table. */
+    int n = zigbee_device_list(s_api_zb_snap, ZB_STORE_MAX_DEVICES);
+    cJSON *devices = cJSON_AddArrayToObject(root, "devices");
+    for (int i = 0; i < n; i++) {
+        cJSON_AddItemToArray(devices, zb_device_json(&s_api_zb_snap[i]));
+    }
+    return send_json(req, root);
+}
+
+/* POST /api/v1/zigbee/permit -- opens the coordinator's permit-join window
+ * (zigbee_permit_join(), Task 1). False means no formed network to open it
+ * on -- disabled build, stack not started, or not yet formed all read the
+ * same to the caller -- reported 409, the same "state doesn't allow this
+ * right now" posture node_ota_start_post()/node_ota_abort_post() above use
+ * for their own single-in-flight-session conflicts. */
+static esp_err_t zigbee_permit_post(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    if (!zigbee_permit_join()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"no formed Zigbee network to join\"}");
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddNumberToObject(root, "permit_s", zigbee_permit_join_remaining());
+    return send_json(req, root);
+}
+
+/* Shared by zigbee_devices_post()/zigbee_devices_delete() below: extracts
+ * and validates the {id} segment of /api/v1/zigbee/devices/{id} -- this
+ * route has no further suffix, unlike devices_post_dispatch()'s "/key"
+ * wildcard, so the whole tail (up to a query string) must be one
+ * device_id_t of kind zb. On success, copies its 8-byte EUI-64 into eui64
+ * and returns true; on any rejection the 400 is already sent and the
+ * caller must return ESP_OK without touching the response again. */
+static bool zb_devices_parse_id(httpd_req_t *req, const char *tail, uint8_t eui64[8])
+{
+    size_t taillen = strcspn(tail, "?");
+    char idbuf[40];
+    if (taillen == 0 || taillen >= sizeof(idbuf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return false;
+    }
+    memcpy(idbuf, tail, taillen);
+    idbuf[taillen] = '\0';
+
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev) || dev.kind != (uint8_t)DEV_KIND_ZIGBEE) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return false;
+    }
+    memcpy(eui64, dev.addr, 8);
+    return true;
+}
+
+/* POST /api/v1/zigbee/devices/{id} {"name":"..."} -- renames a joined
+ * device (zigbee_device_rename(), Task 6). A missing/non-string "name" is
+ * a 400 (bad request, same as sensors_rename_post()'s "bad name" shape
+ * above); once the body is well-formed, a rename that still fails is a 404
+ * -- zigbee_device_rename() collapses "unknown eui64" and "Zigbee
+ * disabled/not started" into one false (zigbee.h's own doc comment), and
+ * both mean "this device is not there to rename." */
+static esp_err_t zigbee_devices_post(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/zigbee/devices/");
+    uint8_t eui64[8];
+    if (!zb_devices_parse_id(req, tail, eui64)) return ESP_OK;
+
+    char body[128];
+    if (req->content_len == 0 || req->content_len > sizeof(body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(body);
+    const cJSON *name = json ? cJSON_GetObjectItem(json, "name") : NULL;
+    if (!cJSON_IsString(name)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing name");
+        return ESP_OK;
+    }
+    bool ok = zigbee_device_rename(eui64, name->valuestring);
+    cJSON_Delete(json);
+    if (!ok) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown zigbee device");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* DELETE /api/v1/zigbee/devices/{id} -- removes a joined device
+ * (zigbee_device_remove(), Task 6): drops it from the store, persists the
+ * change, and asks the stack to remove it from the network. Same
+ * unknown-device-or-disabled collapses-to-404 posture as the rename route
+ * above. */
+static esp_err_t zigbee_devices_delete(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/zigbee/devices/");
+    uint8_t eui64[8];
+    if (!zb_devices_parse_id(req, tail, eui64)) return ESP_OK;
+
+    if (!zigbee_device_remove(eui64)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown zigbee device");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 void api_v1_register(httpd_handle_t server)
 {
     httpd_uri_t health = { .uri = "/api/v1/health", .method = HTTP_GET, .handler = health_get };
@@ -3843,4 +4070,19 @@ void api_v1_register(httpd_handle_t server)
      * own comment on the wildcard-collision rule this relies on). */
     httpd_uri_t devices_guards = { .uri = "/api/v1/devices/*", .method = HTTP_PUT, .handler = devices_guards_put };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &devices_guards));
+
+    /* Zigbee (Task 9, spec §8's Zigbee tab): network state + joined-device
+     * list, permit-join, and per-device rename/remove. "/api/v1/zigbee"
+     * (exact GET) and "/api/v1/zigbee/permit" (exact POST) do not collide
+     * with the "/api/v1/zigbee/devices/*" wildcard below -- three distinct
+     * URI templates, same non-collision every other exact+wildcard group
+     * in this function already relies on. */
+    httpd_uri_t zigbee_g = { .uri = "/api/v1/zigbee", .method = HTTP_GET, .handler = zigbee_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &zigbee_g));
+    httpd_uri_t zigbee_permit = { .uri = "/api/v1/zigbee/permit", .method = HTTP_POST, .handler = zigbee_permit_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &zigbee_permit));
+    httpd_uri_t zigbee_devices_post_u = { .uri = "/api/v1/zigbee/devices/*", .method = HTTP_POST, .handler = zigbee_devices_post };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &zigbee_devices_post_u));
+    httpd_uri_t zigbee_devices_del = { .uri = "/api/v1/zigbee/devices/*", .method = HTTP_DELETE, .handler = zigbee_devices_delete };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &zigbee_devices_del));
 }
