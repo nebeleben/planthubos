@@ -182,6 +182,10 @@ void zb_interview_on_clusters(zb_iv_t *iv, uint8_t endpoint,
                 if (iv->report_clusters[j] == cluster) { dup = true; break; }
             if (!dup && iv->report_count < ZB_STORE_MAX_CAPS) {
                 iv->report_clusters[iv->report_count] = cluster;
+                /* FIX 4: record which endpoint THIS cluster actually
+                 * answered on -- not dev.endpoint, which may belong to an
+                 * entirely different endpoint's mapping. */
+                iv->report_endpoints[iv->report_count] = endpoint;
                 iv->report_count++;
                 yielded = true;
             }

@@ -30,3 +30,26 @@ CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 # groundwork.md, Task 6), which proved this exact pair of options builds.
 CONFIG_ZB_ENABLED=y
 CONFIG_ZB_ZCZR=y
+
+# Whole-branch review, FIX 8: match Espressif's own esp_zigbee_gateway
+# example, which sets these OFF (see its sdkconfig.defaults) precisely
+# because it runs WiFi+TLS alongside Zigbee -- the same combination this
+# hub runs (MQTT and Influx POSTs over TLS, plus Zigbee security traffic
+# once a device is joined). This project left them at the C6's default
+# (=y, hardware AES/MPI/SHA acceleration) on the grounds that concurrent
+# use of the crypto hardware by TLS and by Zigbee security only matters
+# once both are actually live together -- but that precondition was never
+# actually tested: every hardware validation run to date paired this hub
+# with WiFi+TLS but with NO Zigbee device joined, so Zigbee security
+# traffic has never coexisted with this hub's own TLS use of the same
+# crypto hardware. The vendor's example disables these for exactly this
+# coexistence reason, on the same SoC family. Cost of matching the vendor
+# here is TLS throughput this hub does not need (a handful of MQTT/Influx
+# POSTs); the cost of leaving them on and being wrong is silent crypto
+# corruption under concurrent use, which would be indistinguishable from
+# an unrelated bug and blamed on anything but this config. C6-only: the
+# shared sdkconfig.defaults must not carry this, since only C6 (SoC
+# Zigbee + WiFi coexistence) is affected by this reasoning.
+CONFIG_MBEDTLS_HARDWARE_AES=n
+CONFIG_MBEDTLS_HARDWARE_MPI=n
+CONFIG_MBEDTLS_HARDWARE_SHA=n

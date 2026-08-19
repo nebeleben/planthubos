@@ -136,6 +136,19 @@ int main(void) {
     assert(iv.dev.caps[0] == CAP_AIR_TEMPERATURE);
     assert(iv.dev.caps[1] == CAP_AIR_HUMIDITY);
 
+    /* --- FIX 4 (whole-branch review): report_clusters[] accumulates
+     * across every endpoint, but Configure Reporting is per-endpoint --
+     * each entry must remember ITS OWN endpoint, not dev.endpoint (which
+     * is only the first endpoint to yield any mapping at all, here
+     * endpoint 1's temperature). Endpoint 2's humidity report must stay
+     * addressed to endpoint 2. --- */
+    assert(iv.dev.endpoint == 1);
+    assert(iv.report_count == 2);
+    assert(iv.report_clusters[0] == 0x0402);   /* temperature, endpoint 1 */
+    assert(iv.report_endpoints[0] == 1);
+    assert(iv.report_clusters[1] == 0x0405);   /* humidity, endpoint 2 */
+    assert(iv.report_endpoints[1] == 2);
+
     /* --- Task 13: the same undrivable cluster on two endpoints is
      * recorded once, not twice -- same dedup reasoning as caps/actions
      * above, just for unmapped_clusters. --- */

@@ -32,6 +32,8 @@
 #include "esp_coexist.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
 
 /* Task 6: the joined-device store, the interview it drives, and the
  * registry/actor-table it populates. */
@@ -45,8 +47,26 @@
 #include "capability.h"
 #include "data_core.h"
 #include "actor.h"
+#include "actor_persist.h"
 
 static const char *TAG = "zigbee";
+
+/* Whole-branch review, FIX 6: main.c's log_heap("after ble_collector_start")
+ * fires before zigbee_start() is even called, and this stack forms/restores
+ * its network asynchronously on its own task -- so free heap with Zigbee
+ * actually live on the radio was never logged anywhere, even though the
+ * milestone spec requires that measurement. Same shape as ble_collector.c's
+ * own log_heap() (see its comment): a permanent boot-time trace, one level
+ * further down than main.c's coarse "after ble_collector_start"/"end of
+ * app_main" milestones. Called once network formation or restore actually
+ * completes -- see ESP_ZB_BDB_SIGNAL_FORMATION and the restore branch of
+ * ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START/_REBOOT below. */
+static void log_heap(const char *milestone)
+{
+    ESP_LOGI(TAG, "heap @ %s: free=%u B largest_free_block(8BIT|INTERNAL)=%u B",
+             milestone, (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+}
 
 /* The four 802.15.4 channels that sit in the gaps between the commonly-used
  * 2.4 GHz WiFi channels (1/6/11 and their neighbours) -- restricting the
@@ -279,6 +299,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             record_net_info(&channel, &pan_id);
             ESP_LOGI(TAG, "network restored from zb_storage on channel %u, PAN 0x%04x",
                      channel, pan_id);
+            log_heap("after zigbee network restored");
         }
         break;
 
@@ -290,6 +311,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         if (err_status == ESP_OK) {
             record_net_info(&channel, &pan_id);
             ESP_LOGI(TAG, "network formed on channel %u, PAN 0x%04x", channel, pan_id);
+            log_heap("after zigbee network formed");
         } else {
             ESP_LOGE(TAG, "network formation failed (%s)", esp_err_to_name(err_status));
         }
@@ -325,8 +347,33 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         xSemaphoreTake(s_store_mutex, portMAX_DELAY);
         int annce_idx = zb_store_find(&s_store, annce->ieee_addr);
         device_is_new = annce_idx < 0;
+
+        /* FIX 5 (whole-branch review): zb_store_find_by_short() returns
+         * the FIRST record holding a given short address. Short addresses
+         * are reused -- if device A leaves and the coordinator later
+         * hands A's old short address to device B, A's record keeps it
+         * stale until A itself rejoins, and in the meantime an attribute
+         * report from B resolves to A and lands in A's history. Whoever
+         * is announcing this short address right now is its true current
+         * owner, so clear it from every OTHER record first -- this must
+         * run even when the announcing device is not yet known here
+         * (device_is_new), since the collision is with an existing STALE
+         * record, not with this one. 0x0000 is reserved for the
+         * coordinator and never assigned to an end device/router, so it
+         * is a safe "no short address" sentinel. */
+        bool stale_cleared = false;
+        for (int i = 0; i < s_store.count; i++) {
+            if (i != annce_idx && s_store.dev[i].short_addr == annce->device_short_addr) {
+                s_store.dev[i].short_addr = 0;
+                stale_cleared = true;
+            }
+        }
+        bool owner_updated = false;
         if (annce_idx >= 0 && s_store.dev[annce_idx].short_addr != annce->device_short_addr) {
             s_store.dev[annce_idx].short_addr = annce->device_short_addr;
+            owner_updated = true;
+        }
+        if (stale_cleared || owner_updated) {
             zb_store_save();
         }
         xSemaphoreGive(s_store_mutex);
@@ -542,6 +589,19 @@ static void zb_register_restored_devices(void)
                          dev_idx, (unsigned)dev->actions[a]);
             }
         }
+
+        /* Whole-branch review, FIX 1/2: without a device key, actor_service()
+         * can never resolve a dispatch hook for this device (actor.c) and
+         * actor_table_guard_merge() will never carry its guards to flash
+         * (actor_table.c) -- every command silently drops and an operator's
+         * lockout silently un-persists. id is this device's stable EUI-64
+         * identity, already ACTOR_DEVICE_KEY_LEN (9) bytes, exactly as
+         * ble_collector.c's on_gatt_disc_result() does it. Restoring the
+         * guard image here (not just setting the key) is what brings the
+         * operator's lockout, cooldown and spent budget back after this
+         * same reboot instead of only after the next one. */
+        actor_set_device_key(dev_idx, (const uint8_t *)&id);
+        actor_persist_restore_device(dev_idx, (const uint8_t *)&id);
     }
 }
 
@@ -634,6 +694,19 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
      * reading in a plant's history is worse than a gap (zb_map.h). */
     uint8_t cap = zb_map_cluster_to_cap(msg->cluster);
     if (cap == ZB_MAP_NONE) return;
+
+    /* Whole-branch review, FIX 3: zb_map_zcl_to_value() converts whatever
+     * raw value arrived, on the assumption the attribute it is being
+     * handed is the one zb_map_report_attr() named for this cluster when
+     * Configure Reporting was set up. Nothing upstream of this function
+     * enforced that -- a device that reports a DIFFERENT attribute on the
+     * same cluster (e.g. Power Configuration's BatteryVoltage, 0x0020, 100
+     * mV units, instead of BatteryPercentageRemaining, 0x0021) would
+     * otherwise have its raw units silently reinterpreted as the wrong
+     * capability's units and land in history as a fabricated reading --
+     * exactly what zb_map.c's own sentinel checks exist to prevent, just
+     * from outside the file where that guarantee is enforced. */
+    if (msg->attribute.id != zb_map_report_attr(msg->cluster)) return;
 
     int32_t raw;
     if (!zcl_attr_to_i32(&msg->attribute.data, &raw)) return;
@@ -866,6 +939,14 @@ static void zb_iv_simple_desc_cb(esp_zb_zdp_status_t status,
 static void zb_iv_send_config_report(void)
 {
     uint16_t cluster = s_iv.report_clusters[s_iv.report_cursor - 1];
+    /* FIX 4: address Configure Reporting to the endpoint THIS cluster was
+     * found on, not s_iv.dev.endpoint -- dev.endpoint is only the FIRST
+     * endpoint to yield any mapping at all (zb_interview.c's on_clusters()
+     * comment) and report_clusters[] accumulates across every endpoint the
+     * interview walks. On a multi-endpoint device (On/Off on endpoint 1,
+     * a sensor on endpoint 2) sending endpoint 2's Configure Reporting to
+     * endpoint 1 gets it rejected and that sensor never reports again. */
+    uint8_t endpoint = s_iv.report_endpoints[s_iv.report_cursor - 1];
     uint16_t attr = zb_map_report_attr(cluster);
     if (attr == ZB_MAP_NO_ATTR) {
         /* Shouldn't happen -- on_clusters() only ever queues a cluster here
@@ -904,7 +985,7 @@ static void zb_iv_send_config_report(void)
     esp_zb_zcl_config_report_cmd_t cmd = {
         .zcl_basic_cmd = {
             .dst_addr_u.addr_short = s_iv.dev.short_addr,
-            .dst_endpoint = s_iv.dev.endpoint,
+            .dst_endpoint = endpoint,
             .src_endpoint = ZB_ENDPOINT,
         },
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
@@ -998,6 +1079,18 @@ static void zb_iv_handle_store(void)
                      (unsigned)dev->actions[a]);
         }
     }
+
+    /* Whole-branch review, FIX 1/2: same reasoning as
+     * zb_register_restored_devices() above -- without this key
+     * actor_service() has no dispatch hook to resolve (actor.c) and this
+     * device's guards can never reach flash (actor_table_guard_merge() in
+     * actor_table.c skips an unset key). Restoring the guard image now
+     * also means a device re-interviewed after a mid-session rejoin gets
+     * back any lockout/cooldown/budget it already had, same as
+     * ble_collector.c's on_gatt_disc_result(). */
+    actor_set_device_key(dev_idx, (const uint8_t *)&id);
+    actor_persist_restore_device(dev_idx, (const uint8_t *)&id);
+
     ESP_LOGI(TAG, "device %d interviewed: %u capability(ies), %u action(s)", dev_idx,
              (unsigned)dev->cap_count, (unsigned)dev->action_count);
 }
@@ -1263,6 +1356,23 @@ bool zigbee_device_remove(const uint8_t eui64[8])
         .remove_children = 1,
     };
     memcpy(req.device_address, eui64, 8);
+    /* Whole-branch review, FIX 7: NULL/NULL means no confirmation callback
+     * -- this device is forgotten from zb_store (and its registry/actor-
+     * table entries orphaned to reclaim on the next reboot, above)
+     * regardless of whether the leave request actually reached the
+     * device. That is the right failure direction to keep -- "forget
+     * locally" is recoverable (the user re-pairs), while blocking removal
+     * on a radio round-trip is not -- but leaving it silent makes an
+     * unconfirmed leave indistinguishable from a confirmed one. If the
+     * request never landed, the device remains joined in the STACK's own
+     * zb_storage and its very next announce re-interviews it straight
+     * back into the UI, which would otherwise look like an unrelated bug
+     * rather than what it is: a leave the network never actually heard.
+     * Logged unconditionally (not just on a callback failure, since
+     * there is no callback) so that reappearance is diagnosable. */
+    ESP_LOGW(TAG, "leave request sent for short 0x%04x; not confirmed by the network -- "
+                  "if it does not leave, it may re-announce and reappear",
+             (unsigned)short_addr);
     esp_zb_zdo_device_leave_req(&req, NULL, NULL);
     esp_zb_lock_release();
     return true;

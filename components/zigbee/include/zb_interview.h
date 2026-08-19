@@ -50,6 +50,15 @@ typedef struct {
     uint8_t       endpoint_cursor;
     uint8_t       pending_endpoint;     /* the endpoint SEND_SIMPLE_DESC asks about */
     uint16_t      report_clusters[ZB_STORE_MAX_CAPS];
+    /* Whole-branch review, FIX 4: the endpoint EACH report_clusters[]
+     * entry was found on -- report_clusters accumulates across every
+     * endpoint the interview walks, but Configure Reporting is a
+     * per-endpoint request, so dev.endpoint (the FIRST endpoint that
+     * yielded ANY mapping, on_clusters() below) is only sometimes the
+     * right destination. A device with On/Off on endpoint 1 and
+     * temperature on endpoint 2 must have its temperature report
+     * addressed to endpoint 2, not to dev.endpoint's 1. */
+    uint8_t       report_endpoints[ZB_STORE_MAX_CAPS];
     uint8_t       report_count;
     uint8_t       report_cursor;
     zb_device_t   dev;                  /* built up as answers arrive */
