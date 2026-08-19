@@ -73,6 +73,14 @@ static const char *TAG = "zb_cmd";
 
 typedef struct {
     bool        used;
+    /* Set only once the real value from esp_zb_zcl_on_off_cmd_req() has
+     * been written -- see on_zb_dispatch()'s own comment on why a slot is
+     * reserved (used=true) before that value is known, and why matching on
+     * `tsn` alone during that window would misattribute a stale response
+     * for the slot's PREVIOUS occupant to this new command. Cleared, along
+     * with `used`, every time a slot is reserved -- never left stale from
+     * an earlier occupant. */
+    bool        tsn_valid;
     uint8_t     tsn;
     actor_cmd_t cmd;
 } zb_cmd_inflight_t;
@@ -164,7 +172,17 @@ void zb_cmd_on_default_resp(uint8_t tsn, uint16_t cluster, uint8_t resp_to_cmd,
 
     portENTER_CRITICAL(&s_inflight_mux);
     for (int i = 0; i < ZB_CMD_MAX_INFLIGHT; i++) {
-        if (s_inflight[i].used && s_inflight[i].tsn == tsn) {
+        /* tsn_valid gates this: a slot reserved but not yet carrying its
+         * real tsn (on_zb_dispatch() is still inside the Zigbee lock,
+         * between reserving the slot and getting the send's return value)
+         * must never match on whatever tsn its PREVIOUS occupant left
+         * behind -- see zb_cmd_inflight_t's own comment. Fix round 2
+         * (Critical): without this gate, a stale/duplicate Default
+         * Response for that earlier, already-completed command could
+         * clear this slot and report the NEW command confirmed before it
+         * was even sent -- exactly backwards from this file's "sent but
+         * not confirmed counts as not confirmed" rule. */
+        if (s_inflight[i].used && s_inflight[i].tsn_valid && s_inflight[i].tsn == tsn) {
             found = true;
             slot = i;
             cmd = s_inflight[i].cmd;
@@ -257,8 +275,18 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
     portENTER_CRITICAL(&s_inflight_mux);
     for (int i = 0; i < ZB_CMD_MAX_INFLIGHT; i++) {
         if (!s_inflight[i].used) {
-            s_inflight[i].used = true;
-            s_inflight[i].cmd  = *cmd;
+            /* Fix round 2 (Critical): `used` and `tsn_valid` are set
+             * together, under this same critical section, so no
+             * interleaving can ever observe `used == true` while `tsn`
+             * still holds this slot's PREVIOUS occupant's value. The real
+             * tsn is not known until esp_zb_zcl_on_off_cmd_req() returns,
+             * below, after a potentially-blocking esp_zb_lock_acquire() --
+             * `tsn_valid` stays false for that whole window, so
+             * zb_cmd_on_default_resp() cannot match a stale response
+             * against this slot in the meantime (see its own comment). */
+            s_inflight[i].used      = true;
+            s_inflight[i].tsn_valid = false;
+            s_inflight[i].cmd       = *cmd;
             slot = i;
             break;
         }
@@ -296,13 +324,30 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
     };
     uint8_t tsn = esp_zb_zcl_on_off_cmd_req(&req);
 
+    /* Fix round 2 (Critical): tsn_valid flips true in the SAME critical
+     * section as the real tsn write, only now that it is known -- this is
+     * the moment this slot becomes matchable by zb_cmd_on_default_resp().
+     * Before this line the slot was reserved (used=true) but deliberately
+     * unmatchable (see the reservation loop above and zb_cmd_inflight_t's
+     * own comment). */
     portENTER_CRITICAL(&s_inflight_mux);
-    s_inflight[slot].tsn = tsn;
+    s_inflight[slot].tsn       = tsn;
+    s_inflight[slot].tsn_valid = true;
     portEXIT_CRITICAL(&s_inflight_mux);
 
     /* Scheduled while still holding the stack lock, same as the send
      * itself -- see this file's top comment on why every SDK call in this
-     * function needs it. */
+     * function needs it.
+     *
+     * esp_zb_scheduler_alarm() returns void in this SDK
+     * (esp_zigbee_core.h's own declaration) -- there is no failure signal
+     * to check, so a scheduling failure here cannot be told apart from
+     * success and this slot cannot be defensively released against one.
+     * zigbee.c's own zb_iv_ensure_ticking() schedules the interview's
+     * liveness tick through this identical call, equally unchecked, so a
+     * silent failure here would not be a gap unique to this file -- it is
+     * this SDK surface's own limit, already relied on elsewhere in this
+     * component. */
     esp_zb_scheduler_alarm(zb_cmd_timeout_cb, (uint8_t)slot, ZB_CMD_TIMEOUT_MS);
     esp_zb_lock_release();
 }
