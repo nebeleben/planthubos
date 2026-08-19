@@ -204,13 +204,13 @@ $CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/a
 ./test_actor_table
 
 $CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/actions/include \
-    -I../../components/event_log/include \
+    -I../../components/event_log/include -I../../components/capability/include \
     test_actor_queue.c ../../components/actors/actor.c ../../components/actors/actor_table.c \
     ../../components/actions/action.c -o test_actor_queue
 ./test_actor_queue
 
 $CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/actions/include \
-    -I../../components/event_log/include \
+    -I../../components/event_log/include -I../../components/capability/include \
     test_pending_close.c ../../components/actors/pending_close.c \
     ../../components/actions/action.c -o test_pending_close
 ./test_pending_close
@@ -219,6 +219,7 @@ $CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/a
 # FINAL-persist): the wire format in actor_persist.c plus the merge/apply
 # decisions in actor_table.c, which are one mechanism and are tested as one.
 $CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/actions/include \
+    -I../../components/capability/include \
     test_actor_persist.c ../../components/actors/actor_persist.c \
     ../../components/actors/actor_table.c ../../components/actions/action.c \
     -o test_actor_persist

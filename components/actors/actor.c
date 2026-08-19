@@ -209,7 +209,16 @@ static void verdict_alert(actor_verdict_t v, uint8_t *level_out, uint8_t *code_o
 
 static actor_table_t       s_table;
 static actor_queue_t       s_queue;
-static actor_dispatch_fn_t s_dispatch;
+/* One dispatcher per device kind (M6b Task 7). Was a single pointer
+ * through M5b, when GATT was the only radio that could carry an action.
+ * actor_request() is still the ONLY door in; this is only the exit
+ * widening, and every guard in actor_table_check() still runs before a
+ * command can reach any of these. Indexed by device_kind_t
+ * (capability.h); DEV_KIND_COUNT is a plain #define, not a fourth
+ * enumerator -- see its own comment for why. Zero-initialized by static
+ * storage, so every kind starts out NULL/no-op, same posture a NULL
+ * s_dispatch already had. */
+static actor_dispatch_fn_t s_dispatch[DEV_KIND_COUNT];
 
 /* Whole-branch review, ruling FINAL-persist: set whenever anything the
  * guard file records has changed, read-and-cleared by
@@ -262,9 +271,10 @@ void actor_init(void)
     actor_queue_init(&s_queue);
 }
 
-void actor_set_dispatch_hook(actor_dispatch_fn_t fn)
+void actor_set_dispatch_hook(device_kind_t kind, actor_dispatch_fn_t fn)
 {
-    s_dispatch = fn;
+    if ((unsigned)kind < DEV_KIND_COUNT)
+        s_dispatch[kind] = fn;
 }
 
 bool actor_declare(int dev_idx, uint8_t action_id, uint16_t param_max, uint8_t flags)
@@ -495,5 +505,32 @@ void actor_service(void)
 #endif
     }
 
-    if (r.dispatched && s_dispatch) s_dispatch(&r.cmd);
+    if (r.dispatched) {
+        /* Resolve the dispatched command's device kind from its stable
+         * identity (actor_device_key(), already lock-taking and already
+         * plain C99 -- no data_core dependency needed here at all, so
+         * this runs identically on host and target; the queue/table stay
+         * exactly as pure as they were). key[0] is device_id_t.kind
+         * (capability.h; ble_collector.c's _Static_assert pins
+         * sizeof(device_id_t) == ACTOR_DEVICE_KEY_LEN, key[0] first). */
+        uint8_t              key[ACTOR_DEVICE_KEY_LEN];
+        actor_dispatch_fn_t  fn = NULL;
+        if (actor_device_key(r.cmd.dev_idx, key) && key[0] < DEV_KIND_COUNT)
+            fn = s_dispatch[key[0]];
+
+        if (fn) {
+            fn(&r.cmd);
+        } else {
+            /* No registered dispatcher for this kind (or the kind could
+             * not be resolved at all): drop visibly, never silently -- a
+             * queued command that just vanishes is exactly the failure
+             * mode the TTL and re-check machinery above exists to make
+             * observable, and this is that same principle applied to a
+             * third way a command could otherwise disappear. */
+#ifdef ESP_PLATFORM
+            alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_NO_DISPATCHER,
+                       r.cmd.dev_idx, r.cmd.action_id, r.cmd.param);
+#endif
+        }
+    }
 }

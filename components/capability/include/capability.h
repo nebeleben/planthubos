@@ -41,6 +41,16 @@ float   capability_decode(uint8_t id, int16_t raw);       /* raw==CAP_VALUE_NONE
 
 /* --- device_id.c --- */
 typedef enum { DEV_KIND_BLE = 0, DEV_KIND_ESPNOW = 1, DEV_KIND_ZIGBEE = 2 } device_kind_t;
+/* Deliberately a #define, NOT a fourth enumerator in device_kind_t itself
+ * (M6b Task 7, correction to the original dispatch table): device_id.c's
+ * kind_prefix() and kind_addr_len() both switch over device_kind_t with no
+ * `default:` label, exhaustive over exactly the three real kinds above,
+ * and every host test that links capability.c builds with
+ * -Wall -Wextra -Werror. A fourth enumerator would make both switches
+ * non-exhaustive and turn -Wswitch into a hard build break there. A plain
+ * macro gives actor.c a table size without touching the enum those
+ * switches are exhaustive over. */
+#define DEV_KIND_COUNT 3
 typedef struct { uint8_t kind; uint8_t addr[8]; } device_id_t;   /* 9 bytes */
 
 device_id_t device_id_from_mac(device_kind_t kind, const uint8_t mac[6]);  /* pads 6->8 */

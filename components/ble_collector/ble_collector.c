@@ -1595,7 +1595,7 @@ esp_err_t ble_collector_start(void)
          * the actor queue simply never gets pumped past its dispatch hook,
          * which stays NULL and is a documented no-op. */
         gatt_engine_set_cmd_done_hook(on_gatt_cmd_done);
-        actor_set_dispatch_hook(on_actor_dispatch);
+        actor_set_dispatch_hook(DEV_KIND_BLE, on_actor_dispatch);
         s_actors_wired = true;   /* set LAST: it is what opens the path above */
     }
     return ESP_OK;

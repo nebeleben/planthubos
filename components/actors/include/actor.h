@@ -3,6 +3,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "actor_table.h"
+#include "capability.h" /* device_kind_t -- actor_set_dispatch_hook() below is now
+                          * keyed on it (M6b Task 7). Pulls in nothing beyond plain
+                          * typedefs/macros (no ESP-IDF), so this stays link-clean for
+                          * the host tests that include this header without ESP-IDF. */
 
 /* actor_request(), the command queue and its TTL (M5b Task 7, design spec
  * section 3 and section 4.1). actor_request() is the ONLY door onto an
@@ -305,17 +309,32 @@ bool actor_request(int dev_idx, uint8_t action_id, uint16_t param,
 bool actor_request_retry(int dev_idx, uint8_t action_id, uint16_t param,
                           actor_source_t source, uint32_t deadline_s);
 
-/* Registered by whichever module actually owns the radio (the GATT
- * command engine, Task 8); actor_service() calls this once per dispatched
- * command. A NULL hook is a safe no-op -- same convention as alert.h's
- * alert_wake_fn_t and gatt_engine.h's scan-resume hook. */
+/* Registered by whichever module actually owns the radio for a given
+ * device kind (the GATT command engine for DEV_KIND_BLE, M5b Task 8; a
+ * Zigbee dispatcher for DEV_KIND_ZIGBEE is M6b's reason for this widening).
+ * actor_service() resolves the dispatched command's device kind and calls
+ * THAT kind's hook, once per dispatched command -- the single s_dispatch
+ * pointer M5b had, when GATT was the only radio that could carry an
+ * action, is now a small per-kind table indexed by device_kind_t. An
+ * unregistered kind's hook is NULL, the same safe no-op posture a NULL
+ * hook already had through M5b -- same convention as alert.h's
+ * alert_wake_fn_t and gatt_engine.h's scan-resume hook -- except
+ * actor_service() also posts ALERT_CODE_NO_DISPATCHER when that happens,
+ * so a command is never silently dropped just because no dispatcher has
+ * registered for its kind yet (see actor_service()'s doc comment below).
+ * This is still the only exit a dispatched command has, not a second door
+ * onto the radio -- see this header's top comment. */
 typedef void (*actor_dispatch_fn_t)(const actor_cmd_t *cmd);
-void actor_set_dispatch_hook(actor_dispatch_fn_t fn);
+void actor_set_dispatch_hook(device_kind_t kind, actor_dispatch_fn_t fn);
 
 /* Services the queue: calls actor_service_step() under lock, then outside
  * the lock posts a named alert for any TTL drop and for a dispatch-time
- * re-check refusal, and finally hands a dispatched command to the
- * dispatch hook. Call periodically from a task that can own the radio. */
+ * re-check refusal, and finally resolves the dispatched command's device
+ * kind and hands it to that kind's dispatch hook (M6b Task 7). A kind
+ * whose hook was never registered (or whose device's kind cannot be
+ * resolved at all) posts ALERT_CODE_NO_DISPATCHER and drops the command
+ * instead of calling nothing -- never a silent disappearance. Call
+ * periodically from a task that can own the radio. */
 void actor_service(void);
 
 /* ---------------------------------------------------------------------

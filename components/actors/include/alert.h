@@ -57,6 +57,17 @@ typedef enum {
                                      * exactly once per continuous unreachable streak, so
                                      * an actuator that opened next to a hub that can't
                                      * yet see it doesn't stay open in total silence. */
+    ALERT_CODE_NO_DISPATCHER,      /* M6b Task 7: a command passed every guard and was
+                                     * popped for dispatch, but its device's kind has no
+                                     * registered dispatch hook (actor_set_dispatch_hook()
+                                     * was never called for that kind, or resolving the
+                                     * device's kind failed). The command is dropped here,
+                                     * never silently -- a queued command that vanishes
+                                     * with no trace is exactly the failure mode the TTL
+                                     * and re-check machinery exists to make visible, and
+                                     * this is the same principle applied to a third
+                                     * possible cause of disappearance. Appended, never
+                                     * renumbered -- see this enum's own comment. */
 } alert_code_t;
 
 #define ALERT_RING_LEN 8
