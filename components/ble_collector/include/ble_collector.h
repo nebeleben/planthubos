@@ -104,3 +104,8 @@ uint32_t ble_collector_plan_interval_for_device(int dev_idx);
  * Zigbee joining cannot share the antenna. Calls are idempotent, so a
  * second hold or a release with no hold outstanding is harmless. */
 void ble_collector_scan_hold(bool hold);
+
+/* True while a Zigbee permit-join window holds the radio (see
+ * ble_collector_scan_hold). Read by the other BLE connection owners so
+ * they can defer their own work for the window's duration. */
+bool ble_collector_scan_is_held(void);

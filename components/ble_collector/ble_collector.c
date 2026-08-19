@@ -412,6 +412,8 @@ bool ble_collector_resume_scan(void)
     return start_scan();
 }
 
+bool ble_collector_scan_is_held(void) { return s_scan_hold; }
+
 void ble_collector_scan_hold(bool hold)
 {
     if (hold == s_scan_hold) return;
