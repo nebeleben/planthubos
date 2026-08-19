@@ -93,6 +93,45 @@ int main(void) {
     assert(zb_interview_step(&iv, 1000 + ZB_IV_TIMEOUT_S) == ZB_IV_ACT_STORE);
     assert(iv.state == ZB_IV_FAILED);
 
+    /* --- fix round 2: two endpoints reporting the SAME cluster must not
+     * double up. The registry keeps one slot per (device, capability id)
+     * -- a second CAP_SWITCH_STATE entry for this EUI-64 is not just a
+     * wasted array slot, it is unrepresentable downstream and would have
+     * silently starved gang 2's actions of a slot gang 1 already took. --- */
+    zb_interview_begin(&iv, EUI, 0x1234, 500);
+    zb_interview_step(&iv, 500);
+    uint8_t eps2[2] = { 1, 2 };
+    zb_interview_on_endpoints(&iv, eps2, 2);
+    zb_interview_step(&iv, 501);
+    uint16_t gang1[1] = { 0x0006 };
+    zb_interview_on_clusters(&iv, 1, gang1, 1);
+    zb_interview_step(&iv, 502);
+    uint16_t gang2[1] = { 0x0006 };
+    zb_interview_on_clusters(&iv, 2, gang2, 1);
+    zb_interview_step(&iv, 503);                    /* SEND_CONFIG_REPORT */
+    assert(zb_interview_step(&iv, 504) == ZB_IV_ACT_STORE);
+    assert(iv.dev.cap_count == 1);
+    assert(iv.dev.action_count == 2);
+    assert(iv.dev.actions[0] == ACT_SWITCH_ON);
+    assert(iv.dev.actions[1] == ACT_SWITCH_OFF);
+
+    /* --- the dedup must not be over-broad: two endpoints reporting
+     * DIFFERENT clusters keep both capabilities. --- */
+    zb_interview_begin(&iv, EUI, 0x1234, 600);
+    zb_interview_step(&iv, 600);
+    zb_interview_on_endpoints(&iv, eps2, 2);
+    zb_interview_step(&iv, 601);
+    uint16_t humidity[1] = { 0x0405 };
+    zb_interview_on_clusters(&iv, 1, temp, 1);       /* 0x0402, endpoint 1 */
+    zb_interview_step(&iv, 602);
+    zb_interview_on_clusters(&iv, 2, humidity, 1);   /* 0x0405, endpoint 2 */
+    zb_interview_step(&iv, 603);                    /* SEND_CONFIG_REPORT */
+    zb_interview_step(&iv, 604);                    /* SEND_CONFIG_REPORT */
+    assert(zb_interview_step(&iv, 605) == ZB_IV_ACT_STORE);
+    assert(iv.dev.cap_count == 2);
+    assert(iv.dev.caps[0] == CAP_AIR_TEMPERATURE);
+    assert(iv.dev.caps[1] == CAP_AIR_HUMIDITY);
+
     printf("test_zb_interview: OK\n");
     return 0;
 }

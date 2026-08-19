@@ -119,29 +119,55 @@ void zb_interview_on_clusters(zb_iv_t *iv, uint8_t endpoint,
     for (uint8_t i = 0; i < n; i++) {
         uint16_t cluster = clusters[i];
 
+        /* The registry keeps one slot per (device, capability id) --
+         * registry_set_cap() is keyed that way. A second endpoint offering
+         * a capability id this device already has (a 2-gang switch's On/Off
+         * on both endpoint 1 and 2, say) is therefore not a smaller problem
+         * than an array overflow: two entries for one capability id are
+         * unrepresentable downstream, and the second would silently
+         * overwrite the first. So dedup goes in FRONT of the existing
+         * < MAX bounds below, not in place of them. */
         uint8_t cap = zb_map_cluster_to_cap(cluster);
-        if (cap != ZB_MAP_NONE && iv->dev.cap_count < ZB_STORE_MAX_CAPS) {
-            iv->dev.caps[iv->dev.cap_count] = cap;
-            iv->dev.cap_clusters[iv->dev.cap_count] = cluster;
-            iv->dev.cap_count++;
-            yielded = true;
-        }
-
-        if (iv->dev.action_count < ZB_STORE_MAX_ACTIONS) {
-            int room = ZB_STORE_MAX_ACTIONS - iv->dev.action_count;
-            int added = zb_map_cluster_to_actions(
-                cluster, &iv->dev.actions[iv->dev.action_count], room);
-            if (added > 0) {
-                iv->dev.action_count += (uint8_t)added;
+        if (cap != ZB_MAP_NONE) {
+            bool dup = false;
+            for (uint8_t j = 0; j < iv->dev.cap_count; j++)
+                if (iv->dev.caps[j] == cap) { dup = true; break; }
+            if (!dup && iv->dev.cap_count < ZB_STORE_MAX_CAPS) {
+                iv->dev.caps[iv->dev.cap_count] = cap;
+                iv->dev.cap_clusters[iv->dev.cap_count] = cluster;
+                iv->dev.cap_count++;
                 yielded = true;
             }
         }
 
-        if (zb_map_report_attr(cluster) != ZB_MAP_NO_ATTR &&
-            iv->report_count < ZB_STORE_MAX_CAPS) {
-            iv->report_clusters[iv->report_count] = cluster;
-            iv->report_count++;
-            yielded = true;
+        /* Same reasoning for actions: a second endpoint's On/Off must not
+         * re-append ACT_SWITCH_ON/OFF and starve a genuinely different
+         * action of its slot. */
+        uint8_t acts[ZB_STORE_MAX_ACTIONS];
+        int n_acts = zb_map_cluster_to_actions(cluster, acts, ZB_STORE_MAX_ACTIONS);
+        for (int k = 0; k < n_acts; k++) {
+            bool dup = false;
+            for (uint8_t j = 0; j < iv->dev.action_count; j++)
+                if (iv->dev.actions[j] == acts[k]) { dup = true; break; }
+            if (dup)
+                continue;
+            if (iv->dev.action_count < ZB_STORE_MAX_ACTIONS) {
+                iv->dev.actions[iv->dev.action_count++] = acts[k];
+                yielded = true;
+            }
+        }
+
+        /* And for reporting: configuring a report on the same cluster
+         * twice wastes a round trip for no benefit. */
+        if (zb_map_report_attr(cluster) != ZB_MAP_NO_ATTR) {
+            bool dup = false;
+            for (uint8_t j = 0; j < iv->report_count; j++)
+                if (iv->report_clusters[j] == cluster) { dup = true; break; }
+            if (!dup && iv->report_count < ZB_STORE_MAX_CAPS) {
+                iv->report_clusters[iv->report_count] = cluster;
+                iv->report_count++;
+                yielded = true;
+            }
         }
     }
 
