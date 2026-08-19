@@ -238,3 +238,10 @@ $CC -Wall -Wextra -Werror -I../../components/zigbee/include \
 $CC -Wall -Wextra -Werror -I../../components/zigbee/include \
     test_zb_store.c ../../components/zigbee/zb_store.c -o test_zb_store
 ./test_zb_store
+
+$CC -Wall -Wextra -Werror -I../../components/zigbee/include \
+    -I../../components/capability/include -I../../components/actions/include \
+    test_zb_interview.c ../../components/zigbee/zb_interview.c \
+    ../../components/zigbee/zb_map.c ../../components/capability/capability.c \
+    -lm -o test_zb_interview
+./test_zb_interview
