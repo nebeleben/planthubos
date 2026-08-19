@@ -69,6 +69,30 @@ int main(void) {
     assert(iv.state == ZB_IV_FAILED);
     assert(iv.dev.interviewed == 0);        /* joined, NOT interviewed */
 
+    /* --- fix round 1: a burst of callbacks at ONE instant must extend the
+     * deadline once, not once per callback. Four endpoints answering back
+     * to back at t=1000 must leave the deadline at exactly 1000 + TIMEOUT,
+     * never a multiple of it. --- */
+    zb_interview_begin(&iv, EUI, 0x1234, 1000);
+    uint8_t eps4[4] = { 1, 2, 3, 4 };
+    uint16_t temp[1] = { 0x0402 };
+    zb_interview_on_endpoints(&iv, eps4, 4);           /* callback 1 */
+    zb_interview_on_clusters(&iv, 1, temp, 1);         /* callback 2 */
+    zb_interview_on_clusters(&iv, 2, temp, 1);         /* callback 3 */
+    zb_interview_on_clusters(&iv, 3, temp, 1);         /* callback 4 */
+    zb_interview_on_clusters(&iv, 4, temp, 1);         /* callback 5 */
+    /* All five callbacks fired at t=1000; the FIRST step() call after them
+     * is what recomputes the deadline, and it must do so from now_s, not
+     * by stacking one extension per callback delivered. */
+    assert(zb_interview_step(&iv, 1000) == ZB_IV_ACT_SEND_CONFIG_REPORT);
+    assert(iv.deadline_s == 1000 + ZB_IV_TIMEOUT_S);
+
+    /* Then it goes silent: no further callback, so the deadline set above
+     * must hold -- a device that answered and then stopped still times out
+     * exactly on schedule, not minutes late because it was chatty early on. */
+    assert(zb_interview_step(&iv, 1000 + ZB_IV_TIMEOUT_S) == ZB_IV_ACT_STORE);
+    assert(iv.state == ZB_IV_FAILED);
+
     printf("test_zb_interview: OK\n");
     return 0;
 }

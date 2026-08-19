@@ -3,10 +3,18 @@
  * See zb_interview.h for the shape and the reasoning. Two things worth
  * calling out here:
  *
- * - Progress earns more time, silence does not: every on_* callback pushes
- *   deadline_s further out by ZB_IV_TIMEOUT_S. A bare zb_interview_step()
- *   call never touches it -- otherwise a device that never replies would
- *   be waited on forever.
+ * - Progress earns more time, silence does not -- and only step() knows
+ *   how much time has actually passed. Each on_* callback just records
+ *   that an answer arrived (iv->progressed); step() is the one that turns
+ *   that into deadline_s = now_s + ZB_IV_TIMEOUT_S, before it checks the
+ *   deadline. Doing the recompute inside the callback instead -- adding
+ *   ZB_IV_TIMEOUT_S onto whatever deadline_s already held -- was tried and
+ *   rejected: several callbacks delivered back-to-back at one instant (a
+ *   device with four endpoints, say) would then stretch a 30-second budget
+ *   into minutes, which is progress earning time by CALL COUNT rather than
+ *   by elapsed time. A bare zb_interview_step() call with no callback in
+ *   between never sets progressed, so a device that never replies is still
+ *   bounded by the original deadline.
  * - A failed or unmappable interview still ends in ZB_IV_ACT_STORE. The
  *   only difference is dev.interviewed: 0 means "joined, never heard from
  *   again", 1 means "answered, even if nothing it said mapped to
@@ -29,6 +37,15 @@ void zb_interview_begin(zb_iv_t *iv, const uint8_t eui64[8],
 zb_iv_action_t zb_interview_step(zb_iv_t *iv, uint32_t now_s) {
     if (iv->state == ZB_IV_DONE || iv->state == ZB_IV_FAILED)
         return ZB_IV_ACT_NONE;
+
+    /* An answer arrived since the last step(): recompute the deadline from
+     * now_s, the only time this function actually has, before checking it
+     * -- so an answer that lands right up against the deadline still
+     * counts as progress. */
+    if (iv->progressed) {
+        iv->deadline_s = now_s + ZB_IV_TIMEOUT_S;
+        iv->progressed = false;
+    }
 
     /* Silence, not an answer: the device gets stored as joined-but-not-
      * interviewed, never dropped -- see the file header comment. */
@@ -88,7 +105,7 @@ void zb_interview_on_endpoints(zb_iv_t *iv, const uint8_t *eps, uint8_t n) {
 
     iv->state = ZB_IV_WAIT_SIMPLE_DESC;
     iv->request_sent = false;
-    iv->deadline_s += ZB_IV_TIMEOUT_S;
+    iv->progressed = true;
 }
 
 void zb_interview_on_clusters(zb_iv_t *iv, uint8_t endpoint,
@@ -133,5 +150,5 @@ void zb_interview_on_clusters(zb_iv_t *iv, uint8_t endpoint,
 
     iv->endpoint_cursor++;
     iv->request_sent = false;
-    iv->deadline_s += ZB_IV_TIMEOUT_S;
+    iv->progressed = true;
 }

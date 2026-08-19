@@ -41,6 +41,10 @@ typedef struct {
     zb_iv_state_t state;
     uint32_t      deadline_s;
     bool          request_sent;         /* stops a re-send while waiting */
+    bool          progressed;           /* an on_* callback fired since the
+                                          * last step(); only step() knows
+                                          * now_s, so it -- not the callback
+                                          * -- recomputes deadline_s from it */
     uint8_t       endpoints[ZB_IV_MAX_ENDPOINTS];
     uint8_t       endpoint_count;
     uint8_t       endpoint_cursor;
