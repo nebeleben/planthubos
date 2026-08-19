@@ -646,12 +646,29 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
     data_core_submit_cap_id(&id, cap, value);
 }
 
+/* Task 8: the SDK allows exactly one ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID
+ * handler, network-wide -- this file already owns the one registration
+ * (esp_zb_core_action_handler_register() in zb_task() below), so a Default
+ * Response answering a command zb_cmd.c sent arrives here first and is
+ * forwarded on with plain fields (zb_cmd_on_default_resp(), zigbee.h): that
+ * header stays free of esp-zigbee-lib types, and zb_cmd.c stays the only
+ * place that knows which commands it has outstanding. */
+static void zb_handle_default_resp(const esp_zb_zcl_cmd_default_resp_message_t *msg)
+{
+    if (!msg) return;
+    zb_cmd_on_default_resp(msg->info.header.tsn, msg->info.cluster, msg->resp_to_cmd,
+                            (uint8_t)msg->status_code);
+}
+
 static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callback_id,
                                          const void *message)
 {
     switch (callback_id) {
     case ESP_ZB_CORE_REPORT_ATTR_CB_ID:
         zb_handle_report_attr((const esp_zb_zcl_report_attr_message_t *)message);
+        return ESP_OK;
+    case ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID:
+        zb_handle_default_resp((const esp_zb_zcl_cmd_default_resp_message_t *)message);
         return ESP_OK;
     default:
         ESP_LOGD(TAG, "unhandled ZCL core action 0x%x", (unsigned)callback_id);
@@ -1082,6 +1099,13 @@ esp_err_t zigbee_start(void)
     xSemaphoreGive(s_store_mutex);
     zb_register_restored_devices();
 
+    /* Task 8: the command engine only needs the actor dispatch hook
+     * registered (a plain in-RAM function-pointer table, actor.c) -- it
+     * touches neither the store nor the Zigbee SDK to do this, so it is
+     * safe here, before the stack task exists, exactly as the brief asks
+     * ("after the store loads"). */
+    zb_cmd_start();
+
     BaseType_t ok = xTaskCreate(zb_task, "zigbee_stack", 8192, NULL, 5, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(zigbee_stack) failed; running without Zigbee");
@@ -1244,6 +1268,39 @@ bool zigbee_device_remove(const uint8_t eui64[8])
     return true;
 }
 
+/* Task 8: zb_cmd.c's one need from the store this file owns. Copies out
+ * under s_store_mutex and returns immediately -- the store lock is never
+ * held across the SDK call the caller makes next with these values (this
+ * file's own zb_store_save() commentary on why LittleFS I/O and a blocking
+ * SDK call are never done under the same lock applies here just as much to
+ * a stack-lock-guarded SDK call). */
+bool zigbee_store_lookup(const uint8_t eui64[8], uint16_t *short_addr, uint8_t *endpoint)
+{
+    bool started;
+    portENTER_CRITICAL(&s_mux);
+    started = s_started;
+    portEXIT_CRITICAL(&s_mux);
+    if (!started || !eui64) return false;
+
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+    int idx = zb_store_find(&s_store, eui64);
+    bool found = idx >= 0;
+    if (found) {
+        if (short_addr) *short_addr = s_store.dev[idx].short_addr;
+        if (endpoint) *endpoint = s_store.dev[idx].endpoint;
+    }
+    xSemaphoreGive(s_store_mutex);
+    return found;
+}
+
+/* Task 8: the coordinator's own ZCL source endpoint, for zb_cmd.c to stamp
+ * on an outgoing command without a second, independently-drifting copy of
+ * the magic number ZB_ENDPOINT already is. */
+uint8_t zigbee_coordinator_endpoint(void)
+{
+    return ZB_ENDPOINT;
+}
+
 #else /* !CONFIG_PLANTHUB_ZB_ENABLED */
 
 esp_err_t zigbee_start(void)
@@ -1287,6 +1344,19 @@ bool zigbee_device_remove(const uint8_t eui64[8])
 {
     (void)eui64;
     return false;
+}
+
+bool zigbee_store_lookup(const uint8_t eui64[8], uint16_t *short_addr, uint8_t *endpoint)
+{
+    (void)eui64;
+    (void)short_addr;
+    (void)endpoint;
+    return false;
+}
+
+uint8_t zigbee_coordinator_endpoint(void)
+{
+    return 0;
 }
 
 #endif /* CONFIG_PLANTHUB_ZB_ENABLED */

@@ -51,3 +51,50 @@ bool zigbee_device_rename(const uint8_t eui64[8], const char *name);
  * disappears from this list right away, but that slot is only reclaimed
  * on restart. Do not attempt to add registry deletion in this milestone. */
 bool zigbee_device_remove(const uint8_t eui64[8]);
+
+/* ---------------------------------------------------------------------
+ * Task 8: the Zigbee command engine (zb_cmd.c). Split across this header's
+ * two owners the same way the rest of this file is: zigbee.c owns the
+ * store and the coordinator's own endpoint, so it supplies the two lookups
+ * below; zb_cmd.c owns dispatch and correlating a Default Response back to
+ * whichever command it sent, so it supplies the other two. Neither
+ * direction needs the Zigbee SDK's own types in this header -- every
+ * signature below is plain stdint, so a consumer that never touches
+ * esp_zigbee_core.h (webserver code, for one) is unaffected by this
+ * component's growth.
+ * --------------------------------------------------------------------- */
+
+/* The joined-device store's short_addr/endpoint for a device already known
+ * by EUI-64 -- zb_cmd.c's one need from the store zigbee.c owns. Copies
+ * both out under the store's own lock and returns immediately; never holds
+ * that lock across the SDK call the caller makes next with these values
+ * (M6b spec section 3's own constraint on this store). False (out params
+ * untouched) when eui64 is not in the store, or Zigbee is disabled/not
+ * started. */
+bool zigbee_store_lookup(const uint8_t eui64[8], uint16_t *short_addr, uint8_t *endpoint);
+
+/* The coordinator's own ZCL source endpoint (zigbee.c's private
+ * ZB_ENDPOINT) -- exposed rather than duplicated as a second magic-number
+ * 1 in zb_cmd.c that could silently drift from the real one. */
+uint8_t zigbee_coordinator_endpoint(void);
+
+/* Starts the Zigbee command engine: registers the DEV_KIND_ZIGBEE actor
+ * dispatch hook (actor_set_dispatch_hook(), M6b Task 7) so a dispatched
+ * ACT_SWITCH_ON/ACT_SWITCH_OFF command reaches zb_cmd.c. Call once, from
+ * zigbee_start(), after the store has loaded -- a dispatched command
+ * resolves its device through the same store zigbee_store_lookup() reads.
+ * A safe no-op when Zigbee is disabled at build time. */
+void zb_cmd_start(void);
+
+/* Forwards one Default Response's outcome from zigbee.c's single ZCL core
+ * action handler (the SDK allows exactly one, network-wide) to zb_cmd.c,
+ * which owns correlating it against whichever commands it currently has
+ * outstanding by ZCL transaction sequence number (tsn). Plain fields
+ * rather than the SDK's esp_zb_zcl_cmd_default_resp_message_t, for the
+ * same reason as this section's other two signatures. A response that
+ * matches no outstanding command (already timed out, or answering a
+ * command this engine never sent) is dropped, not alerted -- see
+ * zb_cmd.c's zb_cmd_on_default_resp(). A safe no-op when Zigbee is
+ * disabled at build time. */
+void zb_cmd_on_default_resp(uint8_t tsn, uint16_t cluster, uint8_t resp_to_cmd,
+                             uint8_t status_code);
