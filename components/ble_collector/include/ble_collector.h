@@ -1,6 +1,7 @@
 #pragma once
 #include "esp_err.h"
 #include <stdint.h>
+#include <stdbool.h>
 
 esp_err_t ble_collector_start(void);
 
@@ -93,3 +94,13 @@ int ble_collector_wrapper_for_device(int dev_idx);
  * insists on. See s_plan_interval_memo in ble_collector.c for the full
  * argument and for why an unsynchronised read of it is safe. */
 uint32_t ble_collector_plan_interval_for_device(int dev_idx);
+
+/* Hold (true) or release (false) passive scanning. Held, the collector
+ * stays deliberately deaf: start_scan() becomes a no-op, so the GATT
+ * engine's and battery poller's own scan resumes cannot lift the hold.
+ *
+ * The one caller is the Zigbee permit-join window -- see the measurement
+ * table above s_scan_hold in ble_collector.c for why BLE scanning and
+ * Zigbee joining cannot share the antenna. Calls are idempotent, so a
+ * second hold or a release with no hold outstanding is harmless. */
+void ble_collector_scan_hold(bool hold);

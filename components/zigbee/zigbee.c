@@ -30,6 +30,7 @@
 #include "freertos/semphr.h"
 #include "esp_zigbee_core.h"
 #include "esp_coexist.h"
+#include "ble_collector.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -1262,7 +1263,11 @@ static void zb_permit_expiry_cb(uint8_t param)
     portENTER_CRITICAL(&s_mux);
     s_permit_join_deadline_us = 0;
     portEXIT_CRITICAL(&s_mux);
-    ESP_LOGI(TAG, "permit-join window over; TC link key exchange required again");
+    /* Give the BLE radio back. Released here and only here, for the same
+     * reason the link-key requirement is restored here: the window is over,
+     * so nothing further depends on the 802.15.4 radio having priority. */
+    ble_collector_scan_hold(false);
+    ESP_LOGI(TAG, "permit-join window over; BLE scan released, TC link key exchange required again");
 }
 
 bool zigbee_permit_join(void)
@@ -1299,6 +1304,14 @@ bool zigbee_permit_join(void)
     esp_zb_scheduler_alarm(zb_permit_expiry_cb, ZB_PERMIT_ALARM_PARAM,
                            (uint32_t)CONFIG_PLANTHUB_ZB_PERMIT_JOIN_S * 1000u);
     esp_zb_lock_release();
+
+    /* Quiet BLE for the window. Measured on both a C5 and a C6: with this
+     * scan running the coordinator answers 0 of ~15 beacon requests, and a
+     * joining device gets MAC_NO_BEACON and gives up. Held AFTER the stack
+     * lock is released so a slow NimBLE call cannot extend the time the
+     * Zigbee stack is locked, and only once the window is genuinely open --
+     * never for a call that failed above. */
+    ble_collector_scan_hold(true);
 
     /* Closes on expiry (zigbee_permit_join_remaining() below), on reboot
      * (this deadline lives in RAM only, so a reboot resets it to closed

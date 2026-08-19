@@ -360,8 +360,39 @@ static int gap_event(struct ble_gap_event *event, void *arg);
  * invisible with it, since adv_dropped cannot rise when nothing is being
  * received to drop. Reporting the outcome is what lets gatt_engine.c retry
  * (see gatt_engine_set_scan_resume()). */
+/* M6b: a Zigbee permit-join window holds passive scanning down.
+ *
+ * Measured, not assumed. The radio-matrix rig ran an identical bare
+ * coordinator on a C5 and a C6, cycling radios within one boot while a
+ * sniffer probed every 5 s (~15 probes per 75 s phase):
+ *
+ *     zigbee only          C5 14/15   C6 15/15   beacons answered
+ *     zigbee + wifi        C5 15/15   C6 15/15
+ *     zigbee + wifi + ble  C5  0/15   C6  0/15
+ *     zigbee + ble         C5  0/15   C6  0/15
+ *
+ * WiFi costs nothing; BLE takes the beacon reply rate to zero on BOTH
+ * chips. A joining device that never receives a beacon reports
+ * MAC_NO_BEACON and gives up, which is exactly what M6b's gate saw. The
+ * mechanism is airtime: this scan runs an 80 ms window every 200 ms -- a
+ * 40% duty cycle on an antenna shared with 802.15.4 -- and a beacon reply
+ * has a hard deadline.
+ *
+ * Holding is scoped to the permit-join window because pairing is a
+ * deliberate, operator-initiated, time-boxed action; the cost is a few
+ * missed advertisement frames for its duration, against Zigbee pairing
+ * not working at all.
+ *
+ * The flag gates start_scan() itself rather than only cancelling once:
+ * gatt_engine.c and battery_poll.c both resume the scan after their own
+ * GATT work, and either would otherwise silently undo the hold mid-window
+ * -- with nothing in the log to explain why pairing failed again. */
+static volatile bool s_scan_hold;
+
 static bool start_scan(void)
 {
+    if (s_scan_hold) return true;   /* deliberately not scanning; not a failure */
+
     struct ble_gap_disc_params params = {
         .passive = 1,
         .itvl = SCAN_UNITS(CONFIG_PLANTHUB_BLE_SCAN_ITVL_MS),
@@ -379,6 +410,27 @@ static bool start_scan(void)
 bool ble_collector_resume_scan(void)
 {
     return start_scan();
+}
+
+void ble_collector_scan_hold(bool hold)
+{
+    if (hold == s_scan_hold) return;
+    s_scan_hold = hold;
+    if (hold) {
+        /* BLE_HS_EALREADY here means no scan was running, which is a fine
+         * state to be held in -- only a real error is worth reporting. */
+        int rc = ble_gap_disc_cancel();
+        if (rc != 0 && rc != BLE_HS_EALREADY)
+            ESP_LOGW(TAG, "ble_gap_disc_cancel failed (%d) while holding scan for Zigbee pairing", rc);
+        else
+            ESP_LOGI(TAG, "BLE scan held for the Zigbee permit-join window");
+    } else if (!start_scan()) {
+        /* Losing the scan for the rest of the boot is the failure mode
+         * start_scan()'s own comment warns about, so this is loud. */
+        ESP_LOGE(TAG, "BLE scan did NOT resume after the Zigbee permit-join window");
+    } else {
+        ESP_LOGI(TAG, "BLE scan resumed after the Zigbee permit-join window");
+    }
 }
 
 /* M3 Task 3 (spec §4): BTHome v2 is a built-in decoder, matched by its
@@ -1027,7 +1079,16 @@ static void decode_adv_item(const adv_item_t *item)
              * left. item->uptime_s is the uptime captured when gap_event
              * received this advertisement -- the same clock
              * gatt_sched_ok()/gatt_sched_fail() are stamped with. */
-            if (midx >= 0 && !gatt_engine_busy() &&
+            /* s_scan_hold also suppresses NEW periodic connections, not
+             * just scanning: a GATT connect occupies the shared antenna
+             * exactly as a scan does, and holding only the scan left the
+             * coordinator answering ~31% of beacon requests instead of
+             * ~100%. Commands are deliberately NOT gated here -- a safety
+             * close must still reach its valve during a pairing window,
+             * and gatt_engine_request_command() is a separate path. A
+             * connect already in flight is likewise left alone; this only
+             * declines to start new ones. */
+            if (midx >= 0 && !s_scan_hold && !gatt_engine_busy() &&
                 gatt_sched_due(midx, interval_s, item->uptime_s)) {
                 /* item->mac/item->addr_type: the RAW GAP address, which is
                  * what gatt_engine_request() documents it wants (a
