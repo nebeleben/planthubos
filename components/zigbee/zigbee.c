@@ -743,6 +743,24 @@ static void zb_iv_send_active_ep(void)
     esp_zb_zdo_active_ep_req(&req, zb_iv_active_ep_cb, (void *)(uintptr_t)s_iv_generation);
 }
 
+/* Fix round 1: this was forward-declared (and called from zb_iv_pump() for
+ * ZB_IV_ACT_SEND_SIMPLE_DESC) but never defined -- a link error the
+ * controller caught. Modeled directly on zb_iv_send_active_ep() above:
+ * same request/callback/generation shape, plus the one field that request
+ * doesn't need. iv.pending_endpoint -- set by zb_interview_step() just
+ * before it returns ZB_IV_ACT_SEND_SIMPLE_DESC -- is which endpoint this
+ * asks about; using anything else (e.g. defaulting to 0) would silently
+ * interview endpoint 0 forever regardless of what the device actually
+ * announced. */
+static void zb_iv_send_simple_desc(void)
+{
+    esp_zb_zdo_simple_desc_req_param_t req = {
+        .addr_of_interest = s_iv.dev.short_addr,
+        .endpoint = s_iv.pending_endpoint,
+    };
+    esp_zb_zdo_simple_desc_req(&req, zb_iv_simple_desc_cb, (void *)(uintptr_t)s_iv_generation);
+}
+
 static void zb_iv_simple_desc_cb(esp_zb_zdp_status_t status,
                                   esp_zb_af_simple_desc_1_1_t *simple_desc, void *user_ctx)
 {
