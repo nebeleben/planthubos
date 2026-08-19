@@ -172,6 +172,17 @@ bool zb_store_deserialize(zb_table_t *t, const uint8_t *buf, size_t len) {
     const uint8_t *p = buf + ZB_STORE_HEADER_SIZE;
     for (int i = 0; i < count; i++) {
         p = get_record(p, &out.dev[i]);
+        /* A cap_count/action_count beyond the fixed-size arrays they index
+         * is as impossible as a bad table count -- the field exists so a
+         * consumer can loop `for (i = 0; i < d->cap_count; i++)` over
+         * caps[]/actions[], and a corrupted-but-length-valid file must not
+         * hand back a zb_device_t that breaks that invariant. Reject the
+         * whole file rather than clamp: clamping would silently alter what
+         * the file said; *t stays untouched either way. */
+        if (out.dev[i].cap_count > ZB_STORE_MAX_CAPS ||
+            out.dev[i].action_count > ZB_STORE_MAX_ACTIONS) {
+            return false;
+        }
     }
     *t = out;
     return true;

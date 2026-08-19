@@ -66,6 +66,52 @@ int main(void) {
     wrong[4] = 0x7F;                                     /* wrong version */
     assert(!zb_store_deserialize(&bad, wrong, n));
 
+    /* --- cap_count / action_count bounds are enforced on deserialise
+     * (Task 3 fix round 1): a per-record count beyond the fixed-size
+     * caps[]/actions[] arrays it indexes is as impossible as a bad table
+     * count, and must be REJECTED rather than clamped -- clamping would
+     * silently alter what the file said. --- */
+    {
+        /* Offsets within a ZB_STORE_RECORD_SIZE record, per zb_store.h's
+         * field list: eui64 8 + short_addr 2 + endpoint 1 + interviewed 1
+         * -> cap_count @ 12; + caps 4 + cap_clusters 8 -> action_count @ 25. */
+        const size_t rec0 = 8;                 /* header size */
+        const size_t cap_count_off = rec0 + 12;
+        const size_t action_count_off = rec0 + 25;
+
+        uint8_t corrupt[ZB_STORE_IMAGE_MAX];
+        memcpy(corrupt, buf, n);
+        corrupt[cap_count_off] = ZB_STORE_MAX_CAPS + 1;
+        assert(!zb_store_deserialize(&bad, corrupt, n));
+
+        memcpy(corrupt, buf, n);
+        corrupt[action_count_off] = ZB_STORE_MAX_ACTIONS + 1;
+        assert(!zb_store_deserialize(&bad, corrupt, n));
+
+        /* The maximum LEGAL values must still load -- the new guard must
+         * not be off by one and reject a fully-populated device. */
+        zb_device_t full = mk(9, 1);
+        full.cap_count = ZB_STORE_MAX_CAPS;
+        for (int i = 0; i < ZB_STORE_MAX_CAPS; i++) {
+            full.caps[i] = (uint8_t)i;
+            full.cap_clusters[i] = (uint16_t)(0x0400 + i);
+        }
+        full.action_count = ZB_STORE_MAX_ACTIONS;
+        for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
+            full.actions[i] = (uint8_t)i;
+        }
+        zb_table_t legal;
+        zb_store_init(&legal);
+        assert(zb_store_upsert(&legal, &full) == 0);
+        uint8_t lbuf[ZB_STORE_IMAGE_MAX];
+        size_t ln = zb_store_serialize(&legal, lbuf, sizeof lbuf);
+        assert(ln > 0);
+        zb_table_t legal_r;
+        assert(zb_store_deserialize(&legal_r, lbuf, ln));
+        assert(legal_r.dev[0].cap_count == ZB_STORE_MAX_CAPS);
+        assert(legal_r.dev[0].action_count == ZB_STORE_MAX_ACTIONS);
+    }
+
     /* --- remove --- */
     assert(zb_store_remove(&t, a.eui64));
     assert(t.count == 1);
