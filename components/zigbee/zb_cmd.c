@@ -48,6 +48,7 @@
 #include "actor.h"
 #include "action.h"
 #include "alert.h"
+#include "event_log.h"
 #include "capability.h"
 
 static const char *TAG = "zb_cmd";
