@@ -129,6 +129,16 @@ bool      data_core_submit_battery(const uint8_t mac[6], uint8_t pct);
  * as "this reading is now stored". */
 bool      data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value);
 
+/* M6b: the same submission, for a device that is not a 6-byte MAC.
+ * data_core_submit_cap() above builds a DEV_KIND_BLE id from its mac[6];
+ * a Zigbee device is a DEV_KIND_ZIGBEE id over an 8-byte EUI-64 and has no
+ * such form. Identical semantics to data_core_submit_cap() in every other
+ * respect -- same capability_encode() range check, same once-per-(device,
+ * capability) warn throttle, same DATA_EVENT_SENSOR_UPDATE on success,
+ * same "false means nothing was stored" contract. That function is now a
+ * wrapper over this one. */
+bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value);
+
 /* Registry slot index for id (0..REGISTRY_MAX_DEVICES-1), or -1 when the
  * device is not (yet) registered. Never creates an entry -- a pure lookup,
  * thread-safe via the same s_mutex every other accessor here uses, no

@@ -292,7 +292,7 @@ bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)
     return true;
 }
 
-bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
+bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value)
 {
     /* Same "encode before taking the mutex, skip the write (not a clear) on
      * out-of-range" discipline as data_core_submit_battery() above -- see
@@ -316,11 +316,10 @@ bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
          *     no per-device slot exists to throttle against at all, so this
          *     falls back to s_unregistered_cap_warned, a single global
          *     once-per-boot line (see its own doc comment above). */
-        device_id_t id = device_id_from_mac(DEV_KIND_BLE, mac);
         bool already_warned = false;
         bool unregistered = false;
         xSemaphoreTake(s_mutex, portMAX_DELAY);
-        int idx = registry_find(&s_registry, &id);
+        int idx = registry_find(&s_registry, id);
         if (idx >= 0) {
             uint16_t bit = (cap_id < CAPABILITY_COUNT) ? (uint16_t)(1u << cap_id) : CAP_WARN_INVALID_ID_BIT;
             already_warned = (s_cap_warned[idx] & bit) != 0;
@@ -330,7 +329,7 @@ bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
             /* Bounded per-MAC throttle, shared with
              * data_core_find_or_create_index()'s "registry full" warning --
              * see unreg_warn_seen()'s own doc comment above. */
-            already_warned = unreg_warn_seen(mac);
+            already_warned = unreg_warn_seen(id->addr);
         }
         xSemaphoreGive(s_mutex);
 
@@ -341,31 +340,36 @@ bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
                          ", which has no successful reading yet (per-device suppression "
                          "doesn't apply until it registers) -- further such skips from ANY "
                          "never-registered device are suppressed for the rest of this boot",
-                         c ? c->name : "?", (double)value, MAC_ARG(mac));
+                         c ? c->name : "?", (double)value, MAC_ARG(id->addr));
             } else {
                 ESP_LOGW(TAG, "%s: value %.2f out of range, dropping reading for "
                          MACSTR_FMT " (previous value kept, further repeats for this "
                          "device+capability suppressed)",
-                         c ? c->name : "?", (double)value, MAC_ARG(mac));
+                         c ? c->name : "?", (double)value, MAC_ARG(id->addr));
             }
         }
         return false;
     }
 
     uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
-    device_id_t id = device_id_from_mac(DEV_KIND_BLE, mac);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    int idx = registry_set_cap(&s_registry, &id, cap_id, raw, now_s);
+    int idx = registry_set_cap(&s_registry, id, cap_id, raw, now_s);
     xSemaphoreGive(s_mutex);
 
     if (idx < 0) {
-        ESP_LOGW(TAG, "registry full, dropping cap %u reading for " MACSTR_FMT, cap_id, MAC_ARG(mac));
+        ESP_LOGW(TAG, "registry full, dropping cap %u reading for " MACSTR_FMT, cap_id, MAC_ARG(id->addr));
         return false;
     }
     esp_event_post(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE,
-                   (void *)mac, 6, 0 /* don't block the calling task (adv_decoder_task for BTHome) */);
+                   (void *)id->addr, 6, 0 /* don't block the calling task (adv_decoder_task for BTHome) */);
     return true;
+}
+
+bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
+{
+    device_id_t id = device_id_from_mac(DEV_KIND_BLE, mac);
+    return data_core_submit_cap_id(&id, cap_id, value);
 }
 
 int data_core_find_index(const device_id_t *id)
