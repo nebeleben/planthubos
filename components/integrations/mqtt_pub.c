@@ -259,6 +259,20 @@ static char    s_slot_name[PLANTS_MAX][PLANT_NAME_LEN + 1]; /* last name discove
  * once start_mqtt() has already succeeded. */
 static bool (*s_device_disc_sent)[CAPABILITY_COUNT];
 
+/* M6b Task 12: per-registry-slot state-publish throttle for a NON-BLE
+ * (today: Zigbee) reading, mirroring s_last_pub_us above -- but indexed by
+ * the device's registry slot (registry_find()'s return value), not a plant
+ * slot, since plants are a BLE-only V1 concept (plants_resolve_or_create()
+ * is mac-keyed) and a Zigbee reading never resolves to one. Without this, a
+ * Zigbee device configured with Configure Reporting's min_interval=1s
+ * (zigbee.c) could drive one publish_device_state()/publish_device_
+ * discovery() pair per second instead of at most one per
+ * MQTT_PUB_MIN_INTERVAL_US, same flood this file already guards BLE
+ * against. Heap, not static, same reasoning as s_device_disc_sent just
+ * above (calloc'd only when MQTT is actually starting; NULL otherwise, safe
+ * because its only reader runs after start_mqtt() has already succeeded). */
+static int64_t *s_dev_last_pub_us;
+
 /* Publishes one HA discovery config (retained, **qos 0** -- see below) per
  * capability CURRENTLY bound on plant_id (plants_bindings()) -- unlike V1's
  * fixed 5-metric loop, a plant may have any subset of CAPABILITY_COUNT
@@ -595,7 +609,7 @@ static void cleanup_device_cap_discovery(const device_id_t *dev, uint8_t cap_id)
 }
 
 /* The one task that ever calls esp_mqtt_client_publish() for state/
- * discovery/cleanup traffic. Drains s_queue: a STATE_UPDATE resolves the
+ * discovery/cleanup traffic. Drains s_queue: a BLE STATE_UPDATE resolves the
  * reporting mac to its plant (plants_resolve_or_create() -- task context,
  * allowed; this is one of the sanctioned lazy-create call sites, since a
  * DATA_EVENT mac is always a real registry mac by construction), throttles
@@ -614,6 +628,13 @@ static void cleanup_device_cap_discovery(const device_id_t *dev, uint8_t cap_id)
  * it just wrote), and plants_resolve_or_create() unconditionally
  * auto-creates a plant for it, so 1 mac : 1 plant-slot-throttle-window
  * holds every time this path runs.
+ *
+ * A non-BLE (Zigbee) STATE_UPDATE takes a separate, narrower branch (M6b
+ * Task 12): no plant resolution (plants are BLE-only, see that branch's own
+ * comment), just the same publish_device_state()/publish_device_discovery()
+ * pair above, throttled per registry slot instead of per plant slot
+ * (s_dev_last_pub_us). Plant-form publishing and plant-form discovery never
+ * run for a non-BLE device.
  *
  * A RESYNC_DISCOVERY (posted by mqtt_event_handler() right after
  * MQTT_EVENT_CONNECTED, see the file header) walks the whole plants table
@@ -715,10 +736,35 @@ static void mqtt_pub_task(void *arg)
              * old device_id_from_mac(DEV_KIND_BLE, msg.mac) reconstruction
              * below used to do unconditionally, risking a match against an
              * unrelated real BLE device sharing the same first six address
-             * bytes). Plants are a BLE-only V1 concept (plants.h's own
-             * "only DEV_KIND_BLE" precedent, plants_adopt_from_registry()),
-             * and wiring non-BLE kinds into MQTT device-state/discovery is
-             * a later task's job, not this fix's -- skip rather than guess. */
+             * bytes). Plants ARE still a BLE-only V1 concept though
+             * (plants.h's own "only DEV_KIND_BLE" precedent,
+             * plants_adopt_from_registry()) -- plants_resolve_or_create()
+             * below is mac-keyed and would misread a Zigbee 8-byte eui64 as
+             * a 6-byte mac, so plant resolution/binding/plant-form
+             * discovery genuinely stay BLE-only, not a placeholder to lift
+             * later.
+             *
+             * The DEVICE-form publish is a different story (M6b Task 12):
+             * publish_device_state()/publish_device_discovery() are already
+             * generic over device_kind_t (device_id_format() renders
+             * "zb:...", publish_device_discovery() only special-cases BLE
+             * for its optional mac-keyed display name, falling back to no
+             * name otherwise) -- there is no reason a Zigbee reading
+             * shouldn't reach them exactly like a BLE one does below, just
+             * without ever touching the plant path. Throttled per
+             * REGISTRY-slot (s_dev_last_pub_us), not per plant slot, since
+             * there is no plant slot here -- see that array's own comment. */
+            data_core_snapshot(&reg_snap);
+            int dev_slot = registry_find(&reg_snap, &msg.dev);
+            if (dev_slot < 0) continue;   /* defensive: data_core.c only posts for a device it just wrote */
+
+            int64_t now = esp_timer_get_time();
+            if (now - s_dev_last_pub_us[dev_slot] < MQTT_PUB_MIN_INTERVAL_US) continue;
+            s_dev_last_pub_us[dev_slot] = now;
+
+            plants_snapshot(&plants_snap);   /* publish_device_discovery()'s cap_bound_by_plant() dedup needs this */
+            publish_device_state(&reg_snap.devices[dev_slot]);
+            publish_device_discovery(&reg_snap.devices[dev_slot], dev_slot, &plants_snap);
             continue;
         }
 
@@ -877,11 +923,24 @@ static esp_err_t start_mqtt(const integr_config_t *cfg)
         return ESP_ERR_NO_MEM;
     }
 
+    /* Heap, not static -- see s_dev_last_pub_us's own declaration comment.
+     * calloc() zero-initialises to 0, same "never published yet" starting
+     * state s_last_pub_us's static array gets implicitly. */
+    s_dev_last_pub_us = calloc(REGISTRY_MAX_DEVICES, sizeof(*s_dev_last_pub_us));
+    if (!s_dev_last_pub_us) {
+        ESP_LOGE(TAG, "device-publish throttle allocation failed");
+        free(s_device_disc_sent);
+        s_device_disc_sent = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
     s_queue = xQueueCreate(MQTT_PUB_QUEUE_DEPTH, sizeof(mqtt_pub_msg_t));
     if (!s_queue) {
         ESP_LOGE(TAG, "xQueueCreate failed");
         free(s_device_disc_sent);
         s_device_disc_sent = NULL;
+        free(s_dev_last_pub_us);
+        s_dev_last_pub_us = NULL;
         return ESP_ERR_NO_MEM;
     }
 

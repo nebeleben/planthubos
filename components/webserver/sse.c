@@ -186,12 +186,14 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
      * reconstruction was sound only while every producer was BLE-kind, and
      * would otherwise misrepresent a non-BLE device as BLE (worst case,
      * colliding with a real BLE device that happens to share the first six
-     * address bytes). Only BLE is pushed over SSE today -- the milestone
-     * spec keeps everything downstream of the registry unaware Zigbee
-     * exists until a later task wires that up on purpose; skip anything
-     * else rather than exposing it prematurely. */
+     * address bytes). M6b Task 12: this used to `return` here for anything
+     * not DEV_KIND_BLE -- "downstream of the registry stays unaware Zigbee
+     * exists" (the milestone spec's own words) meant downstream needs no
+     * Zigbee-SPECIFIC code, not that a Zigbee reading must be dropped. This
+     * handler already treats a device generically below (device_json() ->
+     * devices_json.c switches on every device_kind_t), so no kind check is
+     * needed at all -- every device, whatever its kind, is just a device. */
     const device_id_t *devid = data;
-    if (devid->kind != DEV_KIND_BLE) return;
     /* Single-device lookup via data_core_get_device() (M1/M2 fixwave), not a
      * full registry_t snapshot + registry_find(): this handler only ever
      * runs on the single default event-loop task, which has just a 2304 B
