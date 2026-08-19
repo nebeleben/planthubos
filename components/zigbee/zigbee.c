@@ -1222,6 +1222,49 @@ bool zigbee_net_info(uint8_t *channel, uint16_t *pan_id, bool *formed)
     return started;
 }
 
+/* Param byte for the permit-join expiry alarm below. The alarm is a
+ * singleton -- there is only ever one permit-join window -- so the value
+ * itself carries no meaning; it only has to match between the arm and the
+ * cancel, which esp_zb_scheduler_alarm_cancel() keys on (cb, param). */
+#define ZB_PERMIT_ALARM_PARAM 0u
+
+/* Legacy (pre-r21) devices -- the whole original Xiaomi/Aqara line among
+ * them -- never perform the Trust Center link key exchange that Zigbee 3.0
+ * makes mandatory. A coordinator left at the SDK default REQUIRES it, so
+ * such a device associates, fails the exchange, is dropped, and goes back
+ * to blinking. From outside that is indistinguishable from a device that
+ * never transmitted at all, which is exactly what two silent pairing
+ * windows looked like at M6b's gate before this was found.
+ *
+ * Relaxing the requirement is a network-wide security decision, not a
+ * per-device one, so it is scoped to the permit-join window instead of
+ * being left off: while the window is open a legacy device can join, and
+ * once it is over the coordinator is back at the strict Zigbee 3.0
+ * default. The relaxation therefore only ever applies during the seconds
+ * an operator deliberately opened the network, never for the rest of the
+ * hub's life.
+ *
+ * Restoring happens HERE and only here -- deliberately NOT in the
+ * device-announce early-close path. A legacy device's authorization is
+ * still settling when DEVICE_ANNCE fires, and flipping the requirement
+ * back on at that instant risks the Trust Center demanding an exchange
+ * the device cannot perform and evicting the device just paired. Waiting
+ * out the full window costs nothing in security: the early close already
+ * called esp_zb_bdb_close_network(), so nothing can join in the meantime
+ * whatever this setting says. */
+static void zb_permit_expiry_cb(uint8_t param)
+{
+    (void)param;
+    /* esp_zb_scheduler_alarm() callbacks run on the stack task, so this is
+     * an "inside" caller and must NOT take the stack lock -- the same rule
+     * the signal handler's SDK calls follow. */
+    esp_zb_secur_link_key_exchange_required_set(true);
+    portENTER_CRITICAL(&s_mux);
+    s_permit_join_deadline_us = 0;
+    portEXIT_CRITICAL(&s_mux);
+    ESP_LOGI(TAG, "permit-join window over; TC link key exchange required again");
+}
+
 bool zigbee_permit_join(void)
 {
     bool formed;
@@ -1238,12 +1281,24 @@ bool zigbee_permit_join(void)
         ESP_LOGE(TAG, "could not acquire the Zigbee stack lock; permit-join not opened");
         return false;
     }
+    /* Re-opening while a window is already open must not leave the previous
+     * alarm armed: it would fire mid-window and re-require the exchange
+     * with the network still open, silently reverting this very call. */
+    esp_zb_scheduler_alarm_cancel(zb_permit_expiry_cb, ZB_PERMIT_ALARM_PARAM);
+    esp_zb_secur_link_key_exchange_required_set(false);
+
     esp_err_t err = esp_zb_bdb_open_network(CONFIG_PLANTHUB_ZB_PERMIT_JOIN_S);
-    esp_zb_lock_release();
     if (err != ESP_OK) {
+        /* Never leave the requirement relaxed on a window that did not
+         * actually open -- a permanent weakening bought for nothing. */
+        esp_zb_secur_link_key_exchange_required_set(true);
+        esp_zb_lock_release();
         ESP_LOGE(TAG, "esp_zb_bdb_open_network failed (%s)", esp_err_to_name(err));
         return false;
     }
+    esp_zb_scheduler_alarm(zb_permit_expiry_cb, ZB_PERMIT_ALARM_PARAM,
+                           (uint32_t)CONFIG_PLANTHUB_ZB_PERMIT_JOIN_S * 1000u);
+    esp_zb_lock_release();
 
     /* Closes on expiry (zigbee_permit_join_remaining() below), on reboot
      * (this deadline lives in RAM only, so a reboot resets it to closed
