@@ -180,11 +180,18 @@ static esp_err_t events_json_get(httpd_req_t *req, uint32_t after)
 
 static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    /* mac is copied into the event queue by esp_event (see data_core.c's
-     * esp_event_post() calls); every current producer is BLE-kind, same as
-     * V1 -- data_core.h doesn't post a device_id_t here, so DEV_KIND_BLE is
-     * the only sound interpretation of a bare 6-byte mac payload. */
-    const uint8_t *mac = data;
+    /* data_core.c now posts a full device_id_t (kind + 8-byte addr), not a
+     * bare mac -- M6b fix round 1. Read it as one directly rather than
+     * reconstructing a DEV_KIND_BLE id from raw bytes; the old
+     * reconstruction was sound only while every producer was BLE-kind, and
+     * would otherwise misrepresent a non-BLE device as BLE (worst case,
+     * colliding with a real BLE device that happens to share the first six
+     * address bytes). Only BLE is pushed over SSE today -- the milestone
+     * spec keeps everything downstream of the registry unaware Zigbee
+     * exists until a later task wires that up on purpose; skip anything
+     * else rather than exposing it prematurely. */
+    const device_id_t *devid = data;
+    if (devid->kind != DEV_KIND_BLE) return;
     /* Single-device lookup via data_core_get_device() (M1/M2 fixwave), not a
      * full registry_t snapshot + registry_find(): this handler only ever
      * runs on the single default event-loop task, which has just a 2304 B
@@ -199,9 +206,8 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
      * of truth (GET /api/v1/plants is; see task-6-report.md's contract
      * notes). The message buffer below is heap, not static -- see its own
      * comment. */
-    device_id_t devid = device_id_from_mac(DEV_KIND_BLE, mac);
     device_entry_t dev;
-    if (!data_core_get_device(&devid, &dev)) return;
+    if (!data_core_get_device(devid, &dev)) return;
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
     cJSON *o = device_json(&dev, NULL, now_uptime_s);
     char *json = cJSON_PrintUnformatted(o);

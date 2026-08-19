@@ -170,13 +170,18 @@ typedef enum {
 
 typedef struct {
     mqtt_pub_msg_type_t type;
-    uint8_t              mac[6];       /* STATE_UPDATE only */
     uint8_t               plant_id;     /* PLANT_DELETED, CAP_UNBOUND, DEVICE_CAP_BOUND (the plant
                                           * cap_id was just bound to -- H2 fixwave: drives the plant-
                                           * form discovery republish below, not just the device-form
                                           * cleanup) */
     uint8_t               cap_id;       /* CAP_UNBOUND, DEVICE_CAP_BOUND */
-    device_id_t            dev;          /* DEVICE_REMOVED, DEVICE_CAP_BOUND */
+    /* DEVICE_REMOVED, DEVICE_CAP_BOUND, and (M6b fix round 1) STATE_UPDATE --
+     * data_core.c posts the full device_id_t on DATA_EVENT_SENSOR_UPDATE
+     * now, not a bare 6-byte mac, so this field carries it end to end
+     * instead of a separate STATE_UPDATE-only mac[6] that would have had to
+     * be reconstructed back into a (wrongly BLE-assumed) device_id_t
+     * downstream. */
+    device_id_t            dev;
     /* EVENT only: heap copy made by mqtt_pub_event() (the caller's own json
      * buffer is not retained past that call); freed by mqtt_pub_task()
      * after publish, or immediately by mqtt_pub_event() itself if the
@@ -215,8 +220,8 @@ static volatile bool s_mqtt_connected;
  * were before this file went plant-centric. Unlike ids, slots CAN be reused
  * (plants_delete() frees a slot for a future plants_create()), so
  * s_slot_plant_id caches which plant id currently owns each slot: on a
- * mismatch (msg.mac resolved to a plant id that doesn't match what this
- * slot last published for), the slot has been reused by a different plant
+ * mismatch (msg.dev.addr resolved to a plant id that doesn't match what
+ * this slot last published for), the slot has been reused by a different plant
  * since we last saw it, and its throttle/discovery state is stale and must
  * be reset before anything below trusts it.
  *
@@ -703,7 +708,21 @@ static void mqtt_pub_task(void *arg)
             continue;
         }
 
-        uint8_t plant_id = plants_resolve_or_create(msg.mac);
+        if (msg.dev.kind != DEV_KIND_BLE) {
+            /* data_core.c posts the full device_id_t now (M6b fix round 1),
+             * so a non-BLE reading (Zigbee) reaches this task as itself
+             * instead of being silently reinterpreted as DEV_KIND_BLE (the
+             * old device_id_from_mac(DEV_KIND_BLE, msg.mac) reconstruction
+             * below used to do unconditionally, risking a match against an
+             * unrelated real BLE device sharing the same first six address
+             * bytes). Plants are a BLE-only V1 concept (plants.h's own
+             * "only DEV_KIND_BLE" precedent, plants_adopt_from_registry()),
+             * and wiring non-BLE kinds into MQTT device-state/discovery is
+             * a later task's job, not this fix's -- skip rather than guess. */
+            continue;
+        }
+
+        uint8_t plant_id = plants_resolve_or_create(msg.dev.addr);
         if (plant_id == 0) continue;   /* plants table full; already logged once/mac/boot */
 
         data_core_snapshot(&reg_snap);
@@ -736,16 +755,13 @@ static void mqtt_pub_task(void *arg)
         publish_state(plant_id, &reg_snap);
 
         /* Device state/discovery for the SAME device that just triggered
-         * this whole branch (msg.mac -- BLE-only today, same assumption
-         * data_core.c's DATA_EVENT producer and sse.c's on_sensor_update()
-         * both already make: "every current producer is BLE-kind"). Reuses
-         * reg_snap/plants_snap already taken above -- no extra registry
-         * walk or snapshot. registry_find() (not plants_resolve_or_create,
-         * which is mac->PLANT) gives this device's own stable registry
-         * slot, required by publish_device_discovery()'s s_device_disc_sent
-         * indexing. */
-        device_id_t dev_id = device_id_from_mac(DEV_KIND_BLE, msg.mac);
-        int dev_slot = registry_find(&reg_snap, &dev_id);
+         * this whole branch (msg.dev -- confirmed DEV_KIND_BLE by the guard
+         * above). Reuses reg_snap/plants_snap already taken above -- no
+         * extra registry walk or snapshot. registry_find() (not
+         * plants_resolve_or_create, which is mac->PLANT) gives this
+         * device's own stable registry slot, required by
+         * publish_device_discovery()'s s_device_disc_sent indexing. */
+        int dev_slot = registry_find(&reg_snap, &msg.dev);
         if (dev_slot >= 0) {
             publish_device_state(&reg_snap.devices[dev_slot]);
             publish_device_discovery(&reg_snap.devices[dev_slot], dev_slot, &plants_snap);
@@ -782,7 +798,10 @@ static void data_event_handler(void *handler_args, esp_event_base_t base, int32_
     if (!s_queue || !event_data) return;
 
     mqtt_pub_msg_t msg = { .type = MQTT_PUB_MSG_STATE_UPDATE };
-    memcpy(msg.mac, event_data, sizeof(msg.mac));
+    /* data_core.c posts the full device_id_t now (M6b fix round 1) --
+     * copy it whole rather than the first 6 bytes, so mqtt_pub_task()
+     * below sees the reading's real kind instead of an assumed one. */
+    memcpy(&msg.dev, event_data, sizeof(msg.dev));
 
     if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
         mqtt_pub_msg_t discard;

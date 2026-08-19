@@ -174,9 +174,12 @@ void data_core_submit_mibeacon(const mibeacon_t *m, const uint8_t via_node[6], i
         return;
     }
     if (rc == 1) {
-        /* mac is copied into the event queue by esp_event */
+        /* Posts the full device_id_t (kind + 8-byte addr), not a bare mac --
+         * a consumer that reconstructed a DEV_KIND_BLE id from 6 raw bytes
+         * would misrepresent any future non-BLE producer as BLE (M6b fix
+         * round 1); esp_event copies it into the event queue by size. */
         esp_event_post(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE,
-                       (void *)m->mac, 6, 0 /* don't block the caller's task */);
+                       (void *)&id, sizeof(id), 0 /* don't block the caller's task */);
     }
 }
 
@@ -219,9 +222,10 @@ void data_core_submit_from(const mibeacon_t *m, const uint8_t via_node[6],
         return;
     }
     if (rc == 1) {
-        /* mac is copied into the event queue by esp_event */
+        /* Full device_id_t, same reasoning as data_core_submit_mibeacon()'s
+         * post just above. */
         esp_event_post(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE,
-                       (void *)m->mac, 6, 0 /* don't block the BLE host task */);
+                       (void *)&id, sizeof(id), 0 /* don't block the BLE host task */);
     }
 }
 
@@ -285,10 +289,12 @@ bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)
         ESP_LOGW(TAG, "registry full, dropping battery reading for " MACSTR_FMT, MAC_ARG(mac));
         return false;
     }
-    /* mac is copied into the event queue by esp_event, same as
-     * data_core_submit_from()'s post on a merge. */
+    /* Full device_id_t, same reasoning as data_core_submit_mibeacon()'s
+     * post above -- every producer on this event must agree on the payload
+     * shape, so this stays a device_id_t even though data_core_submit_battery()
+     * itself is BLE-only today (its own doc comment, above). */
     esp_event_post(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE,
-                   (void *)mac, 6, 0 /* don't block the battery poller task */);
+                   (void *)&id, sizeof(id), 0 /* don't block the battery poller task */);
     return true;
 }
 
@@ -361,8 +367,10 @@ bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value)
         ESP_LOGW(TAG, "registry full, dropping cap %u reading for " MACSTR_FMT, cap_id, MAC_ARG(id->addr));
         return false;
     }
+    /* Full device_id_t (kind + 8-byte addr), not a bare mac -- see
+     * data_core_submit_mibeacon()'s post above for why. */
     esp_event_post(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE,
-                   (void *)id->addr, 6, 0 /* don't block the calling task (adv_decoder_task for BTHome) */);
+                   (void *)id, sizeof(*id), 0 /* don't block the calling task (adv_decoder_task for BTHome) */);
     return true;
 }
 

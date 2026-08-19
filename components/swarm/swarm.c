@@ -1004,15 +1004,27 @@ static void node_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, i
 static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base; (void)id;
-    const uint8_t *mac = data;
+    /* data_core.c now posts a full device_id_t (kind + 8-byte addr), not a
+     * bare mac -- M6b fix round 1. This node's own ESP-NOW forward path
+     * below builds a swarm_reading_t, a fixed V1 wire shape keyed by a bare
+     * 6-byte mac (swarm_frame.h, out of scope for this milestone to
+     * change), so only a BLE-kind update can be forwarded through it at
+     * all -- reconstructing a DEV_KIND_BLE id from a non-BLE device's
+     * address (the old device_id_from_mac(DEV_KIND_BLE, mac) shape) would
+     * instead risk matching some unrelated real BLE device that happens to
+     * share the first six address bytes. Zigbee has no node-side presence
+     * to forward in this milestone anyway (its radio lives on the hub), so
+     * skipping anything non-BLE here costs nothing. */
+    const device_id_t *dev_id = data;
+    if (dev_id->kind != DEV_KIND_BLE) return;
+    const uint8_t *mac = dev_id->addr;
     /* Single-device lookup (data_core_get_device(), ~124 B out-param) rather
      * than a full registry_t snapshot: this handler runs on the default
      * event-loop task, which this file's own comments document as having
      * only ~2304 bytes of stack -- see data_core.h's doc comment on
      * data_core_get_device() for the same reasoning applied there. */
-    device_id_t dev = device_id_from_mac(DEV_KIND_BLE, mac);
     device_entry_t d;
-    if (!data_core_get_device(&dev, &d)) return;
+    if (!data_core_get_device(dev_id, &d)) return;
 
     /* Decode each capability slot back to its V1 swarm_reading_t field
      * shape (deci-C, %, lux, uS/cm, %) -- same conversions the M2 registry-
