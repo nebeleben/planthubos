@@ -10,6 +10,7 @@ import { PlantsTab } from './tabs/plants.jsx'
 import { RoleTab } from './tabs/role.jsx'
 import { RulesTab } from './tabs/rules.jsx'
 import { WrappersTab } from './tabs/wrappers.jsx'
+import { ZigbeeTab } from './tabs/zigbee.jsx'
 import { getStoredTheme, setStoredTheme, systemPrefersDark } from './lib/theme.js'
 
 // Post-M8 split: Dashboard is the live plant cards (DashboardTab),
@@ -26,7 +27,7 @@ import { getStoredTheme, setStoredTheme, systemPrefersDark } from './lib/theme.j
 // tab order already implies. Wrappers (M3 Task 8) follows Rules for the
 // same reason -- another "write PlantScript, compile, save" surface,
 // immediately after its closest sibling.
-const ALL_TABS = ['Dashboard', 'Plants', 'Devices', 'Alerts', 'History', 'Rules', 'Wrappers', 'Nodes', 'Config', 'Network']
+const ALL_TABS = ['Dashboard', 'Plants', 'Devices', 'Alerts', 'History', 'Rules', 'Wrappers', 'Nodes', 'Zigbee', 'Config', 'Network']
 
 // localStorage key the Rules tab's own event feed (rules.jsx) and the
 // Alerts tab's event feed (alerts.jsx) both write on every fetch while
@@ -224,8 +225,10 @@ export function App() {
   // whole event feed is event_log_init()/rules_init() (main.c, inside the
   // `role != SWARM_ROLE_NODE` block) -- neither ever runs on a paired node,
   // so GET /api/v1/events has nothing meaningful to serve there either.
+  // Zigbee (M6b) is hub-only too: the coordinator and its device registry
+  // are owned by the hub, never a paired node.
   const TABS = role === 'node'
-    ? ALL_TABS.filter((t) => t !== 'Nodes' && t !== 'Rules' && t !== 'Wrappers' && t !== 'Alerts')
+    ? ALL_TABS.filter((t) => t !== 'Nodes' && t !== 'Rules' && t !== 'Wrappers' && t !== 'Alerts' && t !== 'Zigbee')
     : ALL_TABS
 
   return (
@@ -262,6 +265,7 @@ export function App() {
            <WrappersTab prefill={wrapperPrefill} onPrefillConsumed={() => setWrapperPrefill(null)} />
          ) :
          tab === 'Nodes' ? <NodesTab /> :
+         tab === 'Zigbee' ? <ZigbeeTab /> :
          tab === 'Config' ? <ConfigTab /> :
          tab === 'Network' ? <NetworkTab /> :
          <Placeholder name={tab} />}
