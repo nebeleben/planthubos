@@ -289,11 +289,11 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 
     case ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE: {
         /* A device joined (or rejoined) the network and is announcing
-         * itself -- Task 6's entry point into the interview, and also the
-         * "successful join" Task 1's permit-join comment deferred to this
-         * task: the window must close now, not just on expiry, so it does
-         * not stay open to any other device in radio range for the rest
-         * of its 180 s. */
+         * itself -- Task 6's entry point into the interview. This signal
+         * fires on a REJOIN too (a mains router power-cycling, a sleepy
+         * device coming back), not only on a device's first-ever join --
+         * fix round 2 -- so everything below is written to be correct for
+         * either case, not just the first. */
         esp_zb_zdo_signal_device_annce_params_t *annce =
             (esp_zb_zdo_signal_device_annce_params_t *)esp_zb_app_signal_get_params(p_sg_p);
         if (!annce) {
@@ -302,22 +302,52 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         }
         ESP_LOGI(TAG, "device announced: short 0x%04x", annce->device_short_addr);
 
-        bool window_was_open;
-        portENTER_CRITICAL(&s_mux);
-        window_was_open = s_permit_join_deadline_us != 0;
-        s_permit_join_deadline_us = 0;
-        portEXIT_CRITICAL(&s_mux);
-        if (window_was_open) {
-            /* Called from the signal handler, so this is already on the
-             * stack task -- no esp_zb_lock_acquire() needed, same as
-             * record_net_info()'s SDK calls above. */
-            esp_err_t close_err = esp_zb_bdb_close_network();
-            if (close_err != ESP_OK) {
-                ESP_LOGW(TAG, "esp_zb_bdb_close_network failed (%s) after a device "
-                              "joined; the network may still accept joins until the "
-                              "window expires", esp_err_to_name(close_err));
-            } else {
-                ESP_LOGI(TAG, "permit-join window closed after a device joined");
+        /* Fix round 2: refresh short_addr for an ALREADY-KNOWN device right
+         * now, keyed on EUI-64 -- zb_store_find_by_short() is how an
+         * attribute report finds its device, and the stored short_addr was
+         * previously only refreshed when a re-interview completed. Between
+         * a rejoin and that completion (or a re-interview that never
+         * completes at all) a recycled short address could match a
+         * different device's stale entry and route a reading into the
+         * wrong plant's history -- the exact harm "keyed on EUI-64, never
+         * an index" exists to prevent, reintroduced through this door.
+         * Also tells us whether this is a genuinely NEW device, which
+         * gates the permit-join close below. */
+        bool device_is_new;
+        xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+        int annce_idx = zb_store_find(&s_store, annce->ieee_addr);
+        device_is_new = annce_idx < 0;
+        if (annce_idx >= 0 && s_store.dev[annce_idx].short_addr != annce->device_short_addr) {
+            s_store.dev[annce_idx].short_addr = annce->device_short_addr;
+            zb_store_save();
+        }
+        xSemaphoreGive(s_store_mutex);
+
+        /* The permit-join window must close once a NEW device has joined,
+         * not on every rejoin of a device already known -- an existing
+         * mains-powered router announcing (a routine rejoin) must not slam
+         * the window shut before the device the user is actually trying to
+         * pair gets in, with nothing in the log to explain why (fix round
+         * 2; this is also "successful join" Task 1's permit-join comment
+         * deferred to this task). */
+        if (device_is_new) {
+            bool window_was_open;
+            portENTER_CRITICAL(&s_mux);
+            window_was_open = s_permit_join_deadline_us != 0;
+            s_permit_join_deadline_us = 0;
+            portEXIT_CRITICAL(&s_mux);
+            if (window_was_open) {
+                /* Called from the signal handler, so this is already on
+                 * the stack task -- no esp_zb_lock_acquire() needed, same
+                 * as record_net_info()'s SDK calls above. */
+                esp_err_t close_err = esp_zb_bdb_close_network();
+                if (close_err != ESP_OK) {
+                    ESP_LOGW(TAG, "esp_zb_bdb_close_network failed (%s) after a new "
+                                  "device joined; the network may still accept joins "
+                                  "until the window expires", esp_err_to_name(close_err));
+                } else {
+                    ESP_LOGI(TAG, "permit-join window closed after a new device joined");
+                }
             }
         }
 
@@ -633,11 +663,22 @@ static void zb_iv_ensure_ticking(void)
 static void zb_iv_enqueue(const uint8_t eui64[8], uint16_t short_addr)
 {
     if (s_iv_active && memcmp(s_iv.dev.eui64, eui64, 8) == 0) {
-        return; /* already interviewing this device */
+        /* Fix round 2: already interviewing this device -- a rejoin can
+         * hand it a new short address before its interview finishes,
+         * and every outstanding/future ZDO request in this interview
+         * addresses it by short_addr, so keep it current rather than
+         * addressing whatever it announced under first. */
+        s_iv.dev.short_addr = short_addr;
+        return;
     }
     for (uint8_t i = 0; i < s_iv_queue_count; i++) {
         uint8_t at = (uint8_t)((s_iv_queue_head + i) % ZB_STORE_MAX_DEVICES);
-        if (memcmp(s_iv_queue[at].eui64, eui64, 8) == 0) return; /* already queued */
+        if (memcmp(s_iv_queue[at].eui64, eui64, 8) == 0) {
+            /* Same reasoning as above, for an entry still waiting in the
+             * queue rather than actively being interviewed. */
+            s_iv_queue[at].short_addr = short_addr;
+            return;
+        }
     }
     if (s_iv_queue_count >= ZB_STORE_MAX_DEVICES) {
         ESP_LOGW(TAG, "interview queue full (%u); dropping a newly joined device's "
@@ -768,8 +809,20 @@ static void zb_iv_simple_desc_cb(esp_zb_zdp_status_t status,
         return;
     }
     if (status != ESP_ZB_ZDP_STATUS_SUCCESS || !simple_desc) {
-        ESP_LOGW(TAG, "simple-descriptor request for endpoint %u failed (status 0x%02x)",
+        /* Fix round 2: a non-responding endpoint (Green Power's 242 is the
+         * common one) must not abort endpoints that already mapped fine --
+         * previously this returned here, leaving endpoint_cursor stuck and
+         * request_sent true, so the whole interview idled out to the 30 s
+         * timeout and threw away everything already learned. Advance past
+         * it instead, the same way zb_interview_on_clusters() advances
+         * endpoint_cursor for a real reply -- 0 clusters contributes
+         * nothing to the map, exactly like a real reply naming clusters
+         * this hub does not understand. */
+        ESP_LOGW(TAG, "simple-descriptor request for endpoint %u failed (status 0x%02x); "
+                      "skipping it and continuing with the rest",
                  (unsigned)s_iv.pending_endpoint, (unsigned)status);
+        zb_interview_on_clusters(&s_iv, s_iv.pending_endpoint, NULL, 0);
+        zb_iv_service();
         return;
     }
     /* Only input (server-role) clusters carry sensor/actuator semantics for
@@ -846,6 +899,41 @@ static void zb_iv_handle_store(void)
     zb_device_t *dev = &s_iv.dev;
 
     xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+
+    /* Fix round 2 (critical): ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE fires on a
+     * REJOIN, not only a device's first-ever join, and zb_interview_begin()
+     * memset()s iv->dev from scratch every time -- so without this, a
+     * routine rejoin's zb_store_upsert() (a whole-record replacement) wipes
+     * the user's zigbee_device_rename() name on EVERY rejoin, and a
+     * re-interview that merely times out (device asleep, radio noise)
+     * DEMOTES an already-interviewed device to interviewed=0/no caps/no
+     * actions -- which zb_register_restored_devices() then drops from the
+     * UI entirely on the next reboot. That is the orphan case this whole
+     * store exists to prevent, caused by the store itself. */
+    int existing = zb_store_find(&s_store, dev->eui64);
+    if (existing >= 0) {
+        /* The stored name is the user's, not the interview's -- carry it
+         * across unconditionally, success or failure. */
+        strncpy(dev->name, s_store.dev[existing].name, ZB_STORE_NAME_MAX - 1);
+        dev->name[ZB_STORE_NAME_MAX - 1] = '\0';
+
+        if (!dev->interviewed && s_store.dev[existing].interviewed) {
+            /* A failed re-interview must never demote a device that
+             * previously interviewed fine: keep the stored record (its
+             * capabilities, actions and now-carried-over name) and only
+             * refresh what this rejoin actually told us. The registry/
+             * actor-table entries this device already has from its
+             * earlier successful interview are untouched -- there is
+             * nothing new here for them to learn. */
+            s_store.dev[existing].short_addr = dev->short_addr;
+            zb_store_save();
+            xSemaphoreGive(s_store_mutex);
+            ESP_LOGW(TAG, "re-interview failed for an already-known device; keeping "
+                          "its previous interview result");
+            return;
+        }
+    }
+
     int idx = zb_store_upsert(&s_store, dev);
     if (idx < 0) {
         xSemaphoreGive(s_store_mutex);
