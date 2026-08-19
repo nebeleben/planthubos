@@ -228,3 +228,9 @@ $CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/a
 $CC -Wall -Wextra -Werror -I../../components/actors/include -I../../components/actions/include \
     test_alert_ring.c ../../components/actors/alert_ring.c -o test_alert_ring
 ./test_alert_ring
+
+$CC -Wall -Wextra -Werror -I../../components/zigbee/include \
+    -I../../components/capability/include -I../../components/actions/include \
+    test_zb_map.c ../../components/zigbee/zb_map.c \
+    ../../components/capability/capability.c -lm -o test_zb_map
+./test_zb_map
