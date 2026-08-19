@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 
+// Consecutive poll(GET /api/v1/zigbee) failures before the on-screen
+// countdown stops being presented as authoritative -- see the `stale`
+// state in ZigbeeTab. One dropped request at the 2s in-window cadence is
+// noise; three in a row (~6s of silence) is a real outage worth flagging.
+const STALE_AFTER_FAILURES = 3
+
 // One joined device's row. `caps`/`actions` here are already the mapped
 // NAME strings GET /api/v1/zigbee's device objects carry (unlike the
 // Devices tab's numeric capability ids) -- nothing to look up against the
@@ -132,6 +138,19 @@ export function ZigbeeTab() {
   // (no fresh d.permit_s to read) can still pick the right retry cadence --
   // see poll()'s catch branch.
   const lastPermitRef = useRef(0)
+  // Fix round 1: a poll failure used to leave `data` (and the countdown it
+  // drives) untouched and silently retry -- fine for one dropped request at
+  // a 2s cadence (noise), but if the hub drops out mid-window the tab kept
+  // showing whatever permit_s it last saw, forever, with nothing marking it
+  // stale. That is exactly the "confident lie" design point 1 warns
+  // against: the operator keeps holding a device up to a window that may
+  // already be closed. consecFailsRef counts consecutive failures (reset to
+  // 0 on any success); once it reaches STALE_AFTER_FAILURES, `stale` flips
+  // true and the countdown renders with a visible connection-lost marker
+  // instead of pretending to still be authoritative. Polling itself keeps
+  // going at the same cadence throughout -- this only changes what's shown.
+  const consecFailsRef = useRef(0)
+  const [stale, setStale] = useState(false)
 
   function toggle(id) {
     setOpenMap((prev) => ({ ...prev, [id]: !prev[id] }))
@@ -155,11 +174,15 @@ export function ZigbeeTab() {
       .then((d) => {
         setData(d)
         setError(false)
+        consecFailsRef.current = 0
+        setStale(false)
         lastPermitRef.current = d.permit_s || 0
         pollTimerRef.current = setTimeout(poll, d.permit_s > 0 ? 2000 : 10000)
       })
       .catch((err) => {
         if (err.name === 'AbortError') return
+        consecFailsRef.current += 1
+        if (consecFailsRef.current >= STALE_AFTER_FAILURES) setStale(true)
         setData((prev) => {
           if (prev == null) setError(true)
           return prev
@@ -188,6 +211,11 @@ export function ZigbeeTab() {
         // switches onto the 2s cadence straight away.
         setData((prev) => (prev ? { ...prev, permit_s: body.permit_s } : prev))
         lastPermitRef.current = body.permit_s || 0
+        // This POST just succeeded, so the hub is reachable right now --
+        // clear any stale-countdown state immediately rather than waiting
+        // for poll()'s own next success to do it.
+        consecFailsRef.current = 0
+        setStale(false)
         clearTimeout(pollTimerRef.current)
         poll()
       } else {
@@ -234,7 +262,14 @@ export function ZigbeeTab() {
       </div>
       <p>
         {data.permit_s > 0 ? (
-          <span class="hint">Pairing open — put the device into pairing mode now ({data.permit_s}s left).</span>
+          <span class="hint">
+            Pairing open — put the device into pairing mode now ({data.permit_s}s left).
+            {stale && (
+              <span class="level-badge level-alert">
+                connection lost — this countdown may be stale
+              </span>
+            )}
+          </span>
         ) : (
           <button class="btn-primary" onClick={doPermit} disabled={busy === 'permit'}>
             {busy === 'permit' ? 'Opening…' : 'Pair a device'}
