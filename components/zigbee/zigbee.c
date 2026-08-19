@@ -148,6 +148,14 @@ static zb_join_t s_iv_queue[ZB_STORE_MAX_DEVICES];
 static uint8_t   s_iv_queue_head;
 static uint8_t   s_iv_queue_count;
 
+/* Fix round 3: zb_store_save() is defined further down (with the rest
+ * of the store-I/O block, after build_endpoint()), but the signal
+ * handler's announce-time short_addr refresh (fix round 2) calls it
+ * before that point in the file -- forward-declared here, alongside
+ * every other function this file calls ahead of its definition,
+ * rather than moving the definition and churning the diff. */
+static void zb_store_save(void);
+
 static void zb_iv_service(void);
 static void zb_iv_pump(void);
 static void zb_iv_tick_cb(uint8_t param);
