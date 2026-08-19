@@ -437,9 +437,10 @@ void app_main(void)
     /* M6b Task 1: the Zigbee coordinator's own stack task, started after
      * ble_collector_start() so BLE is already up first (this ordering
      * mirrors the batt_cycle_task placement just below). zigbee_start()
-     * only creates the stack task -- it returns ESP_OK before any network
-     * exists, formation/restore happen asynchronously through the signal
-     * handler in zigbee.c -- and it is a no-op returning ESP_OK when
+     * selects the native 15.4 radio and creates the stack task -- it
+     * returns ESP_OK before any network exists, formation/restore and the
+     * WiFi/802.15.4 coexistence call all happen asynchronously through the
+     * signal handler in zigbee.c -- and it is a no-op returning ESP_OK when
      * CONFIG_PLANTHUB_ZB_ENABLED is off, so this call is unconditional.
      * Deliberately NOT wrapped in ESP_ERROR_CHECK: a coordinator that
      * cannot start is a degraded hub, not a boot failure -- it still
