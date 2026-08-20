@@ -259,7 +259,19 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
  * would not compile on a target without an 802.15.4 radio. */
 #if CONFIG_ESP_COEX_SW_COEXIST_ENABLE && CONFIG_SOC_IEEE802154_SUPPORTED
         {
-            esp_err_t coex_err = esp_coex_wifi_i154_enable();
+            /* Off by default -- see CONFIG_PLANTHUB_ZB_COEX_ARBITRATION's
+             * help for the measurements. Arbitration costs roughly two
+             * thirds of the beacon reply rate and there is no runtime
+             * disable, so this is a boot-time decision, not something a
+             * permit-join window can suspend. */
+            esp_err_t coex_err = ESP_OK;
+#if CONFIG_PLANTHUB_ZB_COEX_ARBITRATION
+            coex_err = esp_coex_wifi_i154_enable();
+#else
+            ESP_LOGI(TAG, "WiFi/802.15.4 arbitration deliberately OFF "
+                          "(CONFIG_PLANTHUB_ZB_COEX_ARBITRATION); it costs ~2/3 "
+                          "of the Zigbee beacon reply rate");
+#endif
             if (coex_err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_coex_wifi_i154_enable failed (%s); WiFi and "
                               "802.15.4 will contend unarbitrated",
