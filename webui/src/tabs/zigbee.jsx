@@ -151,6 +151,17 @@ export function ZigbeeTab() {
   // going at the same cadence throughout -- this only changes what's shown.
   const consecFailsRef = useRef(0)
   const [stale, setStale] = useState(false)
+  // M6b UX: while a pairing window is open the hub's WiFi is expected to be
+  // unreachable (the radio is deliberately handed to Zigbee -- see
+  // CONFIG_PLANTHUB_ZB_COEX_ARBITRATION's help). A window THIS tab opened is
+  // therefore not a connection loss: windowEndRef records (client clock)
+  // when that window closes, poll failures before that instant drive a
+  // client-side countdown instead of the stale marker, and pairingOutage
+  // swaps the alarming badge for a calm explanation. Only windows this tab
+  // opened get the treatment -- a failure outside one is still a real
+  // connection problem and keeps the fix-round-1 stale semantics.
+  const windowEndRef = useRef(0)
+  const [pairingOutage, setPairingOutage] = useState(false)
 
   function toggle(id) {
     setOpenMap((prev) => ({ ...prev, [id]: !prev[id] }))
@@ -176,11 +187,23 @@ export function ZigbeeTab() {
         setError(false)
         consecFailsRef.current = 0
         setStale(false)
+        setPairingOutage(false)
         lastPermitRef.current = d.permit_s || 0
         pollTimerRef.current = setTimeout(poll, d.permit_s > 0 ? 2000 : 10000)
       })
       .catch((err) => {
         if (err.name === 'AbortError') return
+        const windowRemainingS = Math.ceil((windowEndRef.current - Date.now()) / 1000)
+        if (windowRemainingS > 0) {
+          // Expected pairing outage: keep the countdown running off the
+          // client clock (the server can't answer to run it for us) and do
+          // NOT count this toward the stale threshold.
+          setPairingOutage(true)
+          setData((prev) => (prev ? { ...prev, permit_s: windowRemainingS } : prev))
+          lastPermitRef.current = windowRemainingS
+          pollTimerRef.current = setTimeout(poll, 2000)
+          return
+        }
         consecFailsRef.current += 1
         if (consecFailsRef.current >= STALE_AFTER_FAILURES) setStale(true)
         setData((prev) => {
@@ -211,6 +234,7 @@ export function ZigbeeTab() {
         // switches onto the 2s cadence straight away.
         setData((prev) => (prev ? { ...prev, permit_s: body.permit_s } : prev))
         lastPermitRef.current = body.permit_s || 0
+        windowEndRef.current = Date.now() + (body.permit_s || 0) * 1000
         // This POST just succeeded, so the hub is reachable right now --
         // clear any stale-countdown state immediately rather than waiting
         // for poll()'s own next success to do it.
@@ -264,6 +288,11 @@ export function ZigbeeTab() {
         {data.permit_s > 0 ? (
           <span class="hint">
             Pairing open — put the device into pairing mode now ({data.permit_s}s left).
+            {pairingOutage && !stale && (
+              <span class="hint">
+                {' '}(hub briefly unreachable while pairing — this is normal)
+              </span>
+            )}
             {stale && (
               <span class="level-badge level-alert">
                 connection lost — this countdown may be stale

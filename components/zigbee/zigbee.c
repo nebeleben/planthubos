@@ -106,6 +106,16 @@ static void log_heap(const char *milestone)
  * runs before zigbee_start() in main.c, so zigbee_net_info() must be safe
  * to call before the stack task exists at all. */
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Permit-join expiry alarm (defined beside zigbee_permit_join below).
+ * Forward-declared because the device-announce handler re-arms it: after a
+ * successful join the full window no longer needs to run out before the
+ * radio hold is released. */
+#define ZB_PERMIT_ALARM_PARAM 0u
+#define ZB_POST_JOIN_RELEASE_MS 15000u
+#define ZB_SCAN_HOLD_DELAY_MS 800u
+static void zb_permit_expiry_cb(uint8_t param);
+static void zb_scan_hold_cb(uint8_t param);
 static bool     s_started;                 /* zigbee_start() created the task */
 static bool     s_formed;                  /* a network exists (formed or restored) */
 static uint8_t  s_channel;
@@ -267,11 +277,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             esp_err_t coex_err = ESP_OK;
 #if CONFIG_PLANTHUB_ZB_COEX_ARBITRATION
             coex_err = esp_coex_wifi_i154_enable();
-#else
-            ESP_LOGI(TAG, "WiFi/802.15.4 arbitration deliberately OFF "
-                          "(CONFIG_PLANTHUB_ZB_COEX_ARBITRATION); it costs ~2/3 "
-                          "of the Zigbee beacon reply rate");
-#endif
             if (coex_err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_coex_wifi_i154_enable failed (%s); WiFi and "
                               "802.15.4 will contend unarbitrated",
@@ -279,6 +284,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             } else {
                 ESP_LOGI(TAG, "WiFi/802.15.4 coexistence enabled");
             }
+#else
+            (void)coex_err;
+            ESP_LOGI(TAG, "WiFi/802.15.4 arbitration deliberately OFF "
+                          "(CONFIG_PLANTHUB_ZB_COEX_ARBITRATION); it costs ~2/3 "
+                          "of the Zigbee beacon reply rate");
+#endif
         }
 #else
         ESP_LOGW(TAG, "built without CONFIG_ESP_COEX_SW_COEXIST_ENABLE; WiFi and "
@@ -416,6 +427,19 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 } else {
                     ESP_LOGI(TAG, "permit-join window closed after a new device joined");
                 }
+                /* UX: do not make the user wait out the full window with the
+                 * radio held (and, with arbitration off, WiFi down). The
+                 * join succeeded, so re-arm the expiry alarm to fire in
+                 * ZB_POST_JOIN_RELEASE_MS instead of at the original
+                 * deadline. The grace period exists because the joiner's
+                 * Transport Key delivery and this hub's interview are still
+                 * in flight at announce-time -- both were measured complete
+                 * within ~7 s of the announce; 15 s has margin. The alarm
+                 * itself is unchanged, so the link-key restore and BLE
+                 * release stay in one place. */
+                esp_zb_scheduler_alarm_cancel(zb_permit_expiry_cb, ZB_PERMIT_ALARM_PARAM);
+                esp_zb_scheduler_alarm(zb_permit_expiry_cb, ZB_PERMIT_ALARM_PARAM,
+                                       ZB_POST_JOIN_RELEASE_MS);
             }
         }
 
@@ -1235,12 +1259,6 @@ bool zigbee_net_info(uint8_t *channel, uint16_t *pan_id, bool *formed)
     return started;
 }
 
-/* Param byte for the permit-join expiry alarm below. The alarm is a
- * singleton -- there is only ever one permit-join window -- so the value
- * itself carries no meaning; it only has to match between the arm and the
- * cancel, which esp_zb_scheduler_alarm_cancel() keys on (cb, param). */
-#define ZB_PERMIT_ALARM_PARAM 0u
-
 /* Legacy (pre-r21) devices -- the whole original Xiaomi/Aqara line among
  * them -- never perform the Trust Center link key exchange that Zigbee 3.0
  * makes mandatory. A coordinator left at the SDK default REQUIRES it, so
@@ -1265,6 +1283,26 @@ bool zigbee_net_info(uint8_t *channel, uint16_t *pan_id, bool *formed)
  * out the full window costs nothing in security: the early close already
  * called esp_zb_bdb_close_network(), so nothing can join in the meantime
  * whatever this setting says. */
+/* Deferred entry to the BLE hold. Holding the scan kills the hub's WiFi
+ * for the window (measured; see CONFIG_PLANTHUB_ZB_COEX_ARBITRATION), and
+ * doing it synchronously inside the permit POST handler made the HTTP
+ * response race the WiFi death -- sometimes the operator's own "pairing
+ * started" reply never arrived. Deferring by ZB_SCAN_HOLD_DELAY_MS lets
+ * the response out first; the window itself is already open, and 0.8 s of
+ * un-held beacons at the very start of a 180 s window costs nothing. The
+ * deadline guard keeps a stale alarm from holding the radio after the
+ * window it belonged to has already closed. */
+static void zb_scan_hold_cb(uint8_t param)
+{
+    (void)param;
+    int64_t deadline;
+    portENTER_CRITICAL(&s_mux);
+    deadline = s_permit_join_deadline_us;
+    portEXIT_CRITICAL(&s_mux);
+    if (deadline == 0) return;
+    ble_collector_scan_hold(true);
+}
+
 static void zb_permit_expiry_cb(uint8_t param)
 {
     (void)param;
@@ -1277,7 +1315,10 @@ static void zb_permit_expiry_cb(uint8_t param)
     portEXIT_CRITICAL(&s_mux);
     /* Give the BLE radio back. Released here and only here, for the same
      * reason the link-key requirement is restored here: the window is over,
-     * so nothing further depends on the 802.15.4 radio having priority. */
+     * so nothing further depends on the 802.15.4 radio having priority.
+     * A hold alarm still pending (window closed within its 0.8 s defer)
+     * is cancelled so it cannot re-hold a radio nobody will release. */
+    esp_zb_scheduler_alarm_cancel(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM);
     ble_collector_scan_hold(false);
     ESP_LOGI(TAG, "permit-join window over; BLE scan released, TC link key exchange required again");
 }
@@ -1319,11 +1360,11 @@ bool zigbee_permit_join(void)
 
     /* Quiet BLE for the window. Measured on both a C5 and a C6: with this
      * scan running the coordinator answers 0 of ~15 beacon requests, and a
-     * joining device gets MAC_NO_BEACON and gives up. Held AFTER the stack
-     * lock is released so a slow NimBLE call cannot extend the time the
-     * Zigbee stack is locked, and only once the window is genuinely open --
-     * never for a call that failed above. */
-    ble_collector_scan_hold(true);
+     * joining device gets MAC_NO_BEACON and gives up. Scheduled rather
+     * than called: see zb_scan_hold_cb for why the HTTP response must beat
+     * the hold onto the wire. */
+    esp_zb_scheduler_alarm_cancel(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM);
+    esp_zb_scheduler_alarm(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM, ZB_SCAN_HOLD_DELAY_MS);
 
     /* Closes on expiry (zigbee_permit_join_remaining() below), on reboot
      * (this deadline lives in RAM only, so a reboot resets it to closed
