@@ -1,0 +1,19 @@
+# 32 MB layout for the ESP32-C5 bridge-node board (32 MB flash, 8 MB
+# PSRAM). C5-as-hub was rejected by measurement -- see
+# sdkconfig.defaults.esp32c5 -- so this serves the future Zigbee bridge
+# node and, until then, the C5 build leg.
+# Identical to partitions_16m.csv through the app slots -- that layout is
+# hardware-proven -- with `storage` extended to fill the remaining flash:
+# 0x2000000 - 0x830000 = 24384K, roughly 3x the 16 MB hub's history space.
+# The app slots deliberately stay 4096K: the largest image ever built
+# (Zigbee + debug logging) was 0x20e220, barely half a slot.
+# Name,      Type, SubType,  Offset,    Size
+nvs,         data, nvs,      0x9000,    64K
+otadata,     data, ota,      0x19000,   8K
+phy_init,    data, phy,      0x1B000,   4K
+zb_storage,  data, fat,      0x1C000,   16K
+zb_fct,      data, fat,      0x20000,   4K
+coredump,    data, coredump, 0x21000,   60K
+app0,        app,  ota_0,    0x30000,   4096K
+app1,        app,  ota_1,    0x430000,  4096K
+storage,     data, spiffs,   0x830000,  24384K

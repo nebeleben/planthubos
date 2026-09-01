@@ -1,12 +1,74 @@
-# Auto-applied on top of sdkconfig.defaults when IDF_TARGET=esp32c5
-# (idf.py appends "<defaults-file>.<target>" for every listed defaults
-# file).
+# Auto-applied on top of sdkconfig.defaults when IDF_TARGET=esp32c5.
 #
-# Both lines below are a TEMPORARY override of the base defaults, which
-# now ship the 16 MB layout (M6a). The C5 part on hand is 4 MB, so it
-# stays on partitions_c5.csv and cannot carry the Zigbee stack M6b adds --
-# it is a build-only CI leg that keeps C5 source compatibility from
-# rotting. When the 16 MB C5 arrives, DELETE these two lines (and this
-# comment) and the C5 inherits partitions_16m.csv like every other target.
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_c5.csv"
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# The C5 leg targets the 32 MB / 8 MB-PSRAM ESP32-C5 board as the future
+# ZIGBEE BRIDGE NODE (roadmap section 4.2/4.4) -- NOT the hub. C5-as-hub
+# was attempted and rejected by measurement during bring-up (2026-08-25):
+# the C5 boots with ~96 KiB of internal heap against the C6's 214 KiB
+# (fixed firmware statics eat a constant ~290 KiB, so the smaller SoC
+# keeps proportionally far less), and DMA buffers, radio controller
+# arenas and task stacks cannot live in PSRAM. The full hub stack's
+# internal-only set does not fit: the BLE controller and the Zigbee stack
+# task both failed with ESP_ERR_NO_MEM in every tuning iteration. A
+# bridge node runs a far smaller set (Zigbee + ESP-NOW, no webserver/
+# BLE/MQTT) and additionally benefits from dual-band WiFi never touching
+# 2.4 GHz. Until the bridge firmware exists this remains a build leg that
+# keeps C5 source compatibility from rotting, now with hardware to run
+# on. The 4 MB C5 dev boards run rig firmware from outside this tree;
+# partitions_c5.csv and the old 4 MB override are gone with them.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_32m.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+
+# Core dumps land in the `coredump` partition partitions_32m.csv carries
+# (60K), same reasoning as the C6 leg: this project's recurring failure
+# mode is memory, and a post-mortem partition is how a field failure
+# becomes a backtrace instead of a shrug.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+
+# Zigbee coordinator, same pair as the C6 leg and for the same reason:
+# the SDK components gate their include dirs and prebuilt libs behind
+# their own CONFIG_ZB_ENABLED, which PlantHub's Kconfig cannot reach.
+# ZCZR picks the coordinator/router library variant; the esp32c5 zczr
+# libraries shipped in esp-zigbee-lib 1.6.8 were exercised for hours as
+# rig coordinators during the M6b join investigation.
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_ZCZR=y
+
+# Match the vendor's esp_zigbee_gateway example, exactly as the C6 leg
+# does and for the identical reason: this hub runs WiFi+TLS alongside
+# Zigbee security traffic, the combination the vendor disables hardware
+# crypto for. See sdkconfig.defaults.esp32c6 for the full argument.
+CONFIG_MBEDTLS_HARDWARE_AES=n
+CONFIG_MBEDTLS_HARDWARE_MPI=n
+CONFIG_MBEDTLS_HARDWARE_SHA=n
+
+# The 32 MB module carries 8 MB PSRAM ("Found 8MB PSRAM device", probed
+# during bring-up). Without it the C5 cannot host the hub at all: it boots
+# with ~100 KiB of internal heap against the C6's 214 KiB, and the BLE
+# controller dies with ESP_ERR_NO_MEM before Zigbee even gets a turn.
+# With it, the budget inverts -- bulk allocations go external and internal
+# RAM is reserved for what genuinely needs it (DMA, radio controllers,
+# task stacks).
+CONFIG_SPIRAM=y
+# Default 16384 sends every allocation under 16K to internal RAM, which
+# starves it while 8 MB sits idle (measured: internal largest block 7K,
+# BLE still ESP_ERR_NO_MEM). 2K keeps only small hot allocations internal.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
+# WiFi/lwIP buffers are the single biggest movable block (~43K on this
+# chip's dual-band driver).
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# Keep a larger emergency pool for DMA/internal-only claims than the 32K
+# default; the BLE controller and 802.15.4 driver both allocate internal.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+# mbedTLS session/handshake buffers are among the largest internal
+# consumers (~30-40K during a TLS handshake); external allocation moves
+# them wholesale to PSRAM.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# The dual-band driver's default of 16 static RX buffers does not fit the
+# C5's internal RAM alongside everything else ("Expected to init 16 rx
+# buffer, actual is 10" -> boot loop). Static RX buffers are DMA memory
+# and can never move to PSRAM; dynamic ones can (TRY_ALLOCATE_WIFI_LWIP
+# above), so shift the balance: fewer static, more dynamic.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=24
+CONFIG_ESP_WIFI_RX_BA_WIN=6

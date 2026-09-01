@@ -26,7 +26,7 @@ GEN = os.path.join(IDF, "components", "partition_table", "gen_esp32part.py")
 # table filename -> (flash size passed to the generator, exact end offset)
 TABLES = {
     "partitions_16m.csv": ("16MB", 0x1000000),
-    "partitions_c5.csv": ("4MB", 0x400000),
+    "partitions_32m.csv": ("32MB", 0x2000000),
 }
 
 
