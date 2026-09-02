@@ -102,8 +102,12 @@ uint32_t ble_collector_plan_interval_for_device(int dev_idx);
  * The one caller is the Zigbee permit-join window -- see the measurement
  * table above s_scan_hold in ble_collector.c for why BLE scanning and
  * Zigbee joining cannot share the antenna. Calls are idempotent, so a
- * second hold or a release with no hold outstanding is harmless. */
-void ble_collector_scan_hold(bool hold);
+ * second hold or a release with no hold outstanding is harmless.
+ *
+ * Returns ESP_ERR_INVALID_STATE, without logging or touching NimBLE, if
+ * ble_collector_start() was never called -- the zigbee role's normal
+ * case (one radio per node). Otherwise ESP_OK. */
+esp_err_t ble_collector_scan_hold(bool hold);
 
 /* True while a Zigbee permit-join window holds the radio (see
  * ble_collector_scan_hold). Read by the other BLE connection owners so

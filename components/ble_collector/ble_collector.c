@@ -279,6 +279,13 @@ static bool     s_pc_defer_confirmed;      /* PC_DEFER_NOTE_RESULT only */
  * registration, so this closes a real window, not a theoretical one. */
 static bool s_actors_wired;
 
+/* Radio-role plan: true once ble_collector_start() has completed
+ * successfully. In the zigbee/wifi_only roles this component is never
+ * started at all (one radio per node), so anything reached from outside
+ * this file -- ble_collector_scan_hold() below -- must be able to tell
+ * whether there is a NimBLE stack underneath it before touching one. */
+static bool s_started;
+
 /* Task 5 review FINDING 4/2, corrected by M5a Task 7 fix round 1: s_wrapper_index
  * and the arena are decoder-task-exclusive, full stop -- no reader anywhere
  * else. s_wrapper_memo is NOT exclusive any more: it is single-writer,
@@ -414,9 +421,16 @@ bool ble_collector_resume_scan(void)
 
 bool ble_collector_scan_is_held(void) { return s_scan_hold; }
 
-void ble_collector_scan_hold(bool hold)
+esp_err_t ble_collector_scan_hold(bool hold)
 {
-    if (hold == s_scan_hold) return;
+    /* Radio-role plan: the zigbee role never calls ble_collector_start(),
+     * so there is no NimBLE stack, no scan and no s_scan_hold state worth
+     * touching here -- zigbee.c's permit-join window still calls this
+     * unconditionally either way. Silent and immediate: this is the
+     * expected, common case in that role, not a fault. */
+    if (!s_started) return ESP_ERR_INVALID_STATE;
+
+    if (hold == s_scan_hold) return ESP_OK;
     s_scan_hold = hold;
     if (hold) {
         /* BLE_HS_EALREADY here means no scan was running, which is a fine
@@ -433,6 +447,7 @@ void ble_collector_scan_hold(bool hold)
     } else {
         ESP_LOGI(TAG, "BLE scan resumed after the Zigbee permit-join window");
     }
+    return ESP_OK;
 }
 
 /* M3 Task 3 (spec §4): BTHome v2 is a built-in decoder, matched by its
@@ -1661,5 +1676,10 @@ esp_err_t ble_collector_start(void)
         actor_set_dispatch_hook(DEV_KIND_BLE, on_actor_dispatch);
         s_actors_wired = true;   /* set LAST: it is what opens the path above */
     }
+    /* Radio-role plan: in the zigbee role this component is never started
+     * at all (one radio per node). Set LAST, same reasoning as
+     * s_actors_wired above: it is what tells ble_collector_scan_hold()
+     * below there is a NimBLE stack underneath it to touch. */
+    s_started = true;
     return ESP_OK;
 }

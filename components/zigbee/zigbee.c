@@ -260,8 +260,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
          *    what actually turns it on for this radio pair (esp_coexist.h,
          *    and esp_coex/src/coexist.c: coex_enable() plus
          *    esp_coex_ieee802154_status_enable()). Without it the two
-         *    radios are not arbitrated at all. This hub also runs BLE, so
-         *    it is the worst case for leaving that off.
+         *    radios are not arbitrated at all. Under one-radio-per-node
+         *    this hub runs WiFi + Zigbee only (BLE is a separate role,
+         *    never concurrent) -- but WiFi and 802.15.4 still share this
+         *    same PHY, so leaving this off still costs the hub its LAN.
          * 2. Ask BDB to initialize. Only then does the stack load NVRAM and
          *    raise FIRST_START or REBOOT below. */
 /* This guard is copied verbatim from esp_coexist.h's own guard around the
@@ -1315,7 +1317,14 @@ static void zb_scan_hold_cb(uint8_t param)
     deadline = s_permit_join_deadline_us;
     portEXIT_CRITICAL(&s_mux);
     if (deadline == 0) return;
-    ble_collector_scan_hold(true);
+    esp_err_t err = ble_collector_scan_hold(true);
+    if (err == ESP_ERR_INVALID_STATE) {
+        /* One radio per node: this hub never started the BLE collector, so
+         * there is nothing to hold. Expected in the zigbee role -- a DEBUG
+         * breadcrumb, not the INFO ble_collector.c logs when it actually
+         * held a live scan. */
+        ESP_LOGD(TAG, "BLE scan hold skipped: no BLE in this role");
+    }
 }
 
 static void zb_permit_expiry_cb(uint8_t param)
@@ -1334,8 +1343,14 @@ static void zb_permit_expiry_cb(uint8_t param)
      * A hold alarm still pending (window closed within its 0.8 s defer)
      * is cancelled so it cannot re-hold a radio nobody will release. */
     esp_zb_scheduler_alarm_cancel(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM);
-    ble_collector_scan_hold(false);
-    ESP_LOGI(TAG, "permit-join window over; BLE scan released, TC link key exchange required again");
+    esp_err_t err = ble_collector_scan_hold(false);
+    if (err == ESP_ERR_INVALID_STATE) {
+        /* No BLE collector in this role -- nothing was held, so there is no
+         * resume to report, loud or otherwise (see zb_scan_hold_cb above). */
+        ESP_LOGD(TAG, "BLE scan release skipped: no BLE in this role");
+    } else {
+        ESP_LOGI(TAG, "permit-join window over; BLE scan released, TC link key exchange required again");
+    }
 }
 
 bool zigbee_permit_join(void)

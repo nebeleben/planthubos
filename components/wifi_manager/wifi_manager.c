@@ -21,6 +21,7 @@ static wifi_fsm_t s_fsm;
 static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
 static char s_ip[16] = "0.0.0.0";
+static bool s_boot_prescan_done = false;
 
 static void do_action(wifi_action_t act);
 
@@ -48,11 +49,21 @@ static void start_sta(void)
      * connect succeeds on the first try. Before this fix the BLE-on hub
      * only associated on its 6th attempt (~13 s) and a BLE-off hub hit
      * MAX_RETRIES and fell to the setup AP. So: scan for our SSID, pin
-     * the channel when found, then connect. Blocking, on the boot task,
-     * bounded by the per-channel scan time below (<= ~2 s over 13
-     * channels). Not found is not fatal -- connect anyway and let the FSM
-     * retry as before. */
-    {
+     * the channel when found, then connect. Blocking, bounded by the
+     * per-channel scan time below (<= ~2 s over 13 channels). Not found
+     * is not fatal -- connect anyway and let the FSM retry as before.
+     *
+     * start_sta() has two callers: wifi_manager_start() at boot, and
+     * on_planthub_event()'s WIFI_EV_NEW_CREDS path when the user submits
+     * new credentials at runtime (from the default event-loop task,
+     * where a ~2 s blocking scan would stall every other event handler
+     * on the system). Only the boot call needs this: it is the one
+     * racing a receiver that hasn't seen any APs yet. s_boot_prescan_done
+     * gates it to that first call; every later start_sta() (including a
+     * later NEW_CREDS retry after a first successful boot) just connects
+     * straight away. */
+    if (!s_boot_prescan_done) {
+        s_boot_prescan_done = true;
         wifi_scan_config_t sc = {
             .ssid = (uint8_t *)creds.ssid,
             .scan_type = WIFI_SCAN_TYPE_ACTIVE,
@@ -69,6 +80,11 @@ static void start_sta(void)
                 ESP_LOGI(TAG, "pre-scan: %u BSS for our SSID, best ch=%u rssi=%d", (unsigned)n,
                          recs[0].primary, recs[0].rssi);
                 ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
+            } else {
+                /* calloc failed: the driver still holds the scan list it
+                 * built for esp_wifi_scan_get_ap_records() to consume --
+                 * release it explicitly since nothing will call that now. */
+                esp_wifi_clear_ap_list();
             }
             free(recs);
         } else {
