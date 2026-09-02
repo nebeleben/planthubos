@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include "esp_log.h"
+#include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_littlefs.h"
@@ -426,8 +427,46 @@ void app_main(void)
          * the portal owns the radio/channel. */
     }
 
-    esp_err_t ble_err = ble_collector_start();
-    if (ble_err != ESP_OK) ESP_LOGE(TAG, "BLE collector failed to start (%s); running without BLE", esp_err_to_name(ble_err));
+    /* One universal image, one radio per node. BLE and Zigbee cannot share
+     * a node's antenna (measured; see the radio-architecture findings), so
+     * exactly one of them starts, chosen at runtime from NVS key
+     * "radio_role" (namespace "planthub"), falling back to the build's
+     * default choice. Both stacks are compiled in; only the chosen one
+     * initializes, so the other costs flash + static .bss but no heap.
+     * A role change is applied by reboot -- the BT vs 802.15.4 controllers
+     * cannot be cleanly re-inited live. */
+    char role_str[16] = {0};
+    {
+        nvs_handle_t h;
+        if (nvs_open("planthub", NVS_READONLY, &h) == ESP_OK) {
+            size_t len = sizeof(role_str);
+            nvs_get_str(h, "radio_role", role_str, &len);
+            nvs_close(h);
+        }
+    }
+    bool want_ble, want_zigbee;
+    if (role_str[0]) {
+        want_ble    = (strcmp(role_str, "ble") == 0);
+        want_zigbee = (strcmp(role_str, "zigbee") == 0);
+    } else {
+#if CONFIG_PLANTHUB_RADIO_ROLE_BLE
+        want_ble = true;  want_zigbee = false;
+#elif CONFIG_PLANTHUB_RADIO_ROLE_ZIGBEE
+        want_ble = false; want_zigbee = true;
+#else
+        want_ble = false; want_zigbee = false;
+#endif
+    }
+    ESP_LOGW(TAG, "radio role: %s%s%s (nvs=\"%s\")",
+             want_ble ? "BLE" : "", want_zigbee ? "ZIGBEE" : "",
+             (!want_ble && !want_zigbee) ? "WIFI_ONLY" : "",
+             role_str[0] ? role_str : "unset->default");
+
+    esp_err_t ble_err = ESP_OK;
+    if (want_ble) {
+        ble_err = ble_collector_start();
+        if (ble_err != ESP_OK) ESP_LOGE(TAG, "BLE collector failed to start (%s); running without BLE", esp_err_to_name(ble_err));
+    }
     /* Renamed from "after swarm/BLE bring-up" (round 3): swarm, integrations
      * and rules now have their own milestones above, so this one measures
      * ble_collector_start() -- controller + NimBLE host pools + host task --
@@ -445,8 +484,11 @@ void app_main(void)
      * Deliberately NOT wrapped in ESP_ERROR_CHECK: a coordinator that
      * cannot start is a degraded hub, not a boot failure -- it still
      * collects BLE and serves its web UI (see zigbee.h). */
-    esp_err_t zb_err = zigbee_start();
-    if (zb_err != ESP_OK) ESP_LOGE(TAG, "Zigbee coordinator failed to start (%s); running without Zigbee", esp_err_to_name(zb_err));
+    esp_err_t zb_err = ESP_OK;
+    if (want_zigbee) {
+        zb_err = zigbee_start();
+        if (zb_err != ESP_OK) ESP_LOGE(TAG, "Zigbee coordinator failed to start (%s); running without Zigbee", esp_err_to_name(zb_err));
+    }
 
     /* M7 Task 5 (spec §4): a battery-mode paired node runs its wake cycle
      * (scan -> checkin -> sleep) instead of just sitting always-on -- see
