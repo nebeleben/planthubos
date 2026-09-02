@@ -567,7 +567,7 @@ function UnknownDevicesSection({ onAddWrapper, onGenerateWrapper }) {
   )
 }
 
-export function DevicesTab({ onAddWrapper, onGenerateWrapper }) {
+export function DevicesTab({ onAddWrapper, onGenerateWrapper, radioRole }) {
   const [caps, setCaps] = useState(null)
   const [devices, setDevices] = useState(null)
   const [plants, setPlants] = useState(null)
@@ -653,6 +653,9 @@ export function DevicesTab({ onAddWrapper, onGenerateWrapper }) {
     <div>
       <div class="panel">
         <h2>Devices</h2>
+        {radioRole === 'wifi_only' && (
+          <p class="hint">No sensor radio is enabled. Choose Bluetooth or Zigbee in Config → Radio.</p>
+        )}
         {devices.length === 0 ? (
           <p class="placeholder">No devices discovered yet. MiFlora devices are discovered automatically — bring one in range.</p>
         ) : (

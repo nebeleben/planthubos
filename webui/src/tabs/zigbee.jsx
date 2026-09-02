@@ -262,14 +262,13 @@ export function ZigbeeTab() {
   if (error && !data) return <p class="error">Hub not reachable.</p>
   if (!data) return <p class="placeholder">Loading…</p>
 
-  // Design point 3: Zigbee compiled out on a build with no 802.15.4 radio.
-  // One explanatory line and nothing else -- no empty table, no spinner,
-  // no error styling, since this isn't a fault, it's the build.
+  // Defensive only: app.jsx hides this tab unless the radio role is
+  // zigbee, so reaching here means the coordinator failed to start.
   if (!data.enabled) {
     return (
       <div class="panel">
         <h2>Zigbee</h2>
-        <p class="placeholder">Zigbee is not available on this hub -- it was built without 802.15.4 radio support.</p>
+        <p class="placeholder">Zigbee radio is not running. Check the hub log; the Radio panel in Config selects it.</p>
       </div>
     )
   }

@@ -35,6 +35,9 @@ export function ConfigTab() {
   const [cfgMsg, setCfgMsg] = useState('')
   const [region, setRegion] = useState('')           // '' = build default (GET's null)
   const [regionMsg, setRegionMsg] = useState('')
+  const [radioRole, setRadioRole] = useState('ble')     // select value
+  const [radioRunning, setRadioRunning] = useState('')  // GET's value = what this boot runs
+  const [radioMsg, setRadioMsg] = useState('')
   const [hubName, setHubName] = useState('')
   const [nameMsg, setNameMsg] = useState('')
   const [fresetMsg, setFresetMsg] = useState('')
@@ -64,6 +67,8 @@ export function ConfigTab() {
         setMqtt({ enabled: c.mqtt.enabled, uri: c.mqtt.uri, user: c.mqtt.user, pass: '' })
         setInflux({ enabled: c.influx.enabled, url: c.influx.url, org: c.influx.org, bucket: c.influx.bucket, token: '' })
         setRegion(c.region ?? '')   // null (build default) -> the select's "" option
+        setRadioRole(c.radio_role ?? 'ble')
+        setRadioRunning(c.radio_role ?? '')
         setHubName(c.name ?? '')
         setCfgLoaded(true)
       })
@@ -231,6 +236,27 @@ export function ConfigTab() {
     setBusy('')
   }
 
+  async function doSaveRadio() {
+    setBusy('radio'); setRadioMsg('')
+    try {
+      const res = await fetch('/api/v1/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ radio_role: radioRole }),
+      })
+      if (res.ok) {
+        rebootCountdown(setRadioMsg)
+      } else if (res.status === 401) {
+        setRadioMsg('Unauthorized — set the hub key below.')
+      } else {
+        let msg = 'Save failed.'
+        try { const d = await res.json(); if (d.error) msg = d.error } catch { /* non-JSON body */ }
+        setRadioMsg(msg)
+      }
+    } catch { setRadioMsg('hub not reachable') }
+    setBusy('')
+  }
+
   async function doSaveName() {
     setBusy('name'); setNameMsg('')
     try {
@@ -391,6 +417,31 @@ export function ConfigTab() {
           Home Assistant will rediscover the plants under the new topics.
         </p>
         {nameMsg && <p class="hint">{nameMsg}</p>}
+      </div>
+
+      <div class="panel">
+        <h2>Radio</h2>
+        <p>
+          <label>
+            Sensor radio
+            <select value={radioRole} onChange={(e) => setRadioRole(e.currentTarget.value)} disabled={!cfgLoaded}>
+              <option value="wifi_only">WiFi only (no sensor radio)</option>
+              <option value="ble">Bluetooth (BLE)</option>
+              <option value="zigbee">Zigbee</option>
+            </select>
+          </label>
+          {' '}
+          <button class="btn-primary" onClick={doSaveRadio}
+                  disabled={busy === 'radio' || !cfgLoaded || radioRole === radioRunning}>
+            {busy === 'radio' ? 'Saving…' : 'Save radio'}
+          </button>
+        </p>
+        <p class="infobox">
+          One radio per hub: BLE and Zigbee cannot share the antenna, so this hub runs
+          exactly one of them. Switching reboots the hub. Paired Zigbee devices and BLE
+          device records are kept while the other radio runs; they simply stop updating.
+        </p>
+        {radioMsg && <p class="hint">{radioMsg}</p>}
       </div>
 
       <div class="panel">

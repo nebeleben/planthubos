@@ -246,10 +246,15 @@ export function App() {
   // `role != SWARM_ROLE_NODE` block) -- neither ever runs on a paired node,
   // so GET /api/v1/events has nothing meaningful to serve there either.
   // Zigbee (M6b) is hub-only too: the coordinator and its device registry
-  // are owned by the hub, never a paired node.
-  const TABS = role === 'node'
-    ? ALL_TABS.filter((t) => t !== 'Nodes' && t !== 'Rules' && t !== 'Wrappers' && t !== 'Alerts' && t !== 'Zigbee')
-    : ALL_TABS
+  // are owned by the hub, never a paired node. Zigbee is additionally
+  // gated on the radio role (Config → Radio).
+  const TABS = ALL_TABS.filter((t) => {
+    if (role === 'node' && (t === 'Nodes' || t === 'Rules' || t === 'Wrappers' || t === 'Alerts' || t === 'Zigbee')) return false
+    // Zigbee is only meaningful while the coordinator runs; the Config
+    // tab's Radio panel is where it gets turned on.
+    if (t === 'Zigbee' && radioRole !== 'zigbee') return false
+    return true
+  })
 
   return (
     <div class="app">
@@ -276,7 +281,8 @@ export function App() {
          tab === 'Plants' ? <PlantsTab /> :
          tab === 'Devices' ? (
            <DevicesTab onAddWrapper={(device) => goToWrapperEditor(device, false)}
-                       onGenerateWrapper={(device) => goToWrapperEditor(device, true)} />
+                       onGenerateWrapper={(device) => goToWrapperEditor(device, true)}
+                       radioRole={radioRole} />
          ) :
          tab === 'Alerts' ? <AlertsTab /> :
          tab === 'History' ? <HistoryTab /> :
