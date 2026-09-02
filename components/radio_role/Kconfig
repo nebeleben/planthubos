@@ -1,0 +1,22 @@
+menu "PlantHub radio role"
+
+choice PLANTHUB_DEFAULT_RADIO_ROLE
+    prompt "Default radio role (when NVS radio_role is unset)"
+    default PLANTHUB_RADIO_ROLE_WIFI_ONLY
+    help
+        One universal image, one radio per node chosen at runtime. Both the
+        BLE and Zigbee stacks are compiled in; this selects which one STARTS
+        on a hub whose NVS has no radio_role yet. wifi_only is the shipped
+        default: a fresh hub brings up WiFi and the web UI, and the
+        onboarding step asks the user to pick BLE or Zigbee (a reboot
+        applies it). The other two exist for bench builds.
+
+config PLANTHUB_RADIO_ROLE_WIFI_ONLY
+    bool "wifi_only (neither BLE nor Zigbee)"
+config PLANTHUB_RADIO_ROLE_BLE
+    bool "ble"
+config PLANTHUB_RADIO_ROLE_ZIGBEE
+    bool "zigbee"
+endchoice
+
+endmenu

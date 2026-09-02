@@ -14,6 +14,7 @@
 #include "data_core.h"
 #include "ble_collector.h"
 #include "zigbee.h"
+#include "radio_role.h"
 #include "timekeeper.h"
 #include "sampler.h"
 #include "ota_post.h"
@@ -226,6 +227,10 @@ void app_main(void)
      * unchanged -- this is the byte-for-byte-with-today requirement for
      * ROLE_UNSET and ROLE_MAIN. */
     ESP_ERROR_CHECK(swarm_store_init());
+    /* Radio role (BLE xor Zigbee) cache, read before webserver_start() so
+     * GET /api/v1/status can report it from the httpd task without an NVS
+     * read of its own. See radio_role.h. */
+    ESP_ERROR_CHECK(radio_role_init());
     /* Second half of the rapid power-cycle reset (power_reset.c): a node
      * has no WiFi credentials, so the wifi clear alone is invisible there
      * -- its "back to onboarding" is clearing role + pairing, which needs
@@ -435,32 +440,14 @@ void app_main(void)
      * initializes, so the other costs flash + static .bss but no heap.
      * A role change is applied by reboot -- the BT vs 802.15.4 controllers
      * cannot be cleanly re-inited live. */
-    char role_str[16] = {0};
-    {
-        nvs_handle_t h;
-        if (nvs_open("planthub", NVS_READONLY, &h) == ESP_OK) {
-            size_t len = sizeof(role_str);
-            nvs_get_str(h, "radio_role", role_str, &len);
-            nvs_close(h);
-        }
-    }
-    bool want_ble, want_zigbee;
-    if (role_str[0]) {
-        want_ble    = (strcmp(role_str, "ble") == 0);
-        want_zigbee = (strcmp(role_str, "zigbee") == 0);
-    } else {
-#if CONFIG_PLANTHUB_RADIO_ROLE_BLE
-        want_ble = true;  want_zigbee = false;
-#elif CONFIG_PLANTHUB_RADIO_ROLE_ZIGBEE
-        want_ble = false; want_zigbee = true;
-#else
-        want_ble = false; want_zigbee = false;
-#endif
-    }
-    ESP_LOGW(TAG, "radio role: %s%s%s (nvs=\"%s\")",
-             want_ble ? "BLE" : "", want_zigbee ? "ZIGBEE" : "",
-             (!want_ble && !want_zigbee) ? "WIFI_ONLY" : "",
-             role_str[0] ? role_str : "unset->default");
+    radio_role_t rr = radio_role_get();
+    /* A paired swarm node is a BLE relay by definition today; node radio
+     * roles are M7 work. Everything else follows the stored role. */
+    bool want_ble    = node_paired || (rr == RADIO_ROLE_BLE);
+    bool want_zigbee = !node_paired && (rr == RADIO_ROLE_ZIGBEE);
+    ESP_LOGW(TAG, "radio role: %s (%s)%s", radio_role_str(rr),
+             radio_role_is_set() ? "nvs" : "default",
+             node_paired ? " [paired node: BLE forced]" : "");
 
     esp_err_t ble_err = ESP_OK;
     if (want_ble) {
