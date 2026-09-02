@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 ESP_EVENT_DEFINE_BASE(PLANTHUB_EVENT);
@@ -36,6 +37,44 @@ static void start_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* Boot-time association fix (radio-role plan, Task 2b). Measured on
+     * the C6: esp_wifi_connect() issued straight after esp_wifi_start()
+     * fails its own scan with WIFI_REASON_NO_AP_FOUND on every attempt
+     * (~2.4 s apart) even with the router at -57 dBm on channel 1, while
+     * an explicit active scan first sees the router and the following
+     * connect succeeds on the first try. Before this fix the BLE-on hub
+     * only associated on its 6th attempt (~13 s) and a BLE-off hub hit
+     * MAX_RETRIES and fell to the setup AP. So: scan for our SSID, pin
+     * the channel when found, then connect. Blocking, on the boot task,
+     * bounded by the per-channel scan time below (<= ~2 s over 13
+     * channels). Not found is not fatal -- connect anyway and let the FSM
+     * retry as before. */
+    {
+        wifi_scan_config_t sc = {
+            .ssid = (uint8_t *)creds.ssid,
+            .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+            .scan_time.active = { .min = 60, .max = 150 },
+        };
+        esp_err_t se = esp_wifi_scan_start(&sc, true);
+        uint16_t n = 0;
+        if (se == ESP_OK) esp_wifi_scan_get_ap_num(&n);
+        if (n > 0) {
+            wifi_ap_record_t *recs = calloc(n, sizeof(*recs));
+            if (recs && esp_wifi_scan_get_ap_records(&n, recs) == ESP_OK) {
+                /* Records come sorted by RSSI; pin the strongest BSS's channel. */
+                cfg.sta.channel = recs[0].primary;
+                ESP_LOGI(TAG, "pre-scan: %u BSS for our SSID, best ch=%u rssi=%d", (unsigned)n,
+                         recs[0].primary, recs[0].rssi);
+                ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
+            }
+            free(recs);
+        } else {
+            ESP_LOGW(TAG, "pre-scan: our SSID not seen (%s, n=%u); connecting anyway",
+                     esp_err_to_name(se), (unsigned)n);
+        }
+    }
+
     esp_wifi_connect();
 }
 
@@ -78,6 +117,8 @@ static void do_action(wifi_action_t act)
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
+        ESP_LOGW(TAG, "STA disconnected: reason=%d rssi=%d", d ? d->reason : -1, d ? d->rssi : 0);
         do_action(wifi_fsm_step(&s_fsm, WIFI_EV_DISCONNECTED));
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
