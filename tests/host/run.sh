@@ -246,3 +246,9 @@ $CC -Wall -Wextra -Werror -I../../components/zigbee/include \
     ../../components/zigbee/zb_map.c ../../components/capability/capability.c \
     -lm -o test_zb_interview
 ./test_zb_interview
+
+# radio_role's pure half (enum <-> string), split from the NVS-backed
+# radio_role.c so it runs here without nvs_flash.
+$CC -Wall -Wextra -Werror -I../../components/radio_role/include \
+    test_radio_role.c ../../components/radio_role/radio_role_str.c -o test_radio_role
+./test_radio_role
