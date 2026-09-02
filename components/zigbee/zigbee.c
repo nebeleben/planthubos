@@ -269,27 +269,26 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
  * would not compile on a target without an 802.15.4 radio. */
 #if CONFIG_ESP_COEX_SW_COEXIST_ENABLE && CONFIG_SOC_IEEE802154_SUPPORTED
         {
-            /* Off by default -- see CONFIG_PLANTHUB_ZB_COEX_ARBITRATION's
-             * help for the measurements. Arbitration costs roughly two
-             * thirds of the beacon reply rate and there is no runtime
-             * disable, so this is a boot-time decision, not something a
-             * permit-join window can suspend. */
-            esp_err_t coex_err = ESP_OK;
-#if CONFIG_PLANTHUB_ZB_COEX_ARBITRATION
-            coex_err = esp_coex_wifi_i154_enable();
+            /* Always on. Under the one-radio-per-node architecture this
+             * coordinator never shares the antenna with BLE, only with
+             * WiFi -- Espressif's esp_zigbee_gateway configuration. The
+             * old default-off arbitration Kconfig option (removed) was
+             * measured with BLE scanning alongside, where arbitration cost
+             * ~2/3 of the beacon reply rate; without BLE it is what lets
+             * WiFi STA associate at all (a BLE-less build otherwise falls
+             * to the AP portal: NimBLE's controller init had been enabling
+             * the coex module implicitly). Numbers for this configuration
+             * are in the radio-role-config spec, section 8. */
+            esp_err_t coex_err = esp_coex_wifi_i154_enable();
             if (coex_err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_coex_wifi_i154_enable failed (%s); WiFi and "
                               "802.15.4 will contend unarbitrated",
                          esp_err_to_name(coex_err));
             } else {
                 ESP_LOGI(TAG, "WiFi/802.15.4 coexistence enabled");
+                esp_err_t pref_err = esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+                ESP_LOGI(TAG, "coex preference WIFI: %s", esp_err_to_name(pref_err));
             }
-#else
-            (void)coex_err;
-            ESP_LOGI(TAG, "WiFi/802.15.4 arbitration deliberately OFF "
-                          "(CONFIG_PLANTHUB_ZB_COEX_ARBITRATION); it costs ~2/3 "
-                          "of the Zigbee beacon reply rate");
-#endif
         }
 #else
         ESP_LOGW(TAG, "built without CONFIG_ESP_COEX_SW_COEXIST_ENABLE; WiFi and "
@@ -1284,7 +1283,7 @@ bool zigbee_net_info(uint8_t *channel, uint16_t *pan_id, bool *formed)
  * called esp_zb_bdb_close_network(), so nothing can join in the meantime
  * whatever this setting says. */
 /* Deferred entry to the BLE hold. Holding the scan kills the hub's WiFi
- * for the window (measured; see CONFIG_PLANTHUB_ZB_COEX_ARBITRATION), and
+ * for the window (measured; see the radio-role-config spec section 8), and
  * doing it synchronously inside the permit POST handler made the HTTP
  * response race the WiFi death -- sometimes the operator's own "pairing
  * started" reply never arrived. Deferring by ZB_SCAN_HOLD_DELAY_MS lets

@@ -21,33 +21,4 @@ config PLANTHUB_ZB_PERMIT_JOIN_S
         on a successful join, and on reboot. A permanently open network
         lets any device in radio range join.
 
-config PLANTHUB_ZB_COEX_ARBITRATION
-    bool "Enable WiFi/802.15.4 coexistence arbitration"
-    depends on PLANTHUB_ZB_ENABLED
-    default n
-    help
-        Calls esp_coex_wifi_i154_enable(), which arbitrates the shared
-        antenna between WiFi and 802.15.4.
-
-        Defaults OFF because it was measured to cost roughly two thirds of
-        the coordinator's beacon reply rate, in every configuration. A
-        joining device that does not receive a beacon inside its scan
-        window reports MAC_NO_BEACON and gives up, so with arbitration on,
-        pairing is unreliable. Measured on this hub with a sniffer probing
-        every 5 s over a 180 s permit-join window:
-
-                              arbitration ON   arbitration OFF
-          BLE scanning            ~8%               22%
-          BLE scan held          ~20%               97%
-
-        esp_coex_preference_set(ESP_COEX_PREFER_BT) does not recover it
-        (34%): that API predates 802.15.4 and does not reach its arbiter.
-        There is no esp_coex_wifi_i154_disable(), so this cannot be toggled
-        for the duration of a window -- it is a boot-time decision.
-
-        Turning it on trades Zigbee pairing for whatever arbitration buys.
-        Across the M6b bring-up, WiFi stayed associated and BLE kept
-        decoding sensors with it off; if a future soak shows otherwise,
-        this switch is how you put it back.
-
 endmenu

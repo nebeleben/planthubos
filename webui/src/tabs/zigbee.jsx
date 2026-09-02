@@ -152,8 +152,8 @@ export function ZigbeeTab() {
   const consecFailsRef = useRef(0)
   const [stale, setStale] = useState(false)
   // M6b UX: while a pairing window is open the hub's WiFi is expected to be
-  // unreachable (the radio is deliberately handed to Zigbee -- see
-  // CONFIG_PLANTHUB_ZB_COEX_ARBITRATION's help). A window THIS tab opened is
+  // unreachable (the radio is deliberately handed to Zigbee -- see the
+  // radio-role-config spec section 8). A window THIS tab opened is
   // therefore not a connection loss: windowEndRef records (client clock)
   // when that window closes, poll failures before that instant drive a
   // client-side countdown instead of the stale marker, and pairingOutage
