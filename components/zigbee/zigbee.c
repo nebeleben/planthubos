@@ -1063,9 +1063,21 @@ static void zb_iv_handle_store(void)
         strncpy(dev->name, s_store.dev[existing].name, ZB_STORE_NAME_MAX - 1);
         dev->name[ZB_STORE_NAME_MAX - 1] = '\0';
 
-        if (!dev->interviewed && s_store.dev[existing].interviewed) {
-            /* A failed re-interview must never demote a device that
-             * previously interviewed fine: keep the stored record (its
+        /* An interview that reports success but discovered NOTHING --
+         * no capabilities, no actions, no unmapped clusters -- is a
+         * hollow success, functionally a failure: it happens when a
+         * rejoin's re-interview races the device's own re-announce and
+         * reads an empty endpoint list (observed live with a Xiaomi light
+         * sensor, whose good [illuminance,battery] record was overwritten
+         * by an endpoint-0/zero-cap re-interview on a rejoin, after which
+         * reports had no capability to route to). Treat it exactly like a
+         * failed interview against an already-good record: the >true<
+         * flag alone must not be enough to demote. */
+        bool reinterview_is_hollow =
+            dev->cap_count == 0 && dev->action_count == 0 && dev->unmapped_count == 0;
+        if ((!dev->interviewed || reinterview_is_hollow) && s_store.dev[existing].interviewed) {
+            /* A failed OR hollow re-interview must never demote a device
+             * that previously interviewed fine: keep the stored record (its
              * capabilities, actions and now-carried-over name) and only
              * refresh what this rejoin actually told us. The registry/
              * actor-table entries this device already has from its
