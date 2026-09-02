@@ -35,9 +35,14 @@ export function RadioTab({ onChosen }) {
       if (!res.ok) {
         throw new Error(res.status === 401 ? 'Unauthorized — set the hub key in Config first.' : 'Request failed — is the hub reachable?')
       }
-      const d = await res.json()
-      if (d.rebooting) rebootCountdown(setMsg)
-      else onChosen()
+      let d
+      try { d = await res.json() } catch { throw new Error('Request failed — is the hub reachable?') }
+      if (d.rebooting) {
+        rebootCountdown(setMsg)
+      } else {
+        onChosen()
+        setBusy('')
+      }
     } catch (e) {
       setError(e.message)
       setBusy('')
