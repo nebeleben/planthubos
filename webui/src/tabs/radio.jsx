@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks'
-import { authHeaders } from '../lib/auth.js'
+import { getKey, setKey, authHeaders } from '../lib/auth.js'
 import { rebootCountdown } from '../lib/reboot.js'
 
 // Second onboarding screen (after role.jsx's main/node choice): shown by
@@ -23,9 +23,15 @@ export function RadioTab({ onChosen }) {
   const [busy, setBusy] = useState('')     // '' | choice id in flight
   const [msg, setMsg] = useState('')
   const [error, setError] = useState('')
+  // A claimed hub 401s the picker's POST just like it 401s Config's --
+  // this form is that same recovery, in place, so the user can retry the
+  // same card instead of being sent away to a Config tab they may not
+  // even have a route to yet.
+  const [needKey, setNeedKey] = useState(false)
+  const [keyInput, setKeyInput] = useState(getKey())
 
   async function choose(id) {
-    setBusy(id); setError('')
+    setBusy(id); setError(''); setNeedKey(false)
     try {
       const res = await fetch('/api/v1/config', {
         method: 'POST',
@@ -33,7 +39,11 @@ export function RadioTab({ onChosen }) {
         body: JSON.stringify({ radio_role: id }),
       })
       if (!res.ok) {
-        throw new Error(res.status === 401 ? 'Unauthorized — set the hub key in Config first.' : 'Request failed — is the hub reachable?')
+        if (res.status === 401) {
+          setNeedKey(true)
+          throw new Error('This hub is claimed — enter its key to continue.')
+        }
+        throw new Error('Request failed — is the hub reachable?')
       }
       let d
       try { d = await res.json() } catch { throw new Error('Request failed — is the hub reachable?') }
@@ -47,6 +57,11 @@ export function RadioTab({ onChosen }) {
       setError(e.message)
       setBusy('')
     }
+  }
+
+  function saveKey() {
+    setKey(keyInput)
+    setNeedKey(false)
   }
 
   if (msg) {
@@ -76,6 +91,17 @@ export function RadioTab({ onChosen }) {
         A hub runs one of these radios at a time. You can change it later in Config; changing it reboots the hub.
       </p>
       {error && <p class="error">{error}</p>}
+      {needKey && (
+        <div>
+          <label class="keyrow">
+            Hub key
+            <input type="password" value={keyInput}
+                   onInput={(e) => setKeyInput(e.currentTarget.value)}
+                   placeholder="paste the 64-char key" />
+          </label>
+          <button class="btn-primary" onClick={saveKey}>Save key</button>
+        </div>
+      )}
     </div>
   )
 }

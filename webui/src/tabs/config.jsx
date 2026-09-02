@@ -419,30 +419,32 @@ export function ConfigTab() {
         {nameMsg && <p class="hint">{nameMsg}</p>}
       </div>
 
-      <div class="panel">
-        <h2>Radio</h2>
-        <p>
-          <label>
-            Sensor radio
-            <select value={radioRole} onChange={(e) => setRadioRole(e.currentTarget.value)} disabled={!cfgLoaded}>
-              <option value="wifi_only">WiFi only (no sensor radio)</option>
-              <option value="ble">Bluetooth (BLE)</option>
-              <option value="zigbee">Zigbee</option>
-            </select>
-          </label>
-          {' '}
-          <button class="btn-primary" onClick={doSaveRadio}
-                  disabled={busy === 'radio' || !cfgLoaded || radioRole === radioRunning}>
-            {busy === 'radio' ? 'Saving…' : 'Save radio'}
-          </button>
-        </p>
-        <p class="infobox">
-          One radio per hub: BLE and Zigbee cannot share the antenna, so this hub runs
-          exactly one of them. Switching reboots the hub. Paired Zigbee devices and BLE
-          device records are kept while the other radio runs; they simply stop updating.
-        </p>
-        {radioMsg && <p class="hint">{radioMsg}</p>}
-      </div>
+      {st.role !== 'node' && (
+        <div class="panel">
+          <h2>Radio</h2>
+          <p>
+            <label>
+              Sensor radio
+              <select value={radioRole} onChange={(e) => setRadioRole(e.currentTarget.value)} disabled={!cfgLoaded}>
+                <option value="wifi_only">WiFi only (no sensor radio)</option>
+                <option value="ble">Bluetooth (BLE)</option>
+                <option value="zigbee">Zigbee</option>
+              </select>
+            </label>
+            {' '}
+            <button class="btn-primary" onClick={doSaveRadio}
+                    disabled={busy === 'radio' || !cfgLoaded || radioRole === radioRunning}>
+              {busy === 'radio' ? 'Saving…' : 'Save radio'}
+            </button>
+          </p>
+          <p class="infobox">
+            One radio per hub: BLE and Zigbee cannot share the antenna, so this hub runs
+            exactly one of them. Switching reboots the hub. Paired Zigbee devices and BLE
+            device records are kept while the other radio runs; they simply stop updating.
+          </p>
+          {radioMsg && <p class="hint">{radioMsg}</p>}
+        </div>
+      )}
 
       <div class="panel">
         <h2>WiFi region</h2>

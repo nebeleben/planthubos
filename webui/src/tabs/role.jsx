@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
-import { authHeaders } from '../lib/auth.js'
+import { getKey, setKey, authHeaders } from '../lib/auth.js'
 
 /* Shown by app.jsx instead of the tab shell whenever GET /api/v1/status
  * reports role === "unset" -- i.e. a device that has never been told what
@@ -8,6 +8,12 @@ export function RoleTab({ onMainChosen }) {
   const [busy, setBusy] = useState('')          // '' | 'main' | 'node'
   const [nodePhase, setNodePhase] = useState('') // '' | 'pairing' | 'gone'
   const [error, setError] = useState('')
+  // Same latent shape as radio.jsx's picker: a claimed hub 401s this
+  // screen's POST too, and until now there was no way back in short of
+  // physical recovery. Offer the key here, in place, so the user can
+  // retry the same card.
+  const [needKey, setNeedKey] = useState(false)
+  const [keyInput, setKeyInput] = useState(getKey())
   const pollRef = useRef(null)
 
   useEffect(() => () => clearInterval(pollRef.current), [])
@@ -19,13 +25,21 @@ export function RoleTab({ onMainChosen }) {
       body: JSON.stringify({ role }),
     })
     if (!res.ok) {
-      const msg = res.status === 401 ? 'Unauthorized — set the hub key in Config first.' : 'Request failed — is the hub reachable?'
-      throw new Error(msg)
+      if (res.status === 401) {
+        setNeedKey(true)
+        throw new Error('This hub is claimed — enter its key to continue.')
+      }
+      throw new Error('Request failed — is the hub reachable?')
     }
   }
 
+  function saveKey() {
+    setKey(keyInput)
+    setNeedKey(false)
+  }
+
   async function chooseMain() {
-    setBusy('main'); setError('')
+    setBusy('main'); setError(''); setNeedKey(false)
     try {
       await postRole('main')
       onMainChosen()
@@ -36,7 +50,7 @@ export function RoleTab({ onMainChosen }) {
   }
 
   async function chooseNode() {
-    setBusy('node'); setError('')
+    setBusy('node'); setError(''); setNeedKey(false)
     try {
       await postRole('node')
       setNodePhase('pairing')
@@ -99,6 +113,17 @@ export function RoleTab({ onMainChosen }) {
         </div>
       </div>
       {error && <p class="error">{error}</p>}
+      {needKey && (
+        <div>
+          <label class="keyrow">
+            Hub key
+            <input type="password" value={keyInput}
+                   onInput={(e) => setKeyInput(e.currentTarget.value)}
+                   placeholder="paste the 64-char key" />
+          </label>
+          <button class="btn-primary" onClick={saveKey}>Save key</button>
+        </div>
+      )}
     </div>
   )
 }
