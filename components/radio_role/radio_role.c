@@ -29,8 +29,10 @@ esp_err_t radio_role_init(void)
     s_set = false;
 
     nvs_handle_t h;
-    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) {
-        ESP_LOGI(TAG, "no NVS namespace yet; default %s", radio_role_str(s_role));
+    esp_err_t open_err = nvs_open(NS, NVS_READONLY, &h);
+    if (open_err != ESP_OK) {
+        ESP_LOGI(TAG, "no NVS namespace yet (%s); default %s",
+                 esp_err_to_name(open_err), radio_role_str(s_role));
         return ESP_OK;
     }
     char buf[16] = {0};
@@ -48,6 +50,12 @@ esp_err_t radio_role_init(void)
             ESP_LOGW(TAG, "stored radio_role \"%s\" unknown; treating as unset (default %s)",
                      buf, radio_role_str(s_role));
         }
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        /* A real read error (corrupt entry, truncated value, ...) rather
+         * than the ordinary "never written yet" case -- worth a WARN even
+         * though the fallback behavior (default/unset) is the same. */
+        ESP_LOGW(TAG, "nvs_get_str(\"%s\") failed (%s); treating as unset (default %s)",
+                 KEY, esp_err_to_name(err), radio_role_str(s_role));
     }
     ESP_LOGI(TAG, "radio_role=%s (%s)", radio_role_str(s_role), s_set ? "nvs" : "default");
     return ESP_OK;
