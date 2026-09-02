@@ -271,14 +271,20 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         {
             /* Always on. Under the one-radio-per-node architecture this
              * coordinator never shares the antenna with BLE, only with
-             * WiFi -- Espressif's esp_zigbee_gateway configuration. The
-             * old default-off arbitration Kconfig option (removed) was
-             * measured with BLE scanning alongside, where arbitration cost
-             * ~2/3 of the beacon reply rate; without BLE it is what lets
-             * WiFi STA associate at all (a BLE-less build otherwise falls
-             * to the AP portal: NimBLE's controller init had been enabling
-             * the coex module implicitly). Numbers for this configuration
-             * are in the radio-role-config spec, section 8. */
+             * WiFi -- Espressif's esp_zigbee_gateway configuration. Measured
+             * trade-off, honestly: with arbitration off, the LAN is dead --
+             * the coordinator comes up but WiFi STA never holds an
+             * association (a BLE-less build otherwise falls to the AP
+             * portal: NimBLE's controller init had been enabling the coex
+             * module implicitly). With arbitration on, WiFi is fine (STA
+             * associates and stays reachable) but the Zigbee beacon reply
+             * rate drops to roughly 1/3. WiFi working is the harder
+             * requirement here (it is what the UI-driven pairing flow and
+             * this hub's other duties depend on), so arbitration stays on
+             * unconditionally; esp_coex_preference_set(ESP_COEX_PREFER_WIFI)
+             * was tried and dropped -- it did not move the beacon numbers
+             * outside measurement noise. Full numbers and the open
+             * trade-off note are in the radio-role-config spec, section 8. */
             esp_err_t coex_err = esp_coex_wifi_i154_enable();
             if (coex_err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_coex_wifi_i154_enable failed (%s); WiFi and "
@@ -286,8 +292,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                          esp_err_to_name(coex_err));
             } else {
                 ESP_LOGI(TAG, "WiFi/802.15.4 coexistence enabled");
-                esp_err_t pref_err = esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
-                ESP_LOGI(TAG, "coex preference WIFI: %s", esp_err_to_name(pref_err));
             }
         }
 #else
