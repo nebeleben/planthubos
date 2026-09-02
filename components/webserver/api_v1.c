@@ -24,6 +24,7 @@
 #include "actor.h"
 #include "action.h"
 #include "zigbee.h"
+#include "radio_role.h"
 #include "cJSON.h"
 #include "mbedtls/base64.h"
 #include "esp_littlefs.h"
@@ -191,6 +192,11 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "epoch_s", timekeeper_now());
     cJSON_AddBoolToObject(root, "claimed", claim_is_claimed());
     cJSON_AddStringToObject(root, "role", role_str(role));
+    /* Radio role (BLE xor Zigbee, see radio_role.h): the effective role
+     * this boot runs, and whether it was ever chosen. radio_role_set=false
+     * is what app.jsx keys its onboarding radio picker on. */
+    cJSON_AddStringToObject(root, "radio_role", radio_role_str(radio_role_get()));
+    cJSON_AddBoolToObject(root, "radio_role_set", radio_role_is_set());
     /* Node: paired to a hub. Unset/main: has at least one node paired to it. */
     bool paired = (role == SWARM_ROLE_NODE) ? swarm_store_hub(NULL, NULL, NULL)
                                              : swarm_store_node_count() > 0;
@@ -1565,6 +1571,9 @@ static esp_err_t config_get(httpd_req_t *req)
         cJSON_AddNullToObject(root, "region");
     }
 
+    /* Effective radio role -- the Settings select shows what is running. */
+    cJSON_AddStringToObject(root, "radio_role", radio_role_str(radio_role_get()));
+
     cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
     cJSON_AddBoolToObject(mqtt, "enabled", cfg.mqtt.enabled);
     cJSON_AddStringToObject(mqtt, "uri", cfg.mqtt.uri);
@@ -1687,6 +1696,42 @@ static esp_err_t config_post(httpd_req_t *req)
              * for the rest of this boot). */
             ESP_LOGW(TAG, "config_post: swarm_store_set_region failed: %s", esp_err_to_name(region_err));
         }
+    }
+
+    /* "radio_role": top-level, one of radio_role_str()'s three strings.
+     * Validated and persisted here, before mqtt/influx, so a bad value 400s
+     * without touching them; absent key leaves it untouched. null is NOT a
+     * clear (the default is a real role, and unset is the onboarding state
+     * -- there is no UI path back to it). The reboot below applies it,
+     * with one exception: a body carrying ONLY radio_role whose value is
+     * the role already running (the fresh hub choosing "WiFi only" in
+     * onboarding) just persists the choice and answers rebooting:false --
+     * nothing about this boot would change, and the onboarding screen can
+     * hand over to the tab shell immediately. */
+    const cJSON *radio_j = cJSON_GetObjectItem(json, "radio_role");
+    bool radio_only_and_unchanged = false;
+    if (radio_j) {
+        radio_role_t rr;
+        if (!cJSON_IsString(radio_j) || !radio_role_parse(radio_j->valuestring, &rr)) {
+            cJSON_Delete(json);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"error\":\"bad radio_role\"}");
+            return ESP_OK;
+        }
+        bool unchanged = (rr == radio_role_get());
+        esp_err_t rr_err = radio_role_set(rr);
+        if (rr_err != ESP_OK) {
+            ESP_LOGW(TAG, "config_post: radio_role_set(%s) failed: %s",
+                     radio_role_str(rr), esp_err_to_name(rr_err));
+        }
+        radio_only_and_unchanged = unchanged && cJSON_GetArraySize(json) == 1;
+    }
+    if (radio_only_and_unchanged) {
+        cJSON_Delete(json);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":true,\"rebooting\":false}");
+        return ESP_OK;
     }
 
     integr_config_t cfg;
