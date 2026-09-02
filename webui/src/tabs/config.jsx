@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import { getKey, setKey, authHeaders } from '../lib/auth.js'
+import { rebootCountdown } from '../lib/reboot.js'
 import { getAiSettings, setAiSettings, normEndpoint, AI_DEFAULTS } from '../lib/ai/settings.js'
 import { aiComplete, AiError } from '../lib/ai/provider.js'
 
@@ -45,14 +46,6 @@ export function ConfigTab() {
   const [aiTestMsg, setAiTestMsg] = useState('')
   const [aiTestDetail, setAiTestDetail] = useState('')
   const aiTestAbortRef = useRef(null)   // current in-flight aiComplete()'s AbortController, for the Cancel button
-
-  // Every successful config save reboots the hub (the settings only apply
-  // at boot). One shared countdown: tell the user, then pull the page back
-  // up once the hub should be reachable again.
-  function rebootCountdown(setMsg, extra) {
-    setMsg(`Saved — hub is rebooting to apply.${extra ? ` ${extra}` : ''} This page reloads in ~15 s.`)
-    setTimeout(() => location.reload(), 15000)
-  }
 
   function refresh() {
     fetch('/api/v1/status')

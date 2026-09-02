@@ -7,6 +7,7 @@ import { HistoryTab } from './tabs/history.jsx'
 import { NetworkTab } from './tabs/network.jsx'
 import { NodesTab } from './tabs/nodes.jsx'
 import { PlantsTab } from './tabs/plants.jsx'
+import { RadioTab } from './tabs/radio.jsx'
 import { RoleTab } from './tabs/role.jsx'
 import { RulesTab } from './tabs/rules.jsx'
 import { WrappersTab } from './tabs/wrappers.jsx'
@@ -78,6 +79,12 @@ export function App() {
   // -- only a device that has never chosen a role (fresh out of the box)
   // ever flips this to 'unset' once /api/v1/status answers.
   const [role, setRole] = useState('main')
+
+  // Radio role (BLE xor Zigbee, M6b/M7): what this hub runs, and whether
+  // anyone ever chose it. Defaults assume a pre-feature hub (no keys in
+  // status) so an old firmware never traps the UI on the picker.
+  const [radioRole, setRadioRole] = useState('ble')
+  const [radioRoleSet, setRadioRoleSet] = useState(true)
 
   // Day/night state, purely presentational (drives the toggle icon and the
   // theme state -- the actual palette is CSS, keyed off the same
@@ -180,6 +187,8 @@ export function App() {
       .then((st) => {
         const r = st.role || 'main'   // pre-M5a hubs have no "role" field
         setRole(r)
+        setRadioRole(st.radio_role || 'ble')
+        setRadioRoleSet(st.radio_role_set !== false)
         // An unpaired node reaching the webui at all means it's sitting in
         // its portal after a failed pairing attempt (a paired node runs no
         // web server, and a searching one hasn't set up webserver either)
@@ -209,6 +218,17 @@ export function App() {
             refreshRole()
           }}
         />
+        <Footer />
+      </>
+    )
+  }
+
+  // Second onboarding step: a main hub whose radio was never chosen. A
+  // node never sees this -- its radio is BLE by construction until M7.
+  if (role === 'main' && !radioRoleSet) {
+    return (
+      <>
+        <RadioTab onChosen={refreshRole} />
         <Footer />
       </>
     )
