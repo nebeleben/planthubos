@@ -5,7 +5,9 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_log.h"
+#include "esp_phy_init.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,6 +149,24 @@ esp_err_t wifi_manager_start(void)
     s_ap_netif = esp_netif_create_default_wifi_ap();
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
+
+    /* PHY warm-up (radio-role plan, Task 2c). Measured on the C6: on a
+     * fresh NVS the WiFi receiver comes up deaf -- an unfiltered active
+     * scan sees none of ~20 bench APs and every connect fails with
+     * WIFI_REASON_NO_AP_FOUND -- for as long as we watched (36 s+), with
+     * full or stored PHY calibration alike. Nothing on the WiFi side
+     * (bandwidth/protocol, stop/start, power-save) wakes it. Enabling the
+     * BT modem's PHY once BEFORE WiFi starts does: the first scan then
+     * hears everything and the STA associates first try. That is what
+     * the NimBLE controller init had been doing implicitly on every V1
+     * hub, and why the bug only surfaced once the wifi_only role (no BT
+     * controller) became the fresh-hub default. Placement matters: the
+     * same pulse after esp_wifi_start() has no effect. Harmless in the
+     * ble/zigbee roles (their stacks enable their own modems later). */
+    esp_phy_enable(PHY_MODEM_BT);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_phy_disable(PHY_MODEM_BT);
+
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_wifi_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(PLANTHUB_EVENT, PLANTHUB_EVENT_APPLY_CREDS, on_planthub_event, NULL));
