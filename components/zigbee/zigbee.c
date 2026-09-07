@@ -792,8 +792,9 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
 
     device_id_t id = { .kind = DEV_KIND_ZIGBEE };
     memcpy(id.addr, eui64, 8);
-    esp_err_t sub = data_core_submit_cap_id(&id, cap, value);
-    ESP_LOGI(TAG, "report: cap %u value %.3f -> data_core (%s)", cap, (double)value, esp_err_to_name(sub));
+    bool accepted = data_core_submit_cap_id(&id, cap, value);
+    ESP_LOGI(TAG, "report: cap %u value %.3f -> data_core %s", cap, (double)value,
+             accepted ? "accepted" : "rejected (device not in registry?)");
 }
 
 /* Task 8: the SDK allows exactly one ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID
@@ -1019,7 +1020,6 @@ static void zb_iv_simple_desc_cb(esp_zb_zdp_status_t status,
  * BOUND destination, and this interview configured reporting without ever
  * binding. Logged at INFO so a bind that fails on a sleepy device (the
  * request rides on its next poll) is visible next to the interview lines. */
-static void zb_iv_on_bind(esp_zb_zdp_status_t zdo_status, void *user_ctx) __attribute__((unused));
 static void zb_iv_on_bind(esp_zb_zdp_status_t zdo_status, void *user_ctx)
 {
     uint16_t cluster = (uint16_t)(uintptr_t)user_ctx;
@@ -1077,11 +1077,27 @@ static void zb_iv_send_config_report(void)
         .max_interval = 3600,
         .reportable_change = reportable_change,
     };
-    /* ZDO Bind deliberately NOT sent (bench 2026-09-03): with a bind
-     * request issued here, the Xiaomi light sensor broadcast a NWK Leave
-     * ~3 s after its interview, twice out of twice; without it, the same
-     * sensor stayed joined for minutes. zb_iv_on_bind() is kept for the
-     * follow-up experiment (bind later / read Basic first, z2m-style). */
+    /* Bind first: device endpoint + cluster -> this hub's IEEE address and
+     * endpoint, i.e. "send your reports here". ZCL attribute reports go
+     * only to binding-table destinations, so without this a device never
+     * reports at all -- measured on the bench (M6b gate 3, 2026-09-03): a
+     * joined, interviewed Xiaomi light sensor with reporting configured
+     * sent nothing for minutes; with the bind it reported illuminance
+     * every ~3 s and the value reached the registry. The Configure
+     * Reporting below is queued right behind it; a sleepy device picks
+     * both up on its polls. Two earlier runs saw the sensor broadcast a
+     * NWK Leave ~3 s after binding, at -73 dBm; the run that succeeded was
+     * at -40 dBm -- watch for it, the cause was not established. */
+    esp_zb_zdo_bind_req_param_t bind = {
+        .src_endp = endpoint,
+        .cluster_id = cluster,
+        .dst_addr_mode = ESP_ZB_ZDO_BIND_DST_ADDR_MODE_64_BIT_EXTENDED,
+        .dst_endp = ZB_ENDPOINT,
+        .req_dst_addr = s_iv.dev.short_addr,
+    };
+    memcpy(bind.src_address, s_iv.dev.eui64, sizeof(bind.src_address));
+    esp_zb_get_long_address(bind.dst_address_u.addr_long);
+    esp_zb_zdo_device_bind_req(&bind, zb_iv_on_bind, (void *)(uintptr_t)cluster);
 
     esp_zb_zcl_config_report_cmd_t cmd = {
         .zcl_basic_cmd = {
