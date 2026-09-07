@@ -22,6 +22,11 @@
 #include "mibeacon.h"
 #include "app_config.h"
 #include "rules.h"
+/* M7 Task 5: a zigbee-role node's forwarder pulls the joined-device table
+ * and registers itself as zigbee.c's device/status observer -- one-way
+ * (swarm -> zigbee); zigbee.c itself must never include anything from this
+ * component (see zigbee.h's own top comment on the CMake-cycle this avoids). */
+#include "zigbee.h"
 
 #include "cJSON.h"
 #include "esp_event.h"
@@ -1318,10 +1323,37 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
      * all -- reconstructing a DEV_KIND_BLE id from a non-BLE device's
      * address (the old device_id_from_mac(DEV_KIND_BLE, mac) shape) would
      * instead risk matching some unrelated real BLE device that happens to
-     * share the first six address bytes. Zigbee has no node-side presence
-     * to forward in this milestone anyway (its radio lives on the hub), so
-     * skipping anything non-BLE here costs nothing. */
+     * share the first six address bytes.
+     *
+     * M7 Task 5: a zigbee-role node DOES now have node-side presence to
+     * forward -- its own coordinator runs locally (radio_role.h), so a
+     * DEV_KIND_ZIGBEE update is this node's own registry gaining a fresh
+     * reading from a device it just interviewed, not something relayed
+     * from elsewhere. It has no bare-mac wire shape to fight (its address
+     * is the device's own EUI-64, carried whole in swarm_measurement_t's
+     * swarm_dev_addr_t), so it gets its own branch below rather than being
+     * squeezed through the BLE-shaped swarm_reading_t path. */
     const device_id_t *dev_id = data;
+    if (dev_id->kind == DEV_KIND_ZIGBEE) {
+        device_entry_t d;
+        if (!data_core_get_device(dev_id, &d)) return;
+        /* One MEASUREMENT per valid capability whose value changed since we
+         * last forwarded it: data_core posts one event per submit, so send
+         * the freshest slot only -- the one with the newest timestamp. */
+        int best = -1;
+        for (int c = 0; c < CAPABILITY_COUNT; c++)
+            if (d.caps[c].valid && (best < 0 || d.caps[c].updated_s >= d.caps[best].updated_s)) best = c;
+        if (best < 0) return;
+        swarm_out_t o = { .tag = SWARM_OUT_MEASUREMENT };
+        o.u.meas.dev.kind = DEV_KIND_ZIGBEE;
+        memcpy(o.u.meas.dev.addr, dev_id->addr, SWARM_ADDR_LEN);
+        o.u.meas.cap_id = (uint8_t)best;
+        o.u.meas.value = capability_decode((uint8_t)best, d.caps[best].raw);
+        o.u.meas.age_s = 0;
+        if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
+            ESP_LOGW(TAG, "forward queue full, dropping measurement");
+        return;
+    }
     if (dev_id->kind != DEV_KIND_BLE) return;
     const uint8_t *mac = dev_id->addr;
     /* Single-device lookup (data_core_get_device(), ~124 B out-param) rather
@@ -1338,7 +1370,9 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
      * Task 7); replicated locally here since swarm_reading_t's wire format
      * (this file's swarm_frame.h) is fixed V1-shape and out of scope for
      * this milestone to change. */
-    swarm_reading_t r = {
+    swarm_out_t o = { .tag = SWARM_OUT_READING };
+    swarm_reading_t *r = &o.u.reading;
+    *r = (swarm_reading_t){
         .version = SWARM_PROTO_VERSION,
         .type = SWARM_MSG_READING,
         .frame_cnt = d.last_frame_cnt,
@@ -1372,9 +1406,9 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
         .age_s = 0,  /* just heard */
         ._pad = 0,
     };
-    memcpy(r.mac, mac, 6);
+    memcpy(r->mac, mac, 6);
 
-    if (!s_fwd_queue || xQueueSend(s_fwd_queue, &r, 0) != pdTRUE) {
+    if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE) {
         ESP_LOGW(TAG, "forward queue full, dropping reading for " MACSTR, MAC2STR(mac));
     }
 }
@@ -1398,17 +1432,32 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
  * one untested piece of logic. */
 static swarm_buf_t s_buf;
 
-/* Buffers a reading that just failed to send. When full, the oldest entry is
- * evicted to make room -- logged at debug with a running counter, per the
- * brief, rather than silently discarding without any trace. */
-static void buffer_push(const swarm_reading_t *r, int64_t now_us)
+/* Buffers a swarm_out_t that just failed to send. When full, the oldest
+ * entry is evicted to make room -- logged at debug with a running counter,
+ * per the brief, rather than silently discarding without any trace.
+ *
+ * M7 Task 5: the ring now carries any of the five outgoing tags, not just
+ * READING -- the evicted entry's own tag decides what the log line can
+ * usefully say about it: a MAC for a READING (the only tag with one), a
+ * bare tag number for anything else (ANNOUNCE/GONE/MEASUREMENT/STATUS all
+ * key on an 8-byte EUI-64 or carry none at all, neither of which is worth
+ * a bespoke log line at DEBUG). */
+static void buffer_push(const swarm_out_t *r, int64_t now_us)
 {
     bool was_full = swarm_buf_count(&s_buf) == SWARM_NODE_BUFFER_LEN;
     if (was_full) {
-        ESP_LOGD(TAG, "reading buffer full (%d), dropping oldest for " MACSTR
-                      " (dropped=%" PRIu32 " total, about to become %" PRIu32 ")",
-                 SWARM_NODE_BUFFER_LEN, MAC2STR(s_buf.entries[s_buf.head].r.mac),
-                 swarm_buf_dropped(&s_buf), swarm_buf_dropped(&s_buf) + 1);
+        const swarm_out_t *oldest = &s_buf.entries[s_buf.head].r;
+        if (oldest->tag == SWARM_OUT_READING) {
+            ESP_LOGD(TAG, "forward buffer full (%d), dropping oldest READING for " MACSTR
+                          " (dropped=%" PRIu32 " total, about to become %" PRIu32 ")",
+                     SWARM_NODE_BUFFER_LEN, MAC2STR(oldest->u.reading.mac),
+                     swarm_buf_dropped(&s_buf), swarm_buf_dropped(&s_buf) + 1);
+        } else {
+            ESP_LOGD(TAG, "forward buffer full (%d), dropping oldest entry (tag=%u) "
+                          "(dropped=%" PRIu32 " total, about to become %" PRIu32 ")",
+                     SWARM_NODE_BUFFER_LEN, (unsigned)oldest->tag,
+                     swarm_buf_dropped(&s_buf), swarm_buf_dropped(&s_buf) + 1);
+        }
     }
     swarm_buf_push(&s_buf, r, now_us);
 }
@@ -1430,7 +1479,7 @@ static void buffer_push(const swarm_reading_t *r, int64_t now_us)
 static void forward_task(void *arg)
 {
     (void)arg;
-    swarm_reading_t r;
+    swarm_out_t r;
     int consec_fail = 0;
     /* One-shot: a working node->hub link is otherwise only inferable from
      * the hub side (frames_rx climbing in GET /api/v1/nodes) -- this makes
@@ -1441,23 +1490,13 @@ static void forward_task(void *arg)
     for (;;) {
         bool have_reading = xQueueReceive(s_fwd_queue, &r, 0) == pdTRUE;
         bool from_backlog = false;
+        int64_t captured_us = 0;   /* only meaningful when from_backlog */
 
         if (!have_reading) {
             swarm_buf_entry_t br;
             if (swarm_buf_pop(&s_buf, &br)) {
                 r = br.r;
-                /* age_s is recomputed here, at transmit time, not at the
-                 * moment it was (re)buffered -- the whole point of
-                 * buffering is riding out an outage of unknown length, so
-                 * the hub must see how stale this reading actually is right
-                 * now. r.age_s already carries whatever age had accumulated
-                 * before this buffering, so swarm_buf_recompute_age() ADDS
-                 * the additional wait on top of it, compounding correctly
-                 * across repeated buffer/retry cycles (and clamping at
-                 * UINT16_MAX rather than wrapping -- data_core's own
-                 * DATA_CORE_MAX_AGE_S (30 min) will drop it hub-side long
-                 * before that matters anyway). */
-                r.age_s = swarm_buf_recompute_age(r.age_s, br.captured_us, esp_timer_get_time());
+                captured_us = br.captured_us;
                 have_reading = true;
                 from_backlog = true;
             } else {
@@ -1471,8 +1510,43 @@ static void forward_task(void *arg)
         }
         if (!have_reading) continue;
 
-        uint8_t buf[sizeof(r)];
-        size_t n = swarm_encode_reading(&r, buf, sizeof(buf));
+        /* M7 Task 5: this ring/queue now carries any of five outgoing
+         * shapes (swarm_frame.h's swarm_out_t) -- encode by tag rather than
+         * always calling swarm_encode_reading(). age_s is recomputed here,
+         * at transmit time, not at the moment an entry was (re)buffered --
+         * the whole point of buffering is riding out an outage of unknown
+         * length, so the hub must see how stale this entry actually is
+         * right now. The stored age_s already carries whatever staleness
+         * had accumulated before this buffering, so
+         * swarm_buf_recompute_age() ADDS the additional wait on top of it,
+         * compounding correctly across repeated buffer/retry cycles (and
+         * clamping at UINT16_MAX rather than wrapping -- data_core's own
+         * DATA_CORE_MAX_AGE_S (30 min) will drop a READING hub-side long
+         * before that matters anyway). Only READING and MEASUREMENT carry
+         * an age at all; ANNOUNCE/GONE/STATUS need no recomputation. */
+        uint8_t buf[96];
+        size_t n = 0;
+        switch (r.tag) {
+        case SWARM_OUT_READING:
+            if (from_backlog) r.u.reading.age_s = swarm_buf_recompute_age(r.u.reading.age_s, captured_us, esp_timer_get_time());
+            n = swarm_encode_reading(&r.u.reading, buf, sizeof buf);
+            break;
+        case SWARM_OUT_MEASUREMENT:
+            if (from_backlog) r.u.meas.age_s = swarm_buf_recompute_age(r.u.meas.age_s, captured_us, esp_timer_get_time());
+            n = swarm_encode_measurement(&r.u.meas, buf, sizeof buf);
+            break;
+        case SWARM_OUT_ANNOUNCE:
+            n = swarm_encode_device_announce(&r.u.ann, buf, sizeof buf);
+            break;
+        case SWARM_OUT_GONE:
+            n = swarm_encode_device_gone(&r.u.gone, buf, sizeof buf);
+            break;
+        case SWARM_OUT_STATUS:
+            n = swarm_encode_coord_status(&r.u.status, buf, sizeof buf);
+            break;
+        default:
+            continue;
+        }
         if (n == 0) continue;
 
         esp_err_t err = espnow_link_send(s_hub_mac, buf, n);
@@ -1480,21 +1554,26 @@ static void forward_task(void *arg)
             consec_fail = 0;
             if (!first_delivered) {
                 first_delivered = true;
-                ESP_LOGI(TAG, "first reading delivered to hub");
+                ESP_LOGI(TAG, "first frame delivered to hub (tag=%u)", (unsigned)r.tag);
                 /* Node-side OTA rollback-guard health signal (M5c): the
                  * plan's primary criterion, "successfully delivered a
-                 * reading to its hub". Only needs signalling once -- see
-                 * signal_node_healthy()/ota_rollback_guard_node_confirm(),
-                 * both idempotent past their first call -- so this rides
-                 * the same first_delivered latch as the log line above
-                 * rather than firing on every single successful send. */
-                signal_node_healthy("reading delivered to hub");
+                 * reading to its hub" -- M7 Task 5 widens this to "any
+                 * forwarded frame", since a zigbee-role node's very first
+                 * successful delivery may well be an ANNOUNCE or STATUS
+                 * rather than a READING; either is equally good proof this
+                 * node's forward path works end to end. Only needs
+                 * signalling once -- see signal_node_healthy()/
+                 * ota_rollback_guard_node_confirm(), both idempotent past
+                 * their first call -- so this rides the same
+                 * first_delivered latch as the log line above rather than
+                 * firing on every single successful send. */
+                signal_node_healthy("frame delivered to hub");
             }
             continue;
         }
 
         consec_fail++;
-        ESP_LOGW(TAG, "reading send failed (%s), consecutive=%d", esp_err_to_name(err), consec_fail);
+        ESP_LOGW(TAG, "frame send failed (%s), tag=%u, consecutive=%d", esp_err_to_name(err), (unsigned)r.tag, consec_fail);
         /* Buffer whatever just failed -- live or a backlog entry that failed
          * again on retry -- rather than dropping it. */
         buffer_push(&r, esp_timer_get_time());
@@ -1533,6 +1612,126 @@ static void forward_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
+}
+
+/* ---------------- Node side: zigbee bridge forwarding (M7 Task 5) ----------------
+ *
+ * Only ever wired up when this node's own radio_role_get() is
+ * RADIO_ROLE_ZIGBEE -- a BLE-role node never calls zigbee_set_device_observer()/
+ * zigbee_set_status_observer(), and neither does the hub's own build of this
+ * file (swarm_start_main() has no equivalent of any of this): those callers
+ * stay NULL, and zigbee.c's own call sites already guard on that (see its
+ * header comment). "The hub never registers an observer" is therefore true
+ * by construction, not by a special case here. */
+
+/* zigbee.c's device-table observer. Fires on the caller's own task (the
+ * stack task for a live join/re-interview, this node's own boot task via
+ * zb_boot_replay_task() below for the store-restore replay, or a webserver
+ * task for a rename/remove) -- per zigbee_set_device_observer()'s contract,
+ * this must do nothing but build the frame and a non-blocking queue send,
+ * never block and never call back into zigbee.c. */
+static void zb_observer(const zb_device_t *dev, bool gone)
+{
+    swarm_out_t o = { .tag = gone ? SWARM_OUT_GONE : SWARM_OUT_ANNOUNCE };
+    if (gone) {
+        o.u.gone.dev.kind = DEV_KIND_ZIGBEE;
+        memcpy(o.u.gone.dev.addr, dev->eui64, 8);
+    } else {
+        swarm_device_announce_t *a = &o.u.ann;
+        a->dev.kind = DEV_KIND_ZIGBEE;
+        memcpy(a->dev.addr, dev->eui64, 8);
+        a->endpoint = dev->endpoint;
+        a->interviewed = dev->interviewed;
+        a->name_len = (uint8_t)strnlen(dev->name, SWARM_DEV_NAME_MAX);
+        memcpy(a->name, dev->name, a->name_len);
+        a->cap_count = dev->cap_count > SWARM_DEV_MAX_CAPS ? SWARM_DEV_MAX_CAPS : dev->cap_count;
+        for (uint8_t i = 0; i < a->cap_count; i++) {
+            a->cap_ids[i] = dev->caps[i];
+            a->cap_clusters[i] = dev->cap_clusters[i];
+        }
+        a->action_count = dev->action_count > SWARM_DEV_MAX_ACTIONS ? SWARM_DEV_MAX_ACTIONS : dev->action_count;
+        for (uint8_t i = 0; i < a->action_count; i++) a->action_ids[i] = dev->actions[i];
+    }
+    if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
+        ESP_LOGW(TAG, "forward queue full, dropping %s", gone ? "device-gone" : "device-announce");
+}
+
+/* Builds a COORD_STATUS from zigbee.c's current state and queues it. Called
+ * right after this node's own CHECKIN (always_on_checkin_task(), below --
+ * a zigbee bridge cannot sleep, so that is its only CHECKIN path), once
+ * after the boot replay (zb_boot_replay_task() below), and by
+ * zb_status_observer() whenever zigbee.c reports the permit-join window
+ * opening/closing or the network forming/restoring. */
+static void queue_coord_status(void)
+{
+    uint8_t channel = 0;
+    uint16_t pan_id = 0;
+    bool formed = false;
+    bool started = zigbee_net_info(&channel, &pan_id, &formed);
+
+    swarm_out_t o = { .tag = SWARM_OUT_STATUS };
+    o.u.status.radio_role = (uint8_t)radio_role_get();
+    o.u.status.formed = started && formed;
+    o.u.status.channel = channel;
+    o.u.status.pan_id = pan_id;
+    o.u.status.permit_s = zigbee_permit_join_remaining();
+    o.u.status.device_count = (uint8_t)zigbee_device_count();
+    if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
+        ESP_LOGW(TAG, "forward queue full, dropping coordinator status");
+}
+
+/* zigbee.c's status-change observer -- see zigbee_set_status_observer()'s
+ * header comment for exactly which transitions fire this. Same non-
+ * blocking-only contract as zb_observer() above; queue_coord_status()
+ * itself only ever does a bounded read of a few zigbee.c accessors plus one
+ * xQueueSend, so this is safe to call directly rather than needing its own
+ * wrapper. */
+static void zb_status_observer(void)
+{
+    queue_coord_status();
+}
+
+/* One-shot boot replay: a zigbee-role node's forwarder queue starts empty,
+ * but zigbee_start() (called by main.c right after swarm_start_node()
+ * returns, per this node's own boot order) may already hold devices this
+ * node remembers from a previous boot -- zb_register_restored_devices()
+ * loads them into the store before zigbee_start() returns. Deliberately
+ * NOT wired through the observer itself (zb_register_restored_devices()
+ * calling zb_observer() per device would work too, but would make a
+ * zigbee.c-internal restore loop responsible for this node's own
+ * boot-announce policy); this task instead pulls the finished list itself,
+ * once, the same way any other reader of zigbee_device_list() would.
+ *
+ * Polls zigbee_net_info()'s `started` return (true once zigbee_start()'s
+ * xTaskCreate(zb_task) has succeeded, which -- per zigbee_start()'s own
+ * comment -- is AFTER the store already loaded and restored devices are
+ * already registered) rather than assuming a fixed delay: main.c's own
+ * boot order guarantees zigbee_start() eventually runs when the role is
+ * zigbee, but not how long swarm_start_node()'s own remaining work (this
+ * task is created near its end) takes to return relative to it. Bounded so
+ * a build where CONFIG_PLANTHUB_ZB_ENABLED is off (zigbee_net_info()
+ * always returns false) does not spin forever. */
+#define ZB_BOOT_REPLAY_POLL_MS   100u
+#define ZB_BOOT_REPLAY_MAX_POLLS 100u  /* ~10s */
+
+static void zb_boot_replay_task(void *arg)
+{
+    (void)arg;
+    for (uint32_t i = 0; i < ZB_BOOT_REPLAY_MAX_POLLS; i++) {
+        if (zigbee_net_info(NULL, NULL, NULL)) {
+            zb_device_t list[ZB_STORE_MAX_DEVICES];
+            int n = zigbee_device_list(list, ZB_STORE_MAX_DEVICES);
+            for (int d = 0; d < n; d++) zb_observer(&list[d], false);
+            ESP_LOGI(TAG, "zigbee boot replay: %d device(s) announced", n);
+            queue_coord_status();
+            vTaskDelete(NULL);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(ZB_BOOT_REPLAY_POLL_MS));
+    }
+    ESP_LOGW(TAG, "zigbee boot replay: gave up waiting for zigbee_start() to finish; "
+                  "no boot announce/status sent this boot");
+    vTaskDelete(NULL);
 }
 
 /* Brings up WiFi far enough for ESP-NOW without ever joining any network:
@@ -1684,6 +1883,13 @@ static void always_on_checkin_task(void *arg)
 
         swarm_checkin_ack_t ack;
         if (!send_checkin_and_wait_ack(SWARM_PM_ALWAYS_ON, swarm_store_wake_counter(), &ack)) continue;
+
+        /* M7 Task 5: a zigbee bridge sends its coordinator status right
+         * after every CHECKIN -- this is its only CHECKIN path (a
+         * coordinator cannot sleep, so swarm_node_battery_cycle()'s own
+         * checkin path never runs for it, see main.c's batt_cycle_task
+         * gating). A non-zigbee node sends no STATUS at all. */
+        if (radio_role_get() == RADIO_ROLE_ZIGBEE) queue_coord_status();
 
         if (ack.command == SWARM_CHECKIN_CMD_SET_MODE) {
             esp_err_t serr = swarm_store_set_power_mode((swarm_power_mode_t)ack.arg);
@@ -2165,11 +2371,29 @@ esp_err_t swarm_start_node(void)
     }
 
     swarm_buf_init(&s_buf);   /* static, already zero at boot -- explicit for clarity */
-    s_fwd_queue = xQueueCreate(SWARM_FWD_QUEUE_LEN, sizeof(swarm_reading_t));
+    s_fwd_queue = xQueueCreate(SWARM_FWD_QUEUE_LEN, sizeof(swarm_out_t));
     if (!s_fwd_queue) return ESP_ERR_NO_MEM;
     if (xTaskCreate(forward_task, "swarm_fwd", 4096, NULL, 5, NULL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create forward task");
         return ESP_ERR_NO_MEM;
+    }
+
+    /* M7 Task 5: only a zigbee-role node wires itself into zigbee.c's
+     * observers and replays its stored device table -- a BLE-role node has
+     * nothing to observe (its own radio_role_get() never even starts the
+     * zigbee stack, see main.c), and neither does the hub's own build of
+     * this file. Registered here, with s_fwd_queue already created just
+     * above and BEFORE main.c's own zigbee_start() call (which always runs
+     * after swarm_start_node() returns, per this file's boot-order
+     * comments elsewhere) -- so neither observer can ever fire into a NULL
+     * queue. */
+    if (radio_role_get() == RADIO_ROLE_ZIGBEE) {
+        zigbee_set_device_observer(zb_observer);
+        zigbee_set_status_observer(zb_status_observer);
+        if (xTaskCreate(zb_boot_replay_task, "swarm_zb_replay", 3072, NULL, 3, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "failed to create zigbee boot replay task; the hub will not learn "
+                          "this bridge's already-known devices until they next announce");
+        }
     }
 
     /* M7 Task 5 (spec §4/§6): started unconditionally for every paired

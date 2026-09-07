@@ -64,6 +64,22 @@ static bool s_on_node = false;
 void zigbee_set_on_node(bool on_node) { s_on_node = on_node; }
 bool zigbee_on_node(void) { return s_on_node; }
 
+/* M7 Task 5: swarm.c's bridge into the device/status tables -- see this
+ * file's header comment on zigbee_set_device_observer()/
+ * zigbee_set_status_observer() for the calling contract (non-blocking
+ * queue send only, runs on the caller's own task). Plain file-static
+ * function pointers: at most one consumer ever registers (a device runs
+ * one radio role for the life of a boot), so there is no list and no
+ * unregister. NULL until swarm_start_node() sets them, which is a safe
+ * default -- a hub, or a node not running the zigbee role, never sets
+ * either, and every call site below already guards on `if (s_observer)`/
+ * `if (s_status_observer)`. */
+static zigbee_device_observer_t s_observer;
+static zigbee_status_observer_t s_status_observer;
+
+void zigbee_set_device_observer(zigbee_device_observer_t fn) { s_observer = fn; }
+void zigbee_set_status_observer(zigbee_status_observer_t fn) { s_status_observer = fn; }
+
 /* Whole-branch review, FIX 6: main.c's log_heap("after ble_collector_start")
  * fires before zigbee_start() is even called, and this stack forms/restores
  * its network asynchronously on its own task -- so free heap with Zigbee
@@ -237,6 +253,12 @@ static void record_net_info(uint8_t *out_channel, uint16_t *out_pan_id)
     portEXIT_CRITICAL(&s_mux);
     if (out_channel) *out_channel = channel;
     if (out_pan_id) *out_pan_id = pan_id;
+    /* M7 Task 5: covers both signal handler callers of this function --
+     * ESP_ZB_BDB_SIGNAL_FORMATION (first-start) and the restore branch of
+     * ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START/_REBOOT -- so a zigbee-role
+     * node's COORD_STATUS goes out the moment its network actually exists,
+     * not just after its next CHECKIN. */
+    if (s_status_observer) s_status_observer();
 }
 
 /* Required by the esp-zigbee-lib SDK: every signal the stack raises (BDB
@@ -1240,6 +1262,11 @@ static void zb_iv_handle_store(void)
 
     ESP_LOGI(TAG, "device %d interviewed: %u capability(ies), %u action(s)", dev_idx,
              (unsigned)dev->cap_count, (unsigned)dev->action_count);
+
+    /* M7 Task 5: a zigbee-role node's forwarder announces this device to
+     * the hub now that its interview succeeded. `dev` is s_iv.dev, a
+     * complete record -- the same shape zigbee_device_list() hands out. */
+    if (s_observer) s_observer(dev, false);
 }
 
 /* The stack task. Owns esp_zb_stack_main_loop() for the life of the
@@ -1451,6 +1478,10 @@ static void zb_permit_expiry_cb(uint8_t param)
     } else {
         ESP_LOGI(TAG, "permit-join window over; BLE scan released, TC link key exchange required again");
     }
+    /* M7 Task 5: the window just closed (expiry, or the post-join grace
+     * period above) -- report the now-zero permit_s promptly rather than
+     * waiting for the node's next periodic CHECKIN. */
+    if (s_status_observer) s_status_observer();
 }
 
 bool zigbee_permit_join(void)
@@ -1517,6 +1548,9 @@ bool zigbee_permit_join(void)
     portENTER_CRITICAL(&s_mux);
     s_permit_join_deadline_us = esp_timer_get_time() + (int64_t)CONFIG_PLANTHUB_ZB_PERMIT_JOIN_S * 1000000;
     portEXIT_CRITICAL(&s_mux);
+    /* M7 Task 5: the window just opened -- see zb_permit_expiry_cb() for
+     * the matching close-side call. */
+    if (s_status_observer) s_status_observer();
     return true;
 }
 
@@ -1557,6 +1591,20 @@ int zigbee_device_list(zb_device_t *out, size_t max)
     return (int)n;
 }
 
+int zigbee_device_count(void)
+{
+    bool started;
+    portENTER_CRITICAL(&s_mux);
+    started = s_started;
+    portEXIT_CRITICAL(&s_mux);
+    if (!started) return 0;
+
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+    int n = s_store.count;
+    xSemaphoreGive(s_store_mutex);
+    return n;
+}
+
 bool zigbee_device_rename(const uint8_t eui64[8], const char *name)
 {
     bool started;
@@ -1567,6 +1615,7 @@ bool zigbee_device_rename(const uint8_t eui64[8], const char *name)
 
     xSemaphoreTake(s_store_mutex, portMAX_DELAY);
     bool ok = false;
+    zb_device_t renamed;
     int idx = zb_store_find(&s_store, eui64);
     if (idx >= 0) {
         zb_device_t d = s_store.dev[idx];
@@ -1574,10 +1623,20 @@ bool zigbee_device_rename(const uint8_t eui64[8], const char *name)
         d.name[ZB_STORE_NAME_MAX - 1] = '\0';
         /* Same EUI-64: zb_store_upsert() replaces this entry in place
          * rather than appending a second one. */
-        ok = zb_store_upsert(&s_store, &d) >= 0;
-        if (ok) zb_store_save();
+        int new_idx = zb_store_upsert(&s_store, &d);
+        ok = new_idx >= 0;
+        if (ok) {
+            zb_store_save();
+            /* M7 Task 5: copy the record out under the mutex before
+             * releasing it and calling the observer, per this function's
+             * own contract (see zigbee_set_device_observer()'s header
+             * comment) -- the observer must never see s_store touched
+             * concurrently. */
+            renamed = s_store.dev[new_idx];
+        }
     }
     xSemaphoreGive(s_store_mutex);
+    if (ok && s_observer) s_observer(&renamed, false);
     return ok;
 }
 
@@ -1592,10 +1651,18 @@ bool zigbee_device_remove(const uint8_t eui64[8])
     xSemaphoreTake(s_store_mutex, portMAX_DELAY);
     int idx = zb_store_find(&s_store, eui64);
     uint16_t short_addr = (idx >= 0) ? s_store.dev[idx].short_addr : 0;
+    /* M7 Task 5: copy the record out BEFORE it is erased -- the observer
+     * (fired after the removal, below) needs to report which device is
+     * gone, and there is nothing left in s_store to read from once
+     * zb_store_remove() has compacted it away. */
+    zb_device_t removed_copy;
+    bool have_copy = idx >= 0;
+    if (have_copy) removed_copy = s_store.dev[idx];
     bool removed = zb_store_remove(&s_store, eui64);
     if (removed) zb_store_save();
     xSemaphoreGive(s_store_mutex);
     if (!removed) return false;
+    if (have_copy && s_observer) s_observer(&removed_copy, true);
 
     /* registry.h has no delete (Task 6 brief): the registry entry this
      * device may have had -- its capability readings, and, if it was an
@@ -1701,6 +1768,21 @@ int zigbee_device_list(zb_device_t *out, size_t max)
     (void)out;
     (void)max;
     return 0;
+}
+
+int zigbee_device_count(void)
+{
+    return 0;
+}
+
+void zigbee_set_device_observer(zigbee_device_observer_t fn)
+{
+    (void)fn;
+}
+
+void zigbee_set_status_observer(zigbee_status_observer_t fn)
+{
+    (void)fn;
 }
 
 bool zigbee_device_rename(const uint8_t eui64[8], const char *name)

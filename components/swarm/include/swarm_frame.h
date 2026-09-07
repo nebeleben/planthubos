@@ -380,6 +380,42 @@ typedef struct { uint16_t seq; uint8_t radio_role; } swarm_node_config_t;
 /* Node -> hub. Reply to a NODE_CONFIG, correlated by seq. */
 typedef struct { uint16_t seq; uint8_t status; } swarm_node_config_ack_t;
 
+/* M7 Task 5: the tagged union a node's forwarder (swarm.c's forward_task(),
+ * and its RAM backlog, swarm_buf.c) actually queues and buffers. Before
+ * this task the node only ever forwarded one shape (swarm_reading_t, the
+ * BLE relay path); a zigbee-role node now also forwards device announces/
+ * goodbyes, per-capability measurements and its own coordinator status --
+ * four more outgoing shapes that all share the same queue, the same RAM
+ * backlog ring and the same "encode and espnow_link_send()" tail end of
+ * forward_task(). A tagged union is what lets one queue element type and
+ * one ring-entry type carry any of the five without forward_task() having
+ * to special-case its plumbing per shape -- only its encode switch (see
+ * swarm.c) needs to know the tag.
+ *
+ * Defined here, not in swarm.h/swarm_buf.h, specifically so a host test
+ * (tests/host/test_swarm_buf.c) that only pulls in swarm_buf.h -> this
+ * header can see it too, with no FreeRTOS/ESP-IDF dependency -- exactly
+ * the same reasoning swarm_buf.c/.h's own header comments give for why
+ * that ring is pure C in the first place. */
+typedef enum {
+    SWARM_OUT_READING     = 1,
+    SWARM_OUT_MEASUREMENT = 2,
+    SWARM_OUT_ANNOUNCE    = 3,
+    SWARM_OUT_GONE        = 4,
+    SWARM_OUT_STATUS      = 5,
+} swarm_out_tag_t;
+
+typedef struct {
+    uint8_t tag; /* SWARM_OUT_* above */
+    union {
+        swarm_reading_t          reading;
+        swarm_measurement_t      meas;
+        swarm_device_announce_t  ann;
+        swarm_device_gone_t      gone;
+        swarm_coord_status_t     status;
+    } u;
+} swarm_out_t;
+
 int  swarm_frame_type(const uint8_t *buf, size_t len);
 bool swarm_decode_pair_req(const uint8_t *buf, size_t len, swarm_pair_req_t *out);
 bool swarm_decode_pair_ack(const uint8_t *buf, size_t len, swarm_pair_ack_t *out);

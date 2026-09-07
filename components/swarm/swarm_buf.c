@@ -13,7 +13,7 @@ void swarm_buf_init(swarm_buf_t *b)
     memset(b, 0, sizeof(*b));
 }
 
-void swarm_buf_push(swarm_buf_t *b, const swarm_reading_t *r, int64_t now_us)
+void swarm_buf_push(swarm_buf_t *b, const swarm_out_t *r, int64_t now_us)
 {
     if (!b || !r) return;
 

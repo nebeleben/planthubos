@@ -29,6 +29,54 @@ void zigbee_set_on_node(bool on_node);
 /* See zigbee_set_on_node() above. Defaults to false until that is called. */
 bool zigbee_on_node(void);
 
+/* M7 Task 5: a zigbee-role node's bridge into swarm.c's forwarder. zigbee.c
+ * must not link the swarm component (see this header's own top comment on
+ * that CMake-cycle constraint), so it cannot queue an ANNOUNCE/GONE frame
+ * itself -- instead it reports every device-table change through this
+ * plain function pointer, and swarm.c supplies the one that actually
+ * builds the frame and queues it (swarm_start_node()'s zb_observer()).
+ *
+ * Fires on the CALLER's task, never a dedicated one: end of
+ * zb_iv_handle_store() (the stack task, after a live interview/re-
+ * interview), zigbee_device_rename() and zigbee_device_remove() (both a
+ * webserver task). An observer must therefore do nothing but a non-
+ * blocking queue send -- no flash I/O, no Zigbee SDK call, nothing that
+ * could stall whichever of those callers happens to be running it. Does
+ * NOT fire from zb_register_restored_devices() (zigbee_start()'s own
+ * store-restore loop, on the caller's boot task): the boot-time replay of
+ * already-known devices is deliberately the CONSUMER's job, not this
+ * producer's -- see swarm.c's zb_boot_replay_task(), which reads the
+ * finished list back out through zigbee_device_list() once zigbee_start()
+ * returns, the same way any other reader of that list would, rather than
+ * this component reaching into a boot-ordering policy that belongs to
+ * whichever radio role is running it. gone=true means the device argument
+ * describes a device that just left (zigbee_device_remove()); gone=false
+ * covers every other case (new join, re-interview, rename), where the
+ * argument is that device's current, complete record.
+ *
+ * A plain file-static function pointer, not a list: exactly one consumer
+ * ever exists (this device runs at most one radio role, so at most one
+ * swarm.c registers itself), and a second zigbee_set_device_observer()
+ * call simply replaces the first -- there is no unregister because nothing
+ * in this codebase ever needs one (a node's radio role is fixed for the
+ * life of a boot). */
+typedef void (*zigbee_device_observer_t)(const zb_device_t *dev, bool gone);
+void zigbee_set_device_observer(zigbee_device_observer_t fn);
+
+/* M7 Task 5: same shape as zigbee_set_device_observer() above, but for
+ * coordinator-status changes rather than device-table changes -- fired
+ * (no arguments; the observer re-reads current state via
+ * zigbee_net_info()/zigbee_permit_join_remaining()/zigbee_device_count())
+ * when the permit-join window opens or closes and when the network forms
+ * or is restored from flash. swarm.c uses it to send an up-to-date
+ * COORD_STATUS the moment any of those happen, on top of the one it
+ * already sends after every CHECKIN and at boot. Same non-blocking-queue-
+ * only contract as the device observer: this can fire from the stack task
+ * (formation/restore, permit-window close) or a webserver task
+ * (zigbee_permit_join()'s window-open path). */
+typedef void (*zigbee_status_observer_t)(void);
+void zigbee_set_status_observer(zigbee_status_observer_t fn);
+
 /* Current network state for the UI. Returns false when Zigbee is disabled
  * at build time or the stack has not started. */
 bool zigbee_net_info(uint8_t *channel, uint16_t *pan_id, bool *formed);
@@ -46,6 +94,12 @@ uint8_t zigbee_permit_join_remaining(void);
  * disabled at build time, the stack has not started, or the table is
  * empty. */
 int zigbee_device_list(zb_device_t *out, size_t max);
+
+/* M7 Task 5: the joined-device count only, for swarm.c's COORD_STATUS
+ * (swarm_coord_status_t.device_count) -- cheaper than zigbee_device_list()
+ * into a throwaway array when the caller only needs the count. Same
+ * "0 when disabled/not started/empty" contract as zigbee_device_list(). */
+int zigbee_device_count(void);
 
 /* Renames a stored device (its user-facing name only; every other field is
  * untouched) and persists the change. False when eui64 is not in the
