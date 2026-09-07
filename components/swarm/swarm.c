@@ -8,6 +8,8 @@
 #include "swarm.h"
 #include "swarm_store.h"
 #include "swarm_frame.h"
+#include "swarm_rules.h"
+#include "radio_role.h"
 #include "swarm_buf.h"
 #include "batt_cycle.h"
 #include "node_ota.h"
@@ -79,6 +81,19 @@ typedef struct {
      * guess" reasoning as rssi/last_seen_s being null until first heard). */
     uint8_t  reported_mode;
     bool     reported_mode_valid;
+    /* M7 Task 4: the node's own last-reported radio role (RADIO_ROLE_*,
+     * radio_role_str.h), learned from PAIR_REQ.radio_role (pairing.c, via
+     * swarm_note_node_radio()) or COORD_STATUS (Task 7) -- same
+     * "valid until proven otherwise" shape as reported_mode/
+     * reported_mode_valid above. */
+    uint8_t  reported_radio_role;
+    bool     reported_radio_valid;
+    /* M7 Task 4: per-node NODE_CONFIG sequence counter, incremented by
+     * swarm_send_node_config() on every send so the NODE_CONFIG_ACK this
+     * node replies with can be correlated to the request it answers in the
+     * log (hub_rx_cb's NODE_CONFIG_ACK branch). Persists only for this
+     * boot, same as every other field in this RAM-only struct. */
+    uint16_t cfg_seq;
 } node_stat_t;
 
 static node_stat_t       s_stats[SWARM_MAX_NODES];
@@ -137,6 +152,35 @@ static void record_checkin_mode(const uint8_t mac[6], uint8_t mode)
     xSemaphoreGive(s_stats_mutex);
 }
 
+/* M7 Task 4: copy of record_checkin_mode() above, writing the node's
+ * self-reported radio role instead of its power mode -- see
+ * swarm_note_node_radio()'s doc comment in swarm.h for callers and the
+ * same "a miss just means no slot yet" reasoning. Unlike record_checkin_mode(),
+ * this can be called for a node BEFORE it has ever sent a READING/CHECKIN
+ * this boot (its first-ever call site is pairing.c's PAIR_REQ handling,
+ * which runs before record_stat() has necessarily created a slot for a
+ * still-unadopted node) -- so a miss here is the expected common case for a
+ * freshly pairing node, not just the defensive corner case it is for
+ * record_checkin_mode(). */
+static void record_reported_radio(const uint8_t mac[6], uint8_t r)
+{
+    xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
+    for (int i = 0; i < SWARM_MAX_NODES; i++) {
+        if (s_stats[i].in_use && memcmp(s_stats[i].mac, mac, 6) == 0) {
+            s_stats[i].reported_radio_role = r;
+            s_stats[i].reported_radio_valid = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_stats_mutex);
+}
+
+void swarm_note_node_radio(const uint8_t mac[6], uint8_t r)
+{
+    if (!mac || !s_stats_mutex) return;
+    record_reported_radio(mac, r);
+}
+
 /* Hub: node_ota.c's node_ota_start() (Task 4) consults this to decide
  * whether a push should park (NODE_OTA_ST_PENDING_WAKE) rather than stream
  * immediately -- a node that last reported a battery mode is presumed
@@ -155,6 +199,24 @@ bool swarm_node_reported_mode(const uint8_t mac[6], uint8_t *mode_out)
     for (int i = 0; i < SWARM_MAX_NODES; i++) {
         if (s_stats[i].in_use && memcmp(s_stats[i].mac, mac, 6) == 0 && s_stats[i].reported_mode_valid) {
             *mode_out = s_stats[i].reported_mode;
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_stats_mutex);
+    return found;
+}
+
+/* See swarm.h's doc comment. Same shape as swarm_node_reported_mode() just
+ * above, over reported_radio_role/reported_radio_valid instead. */
+bool swarm_node_reported_radio(const uint8_t mac[6], uint8_t *role_out)
+{
+    if (!mac || !role_out || !s_stats_mutex) return false;
+    bool found = false;
+    xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
+    for (int i = 0; i < SWARM_MAX_NODES; i++) {
+        if (s_stats[i].in_use && memcmp(s_stats[i].mac, mac, 6) == 0 && s_stats[i].reported_radio_valid) {
+            *role_out = s_stats[i].reported_radio_role;
             found = true;
             break;
         }
@@ -225,6 +287,49 @@ static bool is_paired_node(const uint8_t mac[6])
     return false;
 }
 
+/* M7 Task 4: encodes and sends a NODE_CONFIG to `mac`, assigning it a fresh
+ * per-node sequence number (node_stat_t.cfg_seq). Only ever called from a
+ * task context (checkin_task, below) -- see swarm.h's doc comment for why.
+ * Creates this node's RAM stats slot on demand if it doesn't have one yet
+ * (unlike record_checkin_mode()/record_reported_radio(), which only ever
+ * update an EXISTING slot) -- a node targeted by an operator's
+ * POST /api/v1/nodes/{MAC12} {"radio_role":...} may never have transmitted
+ * this boot, but still needs a durable per-node cfg_seq counter that
+ * survives across repeated calls for the same node this boot, same
+ * slot-creation shape as record_stat(). */
+esp_err_t swarm_send_node_config(const uint8_t mac[6], radio_role_t r)
+{
+    if (!mac || !s_stats_mutex) return ESP_ERR_INVALID_STATE;
+
+    xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
+    int idx = -1, free_idx = -1;
+    for (int i = 0; i < SWARM_MAX_NODES; i++) {
+        if (s_stats[i].in_use && memcmp(s_stats[i].mac, mac, 6) == 0) { idx = i; break; }
+        if (!s_stats[i].in_use && free_idx < 0) free_idx = i;
+    }
+    if (idx < 0) idx = free_idx;
+    if (idx < 0) {
+        xSemaphoreGive(s_stats_mutex);
+        return ESP_ERR_NO_MEM;
+    }
+    if (!s_stats[idx].in_use) {
+        s_stats[idx].in_use = true;
+        memcpy(s_stats[idx].mac, mac, 6);
+        s_stats[idx].frames_rx = 0;
+    }
+    uint16_t seq = ++s_stats[idx].cfg_seq;
+    xSemaphoreGive(s_stats_mutex);
+
+    swarm_node_config_t cfg = { .seq = seq, .radio_role = (uint8_t)r };
+    uint8_t buf[16];
+    size_t n = swarm_encode_node_config(&cfg, buf, sizeof(buf));
+    if (n == 0) {
+        ESP_LOGE(TAG, "swarm_send_node_config for " MACSTR ": failed to encode", MAC2STR(mac));
+        return ESP_ERR_INVALID_STATE;
+    }
+    return espnow_link_send(mac, buf, n);
+}
+
 /* ---------------- Hub side: CHECKIN reconciliation (M7) ----------------
  *
  * hub_rx_cb (the ESP-NOW receive callback, WiFi driver task) must never
@@ -235,9 +340,17 @@ static bool is_paired_node(const uint8_t mac[6])
  * non-blocking) evaluated per item, plus an espnow_link_send() -- all of
  * that belongs on a dedicated task, not the callback, exactly like
  * pairing.c's pong_task is the reference for "callback queues, task
- * sends". */
+ * sends".
+ *
+ * config_only (M7 Task 4): true for an item posted by
+ * swarm_request_node_config() (an operator's radio-role change, wanting an
+ * immediate push) rather than decoded from a real CHECKIN frame -- `checkin`
+ * is meaningless in that case. checkin_task() sends such an item a bare
+ * NODE_CONFIG and nothing else (no CHECKIN_ACK, no batt_reconcile()): the
+ * node did not check in, so acking a CHECKIN it never sent would be a lie. */
 typedef struct {
     uint8_t         mac[6];
+    bool            config_only;
     swarm_checkin_t checkin;
 } checkin_item_t;
 
@@ -252,6 +365,24 @@ static void checkin_task(void *arg)
     checkin_item_t item;
     for (;;) {
         if (xQueueReceive(s_checkin_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+
+        if (item.config_only) {
+            /* An operator-triggered push (api_v1.c's node_update_post(), via
+             * swarm_request_node_config()): send the node's CURRENT desired
+             * radio role right now, regardless of what it last reported --
+             * the operator asked for it now, not "eventually, once this
+             * differs from what we last heard". */
+            radio_role_t desired_radio = swarm_store_node_desired_radio(item.mac);
+            esp_err_t rerr = swarm_send_node_config(item.mac, desired_radio);
+            if (rerr != ESP_OK) {
+                ESP_LOGW(TAG, "NODE_CONFIG (requested) -> " MACSTR " failed (%s)",
+                         MAC2STR(item.mac), esp_err_to_name(rerr));
+            } else {
+                ESP_LOGI(TAG, "NODE_CONFIG (requested) -> " MACSTR ": radio_role=%s",
+                         MAC2STR(item.mac), radio_role_str(desired_radio));
+            }
+            continue;
+        }
 
         /* hub_rx_cb already called record_stat() for this item before
          * queuing it (same as READING) -- this only adds the self-reported
@@ -321,6 +452,36 @@ static void checkin_task(void *arg)
             ESP_LOGI(TAG, "CHECKIN_ACK -> " MACSTR ": command=%u arg=%u (desired=%u reported=%u ota_pending=%d)",
                      MAC2STR(item.mac), cmd.command, cmd.arg, desired, item.checkin.power_mode, ota_pending);
         }
+
+        /* M7 Task 4: right AFTER the CHECKIN_ACK above, not instead of it --
+         * a battery node is only reachable during this brief awake window,
+         * so this is the one reliable moment to also push a radio-role
+         * change onto it (an always-on node's periodic checkin gives the
+         * same opportunity every cycle). Sent whenever this node's desired
+         * radio role differs from what it last reported, OR it has never
+         * reported one at all and desired isn't the RADIO_ROLE_BLE default
+         * -- same "pending" condition swarm_node_list_json() computes for
+         * its own radio_role_pending field, kept in sync with it
+         * deliberately (see that function's own comment for why unknown is
+         * treated as "assume BLE" rather than "assume compliant"). A send
+         * failure here is logged and dropped, not retried inline: the next
+         * checkin (or a later operator-triggered swarm_request_node_config())
+         * retries it, same self-healing shape as the CHECKIN_ACK send above. */
+        radio_role_t desired_radio = swarm_store_node_desired_radio(item.mac);
+        uint8_t reported_radio_byte;
+        bool have_reported_radio = swarm_node_reported_radio(item.mac, &reported_radio_byte);
+        bool radio_pending = have_reported_radio ? (reported_radio_byte != (uint8_t)desired_radio)
+                                                  : (desired_radio != RADIO_ROLE_BLE);
+        if (radio_pending) {
+            esp_err_t rerr = swarm_send_node_config(item.mac, desired_radio);
+            if (rerr != ESP_OK) {
+                ESP_LOGW(TAG, "NODE_CONFIG -> " MACSTR " failed (%s), dropped -- reconciliation "
+                              "self-heals next checkin", MAC2STR(item.mac), esp_err_to_name(rerr));
+            } else {
+                ESP_LOGI(TAG, "NODE_CONFIG -> " MACSTR ": radio_role=%s",
+                         MAC2STR(item.mac), radio_role_str(desired_radio));
+            }
+        }
     }
 }
 
@@ -340,6 +501,19 @@ static esp_err_t ensure_checkin_task(void)
         s_checkin_task = NULL;
         return ESP_ERR_NO_MEM;
     }
+    return ESP_OK;
+}
+
+esp_err_t swarm_request_node_config(const uint8_t mac[6])
+{
+    if (!mac) return ESP_ERR_INVALID_ARG;
+    if (!s_checkin_queue) return ESP_ERR_INVALID_STATE;
+
+    checkin_item_t item;
+    memset(&item, 0, sizeof(item));
+    memcpy(item.mac, mac, 6);
+    item.config_only = true;
+    if (xQueueSend(s_checkin_queue, &item, 0) != pdTRUE) return ESP_ERR_NO_MEM;
     return ESP_OK;
 }
 
@@ -441,10 +615,34 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
 
         checkin_item_t item;
         memcpy(item.mac, src_mac, 6);
+        item.config_only = false;
         item.checkin = c;
         if (!s_checkin_queue || xQueueSend(s_checkin_queue, &item, 0) != pdTRUE) {
             ESP_LOGW(TAG, "CHECKIN from " MACSTR ": no checkin task available or queue full, dropping",
                      MAC2STR(src_mac));
+        }
+        return;
+    }
+    if (type == SWARM_MSG_NODE_CONFIG_ACK) {
+        /* Node -> hub, unicast, encrypted (M7 Task 4) -- same pairing/
+         * spoofing reasoning as CHECKIN above: is_paired_node() is the gate
+         * that keeps an unpaired device from injecting a fake ack. Nothing
+         * further is done with the result here beyond logging: the hub's
+         * next reconciliation opportunity (this node's next CHECKIN, or a
+         * fresh swarm_request_node_config()) recomputes desired vs reported
+         * from scratch regardless of whether this particular ack arrived,
+         * same self-healing shape as CHECKIN_ACK/NODE_CONFIG sends above --
+         * record_reported_radio() itself is left to the node's next
+         * PAIR_REQ/COORD_STATUS, not to this ack (this frame carries only
+         * seq+status, not the node's radio role). */
+        if (!is_paired_node(src_mac)) return;
+        swarm_node_config_ack_t ack;
+        if (!swarm_decode_node_config_ack(data, (size_t)len, &ack)) return;
+        if (ack.status == SWARM_ACK_ACCEPTED) {
+            ESP_LOGI(TAG, "NODE_CONFIG_ACK from " MACSTR ": accepted (seq=%u)", MAC2STR(src_mac), ack.seq);
+        } else {
+            ESP_LOGW(TAG, "NODE_CONFIG_ACK from " MACSTR ": refused (seq=%u status=%u)",
+                     MAC2STR(src_mac), ack.seq, ack.status);
         }
         return;
     }
@@ -656,6 +854,29 @@ int swarm_node_list_json(char *buf, size_t cap)
         bool pending = mode_valid ? (stat->reported_mode != (uint8_t)desired)
                                    : (desired != SWARM_PM_ALWAYS_ON);
         cJSON_AddBoolToObject(o, "power_mode_pending", pending);
+        /* M7 Task 4: "radio_role" is this node's DESIRED radio role
+         * (swarm_store's per-node table, set by POST /api/v1/nodes/{MAC12}
+         * {"radio_role":...}) -- same "operator intent, shown immediately"
+         * reasoning as "power_mode" above. "reported_radio_role" is null
+         * until this node's radio role has actually been learned this boot
+         * (PAIR_REQ or COORD_STATUS -- see record_reported_radio()); unlike
+         * reported_mode, there is no CHECKIN carrying this, so a node that
+         * hasn't (re)paired or sent a COORD_STATUS this boot simply has
+         * nothing to report yet, independent of whether it has ever
+         * checked in. "radio_role_pending" mirrors power_mode_pending's own
+         * shape, kept in sync with checkin_task()'s own radio_pending
+         * computation just above -- see that comment for why "never
+         * reported" defaults to comparing against RADIO_ROLE_BLE rather
+         * than treating an unknown report as automatically compliant. */
+        radio_role_t dr = swarm_store_node_desired_radio(mac);
+        cJSON_AddStringToObject(o, "radio_role", radio_role_str(dr));
+        if (stat && stat->reported_radio_valid)
+            cJSON_AddStringToObject(o, "reported_radio_role", radio_role_str((radio_role_t)stat->reported_radio_role));
+        else
+            cJSON_AddNullToObject(o, "reported_radio_role");
+        bool rpending = stat && stat->reported_radio_valid ? (stat->reported_radio_role != (uint8_t)dr)
+                                                             : (dr != RADIO_ROLE_BLE);
+        cJSON_AddBoolToObject(o, "radio_role_pending", rpending);
         /* "buffered": Task 5's RAM ring (swarm.c's forward_task) tracks a
          * NODE's own undelivered-reading backlog, but that state lives only
          * on the node itself -- there is no wire message carrying a
@@ -808,6 +1029,72 @@ static uint8_t       s_hub_mac[6];   /* set once in swarm_start_node(); MAC neve
  * created at all). */
 static QueueHandle_t s_checkin_ack_queue;
 
+/* ---------------- Node side: NODE_CONFIG apply (M7 Task 4) ----------------
+ *
+ * node_rx_cb (the WiFi driver task) must never touch NVS or block, same
+ * project-wide rule as every other deferred-work path in this file -- and
+ * applying a NODE_CONFIG needs radio_role_set() (an NVS write) plus, on
+ * success, esp_restart() (this node's whole reason for switching radios is
+ * that BLE/802.15.4 controllers cannot be re-inited live -- see
+ * radio_role.h). So the callback only ever decodes and does a non-blocking
+ * send onto this depth-1 queue; node_config_task() (below) does the actual
+ * work. Depth 1 is enough: a node has at most one NODE_CONFIG outstanding
+ * at a time in practice (the hub only ever has one reason to send one --
+ * reconciling this node's desired vs reported radio role -- and a rejected
+ * or accepted config always answers with a NODE_CONFIG_ACK before the hub
+ * would plausibly send another), and any stale leftover from a config this
+ * node already restarted for is moot the instant that restart happens.
+ * Created eagerly, in swarm_start_node() below, before espnow_link_init()
+ * hands node_rx_cb its first frame -- same eager-init reasoning as
+ * s_checkin_ack_queue above. */
+static QueueHandle_t s_node_cfg_queue;
+
+/* Pops a NODE_CONFIG off s_node_cfg_queue and applies it: validates the
+ * requested radio role against this node's CURRENT power mode
+ * (swarm_rules_node_radio_ok(), Task 3 -- the same compatibility rule the
+ * hub itself checks before ever sending this) and persists it
+ * (radio_role_set()). Always replies with a NODE_CONFIG_ACK, accepted or
+ * refused, echoing the request's seq -- the hub logs it but does not retry
+ * on a lost ack itself (see hub_rx_cb's NODE_CONFIG_ACK branch); this
+ * node's own next PAIR_REQ/checkin still reports whatever radio role it is
+ * ACTUALLY running, so the hub's view self-heals either way. A refusal
+ * (rules violation, or radio_role_set() itself failing) logs why and loops
+ * back for the next item -- no restart, nothing about this node's running
+ * radio role changes. Acceptance restarts into the new role: the BT/802.15.4
+ * controllers cannot be re-inited live (radio_role.h), so this is the only
+ * way the change actually takes effect. */
+static void node_config_task(void *arg)
+{
+    (void)arg;
+    swarm_node_config_t cfg;
+    for (;;) {
+        if (xQueueReceive(s_node_cfg_queue, &cfg, portMAX_DELAY) != pdTRUE) continue;
+
+        const char *why = NULL;
+        bool ok = swarm_rules_node_radio_ok((radio_role_t)cfg.radio_role, swarm_store_power_mode(), &why)
+                  && radio_role_set((radio_role_t)cfg.radio_role) == ESP_OK;
+        swarm_node_config_ack_t ack = { .seq = cfg.seq, .status = ok ? SWARM_ACK_ACCEPTED : SWARM_ACK_FAILED };
+        uint8_t buf[16];
+        size_t n = swarm_encode_node_config_ack(&ack, buf, sizeof(buf));
+        if (n) {
+            esp_err_t err = espnow_link_send(s_hub_mac, buf, n);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "NODE_CONFIG_ACK send failed (%s), dropped -- the hub's next "
+                              "reconciliation retries", esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGE(TAG, "NODE_CONFIG_ACK: failed to encode");
+        }
+        if (!ok) {
+            ESP_LOGW(TAG, "node config refused: %s", why ? why : "?");
+            continue;
+        }
+        ESP_LOGW(TAG, "radio role -> %s by the hub; rebooting", radio_role_str((radio_role_t)cfg.radio_role));
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    }
+}
+
 /* ---------------- Node side: OTA rollback-guard health signal (M5c) ----------------
  *
  * ota_post.h's ota_rollback_guard_node_confirm() performs a flash write
@@ -927,6 +1214,25 @@ static void node_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, i
     if (type == SWARM_MSG_OTA_ABORT) {
         swarm_ota_abort_t ab;
         if (swarm_decode_ota_abort(data, (size_t)len, &ab)) node_ota_recv_handle_abort(src_mac, &ab);
+        return;
+    }
+
+    if (type == SWARM_MSG_NODE_CONFIG) {
+        /* Hub -> node, unicast, encrypted (M7 Task 4): same source-check
+         * reasoning as CHECKIN_ACK/PONG just below -- only a NODE_CONFIG
+         * from this node's OWN stored hub is ever queued, so a stray or
+         * spoofed frame from anyone else in radio range cannot force a
+         * radio-role switch/reboot. Decode failure is silently dropped,
+         * same as every other decoder call on this path; see
+         * s_node_cfg_queue's own comment for why the actual apply is
+         * deferred to node_config_task(). */
+        swarm_node_config_t cfg;
+        if (swarm_decode_node_config(data, (size_t)len, &cfg)) {
+            uint8_t hub_mac[6];
+            if (swarm_store_hub(hub_mac, NULL, NULL) && memcmp(src_mac, hub_mac, 6) == 0) {
+                if (s_node_cfg_queue) xQueueSend(s_node_cfg_queue, &cfg, 0);
+            }
+        }
         return;
     }
 
@@ -1782,6 +2088,14 @@ esp_err_t swarm_start_node(void)
                       "never be delivered this boot");
     }
 
+    /* Same "must exist before node_rx_cb can call it" reasoning as the
+     * queues just above -- see s_node_cfg_queue's own comment. */
+    if (!s_node_cfg_queue) s_node_cfg_queue = xQueueCreate(1, sizeof(swarm_node_config_t));
+    if (!s_node_cfg_queue) {
+        ESP_LOGE(TAG, "swarm_start_node: failed to create NODE_CONFIG queue; hub-initiated radio "
+                      "role changes will never be delivered this boot");
+    }
+
     esp_err_t err = radio_only_wifi_start();
     if (err != ESP_OK) return err;
 
@@ -1866,6 +2180,15 @@ esp_err_t swarm_start_node(void)
      * this node's next reboot. */
     if (xTaskCreate(always_on_checkin_task, "swarm_ao_checkin", 3072, NULL, 3, NULL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create always-on checkin task; hub-initiated mode changes "
+                      "will not be delivered until this node next reboots");
+    }
+
+    /* M7 Task 4: same "started unconditionally, failure logged not fatal"
+     * shape as always_on_checkin_task() just above -- a node running BLE or
+     * Zigbee both need to be reachable for a hub-initiated radio-role
+     * switch. */
+    if (xTaskCreate(node_config_task, "swarm_nodecfg", 3072, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create node config task; hub-initiated radio role changes "
                       "will not be delivered until this node next reboots");
     }
 

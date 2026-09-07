@@ -1,5 +1,6 @@
 #pragma once
 #include "esp_err.h"
+#include "radio_role_str.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -61,6 +62,55 @@ uint32_t swarm_frames_rx(void);
  * (NODE_OTA_ST_PENDING_WAKE) rather than stream immediately. Safe to call
  * from any task. */
 bool swarm_node_reported_mode(const uint8_t mac[6], uint8_t *mode_out);
+
+/* Hub (M7 Task 4): the given node's last self-reported radio role
+ * (RADIO_ROLE_*, radio_role_str.h), learned from its most recent PAIR_REQ
+ * (pairing.c, via swarm_note_node_radio() below) or COORD_STATUS (Task 7)
+ * this boot -- the same RAM stats slot GET /api/v1/nodes'
+ * "reported_radio_role"/"radio_role_pending" fields come from
+ * (swarm_node_list_json()). Returns false (role_out untouched) if this
+ * node has never reported a radio role this boot -- callers (api_v1.c's
+ * node_update_post(), reconciling a power_mode change against
+ * swarm_rules_node_power_ok()) must fall back to
+ * swarm_store_node_desired_radio() in that case, same "unknown, not a
+ * guess" reasoning as swarm_node_reported_mode() above. Safe to call from
+ * any task. */
+bool swarm_node_reported_radio(const uint8_t mac[6], uint8_t *role_out);
+
+/* Hub (M7 Task 4): records a node's self-reported radio role into its RAM
+ * stats slot -- a no-op if that node has no slot yet (e.g. a PAIR_REQ from
+ * a node that has never sent a READING/CHECKIN this boot; see swarm.c's
+ * record_reported_radio()). Called from pairing.c right after a hub-side
+ * PAIR_REQ is decoded (the frame's own radio_role field), and from Task 7's
+ * COORD_STATUS handling. Safe to call from the ESP-NOW receive callback:
+ * same short, bounded, allocation-free s_stats_mutex critical section as
+ * record_stat()/record_checkin_mode(). */
+void swarm_note_node_radio(const uint8_t mac[6], uint8_t r);
+
+/* Hub (M7 Task 4): encodes and sends a NODE_CONFIG directing `mac` to run
+ * radio role `r`, with a fresh per-node sequence number (node_stat_t.cfg_seq)
+ * so the NODE_CONFIG_ACK the node replies with (hub_rx_cb) can be matched
+ * to it in the log. Must be called from a task context (checkin_task, or
+ * the HTTP handler's own task via swarm_request_node_config() below) --
+ * never from the ESP-NOW receive callback, since espnow_link_send() can
+ * block. Returns ESP_ERR_NO_MEM if this node has no RAM stats slot and none
+ * is free (SWARM_MAX_NODES exceeded, the same corner case record_stat()
+ * itself tolerates), or whatever espnow_link_send() returns on a send
+ * failure -- either way this is best-effort: a dropped NODE_CONFIG is
+ * retried the next time checkin_task notices desired != reported. */
+esp_err_t swarm_send_node_config(const uint8_t mac[6], radio_role_t r);
+
+/* Hub (M7 Task 4): queues an immediate NODE_CONFIG for `mac`, drained by
+ * checkin_task (a config_only checkin_item_t, sent with no CHECKIN_ACK --
+ * see checkin_task()'s own comment) rather than waiting for that node's
+ * next CHECKIN. Called from api_v1.c's node_update_post() right after a
+ * POST /api/v1/nodes/{MAC12} {"radio_role":...} persists a new desired
+ * role, so an awake node gets it without a full checkin round-trip.
+ * ESP_ERR_INVALID_STATE if the checkin queue doesn't exist yet (hub not
+ * started as main), ESP_ERR_NO_MEM if it's momentarily full -- both
+ * best-effort, same reasoning as swarm_send_node_config() above: a missed
+ * request is just picked up by this node's next ordinary checkin. */
+esp_err_t swarm_request_node_config(const uint8_t mac[6]);
 
 /* Hub: called when a node is forgotten (api_v1.c's DELETE handler) -- clears
  * that MAC's per-node RAM stats slot (frames_rx/last_seen_s/rssi), if it has

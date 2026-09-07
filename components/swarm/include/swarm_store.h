@@ -2,6 +2,7 @@
 #include "esp_err.h"
 #include "swarm_frame.h"
 #include "swarm_power_mode.h"
+#include "radio_role_str.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -29,8 +30,20 @@
  *
  * 2 (M7): node_entry_t gained a trailing desired_mode byte (see
  * swarm_power_mode_t below). swarm_store.c migrates a format-1 blob in
- * place, same shape as the format-0 (M5a) migration -- see load_nodes_blob(). */
-#define SWARM_STORE_FORMAT 2
+ * place, same shape as the format-0 (M5a) migration -- see load_nodes_blob().
+ *
+ * 3 (M7 Task 4): node_entry_t gained a further trailing desired_radio byte
+ * (radio_role_t, see radio_role_str.h) -- the hub-side DESIRED radio role
+ * for this node (BLE relay vs Zigbee bridge), mirroring desired_mode's own
+ * "operator intent, persisted here, reconciled against what the node
+ * actually reports" shape. swarm_store.c migrates a format-2 blob in place,
+ * same shape as the format-1 (M7 desired_mode) migration -- see
+ * load_nodes_blob(). A migrated (or brand new) entry defaults to
+ * RADIO_ROLE_BLE: the V1 hub's own NimBLE collector is what every node
+ * defaulted to running before this field existed, so BLE is the value that
+ * changes nothing about a node's actual behaviour until an operator
+ * explicitly asks for Zigbee. */
+#define SWARM_STORE_FORMAT 3
 
 /* Node display name: up to this many bytes, NUL-terminated in the buffer
  * callers pass to swarm_store_node_name(). Empty means unset. */
@@ -164,6 +177,23 @@ esp_err_t swarm_store_forget_node(const uint8_t mac[6]);
  * and returns ESP_ERR_NOT_FOUND if mac isn't paired. */
 swarm_power_mode_t swarm_store_node_desired_mode(const uint8_t mac[6]);
 esp_err_t swarm_store_set_node_desired_mode(const uint8_t mac[6], swarm_power_mode_t m);
+
+/* Hub side (M7 Task 4): per-node desired radio role, persisted as part of
+ * the node's table entry (node_entry_t.desired_radio, format 3 -- see
+ * SWARM_STORE_FORMAT above). This is what swarm_send_node_config()
+ * (swarm.h) reconciles a node's reported radio role against, and what POST
+ * /api/v1/nodes/{MAC12} {"radio_role":...} writes. The getter returns
+ * RADIO_ROLE_BLE for a mac not in the table, matching a freshly-added
+ * node's default -- same "unknown/never-set node behaves like a
+ * newly-adopted one" reasoning as swarm_store_node_desired_mode() above.
+ * The setter rejects anything other than RADIO_ROLE_BLE/RADIO_ROLE_ZIGBEE
+ * (ESP_ERR_INVALID_ARG -- RADIO_ROLE_WIFI_ONLY is a valid *reported* role
+ * for a node that predates radio_role, but never a valid *desired* one: a
+ * node's whole job is relaying sensors, so directing it to run neither
+ * radio makes no sense as an operator intent) and returns ESP_ERR_NOT_FOUND
+ * if mac isn't paired. */
+radio_role_t swarm_store_node_desired_radio(const uint8_t mac[6]);
+esp_err_t swarm_store_set_node_desired_radio(const uint8_t mac[6], radio_role_t r);
 
 /* Node side: true once a pairing search (pairing_node_start(), driven by
  * swarm_start_node_search()) has run to completion and failed/timed out.

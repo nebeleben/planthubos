@@ -46,6 +46,8 @@ typedef struct __attribute__((packed)) {
     char    name[SWARM_NODE_NAME_LEN + 1];  /* "" = unset */
     uint8_t desired_mode;  /* SWARM_PM_*; appended at the end for format 2 --
                              * see the migration in load_nodes_blob() below. */
+    uint8_t desired_radio; /* radio_role_t; appended at the end for format 3 --
+                             * see the migration in load_nodes_blob() below. */
 } node_entry_t;
 
 typedef struct __attribute__((packed)) {
@@ -86,6 +88,25 @@ typedef struct __attribute__((packed)) {
     uint8_t count;
     node_entry_v1_t n[SWARM_MAX_NODES];
 } nodes_blob_v1_t;
+
+/* Format 2's on-disk layout (M7 Tasks 3-3.x, pre-Task-4): identical to
+ * node_entry_t/nodes_blob_t above minus the trailing desired_radio byte. A
+ * blob with exactly this length (and format byte 2) is the format-2 ->
+ * format-3 migration trigger -- see load_nodes_blob() below. Kept private
+ * to this translation unit, same reasoning as node_entry_v1_t/
+ * nodes_blob_v1_t above. */
+typedef struct __attribute__((packed)) {
+    uint8_t mac[6];
+    uint8_t lmk[SWARM_LMK_LEN];
+    char    name[SWARM_NODE_NAME_LEN + 1];
+    uint8_t desired_mode;
+} node_entry_v2_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t format;
+    uint8_t count;
+    node_entry_v2_t n[SWARM_MAX_NODES];
+} nodes_blob_v2_t;
 
 /* ---------------- Locking invariant (M5c) ----------------
  *
@@ -370,44 +391,58 @@ static esp_err_t persist_wake_counter(void)
     return err;
 }
 
-/* Loads the KEY_NODES blob into *out, migrating an M5a-format (v0) or
- * format-1 (M5b/M5c, pre-M7) blob in place if that's what's stored.
+/* Loads the KEY_NODES blob into *out, migrating an M5a-format (v0),
+ * format-1 (M5b/M5c, pre-M7) or format-2 (M7 Tasks 3-3.x, pre-Task-4) blob
+ * in place if that's what's stored.
  *
  * M5a accepted this blob on exact-length match only, and each subsequent
- * layout change (M5b/M5c raising SWARM_MAX_NODES 4->6; M7 appending
- * desired_mode) changes that length again (a longer fixed-size array or a
- * wider entry), so the naive "wrong length -> treat as absent" fallback
- * that already existed here for corrupt/foreign data would, without this
- * function, also silently discard every already-paired node's table on
- * the very first boot after each upgrade. Four cases, decided purely by
- * the blob's on-disk LENGTH (an M5a/v0 blob carries no format byte to key
- * off instead; v1 and the current format both do):
+ * layout change (M5b/M5c raising SWARM_MAX_NODES 4->6; M7 Task 3 appending
+ * desired_mode; M7 Task 4 appending desired_radio) changes that length
+ * again (a longer fixed-size array or a wider entry), so the naive "wrong
+ * length -> treat as absent" fallback that already existed here for
+ * corrupt/foreign data would, without this function, also silently discard
+ * every already-paired node's table on the very first boot after each
+ * upgrade. Five cases, decided purely by the blob's on-disk LENGTH (an
+ * M5a/v0 blob carries no format byte to key off instead; v1, v2 and the
+ * current format all do):
  *
- *   1. Length == sizeof(nodes_blob_t) (current format, 2): read it and
+ *   1. Length == sizeof(nodes_blob_t) (current format, 3): read it and
  *      check the leading format byte. A match is loaded as-is. A
  *      MISMATCH means some future format bumped this again without a
  *      migration branch landing here yet, or on-flash corruption --
  *      either way the layout cannot be trusted, so it is discarded
  *      (loudly) rather than risk misreading node MACs/LMKs from a
  *      different shape as real ones.
- *   2. Length == sizeof(nodes_blob_v1_t) (format 1's exact shape): same
+ *   2. Length == sizeof(nodes_blob_v2_t) (format 2's exact shape): same
+ *      format-byte check as case 1 (expecting 2, not the current format),
+ *      same discard-loudly-on-mismatch reasoning. A match is the M7 Task 4
+ *      migration: read with the OLD (v2) parser, copy mac/lmk/name/
+ *      desired_mode across unchanged, default desired_radio = RADIO_ROLE_BLE
+ *      for every entry (a pre-Task-4 device never had a desired radio role
+ *      to remember, and BLE is the same behaviour every node already ran),
+ *      and immediately persist the result as format 3. A device carrying a
+ *      format-2 blob keeps every node's mac/lmk/name/desired_mode intact
+ *      and never has to re-pair.
+ *   3. Length == sizeof(nodes_blob_v1_t) (format 1's exact shape): same
  *      format-byte check as case 1 (expecting 1, not the current format),
- *      same discard-loudly-on-mismatch reasoning. A match is the M7
- *      migration: read with the OLD (v1) parser, copy mac/lmk/name across
- *      unchanged, default desired_mode = SWARM_PM_ALWAYS_ON for every
- *      entry (a pre-M7 device never had a mode to remember, and
- *      ALWAYS_ON is the same "never sleeps" behaviour it already had),
- *      and immediately persist the result as format 2. A device carrying
- *      a format-1 blob keeps every node's mac/lmk/name intact and never
- *      has to re-pair.
- *   3. Length == sizeof(nodes_blob_v0_t) (M5a's exact shape, no format
+ *      same discard-loudly-on-mismatch reasoning. A match is the M7 Task 3
+ *      migration, extended by Task 4 to also default the new field: read
+ *      with the OLD (v1) parser, copy mac/lmk/name across unchanged,
+ *      default desired_mode = SWARM_PM_ALWAYS_ON (a pre-M7 device never had
+ *      a mode to remember, and ALWAYS_ON is the same "never sleeps"
+ *      behaviour it already had) and desired_radio = RADIO_ROLE_BLE (same
+ *      reasoning as case 2) for every entry, and immediately persist the
+ *      result in the current format. A device carrying a format-1 blob
+ *      keeps every node's mac/lmk/name intact and never has to re-pair.
+ *   4. Length == sizeof(nodes_blob_v0_t) (M5a's exact shape, no format
  *      byte): read with the OLD (v0) parser, copy every entry across
  *      (name left empty -- M5a had no names; desired_mode defaulted to
- *      SWARM_PM_ALWAYS_ON, same as case 2), and immediately persist the
- *      result in the current format. A device carrying an M5a blob keeps
- *      its pairing, gains an empty name and ALWAYS_ON mode per node, and
- *      never has to re-pair.
- *   4. Anything else (including "key absent", the fresh-install case):
+ *      SWARM_PM_ALWAYS_ON and desired_radio to RADIO_ROLE_BLE, same as
+ *      cases 2/3), and immediately persist the result in the current
+ *      format. A device carrying an M5a blob keeps its pairing, gains an
+ *      empty name and ALWAYS_ON/BLE defaults per node, and never has to
+ *      re-pair.
+ *   5. Anything else (including "key absent", the fresh-install case):
  *      start with an empty table. This matches M5a's own behaviour for a
  *      blob it didn't recognise.
  *
@@ -450,6 +485,54 @@ static void load_nodes_blob(nvs_handle_t h, nodes_blob_t *out)
         return;
     }
 
+    if (len == sizeof(nodes_blob_v2_t)) {
+        nodes_blob_v2_t old;
+        size_t rlen = sizeof(old);
+        if (nvs_get_blob(h, KEY_NODES, &old, &rlen) != ESP_OK || rlen != sizeof(old)) {
+            ESP_LOGW(TAG, "format-2 nodes blob read failed; starting with an empty node table");
+            return;
+        }
+        if (old.format != 2) {
+            ESP_LOGE(TAG, "nodes blob has unknown format byte %u (expected 2) at the "
+                          "format-2 length -- DISCARDING it rather than trusting an "
+                          "unrecognised layout; every paired node is lost until re-paired",
+                     old.format);
+            return;
+        }
+        uint8_t n = old.count;
+        if (n > SWARM_MAX_NODES) n = SWARM_MAX_NODES;  /* defensive */
+        ESP_LOGW(TAG, "migrating format-2 node table (%u node(s)) to format %u",
+                 n, (unsigned)SWARM_STORE_FORMAT);
+
+        nodes_blob_t migrated;
+        memset(&migrated, 0, sizeof(migrated));
+        migrated.format = SWARM_STORE_FORMAT;
+        migrated.count = n;
+        for (uint8_t i = 0; i < n; i++) {
+            memcpy(migrated.n[i].mac, old.n[i].mac, 6);
+            memcpy(migrated.n[i].lmk, old.n[i].lmk, SWARM_LMK_LEN);
+            memcpy(migrated.n[i].name, old.n[i].name, sizeof(migrated.n[i].name));
+            migrated.n[i].desired_mode = old.n[i].desired_mode;
+            migrated.n[i].desired_radio = RADIO_ROLE_BLE;
+        }
+
+        esp_err_t werr = write_blob(KEY_NODES, &migrated, sizeof(migrated));
+        if (werr != ESP_OK) {
+            /* Same tradeoff as the other migrations here: keep the migrated
+             * data in RAM for this boot even though the flash write failed
+             * -- losing the pairing THIS boot despite having just proven we
+             * could read it would be strictly worse. The next successful
+             * write (a rename, a forget, a mode/radio change, a fresh
+             * pairing) persists it. */
+            ESP_LOGE(TAG, "failed to persist migrated node table: %s (kept in RAM for this "
+                          "boot only; will retry on the next write)", esp_err_to_name(werr));
+        } else {
+            ESP_LOGI(TAG, "node table migration complete, %u node(s) preserved", n);
+        }
+        *out = migrated;
+        return;
+    }
+
     if (len == sizeof(nodes_blob_v1_t)) {
         nodes_blob_v1_t old;
         size_t rlen = sizeof(old);
@@ -478,6 +561,7 @@ static void load_nodes_blob(nvs_handle_t h, nodes_blob_t *out)
             memcpy(migrated.n[i].lmk, old.n[i].lmk, SWARM_LMK_LEN);
             memcpy(migrated.n[i].name, old.n[i].name, sizeof(migrated.n[i].name));
             migrated.n[i].desired_mode = SWARM_PM_ALWAYS_ON;
+            migrated.n[i].desired_radio = RADIO_ROLE_BLE;
         }
 
         esp_err_t werr = write_blob(KEY_NODES, &migrated, sizeof(migrated));
@@ -519,7 +603,12 @@ static void load_nodes_blob(nvs_handle_t h, nodes_blob_t *out)
             memcpy(migrated.n[i].lmk, old.n[i].lmk, SWARM_LMK_LEN);
             /* migrated.n[i].name stays "" (M5a had no names to carry over)
              * and migrated.n[i].desired_mode stays SWARM_PM_ALWAYS_ON (0,
-             * from the memset above) -- M5a had no modes either. */
+             * from the memset above) -- M5a had no modes either.
+             * desired_radio is explicitly set below (its zero value would
+             * otherwise be RADIO_ROLE_WIFI_ONLY, not the intended BLE
+             * default -- unlike desired_mode, 0 is not the right default
+             * here). */
+            migrated.n[i].desired_radio = RADIO_ROLE_BLE;
         }
 
         esp_err_t werr = write_blob(KEY_NODES, &migrated, sizeof(migrated));
@@ -539,9 +628,10 @@ static void load_nodes_blob(nvs_handle_t h, nodes_blob_t *out)
     }
 
     ESP_LOGW(TAG, "nodes blob has unrecognised length %d (expected %d for the current format, "
-                  "%d for format 1, or %d for M5a); starting with an empty node table",
-             (int)len, (int)sizeof(nodes_blob_t), (int)sizeof(nodes_blob_v1_t),
-             (int)sizeof(nodes_blob_v0_t));
+                  "%d for format 2, %d for format 1, or %d for M5a); starting with an empty "
+                  "node table",
+             (int)len, (int)sizeof(nodes_blob_t), (int)sizeof(nodes_blob_v2_t),
+             (int)sizeof(nodes_blob_v1_t), (int)sizeof(nodes_blob_v0_t));
 }
 
 esp_err_t swarm_store_init(void)
@@ -971,12 +1061,19 @@ esp_err_t swarm_store_add_node(const uint8_t mac[6], const uint8_t lmk[SWARM_LMK
         }
         idx = blob.count++;
         memset(&blob.n[idx], 0, sizeof(blob.n[idx]));  /* fresh slot: no name yet */
+        /* desired_mode's zero value (SWARM_PM_ALWAYS_ON) is already the
+         * right default from the memset above, but desired_radio's zero
+         * value is RADIO_ROLE_WIFI_ONLY, not the RADIO_ROLE_BLE this
+         * interface promises a freshly-adopted node -- set it explicitly,
+         * same reasoning as the v0-migration loop above. */
+        blob.n[idx].desired_radio = RADIO_ROLE_BLE;
     }
     memcpy(blob.n[idx].mac, mac, 6);
     memcpy(blob.n[idx].lmk, lmk, SWARM_LMK_LEN);
-    /* name is deliberately left as-is: re-adopting an already-known MAC
-     * (see pairing.c's find_stored_lmk()/idempotent re-ack) must not wipe
-     * an operator-assigned name out from under them. */
+    /* name/desired_mode/desired_radio are deliberately left as-is when
+     * re-adopting an already-known MAC (see pairing.c's find_stored_lmk()/
+     * idempotent re-ack) -- must not wipe an operator-assigned name or
+     * mode/radio choice out from under them. */
     s_nodes = blob;
     xSemaphoreGive(s_mutex);
 
@@ -1100,6 +1197,47 @@ esp_err_t swarm_store_set_node_desired_mode(const uint8_t mac[6], swarm_power_mo
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "swarm_store_set_node_desired_mode: NVS write failed (%s); RAM cache "
                       "already reflects the new mode and will not revert until the next "
+                      "successful write or a reboot", esp_err_to_name(err));
+    }
+    return err;
+}
+
+radio_role_t swarm_store_node_desired_radio(const uint8_t mac[6])
+{
+    radio_role_t r = RADIO_ROLE_BLE;  /* unknown mac -> same default as a fresh node */
+    if (!mac) return r;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_nodes.count; i++) {
+        if (memcmp(s_nodes.n[i].mac, mac, 6) == 0) { r = (radio_role_t)s_nodes.n[i].desired_radio; break; }
+    }
+    xSemaphoreGive(s_mutex);
+    return r;
+}
+
+esp_err_t swarm_store_set_node_desired_radio(const uint8_t mac[6], radio_role_t r)
+{
+    if (!mac) return ESP_ERR_INVALID_ARG;
+    if (r != RADIO_ROLE_BLE && r != RADIO_ROLE_ZIGBEE) return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    nodes_blob_t blob = s_nodes;
+    blob.format = SWARM_STORE_FORMAT;
+    int idx = -1;
+    for (int i = 0; i < blob.count; i++) {
+        if (memcmp(blob.n[i].mac, mac, 6) == 0) { idx = i; break; }
+    }
+    if (idx < 0) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_NOT_FOUND;
+    }
+    blob.n[idx].desired_radio = (uint8_t)r;
+    s_nodes = blob;
+    xSemaphoreGive(s_mutex);
+
+    esp_err_t err = persist_nodes();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "swarm_store_set_node_desired_radio: NVS write failed (%s); RAM cache "
+                      "already reflects the new radio role and will not revert until the next "
                       "successful write or a reboot", esp_err_to_name(err));
     }
     return err;

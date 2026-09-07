@@ -13,8 +13,10 @@
  * blocked on. That task does every flash write and every send. */
 #include "pairing.h"
 #include "espnow_link.h"
+#include "swarm.h"
 #include "swarm_frame.h"
 #include "swarm_store.h"
+#include "radio_role.h"
 
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -471,9 +473,19 @@ static void node_task(void *arg)
             }
             ESP_LOGD(TAG, "sweep: dwelling on channel %u", ch);
 
+            /* M7 Task 4: this node's own current radio role, so the hub can
+             * populate reported_radio_role (swarm.c's swarm_note_node_radio())
+             * before this node has ever sent a CHECKIN/COORD_STATUS -- see
+             * swarm_frame.h's doc comment on swarm_pair_req_t.radio_role.
+             * radio_role_is_set() == false means this device predates
+             * radio_role entirely (never persisted one) or was just
+             * factory-reset; RADIO_ROLE_BLE is the same "every node
+             * defaults to running the V1 hub's NimBLE collector" default
+             * swarm_store's own desired_radio getter uses. */
             swarm_pair_req_t req = {
                 .version = SWARM_PROTO_VERSION,
                 .type = SWARM_MSG_PAIR_REQ,
+                .radio_role = (uint8_t)(radio_role_is_set() ? radio_role_get() : RADIO_ROLE_BLE),
                 .nonce = nonce,
             };
             uint8_t buf[sizeof(req)];
@@ -664,6 +676,19 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
 
         swarm_pair_req_t req;
         if (!swarm_decode_pair_req(data, (size_t)len, &req)) return;
+
+        /* M7 Task 4: note this node's self-reported radio role regardless
+         * of whether the adoption below actually proceeds (a re-PAIR_REQ
+         * from an already-known node during a busy window still carries a
+         * truthful, worth-recording radio_role) -- see swarm.h's doc
+         * comment on swarm_note_node_radio() for why a miss (no RAM stats
+         * slot yet for a node that has never sent a READING/CHECKIN) is
+         * the expected common case here, not an error. A no-op when this
+         * device is itself a node (s_stats_mutex is NULL, never created --
+         * see swarm_note_node_radio()'s own guard), which in practice never
+         * reaches this branch anyway since a node never opens a pairing
+         * window (win_open above is always false for it). */
+        swarm_note_node_radio(src, req.radio_role);
 
         /* At most one adoption in flight at a time. The window is never
          * closed here (or anywhere on a successful adoption -- see

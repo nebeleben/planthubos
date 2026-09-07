@@ -25,6 +25,7 @@
 #include "action.h"
 #include "zigbee.h"
 #include "radio_role.h"
+#include "swarm_rules.h"
 #include "cJSON.h"
 #include "mbedtls/base64.h"
 #include "esp_littlefs.h"
@@ -106,6 +107,22 @@ esp_err_t api_send_401(httpd_req_t *req)
     httpd_resp_set_status(req, "401 Unauthorized");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
+    return ESP_OK;
+}
+
+/* M7: 409 Conflict, JSON body {"error": msg} -- same status/content-type
+ * idiom as node_ota_start_post()/node_ota_abort_post()'s own inline 409s
+ * elsewhere in this file, factored out here since node_update_post()'s
+ * radio_role/power_mode compatibility checks (swarm_rules.h) need it from
+ * two call sites. msg is always one of swarm_rules.c's static string
+ * literals ("why"), never untrusted input, so no JSON escaping is needed. */
+static esp_err_t send_409(httpd_req_t *req, const char *msg)
+{
+    httpd_resp_set_status(req, "409 Conflict");
+    httpd_resp_set_type(req, "application/json");
+    char body[160];
+    snprintf(body, sizeof(body), "{\"error\":\"%s\"}", msg ? msg : "conflict");
+    httpd_resp_sendstr(req, body);
     return ESP_OK;
 }
 
@@ -1144,15 +1161,16 @@ static bool power_mode_from_str(const char *s, swarm_power_mode_t *out)
  * present must be well-formed -- a present-but-wrong-type "name" or
  * "power_mode" always 400s (see the two checks below), it is never
  * silently ignored just because the other field is valid. At least one of
- * a valid "name" or a valid "power_mode" must be present, same as the
- * name-only contract this handler had before M7. Both fields are
- * validated before any store write, so a bad field never leaves a
- * partially-applied rename/mode-change behind (400, body untouched) --
- * unknown mac is checked by the store calls themselves and reported as 404
- * either way. 128 bytes
- * comfortably covers the worst case (a full 24-byte SWARM_NODE_NAME_LEN
- * name plus a "battery_15"/"battery_60" power_mode in the same body, ~61
- * bytes of JSON) with headroom. */
+ * a valid "name", "power_mode" or "radio_role" (M7 Task 4) must be present,
+ * same as the name-only contract this handler had before M7. Every field
+ * is validated -- including the swarm_rules.h compatibility checks below --
+ * before any store write, so a bad or conflicting field never leaves a
+ * partially-applied rename/mode-change/radio-change behind (400/409, body
+ * untouched) -- unknown mac is checked by the store calls themselves and
+ * reported as 404 either way. 128 bytes comfortably covers the worst case
+ * (a full 24-byte SWARM_NODE_NAME_LEN name plus a "battery_15"/"battery_60"
+ * power_mode plus a "ble"/"zigbee" radio_role in the same body) with
+ * headroom. */
 static esp_err_t node_update_post(httpd_req_t *req, const uint8_t mac[6])
 {
     char body[128];
@@ -1180,6 +1198,7 @@ static esp_err_t node_update_post(httpd_req_t *req, const uint8_t mac[6])
     cJSON *json = cJSON_Parse(body);
     const cJSON *name = cJSON_GetObjectItem(json, "name");
     const cJSON *pm = cJSON_GetObjectItem(json, "power_mode");
+    const cJSON *rr_j = cJSON_GetObjectItem(json, "radio_role");
 
     swarm_power_mode_t mode = SWARM_PM_ALWAYS_ON;
     bool have_mode = false;
@@ -1191,15 +1210,28 @@ static esp_err_t node_update_post(httpd_req_t *req, const uint8_t mac[6])
         }
         have_mode = true;
     }
-    /* Symmetric with power_mode above: a PRESENT-but-wrong-type field is a
-     * malformed request (400), not "not requested" -- only outright
-     * absence (cJSON_GetObjectItem returning NULL) means the caller didn't
-     * intend to touch that field at all. This was the pre-M7 contract for
-     * "name" (this route unconditionally 400'd "invalid name" whenever the
-     * body's "name" wasn't a string) and adding power_mode must not weaken
-     * it: a present-but-malformed name must 400 even when a valid
-     * power_mode also came along in the same body, exactly like a
-     * present-but-malformed power_mode above 400s regardless of "name". */
+    /* M7 Task 4: same "present-but-wrong-type/value is a 400, absence is
+     * not requested" contract as power_mode above. */
+    radio_role_t rr = RADIO_ROLE_BLE;
+    bool have_radio = false;
+    if (rr_j != NULL) {
+        if (!cJSON_IsString(rr_j) || !radio_role_parse(rr_j->valuestring, &rr)) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad radio_role");
+            return ESP_OK;
+        }
+        have_radio = true;
+    }
+    /* Symmetric with power_mode/radio_role above: a PRESENT-but-wrong-type
+     * field is a malformed request (400), not "not requested" -- only
+     * outright absence (cJSON_GetObjectItem returning NULL) means the
+     * caller didn't intend to touch that field at all. This was the pre-M7
+     * contract for "name" (this route unconditionally 400'd "invalid name"
+     * whenever the body's "name" wasn't a string) and adding power_mode/
+     * radio_role must not weaken it: a present-but-malformed name must 400
+     * even when a valid power_mode/radio_role also came along in the same
+     * body, exactly like a present-but-malformed power_mode/radio_role
+     * above 400s regardless of "name". */
     bool have_name = false;
     if (name != NULL) {
         if (!cJSON_IsString(name)) {
@@ -1210,15 +1242,51 @@ static esp_err_t node_update_post(httpd_req_t *req, const uint8_t mac[6])
         have_name = true;
     }
 
-    if (!have_mode && !have_name) {
+    if (!have_mode && !have_name && !have_radio) {
         cJSON_Delete(json);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid name");
         return ESP_OK;
     }
 
+    /* M7 Task 4 (+ the Task 3 review addendum this folds in): compatibility
+     * rules (swarm_rules.h), checked before any store write so a refusal
+     * never leaves a partially-applied change behind -- same "validate
+     * everything, then apply" shape as the type checks above. radio_role is
+     * checked against this node's CURRENT desired power mode; power_mode is
+     * checked against this node's most recently REPORTED radio role,
+     * falling back to its DESIRED radio role when it has never reported one
+     * this boot (swarm_node_reported_radio()) -- without that fallback, a
+     * battery mode pushed onto a node whose desired radio is already
+     * "zigbee" would only ever be refused later, at the node's own
+     * radio_role_set()-adjacent persist, with no hub-visible error at all.
+     * Neither check cross-validates against the OTHER field's NEW value
+     * when both arrive in the same request body (each is checked against
+     * what is currently stored/reported, not what the sibling field in this
+     * same body is about to become) -- a request that would end up
+     * internally consistent only after both fields apply can still 409
+     * needlessly here; a narrow, documented limitation, not a silent
+     * acceptance of an incompatible pair, and trivially worked around with
+     * two separate calls in the right order. */
+    const char *why = NULL;
+    if (have_radio && !swarm_rules_node_radio_ok(rr, swarm_store_node_desired_mode(mac), &why)) {
+        cJSON_Delete(json);
+        return send_409(req, why);
+    }
+    if (have_mode) {
+        uint8_t reported_radio_byte;
+        radio_role_t radio_for_rule = swarm_node_reported_radio(mac, &reported_radio_byte)
+            ? (radio_role_t)reported_radio_byte
+            : swarm_store_node_desired_radio(mac);
+        if (!swarm_rules_node_power_ok(mode, radio_for_rule, &why)) {
+            cJSON_Delete(json);
+            return send_409(req, why);
+        }
+    }
+
     esp_err_t err = ESP_OK;
     if (have_name) err = swarm_store_set_node_name(mac, name->valuestring);
     if (err == ESP_OK && have_mode) err = swarm_store_set_node_desired_mode(mac, mode);
+    if (err == ESP_OK && have_radio) err = swarm_store_set_node_desired_radio(mac, rr);
     cJSON_Delete(json);
 
     if (err == ESP_ERR_NOT_FOUND) {
@@ -1229,6 +1297,15 @@ static esp_err_t node_update_post(httpd_req_t *req, const uint8_t mac[6])
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid name");
         return ESP_OK;
     }
+    /* M7 Task 4: an awake node gets its new radio role without waiting for
+     * its next ordinary CHECKIN -- see swarm_request_node_config()'s own
+     * doc comment. Only when radio_role was actually part of this request;
+     * a power_mode-only or name-only update has nothing for NODE_CONFIG to
+     * carry (that frame is radio-role-only -- swarm_frame.h's
+     * swarm_node_config_t). Best-effort: a dropped/queue-full request is
+     * self-healing, picked up by this node's next checkin regardless (see
+     * checkin_task()'s own radio-reconciliation branch in swarm.c). */
+    if (have_radio) swarm_request_node_config(mac);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
