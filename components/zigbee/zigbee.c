@@ -54,6 +54,16 @@
 
 static const char *TAG = "zigbee";
 
+/* M7 Task 3: set once by main.c (zigbee_set_on_node()) right before the
+ * radio block, from swarm_role_t -- deliberately a plain file-static bool
+ * rather than a call into the swarm component (swarm_store_role()), which
+ * would create a CMake dependency cycle once swarm depends on zigbee
+ * (Task 5). Defaults to false (hub) until main.c calls the setter. */
+static bool s_on_node = false;
+
+void zigbee_set_on_node(bool on_node) { s_on_node = on_node; }
+bool zigbee_on_node(void) { return s_on_node; }
+
 /* Whole-branch review, FIX 6: main.c's log_heap("after ble_collector_start")
  * fires before zigbee_start() is even called, and this stack forms/restores
  * its network asynchronously on its own task -- so free heap with Zigbee
@@ -304,8 +314,16 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
              * zigbee-on-hub trade-off, made explicitly. Overrides
              * espnow_link_init()'s WIFI_PS_NONE, which ran earlier in
              * boot; the setting survives the permit-window stop/start. */
-            esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-            ESP_LOGI(TAG, "zigbee role: WiFi modem sleep on (%s)", esp_err_to_name(ps_err));
+            if (!zigbee_on_node()) {
+                esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+                ESP_LOGI(TAG, "zigbee role: WiFi modem sleep on (%s)", esp_err_to_name(ps_err));
+            } else {
+                /* A Zigbee-role node runs ESP-NOW (not a web UI/portal) on
+                 * its WiFi radio -- modem sleep would delay/drop the
+                 * unicast forward traffic swarm.c depends on, so this
+                 * hub-only power trick stays off on a node. */
+                ESP_LOGI(TAG, "zigbee role on a node: WiFi power save stays off for ESP-NOW");
+            }
             if (coex_err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_coex_wifi_i154_enable failed (%s); WiFi and "
                               "802.15.4 will contend unarbitrated",
@@ -1392,7 +1410,10 @@ static void zb_scan_hold_cb(uint8_t param)
     deadline = s_permit_join_deadline_us;
     portEXIT_CRITICAL(&s_mux);
     if (deadline == 0) return;
-    wifi_manager_radio_pause();
+    /* A zigbee-role node's WiFi radio carries ESP-NOW, not a hub's STA/AP
+     * pair -- wifi_manager owns none of it there, so pausing it would be a
+     * no-op at best and a wrong call into an unrelated radio at worst. */
+    if (!zigbee_on_node()) wifi_manager_radio_pause();
     esp_err_t err = ble_collector_scan_hold(true);
     if (err == ESP_ERR_INVALID_STATE) {
         /* One radio per node: this hub never started the BLE collector, so
@@ -1419,8 +1440,9 @@ static void zb_permit_expiry_cb(uint8_t param)
      * A hold alarm still pending (window closed within its 0.8 s defer)
      * is cancelled so it cannot re-hold a radio nobody will release. */
     esp_zb_scheduler_alarm_cancel(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM);
-    /* Give WiFi its air back (see zigbee_permit_join / wifi_manager.h). */
-    wifi_manager_radio_resume();
+    /* Give WiFi its air back (see zigbee_permit_join / wifi_manager.h). See
+     * zb_scan_hold_cb's matching guard above for why a node skips this. */
+    if (!zigbee_on_node()) wifi_manager_radio_resume();
     esp_err_t err = ble_collector_scan_hold(false);
     if (err == ESP_ERR_INVALID_STATE) {
         /* No BLE collector in this role -- nothing was held, so there is no

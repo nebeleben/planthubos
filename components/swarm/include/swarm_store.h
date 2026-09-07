@@ -1,6 +1,7 @@
 #pragma once
 #include "esp_err.h"
 #include "swarm_frame.h"
+#include "swarm_power_mode.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -30,18 +31,6 @@
  * swarm_power_mode_t below). swarm_store.c migrates a format-1 blob in
  * place, same shape as the format-0 (M5a) migration -- see load_nodes_blob(). */
 #define SWARM_STORE_FORMAT 2
-
-/* Power mode a battery node runs under (M7). ALWAYS_ON never sleeps and is
- * the default for both a brand-new own-device mode and an unknown node's
- * desired mode -- a node/hub that has never heard otherwise behaves exactly
- * like a pre-M7 device. BATTERY_15/60 are the two checkin-interval presets;
- * see batt_cycle.h's batt_period_s() for the actual seconds each maps to. */
-typedef enum {
-    SWARM_PM_ALWAYS_ON  = 0,
-    SWARM_PM_BATTERY_15 = 1,
-    SWARM_PM_BATTERY_60 = 2,
-} swarm_power_mode_t;
-#define SWARM_PM_VALID(m) ((m) <= SWARM_PM_BATTERY_60)
 
 /* Node display name: up to this many bytes, NUL-terminated in the buffer
  * callers pass to swarm_store_node_name(). Empty means unset. */

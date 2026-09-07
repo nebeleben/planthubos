@@ -1,4 +1,6 @@
 #include "swarm_store.h"
+#include "swarm_rules.h"
+#include "radio_role.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -866,6 +868,12 @@ swarm_power_mode_t swarm_store_power_mode(void)
 esp_err_t swarm_store_set_power_mode(swarm_power_mode_t m)
 {
     if (!SWARM_PM_VALID(m)) return ESP_ERR_INVALID_ARG;
+
+    const char *why;
+    if (!swarm_rules_node_power_ok(m, radio_role_get(), &why)) {
+        ESP_LOGW(TAG, "power mode refused: %s", why);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_power_mode = m;

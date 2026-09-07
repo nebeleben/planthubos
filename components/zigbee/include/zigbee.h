@@ -18,6 +18,17 @@
  * it returns ESP_OK and does nothing. */
 esp_err_t zigbee_start(void);
 
+/* M7 Task 3: whether THIS device is a paired swarm node, set once by
+ * main.c right before the radio block (from swarm_role_t, not read here
+ * directly -- zigbee.c must not link the swarm component, which would
+ * create a CMake dependency cycle once swarm depends on zigbee (Task 5)).
+ * Backed by a plain file-static bool; call zigbee_set_on_node() exactly
+ * once, before zigbee_start() and before wifi_manager's power-save/pause/
+ * resume calls that zigbee_on_node() below gates. */
+void zigbee_set_on_node(bool on_node);
+/* See zigbee_set_on_node() above. Defaults to false until that is called. */
+bool zigbee_on_node(void);
+
 /* Current network state for the UI. Returns false when Zigbee is disabled
  * at build time or the stack has not started. */
 bool zigbee_net_info(uint8_t *channel, uint16_t *pan_id, bool *formed);

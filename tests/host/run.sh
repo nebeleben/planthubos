@@ -252,3 +252,10 @@ $CC -Wall -Wextra -Werror -I../../components/zigbee/include \
 $CC -Wall -Wextra -Werror -I../../components/radio_role/include \
     test_radio_role.c ../../components/radio_role/radio_role_str.c -o test_radio_role
 ./test_radio_role
+
+# Node radio/power compatibility rules (M7 Task 3) -- pure so they run here
+# without NVS. swarm_rules.h pulls swarm_power_mode.h, not swarm_store.h
+# (esp_err.h isn't available under plain cc).
+$CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/radio_role/include \
+    test_swarm_rules.c ../../components/swarm/swarm_rules.c -o test_swarm_rules
+./test_swarm_rules
