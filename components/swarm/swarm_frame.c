@@ -32,9 +32,11 @@ static size_t expected_len(int type)
 
 int swarm_frame_type(const uint8_t *buf, size_t len)
 {
-    if (!buf || len < 2) return -1;
+    if (!buf || len < SWARM_HDR_LEN) return -1;
     if (buf[0] != SWARM_PROTO_VERSION) return -1;
     int type = buf[1];
+    uint16_t declared = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
+    if ((size_t)declared + SWARM_HDR_LEN != len) return -1;
     if (type == SWARM_MSG_OTA_CHUNK) {
         /* Range, not exact match -- this is the one frame whose true
          * length depends on a field inside the buffer. The exact check
@@ -42,6 +44,11 @@ int swarm_frame_type(const uint8_t *buf, size_t len)
          * SWARM_OTA_CHUNK_DATA) is swarm_decode_ota_chunk()'s job, not
          * this function's -- see the header comment on swarm_ota_chunk_t. */
         if (len < SWARM_OTA_CHUNK_HDR || len > SWARM_OTA_CHUNK_MAXLEN) return -1;
+        return type;
+    }
+    if (type >= SWARM_MSG_DEVICE_ANNOUNCE && type <= SWARM_MSG_NODE_CONFIG_ACK) {
+        /* Variable-length v4 frames: the decoder validates its counted
+         * arrays against len (Task 2); here only the header is checked. */
         return type;
     }
     size_t want = expected_len(type);
@@ -115,8 +122,11 @@ bool swarm_decode_ota_chunk(const uint8_t *buf, size_t len, swarm_ota_chunk_t *o
 
 static size_t encode_from(const void *in, size_t sz, uint8_t *out, size_t cap)
 {
-    if (!out || cap < sz) return 0;
+    if (!in || !out || cap < sz || sz < SWARM_HDR_LEN) return 0;
     memcpy(out, in, sz);
+    uint16_t body = (uint16_t)(sz - SWARM_HDR_LEN);
+    out[2] = (uint8_t)(body & 0xff);
+    out[3] = (uint8_t)(body >> 8);
     return sz;
 }
 
@@ -171,5 +181,11 @@ size_t swarm_encode_ota_chunk(const swarm_ota_chunk_t *in, uint8_t *out, size_t 
     if (cap < n) return 0;
     memcpy(out, in, SWARM_OTA_CHUNK_HDR);
     memcpy(out + SWARM_OTA_CHUNK_HDR, in->data, in->len);
+    /* v4 header: bytes after the 4-byte header, LE -- written directly by
+     * byte offset since this frame's own `hdr_len` field only exists to
+     * hold these same two bytes in the struct layout (see swarm_frame.h);
+     * SWARM_OTA_CHUNK_HDR already accounts for it via offsetof(data). */
+    out[2] = (uint8_t)((n - SWARM_HDR_LEN) & 0xff);
+    out[3] = (uint8_t)((n - SWARM_HDR_LEN) >> 8);
     return n;
 }

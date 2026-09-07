@@ -3,8 +3,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SWARM_PROTO_VERSION 3
+#define SWARM_PROTO_VERSION 4
+#define SWARM_HDR_LEN 4      /* version(1) + type(1) + len(2) */
 #define SWARM_LMK_LEN 16
+
+/* Protocol v4: every frame on the wire starts with this 4-byte header:
+ *   version (1), type (1), len (2, little-endian).
+ * len = number of bytes after the 4-byte header, little-endian; filled by
+ * the encoder, checked by swarm_frame_type(). Every swarm_*_t struct below
+ * carries this header as its first three fields (version, type, len) --
+ * swarm_ota_chunk_t is the one exception: it already had a field named
+ * `len` for its own data-byte count, so its v4 header-length field is
+ * named `hdr_len` instead (see its definition below). */
 
 typedef enum {
     SWARM_MSG_PAIR_REQ   = 1,
@@ -19,6 +29,17 @@ typedef enum {
     SWARM_MSG_OTA_ABORT  = 10,
     SWARM_MSG_CHECKIN    = 11,
     SWARM_MSG_CHECKIN_ACK = 12,
+    /* M7 zigbee bridge frame types; bodies land in Task 2, but the enum
+     * values must exist now for swarm_frame_type()'s version-check range
+     * to compile. */
+    SWARM_MSG_DEVICE_ANNOUNCE  = 13,
+    SWARM_MSG_DEVICE_GONE      = 14,
+    SWARM_MSG_MEASUREMENT      = 15,
+    SWARM_MSG_COORD_STATUS     = 16,
+    SWARM_MSG_COMMAND          = 17,
+    SWARM_MSG_COMMAND_ACK      = 18,
+    SWARM_MSG_NODE_CONFIG      = 19,
+    SWARM_MSG_NODE_CONFIG_ACK  = 20,
 } swarm_msg_t;
 
 /* Checkin commands (CHECKIN_ACK.command) */
@@ -33,6 +54,7 @@ enum {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint32_t nonce;      /* echoed in the ack so a node ignores stale replies */
 } swarm_pair_req_t;
 
@@ -47,6 +69,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint8_t  channel;    /* the hub's current wifi channel, 1..13 */
     uint8_t  lmk[SWARM_LMK_LEN];
     uint32_t nonce;
@@ -77,6 +100,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint8_t  frame_cnt;      /* sensor's MiBeacon counter, for hub-side dedup */
     uint8_t  mac[6];         /* sensor MAC, human order */
     int16_t  temp_dc;
@@ -98,6 +122,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint32_t nonce;   /* echoed in the PONG so the node matches the reply to this probe */
 } swarm_ping_t;
 
@@ -113,6 +138,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint32_t nonce;   /* copied verbatim from the PING that triggered this reply */
 } swarm_pong_t;
 
@@ -133,9 +159,10 @@ typedef struct __attribute__((packed)) {
  * so every paired node still receives every FORGET; target_mac is what
  * makes only the intended one act on it. */
 typedef struct __attribute__((packed)) {
-    uint8_t version;
-    uint8_t type;
-    uint8_t target_mac[6];
+    uint8_t  version;
+    uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
+    uint8_t  target_mac[6];
 } swarm_forget_t;
 
 /* Node -> hub, unicast, encrypted. Battery nodes report their current power mode
@@ -143,18 +170,20 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;      /* SWARM_PROTO_VERSION */
     uint8_t  type;         /* SWARM_MSG_CHECKIN */
+    uint16_t len;          /* v4 header: bytes after the 4-byte header, LE */
     uint8_t  power_mode;   /* SWARM_PM_*: the node's CURRENT (reported) mode */
     uint32_t wake_counter; /* monotonic per NVS, diagnostic only */
-} swarm_checkin_t;         /* 7 bytes */
+} swarm_checkin_t;         /* 9 bytes */
 
 /* Hub -> node, unicast, encrypted. Hub's reply to CHECKIN; carries command/arg
  * for the node to execute (e.g., change power mode, stay awake). */
 typedef struct __attribute__((packed)) {
-    uint8_t version;
-    uint8_t type;          /* SWARM_MSG_CHECKIN_ACK */
-    uint8_t command;       /* SWARM_CHECKIN_CMD_* */
-    uint8_t arg;
-} swarm_checkin_ack_t;     /* 4 bytes */
+    uint8_t  version;
+    uint8_t  type;          /* SWARM_MSG_CHECKIN_ACK */
+    uint16_t len;           /* v4 header: bytes after the 4-byte header, LE */
+    uint8_t  command;       /* SWARM_CHECKIN_CMD_* */
+    uint8_t  arg;
+} swarm_checkin_ack_t;     /* 6 bytes */
 
 /* Hub -> node, unicast, encrypted (an OTA session only ever targets an
  * already-adopted node, i.e. an existing encrypted peer -- unlike pairing
@@ -178,6 +207,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint32_t session_id;
     uint32_t total_len;
     uint8_t  sha256[32];
@@ -191,13 +221,13 @@ typedef struct __attribute__((packed)) {
  * byte, which is exactly what lets swarm_frame_type() reject anything of
  * the wrong length before a single field is read. This frame instead
  * carries `len` <= SWARM_OTA_CHUNK_DATA data bytes, and the encoded size on
- * the wire is ONLY header (8 bytes: version+type+offset+len) + len -- a
- * short final chunk is never padded out to SWARM_OTA_CHUNK_DATA.
+ * the wire is ONLY header (10 bytes: version+type+hdr_len+offset+len) + len
+ * -- a short final chunk is never padded out to SWARM_OTA_CHUNK_DATA.
  *
  * Consequence for the decoder contract: swarm_frame_type() cannot demand an
  * exact length for this type the way it does for every other frame -- it
  * only knows the buffer is *plausibly* an OTA_CHUNK if its length falls in
- * [8, 8+SWARM_OTA_CHUNK_DATA]. The real check -- that the `len` field
+ * [10, 10+SWARM_OTA_CHUNK_DATA]. The real check -- that the `len` field
  * embedded in the buffer exactly accounts for the buffer's actual length,
  * and that len itself is <= SWARM_OTA_CHUNK_DATA -- is swarm_decode_ota_chunk()'s
  * job, and it MUST run before any byte of `data` is touched. Get either
@@ -211,6 +241,15 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t hdr_len;                   /* v4 header: bytes after the 4-byte
+                                            header (offset + len + data), LE.
+                                            Distinct from `len` below, which
+                                            counts only the data bytes --
+                                            this struct already used that
+                                            name before v4, so the new
+                                            generic header field could not
+                                            reuse it. Filled by the encoder,
+                                            checked by swarm_frame_type(). */
     uint32_t offset;
     uint16_t len;                       /* <= SWARM_OTA_CHUNK_DATA */
     uint8_t  data[SWARM_OTA_CHUNK_DATA];
@@ -249,6 +288,7 @@ enum {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint32_t session_id;  /* echoed from the OTA_BEGIN that started this session */
     uint8_t  state;
     uint8_t  err;
@@ -260,9 +300,10 @@ typedef struct __attribute__((packed)) {
 /* Hub -> node, unicast, encrypted. Ends a session early: hub-initiated
  * abort, or the hub giving up after too many stalls/timeouts. */
 typedef struct __attribute__((packed)) {
-    uint8_t version;
-    uint8_t type;
-    uint8_t reason;
+    uint8_t  version;
+    uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
+    uint8_t  reason;
 } swarm_ota_abort_t;
 
 int  swarm_frame_type(const uint8_t *buf, size_t len);

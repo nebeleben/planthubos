@@ -8,25 +8,43 @@ int main(void)
 {
     uint8_t buf[300];
 
+    /* v4 header: version, type, len (LE16 = bytes after the header) */
+    {
+        swarm_checkin_t c = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_CHECKIN,
+                              .power_mode = 2, .wake_counter = 12345 };
+        uint8_t buf[16];
+        size_t n = swarm_encode_checkin(&c, buf, sizeof buf);
+        assert(n == 9);
+        assert(buf[0] == 4 && buf[1] == SWARM_MSG_CHECKIN);
+        assert(buf[2] == 5 && buf[3] == 0);                 /* len = 9 - 4 */
+        swarm_checkin_t out;
+        assert(swarm_decode_checkin(buf, n, &out));
+        buf[2] = 6;                                          /* len lies */
+        assert(!swarm_decode_checkin(buf, n, &out));
+        buf[2] = 5; buf[0] = 3;                              /* v3 rejected */
+        assert(!swarm_decode_checkin(buf, n, &out));
+    }
+
     /* sizes are part of the contract: they must not drift silently.
      * PAIR_ACK grew by 3 bytes (protocol v2's inherited "country" field).
      * PAIR_REQ, PING and PONG all happen to be the same 6-byte shape
      * (version+type+nonce) -- see the type-confusion checks below, which
-     * matter precisely because of that overlap. */
-    assert(sizeof(swarm_pair_req_t) == 6);
-    assert(sizeof(swarm_pair_ack_t) == 26);
-    assert(sizeof(swarm_reading_t) == 23);
-    assert(sizeof(swarm_ping_t) == 6);
-    assert(sizeof(swarm_pong_t) == 6);
+     * matter precisely because of that overlap. Protocol v4 added a 2-byte
+     * `len` field to every frame's header, so every one of these grew by 2. */
+    assert(sizeof(swarm_pair_req_t) == 8);
+    assert(sizeof(swarm_pair_ack_t) == 28);
+    assert(sizeof(swarm_reading_t) == 25);
+    assert(sizeof(swarm_ping_t) == 8);
+    assert(sizeof(swarm_pong_t) == 8);
     /* protocol v3 additions */
-    assert(sizeof(swarm_forget_t) == 8);  /* +6 for target_mac, closing the "forgets every node" defect */
+    assert(sizeof(swarm_forget_t) == 10);  /* +6 for target_mac, closing the "forgets every node" defect */
     /* +4 for session_id on both (M5c hardware round 1 fix: OTA_STATUS became
      * broadcast/plaintext and needs a way to reject a status from a stale or
      * aborted session -- see swarm_frame.h). */
-    assert(sizeof(swarm_ota_begin_t) == 58);
-    assert(sizeof(swarm_ota_chunk_t) == 8 + SWARM_OTA_CHUNK_DATA);
-    assert(sizeof(swarm_ota_status_t) == 12);
-    assert(sizeof(swarm_ota_abort_t) == 3);
+    assert(sizeof(swarm_ota_begin_t) == 60);
+    assert(sizeof(swarm_ota_chunk_t) == 10 + SWARM_OTA_CHUNK_DATA);
+    assert(sizeof(swarm_ota_status_t) == 14);
+    assert(sizeof(swarm_ota_abort_t) == 5);
 
     /* --- reading round-trip --- */
     swarm_reading_t r = {
@@ -40,6 +58,11 @@ int main(void)
     assert(swarm_frame_type(buf, n) == SWARM_MSG_READING);
     swarm_reading_t out;
     assert(swarm_decode_reading(buf, n, &out));
+    /* the encoder fills `len` on the wire regardless of what `r.len` held
+     * in memory (it was never set above); mirror that into `r` so the
+     * full-struct comparison below reflects the encoder's contract rather
+     * than an incidental zero-initialized field. */
+    r.len = (uint16_t)(n - SWARM_HDR_LEN);
     assert(memcmp(&r, &out, sizeof(r)) == 0);
 
     /* negative temperature and absent markers survive */
@@ -130,7 +153,7 @@ int main(void)
                                  .offset = 4096, .len = SWARM_OTA_CHUNK_DATA };
     for (int i = 0; i < SWARM_OTA_CHUNK_DATA; i++) chunk.data[i] = (uint8_t)i;
     n = swarm_encode_ota_chunk(&chunk, buf, sizeof(buf));
-    assert(n == 8 + SWARM_OTA_CHUNK_DATA);
+    assert(n == 10 + SWARM_OTA_CHUNK_DATA);
     assert(swarm_frame_type(buf, n) == SWARM_MSG_OTA_CHUNK);
     swarm_ota_chunk_t chunk_out;
     assert(swarm_decode_ota_chunk(buf, n, &chunk_out));
@@ -142,7 +165,7 @@ int main(void)
                                 .offset = 1048570, .len = 7 };
     for (int i = 0; i < 7; i++) last.data[i] = (uint8_t)(0x10 + i);
     n = swarm_encode_ota_chunk(&last, buf, sizeof(buf));
-    assert(n == 8 + 7);                                /* true size, not padded */
+    assert(n == 10 + 7);                                /* true size, not padded */
     assert(swarm_frame_type(buf, n) == SWARM_MSG_OTA_CHUNK);
     swarm_ota_chunk_t last_out;
     memset(&last_out, 0xAA, sizeof(last_out));         /* poison to catch stale bytes */
@@ -205,7 +228,7 @@ int main(void)
      * data byte is read. A hostile or buggy sender controls every byte
      * here, including `len` itself. --- */
     {
-        enum { hdr = 8 }; /* version+type+offset+len */
+        enum { hdr = 10 }; /* version+type+hdr_len+offset+len */
 
         /* declared len too large for the actual (short) buffer: the frame
          * claims a full 200-byte chunk but only hdr+50 bytes were sent. */
@@ -216,6 +239,12 @@ int main(void)
         uint16_t declared = SWARM_OTA_CHUNK_DATA;
         memcpy(raw + offsetof(swarm_ota_chunk_t, len), &declared, sizeof(declared));
         size_t short_buf_len = hdr + 50;
+        /* v4 generic header: buf[2..3] must equal (buffer length - 4) for
+         * swarm_frame_type() to accept it at all -- set it to match
+         * short_buf_len (== long_buf_len below) so the OTA_CHUNK-range
+         * check, not this generic one, is what's under test here. */
+        uint16_t hdr_len_field = (uint16_t)(short_buf_len - SWARM_HDR_LEN);
+        memcpy(raw + 2, &hdr_len_field, sizeof(hdr_len_field));
         /* within swarm_frame_type()'s accepted RANGE (still <= hdr+CHUNK_DATA)... */
         assert(swarm_frame_type(raw, short_buf_len) == SWARM_MSG_OTA_CHUNK);
         /* ...but the decoder must still reject it: len says 200, buffer has 50. */
@@ -227,6 +256,7 @@ int main(void)
         declared = 7;
         memcpy(raw + offsetof(swarm_ota_chunk_t, len), &declared, sizeof(declared));
         size_t long_buf_len = hdr + 50;
+        /* long_buf_len == short_buf_len, so the header field set above still matches. */
         assert(swarm_frame_type(raw, long_buf_len) == SWARM_MSG_OTA_CHUNK);
         assert(!swarm_decode_ota_chunk(raw, long_buf_len, &bad_out));
 
@@ -235,6 +265,8 @@ int main(void)
         declared = SWARM_OTA_CHUNK_DATA + 1;
         memcpy(raw + offsetof(swarm_ota_chunk_t, len), &declared, sizeof(declared));
         size_t cap_buf_len = hdr + SWARM_OTA_CHUNK_DATA; /* matches old (wrong) cap only */
+        hdr_len_field = (uint16_t)(cap_buf_len - SWARM_HDR_LEN);
+        memcpy(raw + 2, &hdr_len_field, sizeof(hdr_len_field));
         assert(!swarm_decode_ota_chunk(raw, cap_buf_len, &bad_out));
 
         /* truncated buffer: shorter than even the fixed header. */
@@ -280,7 +312,7 @@ int main(void)
                               .power_mode = 2, .wake_counter = 12345 };
         uint8_t buf[16];
         size_t n = swarm_encode_checkin(&c, buf, sizeof buf);
-        assert(n == 7);
+        assert(n == 9);
         swarm_checkin_t out;
         assert(swarm_decode_checkin(buf, n, &out));
         assert(out.power_mode == 2 && out.wake_counter == 12345);
@@ -294,7 +326,7 @@ int main(void)
                                   .command = SWARM_CHECKIN_CMD_SET_MODE, .arg = 1 };
         uint8_t buf[8];
         size_t n = swarm_encode_checkin_ack(&a, buf, sizeof buf);
-        assert(n == 4);
+        assert(n == 6);
         swarm_checkin_ack_t out;
         assert(swarm_decode_checkin_ack(buf, n, &out));
         assert(out.command == SWARM_CHECKIN_CMD_SET_MODE && out.arg == 1);
