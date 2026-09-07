@@ -138,10 +138,12 @@ actor_verdict_t actor_table_check(actor_table_t *t, int dev_idx, uint8_t action_
     if (!action_param_ok(action_id, param) || param > slot->param_max)
         return ACTOR_REFUSED_BOUND;
 
-    /* The operator's stop button: refuses a rule, permits a manual press,
-     * and permits the safety close -- a lockout that blocked the safety
-     * close would strand an actuator open. */
-    if (row->lockout && source == ACTOR_SRC_RULE)
+    /* The operator's stop button: refuses a rule (and, M7 Task 6, a
+     * hub-relayed remote command -- ACTOR_SRC_REMOTE is rule-class, see
+     * actor_source_t's own comment), permits a manual press, and permits
+     * the safety close -- a lockout that blocked the safety close would
+     * strand an actuator open. */
+    if (row->lockout && (source == ACTOR_SRC_RULE || source == ACTOR_SRC_REMOTE))
         return ACTOR_REFUSED_LOCKOUT;
 
     /* ACTOR_SRC_SAFETY is exempt from every guard below this point: its
@@ -152,9 +154,9 @@ actor_verdict_t actor_table_check(actor_table_t *t, int dev_idx, uint8_t action_
      *
      *   unknown  -> refuses every source
      *   bound    -> refuses every source, SAFETY included
-     *   lockout  -> refuses RULE; permits MANUAL and SAFETY
-     *   cooldown -> refuses RULE and MANUAL; permits SAFETY
-     *   rate     -> refuses RULE and MANUAL; permits SAFETY */
+     *   lockout  -> refuses RULE and REMOTE; permits MANUAL and SAFETY
+     *   cooldown -> refuses RULE, REMOTE and MANUAL; permits SAFETY
+     *   rate     -> refuses RULE, REMOTE and MANUAL; permits SAFETY */
     if (source == ACTOR_SRC_SAFETY) return ACTOR_OK;
 
     /* window_count > 0 doubles as "this pair has fired at least once":

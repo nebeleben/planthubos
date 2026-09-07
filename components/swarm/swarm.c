@@ -27,6 +27,11 @@
  * (swarm -> zigbee); zigbee.c itself must never include anything from this
  * component (see zigbee.h's own top comment on the CMake-cycle this avoids). */
 #include "zigbee.h"
+/* M7 Task 6: a zigbee-role node's command task is the ONLY thing on a
+ * bridge node that ever calls into the actor queue (actor_request()/
+ * actor_service()) -- the hub-side hub_rx_cb path never touches it. Same
+ * one-way dependency shape as zigbee.h just above. */
+#include "actor.h"
 
 #include "cJSON.h"
 #include "esp_event.h"
@@ -1100,6 +1105,39 @@ static QueueHandle_t s_checkin_ack_queue;
  * s_checkin_ack_queue above. */
 static QueueHandle_t s_node_cfg_queue;
 
+/* ---------------- Node side: COMMAND hand-off (M7 Task 6) ----------------
+ *
+ * Same DEFERRAL pattern, and same reasoning, as s_node_cfg_queue just
+ * above: acting on a SWARM_MSG_COMMAND (opening permit-join, sending a ZCL
+ * command, a store rename/remove, a boot-replay-style resync) needs the
+ * Zigbee stack lock and/or a flash write, none of which node_rx_cb (the
+ * WiFi driver task) may ever do -- so it only decodes and does a
+ * non-blocking send onto this queue; command_task() (below, in the "node
+ * side: command task" section) does the actual work. Depth 4, not 1: a
+ * hub could plausibly have more than one command in flight for this node
+ * (e.g. an ACTUATE followed immediately by a RESYNC) and, unlike
+ * NODE_CONFIG/CHECKIN_ACK, this node does not itself gate how many the hub
+ * sends before an ack comes back -- matches swarm_command_t's own seq
+ * space and this being the size the brief specifies. Created eagerly, in
+ * swarm_start_node() below, only for a zigbee-role node (the hub never
+ * sends a COMMAND to a BLE-role node), before espnow_link_init() hands
+ * node_rx_cb its first frame -- same eager-init reasoning as
+ * s_checkin_ack_queue above. */
+static QueueHandle_t s_cmd_queue;
+
+/* Hand-off in the OTHER direction: zb_cmd_report() (zb_cmd.c) reports an
+ * ACTUATE's outcome from on_zb_result() below, which may run on the Zigbee
+ * stack task (a Default Response or a timeout) rather than command_task()'s
+ * own task -- see zb_cmd_result_t's doc comment in zigbee.h. Sending the
+ * SWARM_MSG_COMMAND_ACK itself needs espnow_link_send(), which this file's
+ * other cross-task hand-offs never call directly from a producer either,
+ * so on_zb_result() only ever does a non-blocking send onto this queue;
+ * command_task() drains it on the same loop that drains s_cmd_queue. Depth
+ * 1 is enough: s_actuate_pending (below) is single-slot, so at most one
+ * ACTUATE outcome is ever outstanding at a time. Created eagerly, alongside
+ * s_cmd_queue above. */
+static QueueHandle_t s_ack_queue;
+
 /* Pops a NODE_CONFIG off s_node_cfg_queue and applies it. Fix round 1:
  * first compares the requested role against this node's CURRENT role
  * (radio_role_is_set() ? radio_role_get() : RADIO_ROLE_BLE, same "unknown
@@ -1306,6 +1344,31 @@ static void node_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, i
             uint8_t hub_mac[6];
             if (swarm_store_hub(hub_mac, NULL, NULL) && memcmp(src_mac, hub_mac, 6) == 0) {
                 if (s_node_cfg_queue) xQueueSend(s_node_cfg_queue, &cfg, 0);
+            }
+        }
+        return;
+    }
+
+    if (type == SWARM_MSG_COMMAND) {
+        /* Hub -> node, unicast (M7 Task 6): same source-check reasoning as
+         * NODE_CONFIG just above -- only a COMMAND from this node's own
+         * stored hub is ever queued, so a stray or spoofed frame from
+         * anyone else in radio range cannot permit-join, actuate, remove,
+         * rename or resync this bridge. Decode failure is silently
+         * dropped, same as every other decoder call on this path. Actually
+         * acting on it (permit-join, actor_request(), a store lookup, a
+         * flash-touching rename/remove) needs the Zigbee stack lock and/or
+         * NVS, so -- same DEFERRAL pattern as NODE_CONFIG -- this callback
+         * only decodes and does a non-blocking send onto s_cmd_queue;
+         * command_task() (below) does the actual work. s_cmd_queue is only
+         * ever non-NULL on a zigbee-role node (created in
+         * swarm_start_node()'s zigbee block), so this is a silent no-op on
+         * a BLE-role node that somehow received one. */
+        swarm_command_t cmd;
+        if (swarm_decode_command(data, (size_t)len, &cmd)) {
+            uint8_t hub_mac[6];
+            if (swarm_store_hub(hub_mac, NULL, NULL) && memcmp(src_mac, hub_mac, 6) == 0) {
+                if (s_cmd_queue) xQueueSend(s_cmd_queue, &cmd, 0);
             }
         }
         return;
@@ -1784,15 +1847,30 @@ static void zb_status_observer(void)
 #define ZB_BOOT_REPLAY_POLL_MS   100u
 #define ZB_BOOT_REPLAY_MAX_POLLS 100u  /* ~10s */
 
+/* The actual replay: reads zigbee.c's current device list and re-announces
+ * every entry through zb_observer(), same as a live join/re-interview
+ * would. Factored out (M7 Task 6) so zb_boot_replay_task() below and
+ * command_task()'s SWARM_CMD_RESYNC handling share the exact same replay
+ * rather than two copies that could drift -- a hub-requested resync is
+ * meant to reproduce the boot replay on demand, not a different, looser
+ * approximation of it. Does not touch COORD_STATUS; both callers queue
+ * that themselves right after, since a resync's status is current-state
+ * (queue_coord_status()), never something this function needs to know
+ * about. */
+static void replay_announces(void)
+{
+    zb_device_t list[ZB_STORE_MAX_DEVICES];
+    int n = zigbee_device_list(list, ZB_STORE_MAX_DEVICES);
+    for (int d = 0; d < n; d++) zb_observer(&list[d], false);
+    ESP_LOGI(TAG, "zigbee device replay: %d device(s) announced", n);
+}
+
 static void zb_boot_replay_task(void *arg)
 {
     (void)arg;
     for (uint32_t i = 0; i < ZB_BOOT_REPLAY_MAX_POLLS; i++) {
         if (zigbee_net_info(NULL, NULL, NULL)) {
-            zb_device_t list[ZB_STORE_MAX_DEVICES];
-            int n = zigbee_device_list(list, ZB_STORE_MAX_DEVICES);
-            for (int d = 0; d < n; d++) zb_observer(&list[d], false);
-            ESP_LOGI(TAG, "zigbee boot replay: %d device(s) announced", n);
+            replay_announces();
             queue_coord_status();
             vTaskDelete(NULL);
             return;
@@ -1802,6 +1880,220 @@ static void zb_boot_replay_task(void *arg)
     ESP_LOGW(TAG, "zigbee boot replay: gave up waiting for zigbee_start() to finish; "
                   "no boot announce/status sent this boot");
     vTaskDelete(NULL);
+}
+
+/* ---------------- Node side: command task (M7 Task 6) ----------------
+ *
+ * A zigbee-role bridge node's other half of the M7 bridge: where Task 5
+ * only ever pushes data UP to the hub (announce/gone/measurement/status),
+ * this is the hub pushing commands DOWN -- permit-join, actuate, remove,
+ * rename, resync -- and this node acking each one back. s_cmd_queue is
+ * filled by node_rx_cb's SWARM_MSG_COMMAND case above; s_ack_queue is
+ * filled by on_zb_result() below, whenever zb_cmd_report() (zb_cmd.c)
+ * reports an ACTUATE's outcome from the Zigbee stack task rather than
+ * this task's own. */
+
+/* Encodes and sends one SWARM_COMMAND_ACK to the hub. A failed send is
+ * logged, not retried: the hub's own command retry (if it has one) is what
+ * recovers a lost ack, the same posture node_config_task()'s
+ * NODE_CONFIG_ACK send already takes just above. */
+static void send_cmd_ack(uint16_t seq, uint8_t op, uint8_t status, uint8_t detail)
+{
+    swarm_command_ack_t a = { .seq = seq, .op = op, .status = status, .detail = detail };
+    uint8_t buf[16];
+    size_t  n = swarm_encode_command_ack(&a, buf, sizeof buf);
+    if (!n) {
+        ESP_LOGE(TAG, "COMMAND_ACK: failed to encode (seq=%u op=%u)", (unsigned)seq, (unsigned)op);
+        return;
+    }
+    esp_err_t err = espnow_link_send(s_hub_mac, buf, n);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "COMMAND_ACK send failed (%s), dropped -- the hub's own retry (if any) "
+                      "recovers a lost ack", esp_err_to_name(err));
+    }
+}
+
+/* An ACTUATE is the one command whose outcome is not known until later --
+ * a ZCL Default Response, or zb_cmd.c's own timeout, both of which can be
+ * seconds after actor_request() merely accepted it onto the queue. This is
+ * the single-slot record of "which SWARM_CMD_ACTUATE are we still waiting
+ * on", keyed by dev_idx: single-slot, not a table, because a second
+ * ACTUATE is refused (SWARM_ACK_FAILED, detail 0xfe -- "busy") while one is
+ * still pending, exactly so this never needs to track more than one. Only
+ * ever written by command_task() itself (both the ACTUATE case that arms
+ * it and on_zb_result() -- called synchronously, on this same task, for
+ * every SYNCHRONOUS on_zb_dispatch() failure that routes through
+ * zb_cmd_report() before a tsn is ever assigned; see command_task()'s call
+ * to actor_service() below), except for the async completion path, which
+ * only ever CLEARS `active`, never anything else -- so there is no real
+ * race to guard here even though on_zb_result() can also run on the
+ * Zigbee stack task. */
+static struct { int dev_idx; uint16_t seq; bool active; } s_actuate_pending;
+
+/* zigbee.h's zb_cmd_result_t -- zb_cmd_report()'s one registered consumer
+ * (registered below, in swarm_start_node()'s zigbee block, before
+ * zigbee_start()). Fires on whichever task produced the outcome: the
+ * Zigbee stack task for a real Default Response or a timeout, or
+ * command_task()'s own task for a pre-dispatch failure (on_zb_dispatch()
+ * calls zb_cmd_report() synchronously, from inside actor_service(), which
+ * command_task() calls directly below) -- either way this must do nothing
+ * but a non-blocking queue send, per zb_cmd_result_t's own contract, so
+ * the actual espnow_link_send() always happens on command_task()'s task,
+ * never here. */
+static void on_zb_result(int dev_idx, uint8_t action_id, uint16_t param, bool ok, uint8_t zcl_status)
+{
+    (void)action_id;
+    (void)param;
+    if (!s_actuate_pending.active || s_actuate_pending.dev_idx != dev_idx) {
+        /* Not this node's one outstanding ACTUATE (already cleared by a
+         * duplicate/late report, or an outcome for some other dispatch
+         * entirely -- e.g. a rule/manual command against the same device,
+         * which this bridge does not track here). Nothing to ack. */
+        return;
+    }
+    s_actuate_pending.active = false;
+    swarm_command_ack_t a = { .seq = s_actuate_pending.seq, .op = SWARM_CMD_ACTUATE,
+                              .status = ok ? SWARM_ACK_DONE : SWARM_ACK_FAILED, .detail = zcl_status };
+    if (!s_ack_queue || xQueueSend(s_ack_queue, &a, 0) != pdTRUE)
+        ESP_LOGW(TAG, "ack queue full/absent, dropping ACTUATE result (seq=%u)", (unsigned)a.seq);
+}
+
+/* Drains s_ack_queue (deferred acks for an ACTUATE outcome reported from
+ * off-task) and s_cmd_queue (fresh COMMAND frames from the hub), and pumps
+ * actor_service() -- the dispatch pump ble_collector.c's adv_decoder_task
+ * runs for a BLE-role device, which a zigbee-role bridge node never starts
+ * (main.c only calls ble_collector_start() for RADIO_ROLE_BLE), so without
+ * this an ACTUATE would sit in actor.c's queue forever and never reach
+ * zb_cmd.c's dispatch hook at all. Safe to call every pass: actor_service()
+ * is a cheap no-op when its queue is empty, the same way it is for
+ * ble_collector.c's caller.
+ *
+ * Duplicate suppression: `last_seq`/`last_op`/`last_status` remember only
+ * the MOST RECENT command's outcome, not a history -- a hub that resends
+ * the same seq (its own ack timeout/retry) gets the identical ack replayed
+ * (detail forced to 0, since a replay's actual detail is a separate zb_cmd
+ * result already reported once, not a full re-run of the command) rather
+ * than the command being acted on twice; an ACTUATE in particular must
+ * never re-issue a second actor_request() for a command already accepted.
+ * A single remembered seq is enough because command_task() processes
+ * s_cmd_queue strictly one at a time, so an out-of-order duplicate two-back
+ * (rather than the immediately preceding command) is not a case the hub's
+ * own single-outstanding-command-per-node discipline produces. */
+static void command_task(void *arg)
+{
+    (void)arg;
+    static uint16_t last_seq = 0xffff;
+    static uint8_t  last_status = 0, last_op = 0;
+    for (;;) {
+        actor_service();
+
+        swarm_command_ack_t queued;
+        if (xQueueReceive(s_ack_queue, &queued, 0) == pdTRUE) {
+            send_cmd_ack(queued.seq, queued.op, queued.status, queued.detail);
+            continue;
+        }
+
+        swarm_command_t c;
+        if (xQueueReceive(s_cmd_queue, &c, pdMS_TO_TICKS(200)) != pdTRUE) continue;
+
+        if (c.seq == last_seq) {
+            send_cmd_ack(c.seq, last_op, last_status, 0);
+            continue;
+        }
+
+        /* ttl_s is informational here, not enforced: this task cannot know
+         * how long a COMMAND frame sat anywhere before being decoded (no
+         * receipt timestamp travels with it), so there is no honest way to
+         * treat it as already-expired and drop it silently. Every decoded
+         * command gets an ack, always -- ACTUATE alone forwards ttl_s
+         * onward, as actor_request()'s own deadline_s, where actor.c's
+         * queue (which DOES know when "now" is on this device) enforces it
+         * for real. */
+        uint8_t status = SWARM_ACK_FAILED, detail = 0;
+        switch (c.op) {
+        case SWARM_CMD_PERMIT_JOIN:
+            /* c.arg is NOT consulted here: zigbee.h's zigbee_permit_join()
+             * takes no duration argument -- it always opens for
+             * CONFIG_PLANTHUB_ZB_PERMIT_JOIN_S and has no "close now" entry
+             * point, and widening its signature would also have to touch
+             * api_v1.c's own PERMIT_JOIN route (out of this task's file
+             * list, and off-limits). So a hub-requested permit-join always
+             * opens (or re-opens) for the compiled-in duration regardless
+             * of what `arg` asked for; c.arg == 0 does NOT close an
+             * already-open window early. The STATUS frame this bridge
+             * already sends on open/close (Task 5) still carries the real
+             * countdown either way, so the hub's UI is never told a wrong
+             * duration -- only a hub that specifically wants a SHORTER or
+             * an early-closed window than the compiled-in default does not
+             * get that today. */
+            status = zigbee_permit_join() ? SWARM_ACK_DONE : SWARM_ACK_FAILED;
+            break;
+        case SWARM_CMD_DEVICE_REMOVE: {
+            zb_device_t list[ZB_STORE_MAX_DEVICES];
+            int n = zigbee_device_list(list, ZB_STORE_MAX_DEVICES);
+            int found = -1;
+            for (int i = 0; i < n; i++)
+                if (memcmp(list[i].eui64, c.dev.addr, 8) == 0) { found = i; break; }
+            if (found < 0) { detail = 1; break; }
+            status = zigbee_device_remove(c.dev.addr) ? SWARM_ACK_DONE : SWARM_ACK_FAILED;
+            if (status != SWARM_ACK_DONE) detail = 2;
+            break; }
+        case SWARM_CMD_DEVICE_RENAME: {
+            zb_device_t list[ZB_STORE_MAX_DEVICES];
+            int n = zigbee_device_list(list, ZB_STORE_MAX_DEVICES);
+            int found = -1;
+            for (int i = 0; i < n; i++)
+                if (memcmp(list[i].eui64, c.dev.addr, 8) == 0) { found = i; break; }
+            if (found < 0) { detail = 1; break; }
+            char name[SWARM_DEV_NAME_MAX + 1];
+            uint8_t name_len = c.name_len > SWARM_DEV_NAME_MAX ? SWARM_DEV_NAME_MAX : c.name_len;
+            memcpy(name, c.name, name_len);
+            name[name_len] = '\0';
+            status = zigbee_device_rename(c.dev.addr, name) ? SWARM_ACK_DONE : SWARM_ACK_FAILED;
+            if (status != SWARM_ACK_DONE) detail = 2;
+            break; }
+        case SWARM_CMD_RESYNC:
+            replay_announces();
+            queue_coord_status();
+            status = SWARM_ACK_DONE;
+            break;
+        case SWARM_CMD_ACTUATE: {
+            if (s_actuate_pending.active) {
+                /* Single-slot pending record, already occupied: refuse
+                 * rather than clobber the ACTUATE this bridge is already
+                 * waiting on a result for. */
+                detail = 0xfe;
+                break;
+            }
+            device_id_t id = { .kind = DEV_KIND_ZIGBEE };
+            memcpy(id.addr, c.dev.addr, 8);
+            int idx = data_core_find_index(&id);
+            if (idx < 0) {
+                /* Vanished between the hub last seeing it announced and
+                 * this command arriving (removed, or never actually
+                 * registered on this bridge) -- FAILED, not a crash. */
+                detail = 1;
+                break;
+            }
+            s_actuate_pending = (typeof(s_actuate_pending)){ .dev_idx = idx, .seq = c.seq, .active = true };
+            bool queued_ok = actor_request(idx, (uint8_t)(c.arg & 0xff), (uint16_t)(c.arg >> 8),
+                                            ACTOR_SRC_REMOTE, actor_now_s() + c.ttl_s);
+            if (!queued_ok) {
+                s_actuate_pending.active = false;
+                detail = 2;
+                break;
+            }
+            status = SWARM_ACK_ACCEPTED;
+            break; }
+        default:
+            break;
+        }
+
+        last_seq = c.seq;
+        last_op = c.op;
+        last_status = status;
+        send_cmd_ack(c.seq, c.op, status, detail);
+    }
 }
 
 /* Brings up WiFi far enough for ESP-NOW without ever joining any network:
@@ -2463,6 +2755,49 @@ esp_err_t swarm_start_node(void)
         if (xTaskCreate(zb_boot_replay_task, "swarm_zb_replay", 3072, NULL, 3, NULL) != pdPASS) {
             ESP_LOGE(TAG, "failed to create zigbee boot replay task; the hub will not learn "
                           "this bridge's already-known devices until they next announce");
+        }
+
+        /* M7 Task 6: a zigbee-role bridge never calls ble_collector_start()
+         * (main.c starts exactly one of BLE/Zigbee per node -- see
+         * radio_role.h), and actor_init() is otherwise called ONLY from
+         * there -- so without this, the shared actor table this device's
+         * own zigbee.c uses (actor_declare() at every device
+         * interview/restore) would stay raw BSS zero, where every row's
+         * dev_idx reads as 0 (not actor_table_init()'s -1 "free" sentinel)
+         * and actor_declare()/actor_request() silently fail or misattribute
+         * for any device other than index 0. Called here, before
+         * zigbee_start() (always the caller's very next step after this
+         * function returns -- see this file's own boot-order comments),
+         * so the table is ready before zb_register_restored_devices()
+         * makes its first actor_declare() call. actor_persist_init()/
+         * pending_close_init() are deliberately NOT called here: neither
+         * ACT_SWITCH_ON nor ACT_SWITCH_OFF (the only actions zb_cmd.c
+         * implements) ever arms a pending close (see zb_cmd.c's own top
+         * comment), and this bridge has no HTTP API of its own to persist
+         * operator-configured guards through a reboot. */
+        actor_init();
+
+        /* Same "must exist before node_rx_cb/command_task can use it"
+         * eager-init reasoning as s_checkin_ack_queue/s_node_cfg_queue
+         * above -- see s_cmd_queue/s_ack_queue's own comments. Only
+         * created on a zigbee-role node: the hub never sends a COMMAND to
+         * a BLE-role node, so neither queue is ever needed there. */
+        if (!s_cmd_queue) s_cmd_queue = xQueueCreate(4, sizeof(swarm_command_t));
+        if (!s_ack_queue) s_ack_queue = xQueueCreate(1, sizeof(swarm_command_ack_t));
+        if (!s_cmd_queue || !s_ack_queue) {
+            ESP_LOGE(TAG, "failed to create COMMAND queue(s); hub-initiated permit-join/"
+                          "actuate/remove/rename/resync will never be delivered this boot");
+        }
+
+        /* zb_cmd_result_t's one registrant (see zigbee.h's own doc
+         * comment) -- registered before zigbee_start() so no ACTUATE
+         * dispatched right after the network forms can ever report through
+         * an unset callback. */
+        zb_cmd_set_result_cb(on_zb_result);
+
+        if (xTaskCreate(command_task, "swarm_cmd", 3072, NULL, 3, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "failed to create command task; hub-initiated permit-join/actuate/"
+                          "remove/rename/resync will never be delivered this boot");
         }
     }
 

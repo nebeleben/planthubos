@@ -151,6 +151,28 @@ uint8_t zigbee_coordinator_endpoint(void);
  * A safe no-op when Zigbee is disabled at build time. */
 void zb_cmd_start(void);
 
+/* M7 Task 6: reports how a dispatched Zigbee actuator command ended, to
+ * whichever module cares about individual outcomes -- swarm.c's node-side
+ * command_task() on a zigbee-role bridge node, which acks ACCEPTED/DONE/
+ * FAILED back to the hub for a SWARM_CMD_ACTUATE. Called from zb_cmd.c's
+ * zb_cmd_report() on BOTH branches (confirmed and failed alike): `ok`
+ * mirrors zb_cmd_report()'s own outcome, and `zcl_status` is the ZCL
+ * Default Response's status code when one arrived (ESP_ZB_ZCL_STATUS_*) or
+ * 0xff when there is no real status to report -- a timeout
+ * (zb_cmd_timeout_cb()) or a failure before the command was ever sent
+ * (on_zb_dispatch()'s own early returns). Fires on whichever task produced
+ * the outcome -- the Zigbee stack task for a Default Response or a
+ * timeout, but the dispatching task itself (actor_service()'s caller) for
+ * a pre-dispatch failure -- so a registered callback must do nothing but a
+ * non-blocking queue send, the same contract as
+ * zigbee_device_observer_t/zigbee_status_observer_t above. A plain
+ * file-static function pointer, not a list, for the same "at most one
+ * radio role, at most one consumer" reason those two use. A safe no-op
+ * (the setter simply does nothing) when Zigbee is disabled at build time. */
+typedef void (*zb_cmd_result_t)(int dev_idx, uint8_t action_id, uint16_t param,
+                                 bool ok, uint8_t zcl_status);
+void zb_cmd_set_result_cb(zb_cmd_result_t fn);
+
 /* Forwards one Default Response's outcome from zigbee.c's single ZCL core
  * action handler (the SDK allows exactly one, network-wide) to zb_cmd.c,
  * which owns correlating it against whichever commands it currently has

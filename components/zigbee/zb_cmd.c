@@ -96,6 +96,18 @@ typedef struct {
 static portMUX_TYPE s_inflight_mux = portMUX_INITIALIZER_UNLOCKED;
 static zb_cmd_inflight_t s_inflight[ZB_CMD_MAX_INFLIGHT];
 
+/* M7 Task 6: the one registered consumer of zb_cmd_report()'s per-command
+ * outcome -- see zb_cmd_result_t's doc comment in zigbee.h. Plain
+ * file-static pointer, same convention as zigbee.c's own device/status
+ * observers: at most one radio role runs per boot, so at most one
+ * registrant ever exists. */
+static zb_cmd_result_t s_result_cb;
+
+void zb_cmd_set_result_cb(zb_cmd_result_t fn)
+{
+    s_result_cb = fn;
+}
+
 /* Reports how a dispatched command ended -- the completion contract
  * on_gatt_cmd_done() (ble_collector.c) already satisfies for GATT, applied
  * here. A FAILED command alerts, with the same code on_gatt_cmd_done()
@@ -116,16 +128,18 @@ static zb_cmd_inflight_t s_inflight[ZB_CMD_MAX_INFLIGHT];
  * has, so `ok` below already means "confirmed" -- there is nothing weaker
  * to distinguish it from. */
 static void zb_cmd_report(int8_t dev_idx, uint8_t action_id, uint16_t param,
-                           bool ok, const char *reason)
+                           bool ok, const char *reason, uint8_t zcl_status)
 {
     if (!ok) {
         ESP_LOGW(TAG, "command failed: dev=%d action=%u param=%u (%s)", (int)dev_idx,
                  (unsigned)action_id, (unsigned)param, reason ? reason : "unknown");
         alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_COMMAND_FAILED, dev_idx, action_id, param);
+        if (s_result_cb) s_result_cb(dev_idx, action_id, param, ok, zcl_status);
         return;
     }
     ESP_LOGI(TAG, "command confirmed: dev=%d action=%u param=%u", (int)dev_idx,
              (unsigned)action_id, (unsigned)param);
+    if (s_result_cb) s_result_cb(dev_idx, action_id, param, ok, zcl_status);
 }
 
 /* esp_zb_scheduler_alarm() callback (esp_zb_callback_t: void(uint8_t)) --
@@ -156,7 +170,7 @@ static void zb_cmd_timeout_cb(uint8_t slot_idx)
     if (!was_used) return;
 
     zb_cmd_report(cmd.dev_idx, cmd.action_id, cmd.param, false,
-                  "no Default Response within the timeout");
+                  "no Default Response within the timeout", 0xff);
 }
 
 void zb_cmd_on_default_resp(uint8_t tsn, uint16_t cluster, uint8_t resp_to_cmd,
@@ -211,7 +225,8 @@ void zb_cmd_on_default_resp(uint8_t tsn, uint16_t cluster, uint8_t resp_to_cmd,
 
     bool ok = (status_code == ESP_ZB_ZCL_STATUS_SUCCESS);
     zb_cmd_report(cmd.dev_idx, cmd.action_id, cmd.param, ok,
-                  ok ? NULL : "device returned a non-success Default Response status");
+                  ok ? NULL : "device returned a non-success Default Response status",
+                  status_code);
 }
 
 /* actor_service()'s DEV_KIND_ZIGBEE dispatch hook (actor_dispatch_fn_t,
@@ -232,7 +247,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
          * (ACT_IRRIGATION_OPEN, ACT_PUMP_RUN -- action.h) must post an
          * alert and never be silently dropped. */
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "the Zigbee command engine does not implement this action");
+                      "the Zigbee command engine does not implement this action", 0xff);
         return;
     }
 
@@ -247,7 +262,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
     uint8_t key[ACTOR_DEVICE_KEY_LEN];
     if (!actor_device_key(cmd->dev_idx, key) || key[0] != DEV_KIND_ZIGBEE) {
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "no stable Zigbee identity for this device");
+                      "no stable Zigbee identity for this device", 0xff);
         return;
     }
     const uint8_t *eui64 = key + 1;
@@ -258,7 +273,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
     uint8_t  endpoint;
     if (!zigbee_store_lookup(eui64, &short_addr, &endpoint)) {
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "device not present in the Zigbee store");
+                      "device not present in the Zigbee store", 0xff);
         return;
     }
     if (short_addr == 0xFFFF) {
@@ -267,7 +282,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
          * response that carries one) -- never a real joined device's short
          * address. */
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "device has no usable short address");
+                      "device has no usable short address", 0xff);
         return;
     }
 
@@ -296,7 +311,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
         ESP_LOGW(TAG, "%u Zigbee command(s) already outstanding; dev=%d action=%u dropped",
                  (unsigned)ZB_CMD_MAX_INFLIGHT, (int)cmd->dev_idx, (unsigned)cmd->action_id);
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "too many Zigbee commands already outstanding");
+                      "too many Zigbee commands already outstanding", 0xff);
         return;
     }
 
@@ -309,7 +324,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
         s_inflight[slot].used = false;
         portEXIT_CRITICAL(&s_inflight_mux);
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "could not acquire the Zigbee stack lock");
+                      "could not acquire the Zigbee stack lock", 0xff);
         return;
     }
 
@@ -370,6 +385,11 @@ void zb_cmd_on_default_resp(uint8_t tsn, uint16_t cluster, uint8_t resp_to_cmd,
     (void)cluster;
     (void)resp_to_cmd;
     (void)status_code;
+}
+
+void zb_cmd_set_result_cb(zb_cmd_result_t fn)
+{
+    (void)fn;
 }
 
 #endif /* CONFIG_PLANTHUB_ZB_ENABLED */
