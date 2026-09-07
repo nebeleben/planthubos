@@ -30,8 +30,11 @@ int main(void)
      * PAIR_REQ, PING and PONG all happen to be the same 6-byte shape
      * (version+type+nonce) -- see the type-confusion checks below, which
      * matter precisely because of that overlap. Protocol v4 added a 2-byte
-     * `len` field to every frame's header, so every one of these grew by 2. */
-    assert(sizeof(swarm_pair_req_t) == 8);
+     * `len` field to every frame's header, so every one of these grew by 2.
+     * M7 then added `radio_role` to PAIR_REQ alone (after `len`, ahead of
+     * the still-load-bearing `nonce` -- see swarm_frame.h), so it no
+     * longer shares PING/PONG's size. */
+    assert(sizeof(swarm_pair_req_t) == 9);
     assert(sizeof(swarm_pair_ack_t) == 28);
     assert(sizeof(swarm_reading_t) == 25);
     assert(sizeof(swarm_ping_t) == 8);
@@ -269,12 +272,23 @@ int main(void)
         memcpy(raw + 2, &hdr_len_field, sizeof(hdr_len_field));
         assert(!swarm_decode_ota_chunk(raw, cap_buf_len, &bad_out));
 
-        /* truncated buffer: shorter than even the fixed header. */
-        assert(swarm_frame_type(raw, hdr - 1) == -1);
-        assert(!swarm_decode_ota_chunk(raw, hdr - 1, &bad_out));
+        /* truncated buffer: shorter than even the fixed header. Set
+         * raw[2..3] to match this buffer's own length first, so it's the
+         * chunk-specific range check under test here, not the generic
+         * header-length mismatch left over from the block above. */
+        size_t trunc_len = hdr - 1;
+        hdr_len_field = (uint16_t)(trunc_len - SWARM_HDR_LEN);
+        memcpy(raw + 2, &hdr_len_field, sizeof(hdr_len_field));
+        assert(swarm_frame_type(raw, trunc_len) == -1);
+        assert(!swarm_decode_ota_chunk(raw, trunc_len, &bad_out));
 
-        /* over-long buffer: longer than header + max data. */
-        assert(swarm_frame_type(raw, hdr + SWARM_OTA_CHUNK_DATA + 1) == -1);
+        /* over-long buffer: longer than header + max data. Same fix: match
+         * raw[2..3] to this buffer's length so the OTA_CHUNK range check
+         * (not the generic header-length check) is what rejects it. */
+        size_t overlong_len = hdr + SWARM_OTA_CHUNK_DATA + 1;
+        hdr_len_field = (uint16_t)(overlong_len - SWARM_HDR_LEN);
+        memcpy(raw + 2, &hdr_len_field, sizeof(hdr_len_field));
+        assert(swarm_frame_type(raw, overlong_len) == -1);
     }
 
     /* type confusion: a PAIR_ACK-length buffer must not decode as a reading
@@ -333,6 +347,91 @@ int main(void)
         assert(!swarm_decode_checkin_ack(buf, 3, &out));
         buf[1] = SWARM_MSG_CHECKIN;                            /* wrong type */
         assert(!swarm_decode_checkin_ack(buf, n, &out));
+    }
+
+    /* v4: DEVICE_ANNOUNCE round trip, sizes, bounds */
+    {
+        swarm_device_announce_t a = { .dev = { .kind = 2, .addr = {1,2,3,4,5,6,7,8} },
+            .endpoint = 1, .interviewed = 1, .name_len = 5, .name = "Light",
+            .cap_count = 2, .cap_ids = {2, 7}, .cap_clusters = {0x0400, 0x0001},
+            .action_count = 1, .action_ids = {0} };
+        uint8_t buf[80];
+        size_t n = swarm_encode_device_announce(&a, buf, sizeof buf);
+        /* 4 hdr + 1 kind + 8 addr + 1 ep + 1 iv + 1 + 5 name + 1 + 2*(1+2) + 1 + 1
+         * = 4+1+8+1+1+1+5+1+6+1+1 = 30 (the brief's own listed terms sum to 30,
+         * not the 32 its assert originally claimed -- arithmetic slip, fixed here). */
+        assert(n == 30);
+        swarm_device_announce_t o;
+        assert(swarm_decode_device_announce(buf, n, &o));
+        assert(o.dev.kind == 2 && o.dev.addr[7] == 8 && o.endpoint == 1 && o.interviewed == 1);
+        assert(o.name_len == 5 && memcmp(o.name, "Light", 5) == 0);
+        assert(o.cap_count == 2 && o.cap_ids[1] == 7 && o.cap_clusters[1] == 0x0001);
+        assert(o.action_count == 1 && o.action_ids[0] == 0);
+        assert(!swarm_decode_device_announce(buf, n - 1, &o));      /* short */
+        uint8_t big[80]; memcpy(big, buf, n); big[15] = 30;           /* name_len > max */
+        assert(!swarm_decode_device_announce(big, n, &o));
+        memcpy(big, buf, n); big[21] = 5;                             /* cap_count > max */
+        assert(!swarm_decode_device_announce(big, n, &o));
+        swarm_device_announce_t z = { .dev = { .kind = 2 } };         /* empty lists, empty name */
+        n = swarm_encode_device_announce(&z, buf, sizeof buf);
+        assert(n == 4 + 1 + 8 + 1 + 1 + 1 + 1 + 1);
+        assert(swarm_decode_device_announce(buf, n, &o) && o.cap_count == 0 && o.name_len == 0);
+        assert(swarm_encode_device_announce(&a, buf, 10) == 0);       /* cap too small */
+    }
+    /* v4: DEVICE_GONE */
+    {
+        swarm_device_gone_t g = { .dev = { .kind = 2, .addr = {9,9,9,9,9,9,9,9} } };
+        uint8_t buf[16]; size_t n = swarm_encode_device_gone(&g, buf, sizeof buf);
+        assert(n == 13);
+        swarm_device_gone_t o; assert(swarm_decode_device_gone(buf, n, &o) && o.dev.addr[0] == 9);
+        buf[1] = SWARM_MSG_MEASUREMENT; assert(!swarm_decode_device_gone(buf, n, &o));
+    }
+    /* v4: MEASUREMENT */
+    {
+        swarm_measurement_t m = { .dev = { .kind = 2, .addr = {1} }, .cap_id = 2, .value = 16.5f, .age_s = 7 };
+        uint8_t buf[32]; size_t n = swarm_encode_measurement(&m, buf, sizeof buf);
+        assert(n == 4 + 9 + 1 + 4 + 4);
+        swarm_measurement_t o; assert(swarm_decode_measurement(buf, n, &o));
+        assert(o.cap_id == 2 && o.value == 16.5f && o.age_s == 7);
+        assert(!swarm_decode_measurement(buf, n + 1, &o));
+    }
+    /* v4: COORD_STATUS */
+    {
+        swarm_coord_status_t s = { .radio_role = 2, .formed = 1, .channel = 15, .pan_id = 0x489a, .permit_s = 179, .device_count = 3 };
+        uint8_t buf[16]; size_t n = swarm_encode_coord_status(&s, buf, sizeof buf);
+        assert(n == 4 + 7);
+        swarm_coord_status_t o; assert(swarm_decode_coord_status(buf, n, &o) && o.pan_id == 0x489a && o.permit_s == 179);
+    }
+    /* v4: COMMAND / COMMAND_ACK */
+    {
+        swarm_command_t c = { .seq = 0x1234, .ttl_s = 30, .op = SWARM_CMD_DEVICE_RENAME,
+            .dev = { .kind = 2, .addr = {1,2,3,4,5,6,7,8} }, .arg = 0, .name_len = 3, .name = "Bob" };
+        uint8_t buf[64]; size_t n = swarm_encode_command(&c, buf, sizeof buf);
+        assert(n == 4 + 2 + 2 + 1 + 9 + 2 + 1 + 3);
+        swarm_command_t o; assert(swarm_decode_command(buf, n, &o));
+        assert(o.seq == 0x1234 && o.ttl_s == 30 && o.op == SWARM_CMD_DEVICE_RENAME && o.name_len == 3 && o.name[2] == 'b');
+        swarm_command_t p = { .seq = 1, .ttl_s = 5, .op = SWARM_CMD_PERMIT_JOIN };
+        n = swarm_encode_command(&p, buf, sizeof buf); assert(n == 4 + 2 + 2 + 1 + 9 + 2 + 1);
+        swarm_command_ack_t a = { .seq = 0x1234, .op = SWARM_CMD_ACTUATE, .status = SWARM_ACK_DONE, .detail = 0 };
+        n = swarm_encode_command_ack(&a, buf, sizeof buf); assert(n == 4 + 5);
+        swarm_command_ack_t ao; assert(swarm_decode_command_ack(buf, n, &ao) && ao.status == SWARM_ACK_DONE);
+    }
+    /* v4: NODE_CONFIG / ACK, PAIR_REQ radio_role */
+    {
+        swarm_node_config_t c = { .seq = 7, .radio_role = 2 };
+        uint8_t buf[16]; size_t n = swarm_encode_node_config(&c, buf, sizeof buf); assert(n == 4 + 3);
+        swarm_node_config_t o; assert(swarm_decode_node_config(buf, n, &o) && o.radio_role == 2);
+        swarm_node_config_ack_t a = { .seq = 7, .status = SWARM_ACK_ACCEPTED };
+        n = swarm_encode_node_config_ack(&a, buf, sizeof buf); assert(n == 4 + 3);
+        /* swarm_pair_req_t keeps its pre-existing `nonce` field (still
+         * load-bearing in pairing.c's anti-replay matching -- see
+         * swarm_frame.h); `radio_role` sits between `len` and `nonce`, so
+         * the encoded frame is 4 (header) + 1 (radio_role) + 4 (nonce) = 9,
+         * not the header-plus-radio_role-only 5 a nonce-less PAIR_REQ would
+         * encode to. */
+        swarm_pair_req_t pr = { .version = SWARM_PROTO_VERSION, .type = SWARM_MSG_PAIR_REQ, .radio_role = 2 };
+        n = swarm_encode_pair_req(&pr, buf, sizeof buf); assert(n == 9);
+        swarm_pair_req_t po; assert(swarm_decode_pair_req(buf, n, &po) && po.radio_role == 2);
     }
 
     printf("test_swarm_frame: OK\n");
