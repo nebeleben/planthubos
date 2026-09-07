@@ -30,6 +30,8 @@
 #include "freertos/semphr.h"
 #include "esp_zigbee_core.h"
 #include "esp_coexist.h"
+#include "wifi_manager.h"
+#include "esp_wifi.h"
 #include "ble_collector.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -288,6 +290,22 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
              * outside measurement noise. Full numbers and the open
              * trade-off note are in the radio-role-config spec, section 8. */
             esp_err_t coex_err = esp_coex_wifi_i154_enable();
+            /* Keep WiFi in modem sleep for as long as this role runs.
+             * Measured on the C6 with the C5 sniffer (radio-role-config
+             * spec section 8): with arbitration on and WiFi awake, the
+             * coordinator answers beacons but cannot return the antenna
+             * fast enough to ACK a sleepy end device's ~1 Hz keep-alive
+             * polls; a freshly joined Xiaomi sensor saw 4x4 unanswered
+             * polls and left within a minute. With the WiFi radio parked
+             * between the router's DTIM beacons the 802.15.4 radio owns
+             * the air almost all the time. HTTP latency ~200 ms. Costs
+             * ESP-NOW receive on this hub while it runs Zigbee -- the
+             * target bridge has no STA at all, so this is the transitional
+             * zigbee-on-hub trade-off, made explicitly. Overrides
+             * espnow_link_init()'s WIFI_PS_NONE, which ran earlier in
+             * boot; the setting survives the permit-window stop/start. */
+            esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+            ESP_LOGI(TAG, "zigbee role: WiFi modem sleep on (%s)", esp_err_to_name(ps_err));
             if (coex_err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_coex_wifi_i154_enable failed (%s); WiFi and "
                               "802.15.4 will contend unarbitrated",
@@ -726,16 +744,22 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
     if (found) memcpy(eui64, s_store.dev[idx].eui64, 8);
     xSemaphoreGive(s_store_mutex);
 
-    if (!found) {
-        ESP_LOGD(TAG, "attribute report from an unrecognised device; ignored");
-        return;
-    }
+    /* One INFO line per report, whatever its fate: the M6b gate-3 bench
+     * run (2026-09-03) could not tell from the outside whether a joined
+     * sensor's frames were dropped here or never arrived. Reports are
+     * sparse (on-change / periodic), so this is cheap. */
+    uint16_t src_short = (msg->src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_SHORT)
+                             ? msg->src_address.u.short_addr : 0xffff;
+    ESP_LOGI(TAG, "report: src 0x%04x ep %u cluster 0x%04x attr 0x%04x type 0x%02x%s",
+             src_short, msg->src_endpoint, msg->cluster, msg->attribute.id,
+             msg->attribute.data.type, found ? "" : " (unrecognised device; ignored)");
+    if (!found) return;
 
     /* Cluster unmapped, or the value is one of ZCL's not-a-reading
      * sentinels: dropped silently, never substituted -- a fabricated
      * reading in a plant's history is worse than a gap (zb_map.h). */
     uint8_t cap = zb_map_cluster_to_cap(msg->cluster);
-    if (cap == ZB_MAP_NONE) return;
+    if (cap == ZB_MAP_NONE) { ESP_LOGI(TAG, "report: cluster 0x%04x unmapped; dropped", msg->cluster); return; }
 
     /* Whole-branch review, FIX 3: zb_map_zcl_to_value() converts whatever
      * raw value arrived, on the assumption the attribute it is being
@@ -748,17 +772,28 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
      * capability's units and land in history as a fabricated reading --
      * exactly what zb_map.c's own sentinel checks exist to prevent, just
      * from outside the file where that guarantee is enforced. */
-    if (msg->attribute.id != zb_map_report_attr(msg->cluster)) return;
+    if (msg->attribute.id != zb_map_report_attr(msg->cluster)) {
+        ESP_LOGI(TAG, "report: attr 0x%04x is not the mapped attr 0x%04x for cluster 0x%04x; dropped",
+                 msg->attribute.id, zb_map_report_attr(msg->cluster), msg->cluster);
+        return;
+    }
 
     int32_t raw;
-    if (!zcl_attr_to_i32(&msg->attribute.data, &raw)) return;
+    if (!zcl_attr_to_i32(&msg->attribute.data, &raw)) {
+        ESP_LOGI(TAG, "report: attr type 0x%02x not convertible; dropped", msg->attribute.data.type);
+        return;
+    }
 
     float value;
-    if (!zb_map_zcl_to_value(msg->cluster, raw, &value)) return;
+    if (!zb_map_zcl_to_value(msg->cluster, raw, &value)) {
+        ESP_LOGI(TAG, "report: raw %ld is a ZCL sentinel for cluster 0x%04x; dropped", (long)raw, msg->cluster);
+        return;
+    }
 
     device_id_t id = { .kind = DEV_KIND_ZIGBEE };
     memcpy(id.addr, eui64, 8);
-    data_core_submit_cap_id(&id, cap, value);
+    esp_err_t sub = data_core_submit_cap_id(&id, cap, value);
+    ESP_LOGI(TAG, "report: cap %u value %.3f -> data_core (%s)", cap, (double)value, esp_err_to_name(sub));
 }
 
 /* Task 8: the SDK allows exactly one ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID
@@ -978,6 +1013,24 @@ static void zb_iv_simple_desc_cb(esp_zb_zdp_status_t status,
     zb_iv_service();
 }
 
+/* ZDO Bind result. Bench finding (M6b gate 3, 2026-09-03): a joined,
+ * interviewed Xiaomi light sensor with reporting configured never sent a
+ * single attribute report -- Xiaomi/Aqara end devices only report to a
+ * BOUND destination, and this interview configured reporting without ever
+ * binding. Logged at INFO so a bind that fails on a sleepy device (the
+ * request rides on its next poll) is visible next to the interview lines. */
+static void zb_iv_on_bind(esp_zb_zdp_status_t zdo_status, void *user_ctx) __attribute__((unused));
+static void zb_iv_on_bind(esp_zb_zdp_status_t zdo_status, void *user_ctx)
+{
+    uint16_t cluster = (uint16_t)(uintptr_t)user_ctx;
+    if (zdo_status == ESP_ZB_ZDP_STATUS_SUCCESS) {
+        ESP_LOGI(TAG, "bind: cluster 0x%04x -> hub ep %u ok", cluster, ZB_ENDPOINT);
+    } else {
+        ESP_LOGW(TAG, "bind: cluster 0x%04x failed (zdo status 0x%02x); reports may never come",
+                 cluster, (unsigned)zdo_status);
+    }
+}
+
 static void zb_iv_send_config_report(void)
 {
     uint16_t cluster = s_iv.report_clusters[s_iv.report_cursor - 1];
@@ -1024,6 +1077,12 @@ static void zb_iv_send_config_report(void)
         .max_interval = 3600,
         .reportable_change = reportable_change,
     };
+    /* ZDO Bind deliberately NOT sent (bench 2026-09-03): with a bind
+     * request issued here, the Xiaomi light sensor broadcast a NWK Leave
+     * ~3 s after its interview, twice out of twice; without it, the same
+     * sensor stayed joined for minutes. zb_iv_on_bind() is kept for the
+     * follow-up experiment (bind later / read Basic first, z2m-style). */
+
     esp_zb_zcl_config_report_cmd_t cmd = {
         .zcl_basic_cmd = {
             .dst_addr_u.addr_short = s_iv.dev.short_addr,
@@ -1317,6 +1376,7 @@ static void zb_scan_hold_cb(uint8_t param)
     deadline = s_permit_join_deadline_us;
     portEXIT_CRITICAL(&s_mux);
     if (deadline == 0) return;
+    wifi_manager_radio_pause();
     esp_err_t err = ble_collector_scan_hold(true);
     if (err == ESP_ERR_INVALID_STATE) {
         /* One radio per node: this hub never started the BLE collector, so
@@ -1343,6 +1403,8 @@ static void zb_permit_expiry_cb(uint8_t param)
      * A hold alarm still pending (window closed within its 0.8 s defer)
      * is cancelled so it cannot re-hold a radio nobody will release. */
     esp_zb_scheduler_alarm_cancel(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM);
+    /* Give WiFi its air back (see zigbee_permit_join / wifi_manager.h). */
+    wifi_manager_radio_resume();
     esp_err_t err = ble_collector_scan_hold(false);
     if (err == ESP_ERR_INVALID_STATE) {
         /* No BLE collector in this role -- nothing was held, so there is no
@@ -1395,6 +1457,15 @@ bool zigbee_permit_join(void)
      * the hold onto the wire. */
     esp_zb_scheduler_alarm_cancel(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM);
     esp_zb_scheduler_alarm(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM, ZB_SCAN_HOLD_DELAY_MS);
+
+    /* WiFi itself is paused (STA stopped) from zb_scan_hold_cb, on the
+     * same 0.8 s defer as the BLE hold, so this HTTP response gets out
+     * first. See wifi_manager.h for the measurement behind it: with coex
+     * arbitration on, beacons still go out but the MAC ACK a joining
+     * device needs never does, so association is impossible while WiFi
+     * holds any claim on the antenna. Modem sleep was tried first and
+     * measured no better (8/12 beacon replies, association still
+     * unanswered). */
 
     /* Closes on expiry (zigbee_permit_join_remaining() below), on reboot
      * (this deadline lives in RAM only, so a reboot resets it to closed
