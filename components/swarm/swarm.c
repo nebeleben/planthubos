@@ -514,6 +514,24 @@ esp_err_t swarm_request_node_config(const uint8_t mac[6])
     if (!mac) return ESP_ERR_INVALID_ARG;
     if (!s_checkin_queue) return ESP_ERR_INVALID_STATE;
 
+    /* Fix round 1: skip queuing entirely when this node's desired radio
+     * role already matches what it last reported -- an idempotent repeat
+     * of an already-applied POST /api/v1/nodes/{MAC12} {"radio_role":...}
+     * (or one that raced a DONE ack that already cleared this) then sends
+     * nothing over the air and never reaches node_config_task() at all, so
+     * it can never trigger a needless reboot there either. A node that has
+     * never reported a radio role this boot falls back to comparing against
+     * RADIO_ROLE_BLE, same "unknown treated as the default" reasoning as
+     * every other reported/desired comparison in this file
+     * (swarm_node_list_json()'s radio_role_pending, checkin_task()'s own
+     * radio_pending). */
+    radio_role_t desired = swarm_store_node_desired_radio(mac);
+    uint8_t reported_byte;
+    bool have_reported = swarm_node_reported_radio(mac, &reported_byte);
+    bool already_applied = have_reported ? (reported_byte == (uint8_t)desired)
+                                          : (desired == RADIO_ROLE_BLE);
+    if (already_applied) return ESP_OK;
+
     checkin_item_t item;
     memset(&item, 0, sizeof(item));
     memcpy(item.mac, mac, 6);
@@ -631,20 +649,48 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
     if (type == SWARM_MSG_NODE_CONFIG_ACK) {
         /* Node -> hub, unicast, encrypted (M7 Task 4) -- same pairing/
          * spoofing reasoning as CHECKIN above: is_paired_node() is the gate
-         * that keeps an unpaired device from injecting a fake ack. Nothing
-         * further is done with the result here beyond logging: the hub's
-         * next reconciliation opportunity (this node's next CHECKIN, or a
-         * fresh swarm_request_node_config()) recomputes desired vs reported
-         * from scratch regardless of whether this particular ack arrived,
-         * same self-healing shape as CHECKIN_ACK/NODE_CONFIG sends above --
-         * record_reported_radio() itself is left to the node's next
-         * PAIR_REQ/COORD_STATUS, not to this ack (this frame carries only
-         * seq+status, not the node's radio role). */
+         * that keeps an unpaired device from injecting a fake ack.
+         *
+         * Fix round 1: a DONE ack (the node has ALREADY applied the role --
+         * see node_config_task()'s own comment for why ACCEPTED, meaning
+         * only "queued", was the wrong status here) whose seq matches the
+         * last cfg_seq THIS hub sent to THIS node is credited immediately
+         * via record_reported_radio(), using the node's current desired
+         * radio role (what this NODE_CONFIG asked it to become) -- so
+         * radio_role_pending clears the moment the hub hears back, instead
+         * of waiting for this node's next PAIR_REQ/COORD_STATUS. A seq
+         * mismatch (a DONE for a stale/superseded request -- e.g. this hub
+         * restarted and re-sent with a fresh cfg_seq before an old ack
+         * arrived) or a FAILED status changes nothing here: the hub's next
+         * reconciliation opportunity (this node's next CHECKIN, or a fresh
+         * swarm_request_node_config()) recomputes desired vs reported from
+         * scratch regardless, same self-healing shape as CHECKIN_ACK/
+         * NODE_CONFIG sends above. */
         if (!is_paired_node(src_mac)) return;
         swarm_node_config_ack_t ack;
         if (!swarm_decode_node_config_ack(data, (size_t)len, &ack)) return;
-        if (ack.status == SWARM_ACK_ACCEPTED) {
-            ESP_LOGI(TAG, "NODE_CONFIG_ACK from " MACSTR ": accepted (seq=%u)", MAC2STR(src_mac), ack.seq);
+        if (ack.status == SWARM_ACK_DONE) {
+            bool seq_match = false;
+            if (s_stats_mutex) {
+                xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
+                for (int i = 0; i < SWARM_MAX_NODES; i++) {
+                    if (s_stats[i].in_use && memcmp(s_stats[i].mac, src_mac, 6) == 0) {
+                        seq_match = (s_stats[i].cfg_seq == ack.seq);
+                        break;
+                    }
+                }
+                xSemaphoreGive(s_stats_mutex);
+            }
+            if (seq_match) {
+                radio_role_t desired = swarm_store_node_desired_radio(src_mac);
+                record_reported_radio(src_mac, (uint8_t)desired);
+                ESP_LOGI(TAG, "NODE_CONFIG_ACK from " MACSTR ": done (seq=%u), radio_role=%s confirmed",
+                         MAC2STR(src_mac), ack.seq, radio_role_str(desired));
+            } else {
+                ESP_LOGW(TAG, "NODE_CONFIG_ACK from " MACSTR ": done but seq=%u doesn't match the "
+                              "last request sent to it -- ignoring (stale/superseded)",
+                         MAC2STR(src_mac), ack.seq);
+            }
         } else {
             ESP_LOGW(TAG, "NODE_CONFIG_ACK from " MACSTR ": refused (seq=%u status=%u)",
                      MAC2STR(src_mac), ack.seq, ack.status);
@@ -1054,20 +1100,32 @@ static QueueHandle_t s_checkin_ack_queue;
  * s_checkin_ack_queue above. */
 static QueueHandle_t s_node_cfg_queue;
 
-/* Pops a NODE_CONFIG off s_node_cfg_queue and applies it: validates the
- * requested radio role against this node's CURRENT power mode
- * (swarm_rules_node_radio_ok(), Task 3 -- the same compatibility rule the
- * hub itself checks before ever sending this) and persists it
- * (radio_role_set()). Always replies with a NODE_CONFIG_ACK, accepted or
- * refused, echoing the request's seq -- the hub logs it but does not retry
+/* Pops a NODE_CONFIG off s_node_cfg_queue and applies it. Fix round 1:
+ * first compares the requested role against this node's CURRENT role
+ * (radio_role_is_set() ? radio_role_get() : RADIO_ROLE_BLE, same "unknown
+ * treated as the default" reasoning as everywhere else in this file) --
+ * without this, a hub whose own reported_radio_role only ever refreshes at
+ * PAIR_REQ/COORD_STATUS would keep re-sending the SAME already-applied
+ * role on every checkin (checkin_task()'s radio_pending check comparing
+ * against a stale "unknown"/mismatched report), and this node would reboot
+ * every single time it heard one -- a reboot loop for no actual change. If
+ * the requested role already matches: ack DONE (it genuinely IS done,
+ * trivially), no persist, no reboot. Otherwise, validate the requested
+ * role against this node's CURRENT power mode (swarm_rules_node_radio_ok(),
+ * Task 3 -- the same compatibility rule the hub itself checks before ever
+ * sending this) and persist it (radio_role_set()); on success, ack DONE
+ * and restart into the new role (the BT/802.15.4 controllers cannot be
+ * re-inited live -- radio_role.h -- so this is the only way the change
+ * actually takes effect). A refusal (rules violation, or radio_role_set()
+ * itself failing) acks FAILED and changes nothing -- no persist, no
+ * reboot, loops back for the next item. The ack status is DONE, not
+ * ACCEPTED (M7 Task 4's original choice): by the time this ack goes out
+ * the change (or the no-op) has already actually happened, not merely been
+ * queued, so DONE is the accurate status -- see swarm_frame.h's
+ * SWARM_ACK_* enum. Either way, the hub logs the result but does not retry
  * on a lost ack itself (see hub_rx_cb's NODE_CONFIG_ACK branch); this
  * node's own next PAIR_REQ/checkin still reports whatever radio role it is
- * ACTUALLY running, so the hub's view self-heals either way. A refusal
- * (rules violation, or radio_role_set() itself failing) logs why and loops
- * back for the next item -- no restart, nothing about this node's running
- * radio role changes. Acceptance restarts into the new role: the BT/802.15.4
- * controllers cannot be re-inited live (radio_role.h), so this is the only
- * way the change actually takes effect. */
+ * ACTUALLY running, so the hub's view self-heals either way. */
 static void node_config_task(void *arg)
 {
     (void)arg;
@@ -1075,10 +1133,17 @@ static void node_config_task(void *arg)
     for (;;) {
         if (xQueueReceive(s_node_cfg_queue, &cfg, portMAX_DELAY) != pdTRUE) continue;
 
+        radio_role_t requested = (radio_role_t)cfg.radio_role;
+        radio_role_t current = radio_role_is_set() ? radio_role_get() : RADIO_ROLE_BLE;
+        bool already_running = (requested == current);
+        bool ok = already_running;
         const char *why = NULL;
-        bool ok = swarm_rules_node_radio_ok((radio_role_t)cfg.radio_role, swarm_store_power_mode(), &why)
-                  && radio_role_set((radio_role_t)cfg.radio_role) == ESP_OK;
-        swarm_node_config_ack_t ack = { .seq = cfg.seq, .status = ok ? SWARM_ACK_ACCEPTED : SWARM_ACK_FAILED };
+        if (!already_running) {
+            ok = swarm_rules_node_radio_ok(requested, swarm_store_power_mode(), &why)
+                 && radio_role_set(requested) == ESP_OK;
+        }
+
+        swarm_node_config_ack_t ack = { .seq = cfg.seq, .status = ok ? SWARM_ACK_DONE : SWARM_ACK_FAILED };
         uint8_t buf[16];
         size_t n = swarm_encode_node_config_ack(&ack, buf, sizeof(buf));
         if (n) {
@@ -1094,7 +1159,12 @@ static void node_config_task(void *arg)
             ESP_LOGW(TAG, "node config refused: %s", why ? why : "?");
             continue;
         }
-        ESP_LOGW(TAG, "radio role -> %s by the hub; rebooting", radio_role_str((radio_role_t)cfg.radio_role));
+        if (already_running) {
+            ESP_LOGI(TAG, "radio role already %s; NODE_CONFIG is a no-op, not rebooting",
+                     radio_role_str(current));
+            continue;
+        }
+        ESP_LOGW(TAG, "radio role -> %s by the hub; rebooting", radio_role_str(requested));
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();
     }
