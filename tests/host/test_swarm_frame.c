@@ -433,6 +433,25 @@ int main(void)
         n = swarm_encode_pair_req(&pr, buf, sizeof buf); assert(n == 9);
         swarm_pair_req_t po; assert(swarm_decode_pair_req(buf, n, &po) && po.radio_role == 2);
     }
+    /* v4: POLL -- header only, no body */
+    {
+        uint8_t pbuf[8];
+        size_t n = swarm_encode_poll(pbuf, sizeof pbuf);
+        assert(n == 4);
+        assert(pbuf[0] == SWARM_PROTO_VERSION && pbuf[1] == SWARM_MSG_POLL);
+        assert(pbuf[2] == 0 && pbuf[3] == 0);                 /* len = 0 */
+        assert(swarm_frame_type(pbuf, n) == SWARM_MSG_POLL);
+
+        /* A POLL with a non-zero len is rejected -- even a buffer whose own
+         * declared len is internally consistent with the bytes supplied
+         * (so the generic header check alone would pass it) must still be
+         * refused, because POLL's expected_len() demands an exact 4-byte
+         * frame. */
+        uint8_t bad[5];
+        memcpy(bad, pbuf, 4);
+        bad[2] = 1; bad[4] = 0xAA;   /* declared len=1, one extra body byte */
+        assert(swarm_frame_type(bad, sizeof bad) == -1);
+    }
 
     printf("test_swarm_frame: OK\n");
     return 0;

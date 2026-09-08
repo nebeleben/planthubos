@@ -40,6 +40,14 @@ typedef enum {
     SWARM_MSG_COMMAND_ACK      = 18,
     SWARM_MSG_NODE_CONFIG      = 19,
     SWARM_MSG_NODE_CONFIG_ACK  = 20,
+    /* Node -> hub, header-only (no body). A zigbee-role bridge's WiFi
+     * receive path is only reliably open right after the node's OWN
+     * transmit (bench finding, M7 zigbee bridge follow-up) -- this frame
+     * exists purely so a node with nothing else to report still transmits
+     * every couple of seconds, giving the hub a window to push a stuck
+     * command through (see swarm.c's poll_task and hub_rx_cb's
+     * BRIDGE_ITEM_FLUSH handling). No ack, no fields; len must be 0. */
+    SWARM_MSG_POLL             = 21,
 } swarm_msg_t;
 
 /* Checkin commands (CHECKIN_ACK.command) */
@@ -460,3 +468,8 @@ size_t swarm_encode_command(const swarm_command_t *in, uint8_t *out, size_t cap)
 size_t swarm_encode_command_ack(const swarm_command_ack_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_node_config(const swarm_node_config_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_node_config_ack(const swarm_node_config_ack_t *in, uint8_t *out, size_t cap);
+
+/* Node -> hub liveness poll (see SWARM_MSG_POLL above): header only, no
+ * in-memory struct to encode from -- unlike every other encoder in this
+ * file, this one just writes the 4-byte v4 header with len = 0. */
+size_t swarm_encode_poll(uint8_t *out, size_t cap);

@@ -30,6 +30,34 @@ int main(void)
     assert(bridge_cmd_next_send(&r, 2032) == NULL);
     uint8_t other[6] = {9,9,9,9,9,9};
     assert(bridge_cmd_submit(&r, other, SWARM_CMD_RESYNC, NULL, 0, NULL, 0, 10, 3000, -1, 0, 0));   /* per-node slots */
+
+    /* M7: bridge_cmd_peek_pending()/bridge_cmd_mark_sent() (POLL-triggered
+     * opportunistic send). `other` has a fresh, never-sent RESYNC (sends==0,
+     * not accepted) -- peek must return it. */
+    const bridge_cmd_t *pk = bridge_cmd_peek_pending(&r, other);
+    assert(pk && pk->op == SWARM_CMD_RESYNC && pk->sends == 0);
+    bridge_cmd_mark_sent(&r, other, 3001);
+    /* mark_sent bumped sends to 1 and sent_s to 3001 -- next_send() must not
+     * offer it again immediately (not due for retry until BRIDGE_CMD_RETRY_S
+     * later), the whole point of calling mark_sent after an out-of-band send. */
+    assert(bridge_cmd_next_send(&r, 3001) == NULL);
+    assert(bridge_cmd_next_send(&r, 3002) == NULL);          /* still < retry interval */
+    const bridge_cmd_t *s2 = bridge_cmd_next_send(&r, 3003); assert(s2 && s2->sends == 2);   /* retry due */
+
+    /* Unknown mac: no active slot. */
+    uint8_t unknown[6] = {8,8,8,8,8,8};
+    assert(bridge_cmd_peek_pending(&r, unknown) == NULL);
+    bridge_cmd_mark_sent(&r, unknown, 3010);   /* no-op, must not crash */
+
+    /* Accepted slot: peek must return NULL (already progressing, no resend). */
+    uint8_t acc_mac[6] = {7,7,7,7,7,7};
+    assert(bridge_cmd_submit(&r, acc_mac, SWARM_CMD_ACTUATE, &d, 0, NULL, 0, 30, 4000, -1, 0, 0));
+    assert(bridge_cmd_peek_pending(&r, acc_mac) != NULL);     /* not yet accepted: pending */
+    swarm_command_ack_t acc2 = { .seq = 1, .op = SWARM_CMD_ACTUATE, .status = SWARM_ACK_ACCEPTED };
+    bridge_cmd_t done2;
+    assert(!bridge_cmd_on_ack(&r, acc_mac, &acc2, 4001, &done2));   /* still in flight, now accepted */
+    assert(bridge_cmd_peek_pending(&r, acc_mac) == NULL);     /* accepted: nothing to flush-send */
+
     printf("test_bridge_cmd: OK\n");
     return 0;
 }

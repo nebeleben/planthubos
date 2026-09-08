@@ -774,6 +774,19 @@ static void bridge_load(void)
  * caller: every path that wants to submit a command funnels through here. */
 #define BRIDGE_ITEM_SUBMIT 100
 
+/* M7 zigbee bridge follow-up: a third, also purely-internal producer --
+ * posted by hub_rx_cb (via post_bridge_flush(), below request_resync())
+ * for every accepted frame from a known node (CHECKIN, the v4 bridge
+ * frames, POLL, acks). Same "well outside the SWARM_MSG_* range" reasoning
+ * as BRIDGE_ITEM_SUBMIT's own comment -- this is never decoded off the
+ * wire. bridge_task's FLUSH case (below) uses it as the trigger to push
+ * mac's pending, not-yet-accepted command out right now (see
+ * bridge_cmd_peek_pending()/bridge_cmd_mark_sent(), bridge_cmd.h) rather
+ * than wait for the periodic retry -- the bench finding behind this is
+ * that a zigbee-role bridge's WiFi receive window is only reliably open
+ * right this soon after the node's own transmit. */
+#define BRIDGE_ITEM_FLUSH 101
+
 typedef struct {
     uint8_t          op;             /* SWARM_CMD_* */
     swarm_dev_addr_t dev;
@@ -861,6 +874,24 @@ static void request_resync(const uint8_t mac[6])
     }
 }
 
+/* M7 zigbee bridge follow-up: posts a BRIDGE_ITEM_FLUSH for mac -- called
+ * from hub_rx_cb (WiFi driver task) for every accepted frame from a known
+ * node (CHECKIN, the v4 bridge frames, POLL, acks), right after that
+ * frame's own existing handling. Same "callback queues, task does the real
+ * work" discipline as every other hub_rx_cb producer in this file:
+ * xQueueSend is non-blocking, and a momentarily full queue just drops this
+ * one flush -- best-effort, since this node's next frame (POLL included,
+ * at most ~2 s away on a zigbee-role node) tries again. */
+static void post_bridge_flush(const uint8_t mac[6])
+{
+    if (!s_bridge_queue) return;
+    bridge_item_t item;
+    memset(&item, 0, sizeof(item));
+    memcpy(item.mac, mac, 6);
+    item.type = BRIDGE_ITEM_FLUSH;
+    xQueueSend(s_bridge_queue, &item, 0);
+}
+
 /* M7 Task 8: reports a bridge-routed ACTUATE's outcome (a DONE/FAILED ack
  * from the owning bridge node, or this hub's own TTL expiry) to the actor
  * layer through EXACTLY the path a locally dispatched Zigbee command
@@ -897,8 +928,16 @@ static void bridge_task(void *arg)
              * s_bridges_mutex is held, matching the router tick's and the
              * boot-time resync sweep's own "release, then send" discipline
              * just below/above. Set instead of calling directly inside the
-             * switch; sent once, after xSemaphoreGive(), further down. */
+             * switch; sent once, after xSemaphoreGive(), further down. Same
+             * reasoning for flush_cmd (M7 zigbee bridge follow-up,
+             * BRIDGE_ITEM_FLUSH below): bridge_cmd_peek_pending() itself is
+             * a pure lookup (s_router needs no lock -- this task is its
+             * only caller, see s_router's own top comment), but the
+             * encode + espnow_link_send() that acts on it is exactly the
+             * kind of "send" this discipline keeps out from under
+             * s_bridges_mutex. */
             bool need_resync = false;
+            const bridge_cmd_t *flush_cmd = NULL;
             /* I2 fix: bridge_save() is no longer called per item -- ANNOUNCE/
              * GONE/STATUS-with-change below call mark_bridge_dirty(now_s)
              * instead (defined above, next to s_bridge_dirty), and this
@@ -1105,6 +1144,18 @@ static void bridge_task(void *arg)
                 }
                 break;
             }
+            case BRIDGE_ITEM_FLUSH: {
+                /* M7 zigbee bridge follow-up: mac just transmitted to this
+                 * hub (that's what queued this FLUSH -- see
+                 * post_bridge_flush()'s callers in hub_rx_cb), which is
+                 * precisely the brief window this bench's finding says
+                 * mac's WiFi receive path is actually open. If this router
+                 * has a pending, not-yet-accepted command for it, grab the
+                 * pointer now (peek only; no mutation) -- sent further
+                 * down, outside s_bridges_mutex, same as need_resync. */
+                flush_cmd = bridge_cmd_peek_pending(&s_router, it.mac);
+                break;
+            }
             default:
                 break;
             }
@@ -1121,6 +1172,45 @@ static void bridge_task(void *arg)
              * once per pass (not once per item) whether this is the pass
              * that actually persists. */
             if (need_resync) request_resync(it.mac);
+
+            /* flush_cmd (M7 zigbee bridge follow-up): send the pending
+             * command NOW, regardless of this router's own retry timer --
+             * same encode + espnow_link_send() shape as the router tick
+             * below, deliberately duplicated rather than shared because the
+             * router tick's loop also has to re-poll bridge_cmd_next_send()
+             * for every other due command this same pass, which a flush (at
+             * most one mac, one peek) has no need for. bridge_cmd_mark_sent()
+             * updates sent_s/sends on a successful encode so the router
+             * tick's own bridge_cmd_next_send(), called later this same
+             * pass, does not immediately re-offer (and re-send) the exact
+             * same command again. flush_cmd aliases s_router (see
+             * bridge_cmd_peek_pending()'s own doc comment) and nothing else
+             * calls a bridge_cmd_* function on s_router between the peek
+             * above and this use, so it is still valid here. */
+            if (flush_cmd) {
+                swarm_command_t cmd = { .seq = flush_cmd->seq, .op = flush_cmd->op, .dev = flush_cmd->dev,
+                                         .arg = flush_cmd->arg, .name_len = flush_cmd->name_len };
+                memcpy(cmd.name, flush_cmd->name, flush_cmd->name_len);
+                cmd.ttl_s = (uint16_t)(flush_cmd->deadline_s > now_s ? (flush_cmd->deadline_s - now_s) : 1);
+                uint8_t buf[64];
+                size_t n = swarm_encode_command(&cmd, buf, sizeof(buf));
+                if (n == 0) {
+                    ESP_LOGE(TAG, "flush command encode failed for " MACSTR " (op=%u seq=%u)",
+                             MAC2STR(it.mac), (unsigned)flush_cmd->op, (unsigned)flush_cmd->seq);
+                } else {
+                    esp_err_t err = espnow_link_send(it.mac, buf, n);
+                    if (err != ESP_OK) {
+                        ESP_LOGW(TAG, "flush command -> " MACSTR " (op=%u seq=%u) send failed: %s",
+                                 MAC2STR(it.mac), (unsigned)flush_cmd->op, (unsigned)flush_cmd->seq,
+                                 esp_err_to_name(err));
+                    } else {
+                        ESP_LOGI(TAG, "flush command -> " MACSTR " (op=%u seq=%u, send #%u)",
+                                 MAC2STR(it.mac), (unsigned)flush_cmd->op, (unsigned)flush_cmd->seq,
+                                 (unsigned)flush_cmd->sends + 1);
+                    }
+                    bridge_cmd_mark_sent(&s_router, it.mac, now_s);
+                }
+            }
         }   /* if (got == pdTRUE) */
 
         /* I2 fix (save storms): coalesce bridge_save() calls. Rather than a
@@ -1235,10 +1325,16 @@ static esp_err_t ensure_bridge_task(void)
 }
 
 /* M7 Task 8: default TTL for a hub-initiated PERMIT_JOIN/DEVICE_REMOVE/
- * DEVICE_RENAME (swarm_bridge_permit/remove/rename() below) -- same value
- * request_resync() already used for RESYNC, generous over one ESP-NOW
- * round trip plus this router's own one retry (BRIDGE_CMD_RETRY_S). */
-#define BRIDGE_API_TTL_S 30
+ * DEVICE_RENAME (swarm_bridge_permit/remove/rename() below) -- originally
+ * 30 s (the same value request_resync() still uses for RESYNC, generous
+ * over one ESP-NOW round trip plus this router's own one retry,
+ * BRIDGE_CMD_RETRY_S). Raised to 60 s (M7 zigbee bridge follow-up): the
+ * bench finding behind SWARM_MSG_POLL/BRIDGE_ITEM_FLUSH is that a
+ * zigbee-role bridge's WiFi receive path is only reliably open right after
+ * its OWN transmit, so even with the POLL-triggered early-send path this
+ * is still a synchronous HTTP-handler-facing TTL and deserves more margin
+ * than the fire-and-forget RESYNC path it was originally copied from. */
+#define BRIDGE_API_TTL_S 60
 
 /* Posts a BRIDGE_ITEM_SUBMIT for `mac` and blocks (this caller's own task,
  * never bridge_task or the ESP-NOW receive callback -- see swarm.h's
@@ -1478,6 +1574,25 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
             ESP_LOGW(TAG, "CHECKIN from " MACSTR ": no checkin task available or queue full, dropping",
                      MAC2STR(src_mac));
         }
+        /* M7 zigbee bridge follow-up: this node just transmitted to us --
+         * see post_bridge_flush()'s own comment for why that's the trigger
+         * to try pushing any pending command through right now. */
+        post_bridge_flush(src_mac);
+        return;
+    }
+    if (type == SWARM_MSG_POLL) {
+        /* Node -> hub, header-only liveness poll (M7 zigbee bridge
+         * follow-up) -- same pairing/spoofing reasoning as CHECKIN/READING
+         * above: is_paired_node() is the gate that keeps an unpaired
+         * device from injecting one. No ack, no fields beyond the frame
+         * type itself, and nothing to decode -- its only purpose is this
+         * node having just transmitted, which post_bridge_flush() below
+         * uses as the trigger to try pushing a pending command through
+         * right now (see swarm_frame.h's SWARM_MSG_POLL and swarm.c's
+         * poll_task, node side, for the bench finding behind this). */
+        if (!is_paired_node(src_mac)) return;
+        record_stat(src_mac, rssi);
+        post_bridge_flush(src_mac);
         return;
     }
     if (type == SWARM_MSG_NODE_CONFIG_ACK) {
@@ -1529,6 +1644,8 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
             ESP_LOGW(TAG, "NODE_CONFIG_ACK from " MACSTR ": refused (seq=%u status=%u)",
                      MAC2STR(src_mac), ack.seq, ack.status);
         }
+        /* M7 zigbee bridge follow-up: see post_bridge_flush()'s own comment. */
+        post_bridge_flush(src_mac);
         return;
     }
     if (type == SWARM_MSG_DEVICE_ANNOUNCE || type == SWARM_MSG_DEVICE_GONE ||
@@ -1577,6 +1694,8 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
             ESP_LOGW(TAG, "bridge frame (type=%d) from " MACSTR ": no bridge task/queue full, dropping",
                      type, MAC2STR(src_mac));
         }
+        /* M7 zigbee bridge follow-up: see post_bridge_flush()'s own comment. */
+        post_bridge_flush(src_mac);
         return;
     }
     /* PAIR_REQ/PAIR_ACK, PING/PONG, FORGET or anything unrecognised:
@@ -2133,6 +2252,25 @@ static QueueHandle_t s_fwd_queue;
 static uint8_t       s_hub_mac[6];   /* set once in swarm_start_node(); MAC never
                                        * changes across a resync, only the channel does */
 
+/* M7 zigbee bridge follow-up: esp_timer_get_time() at the moment this node
+ * last sent ANYTHING to s_hub_mac -- updated by note_hub_tx() (below),
+ * called from every one of this file's node->hub espnow_link_send() sites
+ * (forward_task, send_checkin_and_wait_ack, node_config_task's
+ * NODE_CONFIG_ACK, send_cmd_ack's COMMAND_ACK). poll_task (below) reads
+ * this to skip sending a POLL when a real frame already went out recently
+ * enough to have opened the same post-TX WiFi receive window a POLL exists
+ * to manufacture -- see poll_task's own comment for the bench finding
+ * behind this. Plain int64_t, no lock: every writer runs on its own
+ * dedicated task and a torn read here (this is not atomic on every target)
+ * can at worst make poll_task decide one poll early or late, never anything
+ * unsafe. */
+static int64_t s_last_hub_tx_us;
+
+static void note_hub_tx(void)
+{
+    s_last_hub_tx_us = esp_timer_get_time();
+}
+
 /* ---------------- Node side: CHECKIN_ACK hand-off (M7 Task 5) ----------------
  *
  * node_rx_cb (the ESP-NOW receive callback, WiFi driver task) must never
@@ -2256,6 +2394,7 @@ static void node_config_task(void *arg)
         size_t n = swarm_encode_node_config_ack(&ack, buf, sizeof(buf));
         if (n) {
             esp_err_t err = espnow_link_send(s_hub_mac, buf, n);
+            note_hub_tx();
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "NODE_CONFIG_ACK send failed (%s), dropped -- the hub's next "
                               "reconciliation retries", esp_err_to_name(err));
@@ -2765,6 +2904,7 @@ static void forward_task(void *arg)
         if (n == 0) continue;
 
         esp_err_t err = espnow_link_send(s_hub_mac, buf, n);
+        note_hub_tx();
         if (err == ESP_OK) {
             consec_fail = 0;
             if (!first_delivered) {
@@ -2989,6 +3129,7 @@ static void send_cmd_ack(uint16_t seq, uint8_t op, uint8_t status, uint8_t detai
         return;
     }
     esp_err_t err = espnow_link_send(s_hub_mac, buf, n);
+    note_hub_tx();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "COMMAND_ACK send failed (%s), dropped -- the hub's own retry (if any) "
                       "recovers a lost ack", esp_err_to_name(err));
@@ -3292,6 +3433,7 @@ static bool send_checkin_and_wait_ack(uint8_t mode, uint32_t wake_counter, swarm
     }
 
     esp_err_t err = espnow_link_send(s_hub_mac, buf, n);
+    note_hub_tx();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "CHECKIN send failed: %s", esp_err_to_name(err));
         return false;
@@ -3347,6 +3489,51 @@ static bool running_image_pending_verify(void)
  * ALWAYS_ON fallback (below) sets the mode and simply returns, no
  * esp_restart(). From that moment this task is what keeps mode changes
  * deliverable again, exactly as if the node had been ALWAYS_ON from boot. */
+/* M7 zigbee bridge follow-up: this bench's finding is that a zigbee-role
+ * node's WiFi receive path only reliably opens right after this node's OWN
+ * transmit (WiFi/802.15.4 coexistence, coex priority config already at its
+ * most permissive defaults) -- so a hub->node command sent "cold" is
+ * dropped (espnow_link_send() ESP_FAIL, no MAC ack) unless it happens to
+ * land within roughly a millisecond of this node's own last send. A
+ * bridge node that has nothing new to forward for a while (no fresh
+ * ANNOUNCE/MEASUREMENT/CHECKIN/ack) never reopens that window on its own,
+ * so any command the hub queues in the meantime just sits until the
+ * periodic retry (bridge_task's router tick, swarm.c hub side) happens to
+ * line up -- which this bench showed does not reliably happen within a
+ * command's TTL.
+ *
+ * This task manufactures that opening on a fixed cadence instead of
+ * waiting for one: every SWARM_POLL_INTERVAL_US, if this node has not
+ * sent ANYTHING ELSE to the hub in that same window (s_last_hub_tx_us,
+ * updated by note_hub_tx() at every node->hub send site in this file), it
+ * sends an empty SWARM_MSG_POLL purely to trigger a transmit -- the POLL
+ * itself carries no data and gets no reply. hub_rx_cb's POLL branch (hub
+ * side) posts a BRIDGE_ITEM_FLUSH for this mac the moment that POLL (or
+ * any other accepted frame) arrives, and bridge_task's FLUSH case is what
+ * actually seizes the resulting window to push a pending command through,
+ * via bridge_cmd_peek_pending()/bridge_cmd_mark_sent() (bridge_cmd.h). */
+#define SWARM_POLL_INTERVAL_US (2 * 1000000)
+
+static void poll_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "poll task started, 2 s");
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(SWARM_POLL_INTERVAL_US / 1000));
+
+        if (esp_timer_get_time() - s_last_hub_tx_us < SWARM_POLL_INTERVAL_US) continue;
+
+        uint8_t buf[SWARM_HDR_LEN];
+        size_t n = swarm_encode_poll(buf, sizeof buf);
+        if (n == 0) continue;
+        esp_err_t err = espnow_link_send(s_hub_mac, buf, n);
+        note_hub_tx();
+        if (err != ESP_OK) {
+            ESP_LOGD(TAG, "POLL send failed: %s", esp_err_to_name(err));
+        }
+    }
+}
+
 static void always_on_checkin_task(void *arg)
 {
     (void)arg;
@@ -3923,6 +4110,18 @@ esp_err_t swarm_start_node(void)
         if (xTaskCreate(command_task, "swarm_cmd", 4096, NULL, 3, NULL) != pdPASS) {
             ESP_LOGE(TAG, "failed to create command task; hub-initiated permit-join/actuate/"
                           "remove/rename/resync will never be delivered this boot");
+        }
+
+        /* M7 zigbee bridge follow-up: only a zigbee-role node needs to
+         * manufacture its own post-TX WiFi receive window this way -- see
+         * poll_task's own comment for the bench finding behind it. Failure
+         * here is logged, not fatal to starting as a node: forwarding/
+         * pairing/OTA and the periodic router-tick retry all still work,
+         * only the early-flush path a POLL enables goes missing until this
+         * node's next reboot. */
+        if (xTaskCreate(poll_task, "swarm_poll", 2048, NULL, 2, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "failed to create poll task; hub-initiated commands will only be "
+                          "delivered on this bridge's own periodic retry timer");
         }
     }
 

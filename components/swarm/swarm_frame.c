@@ -26,6 +26,7 @@ static size_t expected_len(int type)
     case SWARM_MSG_OTA_BEGIN:  return sizeof(swarm_ota_begin_t);
     case SWARM_MSG_OTA_STATUS: return sizeof(swarm_ota_status_t);
     case SWARM_MSG_OTA_ABORT:  return sizeof(swarm_ota_abort_t);
+    case SWARM_MSG_POLL:       return SWARM_HDR_LEN;   /* header only, no body */
     default:                   return 0;
     }
 }
@@ -388,4 +389,18 @@ bool swarm_decode_node_config_ack(const uint8_t *buf, size_t len, swarm_node_con
     memset(out, 0, sizeof(*out));
     out->seq = r16(&r); out->status = r8(&r);
     return rend(&r);
+}
+
+/* SWARM_MSG_POLL: header only, no in-memory struct -- unlike every encoder
+ * above, there is no `in` to copy fields from, so this just writes the
+ * 4-byte v4 header directly with the same wr_t cursor the variable-length
+ * M7 frames use. expected_len(SWARM_MSG_POLL) (this file, above) demands
+ * an exact 4-byte frame, so a decoded buffer with any trailing byte -- even
+ * one whose own `len` field is internally consistent with the buffer it
+ * came in -- is rejected by swarm_frame_type() before it ever reaches here. */
+size_t swarm_encode_poll(uint8_t *out, size_t cap)
+{
+    wr_t w = { out, cap, 0, out != NULL };
+    whdr(&w, SWARM_MSG_POLL);
+    return wfinish(&w);
 }

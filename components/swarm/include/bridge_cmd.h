@@ -125,3 +125,26 @@ bool bridge_cmd_on_ack(bridge_router_t *r, const uint8_t mac[6], const swarm_com
  * accessors -- so a caller running this on a periodic tick must call it
  * in a loop if it wants every expiry this pass, not just the first. */
 bool bridge_cmd_expire(bridge_router_t *r, uint32_t now_s, bridge_cmd_t *expired_out);
+
+/* M7: a POLL-triggered opportunistic-send peek (swarm.c's hub_rx_cb/
+ * bridge_task, BRIDGE_ITEM_FLUSH) -- returns the active, not-yet-accepted
+ * slot for mac (the same "still needs sending" condition
+ * bridge_cmd_next_send() itself checks via !accepted), or NULL when mac is
+ * unknown to this router, has no active command, or its outstanding
+ * command has already been ACCEPTED (only DONE/FAILED clear a slot, but an
+ * ACCEPTED one is already progressing on the bridge's side and a resend
+ * would just be redundant). Unlike bridge_cmd_next_send(), this never
+ * mutates the slot (no sends/sent_s bump) and ignores BRIDGE_CMD_RETRY_S
+ * entirely -- the caller decides whether to actually act on the peek, and
+ * must call bridge_cmd_mark_sent() itself if it does. Same pointer-aliasing
+ * caveat as bridge_cmd_next_send(): valid only until the next bridge_cmd_*
+ * call on this router. */
+const bridge_cmd_t *bridge_cmd_peek_pending(bridge_router_t *r, const uint8_t mac[6]);
+
+/* Records that the caller just sent (or attempted to send) mac's active
+ * command outside the normal bridge_cmd_next_send() cadence -- updates
+ * sent_s = now_s and bumps sends, the same two fields bridge_cmd_next_send()
+ * itself updates on a normal (re)send, so bridge_cmd_next_send()'s own
+ * due_first_send/due_retry checks see this as already sent and don't
+ * immediately resend it again. No-op when mac has no active slot. */
+void bridge_cmd_mark_sent(bridge_router_t *r, const uint8_t mac[6], uint32_t now_s);

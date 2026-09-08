@@ -111,6 +111,25 @@ bool bridge_cmd_on_ack(bridge_router_t *r, const uint8_t mac[6], const swarm_com
     return false;   /* an unrecognised status: leave the command outstanding rather than guess */
 }
 
+const bridge_cmd_t *bridge_cmd_peek_pending(bridge_router_t *r, const uint8_t mac[6])
+{
+    int i = slot_for_mac(r, mac, false);
+    if (i < 0) return NULL;
+    bridge_cmd_t *s = &r->slot[i];
+    if (!s->active || s->accepted) return NULL;
+    return s;
+}
+
+void bridge_cmd_mark_sent(bridge_router_t *r, const uint8_t mac[6], uint32_t now_s)
+{
+    int i = slot_for_mac(r, mac, false);
+    if (i < 0) return;
+    bridge_cmd_t *s = &r->slot[i];
+    if (!s->active) return;
+    s->sent_s = now_s;
+    s->sends++;
+}
+
 bool bridge_cmd_expire(bridge_router_t *r, uint32_t now_s, bridge_cmd_t *expired_out)
 {
     for (int i = 0; i < BRIDGE_MAX_NODES; i++) {
