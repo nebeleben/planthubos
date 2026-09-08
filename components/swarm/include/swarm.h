@@ -1,6 +1,7 @@
 #pragma once
 #include "esp_err.h"
 #include "radio_role_str.h"
+#include "bridge_table.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -179,6 +180,19 @@ esp_err_t swarm_bridge_remove(const uint8_t mac[6], const uint8_t eui64[8]);
  * before this function returns -- the caller's buffer need not outlive the
  * call. See swarm_bridge_permit() above for the return contract. */
 esp_err_t swarm_bridge_rename(const uint8_t mac[6], const uint8_t eui64[8], const char *name);
+
+/* Hub (M7 Task 9): copies the hub's own bridge-node bookkeeping into *out
+ * under s_bridges_mutex (swarm.c), for GET /api/v1/zigbee's coordinator
+ * list and the device remove/rename routes' bridge_table_find_device()
+ * lookup. Returns false (out left untouched) only when this hub has no
+ * bridge machinery at all (s_bridges_mutex never created -- Zigbee
+ * disabled at build time or ensure_bridge_task() never ran), the same
+ * "nothing to report" posture the rest of this surface uses -- callers
+ * should treat that the same as an empty/all-absent table. Safe to call
+ * from any task, including bridge_task's own (unlike swarm_bridge_permit/
+ * remove/rename() above, this never waits on bridge_task -- it just takes
+ * the mutex bridge_task already yields whenever it isn't mid-tick). */
+bool swarm_bridge_snapshot(bridge_table_t *out);
 
 /* Battery-mode wake cycle (spec §4). Called from main.c's node-paired
  * branch INSTEAD OF returning to a plain always-on run, when
