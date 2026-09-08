@@ -563,7 +563,13 @@ esp_err_t swarm_request_node_config(const uint8_t mac[6])
  * handler's task, api_v1.c) also writes it directly and synchronously
  * (forgetting a node must take effect immediately, not queue behind
  * whatever bridge_task is mid-processing) -- so unlike s_bridges itself,
- * this needs an explicit mutex the brief's pseudocode doesn't spell out. */
+ * this needs an explicit mutex the brief's pseudocode doesn't spell out.
+ * ONLY ever held for a short, bounded, in-memory scan/mutation -- never
+ * across a blocking send (see request_resync()'s own "release, then send"
+ * discipline) or file I/O (see bridge_save()/bridge_load() and
+ * s_bridge_io_mutex below): swarm_zb_dispatch() (ble_collector.c's
+ * adv_decoder_task, the BLE decoder task) also takes this mutex for a
+ * quick lookup and must never be made to wait on a flash write. */
 static bridge_table_t     s_bridges;
 static SemaphoreHandle_t  s_bridges_mutex;
 
@@ -596,33 +602,60 @@ _Static_assert(BRIDGE_MAX_NODES == SWARM_MAX_NODES,
  * bridge_task, a 4096 B stack; bridge_load() runs once at boot, on
  * swarm_start_main()'s caller's stack, smaller still) -- a stack-local
  * array of this size (this function's original shape) is a guaranteed
- * overflow on real hardware. static instead: no heap, and a single shared
- * buffer for both functions is safe because they can never run
- * concurrently -- every bridge_save() call site already holds
- * s_bridges_mutex (this function's own "caller must hold" contract,
- * below), and bridge_load() runs exactly once, at boot, strictly BEFORE
- * ensure_bridge_task() ever creates that mutex or starts bridge_task (see
- * swarm_start_main()) -- so there is only ever one writer to this buffer
- * at any instant. */
-static uint8_t s_bridge_io_buf[BRIDGE_STORE_IMAGE_MAX];
+ * overflow on real hardware. static instead: no heap.
+ *
+ * Fix round 1 addendum (from Task 8's review): this buffer, and the file
+ * I/O around it, must NOT run while s_bridges_mutex is held -- Task 8's
+ * swarm_zb_dispatch() (ble_collector.c's adv_decoder_task, the BLE decoder
+ * task) also takes s_bridges_mutex for a quick lookup and must never be
+ * made to wait on a flash write. s_bridge_io_mutex is this buffer's OWN
+ * lock, serialising bridge_save()/bridge_load() against each other (so two
+ * saves, or a save racing the one boot-time load, can never interleave
+ * their writes into this shared buffer) entirely independently of
+ * s_bridges_mutex.
+ *
+ * LOCK ORDER, wherever both are ever held together (bridge_save() below is
+ * the only such place): s_bridge_io_mutex OUTER, s_bridges_mutex INNER.
+ * Never the other way around, anywhere in this file -- reversing it would
+ * risk a classic lock-order deadlock against swarm_zb_dispatch() or
+ * bridge_task's own table-mutating cases if either of those ever grew a
+ * reason to also take s_bridge_io_mutex while already holding
+ * s_bridges_mutex. */
+static uint8_t          s_bridge_io_buf[BRIDGE_STORE_IMAGE_MAX];
+static SemaphoreHandle_t s_bridge_io_mutex;
 
-/* Caller must hold s_bridges_mutex. Same tmp+rename discipline as
- * zigbee.c's zb_store_save() (that file's own comment has the full
- * power-loss-atomicity reasoning); this omits the explicit fsync() that
- * file adds -- the bridge table is reconstructible from the next RESYNC
- * round-trip with every node, unlike the zigbee joined-device table, which
- * has no such second source of truth if a torn write lost it. */
+/* Same tmp+rename discipline as zigbee.c's zb_store_save() (that file's own
+ * comment has the full power-loss-atomicity reasoning); this omits the
+ * explicit fsync() that file adds -- the bridge table is reconstructible
+ * from the next RESYNC round-trip with every node, unlike the zigbee
+ * joined-device table, which has no such second source of truth if a torn
+ * write lost it.
+ *
+ * Callers must NOT hold s_bridges_mutex when calling this (see the lock-
+ * order comment above s_bridge_io_buf) -- bridge_task's cases and
+ * swarm_forget_node_stats() both mutate the table under s_bridges_mutex,
+ * release it, and only THEN call this; this function re-takes
+ * s_bridges_mutex itself, briefly, purely to serialise a stable snapshot
+ * into s_bridge_io_buf, and releases it again before touching the
+ * filesystem. */
 static void bridge_save(void)
 {
+    xSemaphoreTake(s_bridge_io_mutex, portMAX_DELAY);
+
+    xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
     size_t len = bridge_table_serialize(&s_bridges, s_bridge_io_buf, sizeof s_bridge_io_buf);
+    xSemaphoreGive(s_bridges_mutex);
+
     if (len == 0) {
         ESP_LOGE(TAG, "bridge table serialize failed; not persisted");
+        xSemaphoreGive(s_bridge_io_mutex);
         return;
     }
     FILE *f = fopen(BRIDGE_STORE_TMP_PATH, "wb");
     if (!f) {
         ESP_LOGW(TAG, "could not open %s for write (errno=%d); a reboot now would lose the "
                       "bridge table", BRIDGE_STORE_TMP_PATH, errno);
+        xSemaphoreGive(s_bridge_io_mutex);
         return;
     }
     size_t wrote = fwrite(s_bridge_io_buf, 1, len, f);
@@ -630,6 +663,7 @@ static void bridge_save(void)
         ESP_LOGW(TAG, "short write or close failure persisting the bridge table to %s",
                  BRIDGE_STORE_TMP_PATH);
         remove(BRIDGE_STORE_TMP_PATH);
+        xSemaphoreGive(s_bridge_io_mutex);
         return;
     }
     if (rename(BRIDGE_STORE_TMP_PATH, BRIDGE_STORE_PATH) != 0) {
@@ -637,27 +671,36 @@ static void bridge_save(void)
                  BRIDGE_STORE_TMP_PATH, BRIDGE_STORE_PATH, errno);
         remove(BRIDGE_STORE_TMP_PATH);
     }
+    xSemaphoreGive(s_bridge_io_mutex);
 }
 
-/* Called once, from swarm_start_main(), before any other task can touch
- * s_bridges -- no locking needed here (mirrors zb_store_load()'s own
- * comment on the same point), and strictly before ensure_bridge_task()
- * ever runs, so s_bridge_io_buf (shared with bridge_save() above) has no
- * concurrent writer yet either -- see that buffer's own comment. */
+/* Called once, from swarm_start_main(), before ensure_bridge_task() ever
+ * creates s_bridges_mutex or starts bridge_task -- so s_bridges itself
+ * needs no lock here (mirrors zb_store_load()'s own comment on the same
+ * point). Still takes s_bridge_io_mutex around s_bridge_io_buf, even though
+ * nothing else can be running yet: keeps "every access to this buffer holds
+ * this mutex" an unconditional invariant rather than one with a boot-time
+ * exception to remember. s_bridge_io_mutex itself is created in
+ * swarm_start_main() BEFORE this is called (unlike s_bridges_mutex, which
+ * ensure_bridge_task() creates lazily afterwards) -- see that function. */
 static void bridge_load(void)
 {
     bridge_table_init(&s_bridges);
 
+    xSemaphoreTake(s_bridge_io_mutex, portMAX_DELAY);
     FILE *f = fopen(BRIDGE_STORE_PATH, "rb");
     if (!f) {
+        xSemaphoreGive(s_bridge_io_mutex);
         ESP_LOGI(TAG, "%s: not present (first boot, or no bridge node has announced a device yet)",
                  BRIDGE_STORE_PATH);
         return;
     }
     size_t n = fread(s_bridge_io_buf, 1, sizeof s_bridge_io_buf, f);
     fclose(f);
+    bool ok = bridge_table_deserialize(&s_bridges, s_bridge_io_buf, n);
+    xSemaphoreGive(s_bridge_io_mutex);
 
-    if (!bridge_table_deserialize(&s_bridges, s_bridge_io_buf, n)) {
+    if (!ok) {
         ESP_LOGW(TAG, "%s: %u byte(s) unreadable (bad magic, version, length or count); "
                       "starting this boot with an empty bridge table", BRIDGE_STORE_PATH, (unsigned)n);
         bridge_table_init(&s_bridges);
@@ -802,6 +845,14 @@ static void bridge_task(void *arg)
              * just below/above. Set instead of calling directly inside the
              * switch; sent once, after xSemaphoreGive(), further down. */
             bool need_resync = false;
+            /* Fix round 1 addendum: bridge_save() itself now does file I/O
+             * OUTSIDE s_bridges_mutex (see its own comment) -- but it still
+             * must not run while THIS mutex acquisition is held, since
+             * bridge_save() re-takes s_bridges_mutex internally (briefly,
+             * to serialise) and this mutex implementation is not
+             * recursive. Same "flag now, act after xSemaphoreGive()" shape
+             * as need_resync just above. */
+            bool need_save = false;
 
             xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
             switch (it.type) {
@@ -847,12 +898,12 @@ static void bridge_task(void *arg)
                     }
                 }
                 actor_set_device_key(idx, (const uint8_t *)&id);
-                bridge_save();
+                need_save = true;
                 break;
             }
             case SWARM_MSG_DEVICE_GONE: {
                 bridge_table_remove(&s_bridges, it.mac, &it.u.gone.dev);
-                bridge_save();
+                need_save = true;
                 /* M7 Task 7 fix round 1 (critical #2): the registry never
                  * deletes rows (registry.h), so the device entry survives
                  * this device leaving its bridge's zigbee network -- but its
@@ -896,7 +947,7 @@ static void bridge_task(void *arg)
                 bool mismatch = b->status_valid && it.u.status.device_count != b->count;
                 b->status = it.u.status;
                 b->status_valid = true;
-                bridge_save();
+                need_save = true;
                 if (mismatch || !b->synced_once) {
                     need_resync = true;
                     b->synced_once = true;
@@ -975,13 +1026,17 @@ static void bridge_task(void *arg)
             }
             xSemaphoreGive(s_bridges_mutex);
 
-            /* need_resync (fix round 1, important #3): request_resync()
-             * runs here, AFTER the mutex is released, never inside the
-             * switch above -- same discipline the router tick and
-             * swarm_start_main()'s boot sweep already use for their own
-             * sends. it.mac is a plain byte array copied into this local
-             * item, so it stays valid regardless of anything the mutex was
-             * protecting. */
+            /* need_save/need_resync (fix round 1): both run here, AFTER
+             * s_bridges_mutex is released, never inside the switch above --
+             * bridge_save() re-takes s_bridges_mutex itself (briefly, to
+             * serialise -- see its own comment) so calling it while this
+             * mutex is still held would self-deadlock (it is not
+             * recursive); request_resync() follows the same discipline the
+             * router tick and swarm_start_main()'s boot sweep already use
+             * for their own sends. it.mac is a plain byte array copied into
+             * this local item, so it stays valid regardless of anything the
+             * mutex was protecting. */
+            if (need_save) bridge_save();
             if (need_resync) request_resync(it.mac);
         }   /* if (got == pdTRUE) */
 
@@ -1516,6 +1571,13 @@ esp_err_t swarm_start_main(void)
     if (!s_stats_mutex) s_stats_mutex = xSemaphoreCreateMutex();
     if (!s_stats_mutex) return ESP_ERR_NO_MEM;
 
+    /* Created here, BEFORE bridge_load() below (which takes it) -- unlike
+     * s_bridges_mutex, which ensure_bridge_task() creates lazily further
+     * down, this one has a user before that point. See s_bridge_io_buf's
+     * own top comment for the lock-order/why. */
+    if (!s_bridge_io_mutex) s_bridge_io_mutex = xSemaphoreCreateMutex();
+    if (!s_bridge_io_mutex) return ESP_ERR_NO_MEM;
+
     esp_err_t err = espnow_link_init(hub_rx_cb);
     if (err != ESP_OK) return err;
 
@@ -1806,12 +1868,18 @@ uint32_t swarm_frames_rx(void)
  * M7 Task 7: also forgets mac's bridge table entry (its coordinator status
  * and every device it announced) -- without this, a re-paired replacement
  * node reusing the same registry attribution would find a stale bridge
- * entry left behind by whichever node this MAC used to belong to. Runs
- * under s_bridges_mutex, the same lock bridge_task uses, since this can run
- * concurrently with it (unlike s_stats above, which only bridge_task and
- * this function ever touch, this table has two writers). api_v1.c's forget
- * handler already calls data_core_clear_node_attribution(mac) itself right
- * alongside this call -- not duplicated here. */
+ * entry left behind by whichever node this MAC used to belong to. The
+ * table mutation runs under s_bridges_mutex, the same lock bridge_task
+ * uses, since this can run concurrently with it (unlike s_stats above,
+ * which only bridge_task and this function ever touch, this table has two
+ * writers). api_v1.c's forget handler already calls
+ * data_core_clear_node_attribution(mac) itself right alongside this call --
+ * not duplicated here.
+ *
+ * Fix round 1 addendum: bridge_save() is called AFTER s_bridges_mutex is
+ * released, not while held -- it re-takes s_bridges_mutex itself, briefly,
+ * purely to serialise (see its own comment), and this mutex is not
+ * recursive. */
 void swarm_forget_node_stats(const uint8_t mac[6])
 {
     if (s_stats_mutex) {
@@ -1828,8 +1896,8 @@ void swarm_forget_node_stats(const uint8_t mac[6])
     if (s_bridges_mutex) {
         xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
         bridge_table_forget_node(&s_bridges, mac);
-        bridge_save();
         xSemaphoreGive(s_bridges_mutex);
+        bridge_save();
     }
 }
 
