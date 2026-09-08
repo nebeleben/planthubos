@@ -44,6 +44,7 @@
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_crc.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -624,6 +625,37 @@ _Static_assert(BRIDGE_MAX_NODES == SWARM_MAX_NODES,
 static uint8_t          s_bridge_io_buf[BRIDGE_STORE_IMAGE_MAX];
 static SemaphoreHandle_t s_bridge_io_mutex;
 
+/* I2 fix (save storms): the CRC32 of the last image actually written to
+ * flash by bridge_save(), so an idempotent re-announce/resync round (the
+ * common case once the table has converged) skips the tmp+rename entirely
+ * instead of rewriting a byte-identical image. Guarded by s_bridge_io_mutex
+ * -- the same lock that already serialises every access to s_bridge_io_buf
+ * and every bridge_save() call, so no separate lock is needed here. */
+static uint32_t s_bridge_saved_crc;
+static bool     s_bridge_saved_crc_valid;
+
+/* I2 fix (save storms): coalesces bridge_save() calls across a burst of
+ * queue items (a RESYNC replay can post up to ZB_STORE_MAX_DEVICES ANNOUNCE
+ * frames back-to-back) instead of one flash rewrite per item. Set true by
+ * bridge_task's own ANNOUNCE/GONE/STATUS-with-change cases and by
+ * swarm_forget_node_stats() (a different task) -- both already hold
+ * s_bridges_mutex at the point they set it, which is this flag's guard.
+ * bridge_task itself decides WHEN to act on it (queue-drained or the 2 s
+ * cap), in its main loop below. */
+static bool     s_bridge_dirty;
+static uint32_t s_bridge_dirty_since_s;
+
+/* Marks the bridge table dirty; caller must hold s_bridges_mutex (every
+ * call site already does, for the table mutation that makes this dirty in
+ * the first place). now_s is only recorded the first time the flag flips
+ * from clean to dirty, so a steady stream of further changes doesn't keep
+ * pushing the 2 s deadline back. */
+static void mark_bridge_dirty(uint32_t now_s)
+{
+    if (!s_bridge_dirty) s_bridge_dirty_since_s = now_s;
+    s_bridge_dirty = true;
+}
+
 /* Same tmp+rename discipline as zigbee.c's zb_store_save() (that file's own
  * comment has the full power-loss-atomicity reasoning); this omits the
  * explicit fsync() that file adds -- the bridge table is reconstructible
@@ -651,6 +683,17 @@ static void bridge_save(void)
         xSemaphoreGive(s_bridge_io_mutex);
         return;
     }
+
+    /* I2 fix: skip the tmp+rename entirely when this image is byte-
+     * identical to the last one actually written -- an idempotent
+     * re-announce, a resync round after the table has already converged,
+     * or a forget that nets out to no change all hit this. */
+    uint32_t crc = esp_crc32_le(0, s_bridge_io_buf, len);
+    if (s_bridge_saved_crc_valid && crc == s_bridge_saved_crc) {
+        xSemaphoreGive(s_bridge_io_mutex);
+        return;
+    }
+
     FILE *f = fopen(BRIDGE_STORE_TMP_PATH, "wb");
     if (!f) {
         ESP_LOGW(TAG, "could not open %s for write (errno=%d); a reboot now would lose the "
@@ -670,6 +713,9 @@ static void bridge_save(void)
         ESP_LOGW(TAG, "rename %s -> %s failed (errno=%d); a reboot now would lose the bridge table",
                  BRIDGE_STORE_TMP_PATH, BRIDGE_STORE_PATH, errno);
         remove(BRIDGE_STORE_TMP_PATH);
+    } else {
+        s_bridge_saved_crc = crc;
+        s_bridge_saved_crc_valid = true;
     }
     xSemaphoreGive(s_bridge_io_mutex);
 }
@@ -749,6 +795,14 @@ typedef struct {
 typedef struct {
     uint8_t mac[6];
     int     type;
+    /* I4 fix: esp_timer_get_time() at the moment hub_rx_cb decoded this
+     * item (BEFORE it sat on s_bridge_queue waiting for bridge_task) -- the
+     * SWARM_MSG_MEASUREMENT case adds "time since receipt" on top of the
+     * frame's own age_s to get the reading's TOTAL age before deciding
+     * whether to submit it. Set for every item, not just MEASUREMENT, so
+     * there is one uniform place doing it (BRIDGE_ITEM_SUBMIT posts, which
+     * originate hub-side rather than off the wire, don't use this field). */
+    int64_t recv_us;
     union {
         swarm_device_announce_t ann;
         swarm_device_gone_t     gone;
@@ -759,7 +813,7 @@ typedef struct {
     } u;
 } bridge_item_t;
 
-#define BRIDGE_QUEUE_LEN 8
+#define BRIDGE_QUEUE_LEN 16
 
 static QueueHandle_t s_bridge_queue;
 static TaskHandle_t  s_bridge_task;
@@ -845,14 +899,11 @@ static void bridge_task(void *arg)
              * just below/above. Set instead of calling directly inside the
              * switch; sent once, after xSemaphoreGive(), further down. */
             bool need_resync = false;
-            /* Fix round 1 addendum: bridge_save() itself now does file I/O
-             * OUTSIDE s_bridges_mutex (see its own comment) -- but it still
-             * must not run while THIS mutex acquisition is held, since
-             * bridge_save() re-takes s_bridges_mutex internally (briefly,
-             * to serialise) and this mutex implementation is not
-             * recursive. Same "flag now, act after xSemaphoreGive()" shape
-             * as need_resync just above. */
-            bool need_save = false;
+            /* I2 fix: bridge_save() is no longer called per item -- ANNOUNCE/
+             * GONE/STATUS-with-change below call mark_bridge_dirty(now_s)
+             * instead (defined above, next to s_bridge_dirty), and this
+             * loop's tail decides whether THIS pass is the one that actually
+             * calls bridge_save(), after s_bridges_mutex is released. */
 
             xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
             switch (it.type) {
@@ -898,12 +949,12 @@ static void bridge_task(void *arg)
                     }
                 }
                 actor_set_device_key(idx, (const uint8_t *)&id);
-                need_save = true;
+                mark_bridge_dirty(now_s);
                 break;
             }
             case SWARM_MSG_DEVICE_GONE: {
                 bridge_table_remove(&s_bridges, it.mac, &it.u.gone.dev);
-                need_save = true;
+                mark_bridge_dirty(now_s);
                 /* M7 Task 7 fix round 1 (critical #2): the registry never
                  * deletes rows (registry.h), so the device entry survives
                  * this device leaving its bridge's zigbee network -- but its
@@ -932,8 +983,26 @@ static void bridge_task(void *arg)
                     need_resync = true;
                     break;
                 }
-                data_core_submit_cap_id(&id, it.u.meas.cap_id, it.u.meas.value);
-                rules_notify_value_update();
+                /* I4 fix: mirror the BLE relay path's honesty
+                 * (data_core_submit_from()'s age policy) instead of always
+                 * stamping this as "now". it.u.meas.age_s is the bridge
+                 * node's own transmit-time age (already inclusive of any
+                 * backlog wait, see forward_task()'s recompute); add on the
+                 * time this item spent decoded-but-unprocessed (queued on
+                 * s_bridge_queue since hub_rx_cb's item.recv_us) to get the
+                 * TOTAL age as of right now. Clamped at UINT16_MAX the same
+                 * way the node's own recompute is -- data_core_submit_cap_id_aged()
+                 * drops anything past DATA_CORE_MAX_AGE_S (1800 s) long
+                 * before that clamp could matter. */
+                int64_t queued_us = esp_timer_get_time() - it.recv_us;
+                uint32_t queued_s = queued_us > 0 ? (uint32_t)(queued_us / 1000000) : 0;
+                uint32_t total_age_s = it.u.meas.age_s + queued_s;
+                uint16_t age_for_data_core = (total_age_s > UINT16_MAX) ? UINT16_MAX : (uint16_t)total_age_s;
+                /* data_core_submit_cap_id_aged() already logs its own
+                 * reason (too old, out-of-range value, or registry full)
+                 * on a false return -- nothing further to log here. */
+                if (data_core_submit_cap_id_aged(&id, it.u.meas.cap_id, it.u.meas.value, age_for_data_core))
+                    rules_notify_value_update();
                 break;
             }
             case SWARM_MSG_COORD_STATUS: {
@@ -945,9 +1014,24 @@ static void bridge_task(void *arg)
                 }
                 swarm_note_node_radio(it.mac, it.u.status.radio_role);
                 bool mismatch = b->status_valid && it.u.status.device_count != b->count;
+                /* I2 fix: only dirty the table when this status actually
+                 * differs from what's already persisted -- a bridge's
+                 * periodic re-announce of an unchanged COORD_STATUS (the
+                 * common steady-state case) must not force a flash rewrite
+                 * every time it arrives. Field-by-field, not memcmp: the
+                 * struct has a padding byte (after `channel`) that a
+                 * field-wise decode never initialises, so a raw memcmp
+                 * could report "changed" on padding garbage alone. */
+                bool status_changed = !b->status_valid
+                    || b->status.radio_role    != it.u.status.radio_role
+                    || b->status.formed        != it.u.status.formed
+                    || b->status.channel       != it.u.status.channel
+                    || b->status.pan_id        != it.u.status.pan_id
+                    || b->status.permit_s      != it.u.status.permit_s
+                    || b->status.device_count  != it.u.status.device_count;
                 b->status = it.u.status;
                 b->status_valid = true;
-                need_save = true;
+                if (status_changed) mark_bridge_dirty(now_s);
                 if (mismatch || !b->synced_once) {
                     need_resync = true;
                     b->synced_once = true;
@@ -1026,19 +1110,54 @@ static void bridge_task(void *arg)
             }
             xSemaphoreGive(s_bridges_mutex);
 
-            /* need_save/need_resync (fix round 1): both run here, AFTER
-             * s_bridges_mutex is released, never inside the switch above --
-             * bridge_save() re-takes s_bridges_mutex itself (briefly, to
-             * serialise -- see its own comment) so calling it while this
-             * mutex is still held would self-deadlock (it is not
-             * recursive); request_resync() follows the same discipline the
-             * router tick and swarm_start_main()'s boot sweep already use
-             * for their own sends. it.mac is a plain byte array copied into
-             * this local item, so it stays valid regardless of anything the
-             * mutex was protecting. */
-            if (need_save) bridge_save();
+            /* need_resync (fix round 1) runs here, AFTER s_bridges_mutex is
+             * released, never inside the switch above -- request_resync()
+             * follows the same discipline the router tick and
+             * swarm_start_main()'s own boot sweep already use for their own
+             * sends. it.mac is a plain byte array copied into this local
+             * item, so it stays valid regardless of anything the mutex was
+             * protecting. bridge_save() itself is no longer called from
+             * here -- see the dirty-flag coalescing below, which decides
+             * once per pass (not once per item) whether this is the pass
+             * that actually persists. */
             if (need_resync) request_resync(it.mac);
         }   /* if (got == pdTRUE) */
+
+        /* I2 fix (save storms): coalesce bridge_save() calls. Rather than a
+         * flash tmp+rename per ANNOUNCE/GONE/STATUS-with-change (which a
+         * RESYNC replay burst -- up to ZB_STORE_MAX_DEVICES frames back to
+         * back -- turned into a rewrite storm through the queue), persist
+         * at most once per pass, and only when: the queue just went quiet
+         * (got != pdTRUE, i.e. this pass's xQueueReceive() above timed out
+         * rather than finding an item -- the table has stopped changing for
+         * now) OR the dirty flag has stood for >= 2 s (so a continuous
+         * burst still gets flushed periodically instead of waiting for it
+         * to fully drain). bridge_save()'s own CRC32 check (s_bridge_saved_crc)
+         * additionally skips the actual write on top of this when the
+         * image turns out byte-identical to what's already on flash. */
+        bool bridge_queue_drained = (got != pdTRUE);
+        bool do_bridge_save = false;
+        xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
+        if (s_bridge_dirty && (bridge_queue_drained || (now_s - s_bridge_dirty_since_s) >= 2)) {
+            s_bridge_dirty = false;
+            do_bridge_save = true;
+        }
+        xSemaphoreGive(s_bridges_mutex);
+        if (do_bridge_save) bridge_save();
+
+        /* I6 fix: a hub whose radio role is NOT BLE never starts
+         * ble_collector_start() (main.c's want_ble == false), so nothing
+         * else on a hub ever pumps actor_service() -- without this, a
+         * bridged (or local Zigbee) ACTUATE sits in the actor queue forever
+         * and never reaches swarm_zb_dispatch(). Gated on radio_role_get()
+         * != RADIO_ROLE_BLE so a BLE-role hub, where adv_decoder_task's own
+         * loop already pumps this (ble_collector.c, under s_actors_wired),
+         * is never double-pumped -- calling actor_service() twice from two
+         * tasks would just be redundant work, not unsafe (actor_lock()
+         * serialises it), but there is no reason to pay for it. Driven off
+         * this task's own 500 ms tick, same cadence as everything else in
+         * this loop's tail. */
+        if (radio_role_get() != RADIO_ROLE_BLE) actor_service();
 
         /* Router tick (Task 8), driven every pass regardless of whether an
          * item arrived this time -- the 500 ms queue-receive timeout above
@@ -1433,6 +1552,7 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
         memset(&item, 0, sizeof(item));
         memcpy(item.mac, src_mac, 6);
         item.type = type;
+        item.recv_us = esp_timer_get_time();   /* I4 fix: see bridge_item_t's own comment */
         bool ok;
         switch (type) {
         case SWARM_MSG_DEVICE_ANNOUNCE: ok = swarm_decode_device_announce(data, (size_t)len, &item.u.ann); break;
@@ -1443,6 +1563,16 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
         default:                        ok = false; break;   /* unreachable: the outer if() already narrowed type */
         }
         if (!ok) return;
+        /* I3 fix: same record_stat() call the READING/CHECKIN branches
+         * above already make, at the same point (after a successful
+         * decode, before queuing) -- without it, a bridge streaming
+         * MEASUREMENT/COORD_STATUS/etc. every few seconds still only moves
+         * last_seen_s/frames_rx/rssi on its ~300 s CHECKIN cadence, making
+         * an actively-talking bridge look nearly lost, and (via
+         * swarm_note_node_radio()'s "existing slot only" contract) drops
+         * every COORD_STATUS radio-role report until that first CHECKIN
+         * creates the stats slot. */
+        record_stat(src_mac, rssi);
         if (!s_bridge_queue || xQueueSend(s_bridge_queue, &item, 0) != pdTRUE) {
             ESP_LOGW(TAG, "bridge frame (type=%d) from " MACSTR ": no bridge task/queue full, dropping",
                      type, MAC2STR(src_mac));
@@ -1577,6 +1707,17 @@ esp_err_t swarm_start_main(void)
      * own top comment for the lock-order/why. */
     if (!s_bridge_io_mutex) s_bridge_io_mutex = xSemaphoreCreateMutex();
     if (!s_bridge_io_mutex) return ESP_ERR_NO_MEM;
+
+    /* I6 fix: unconditional, not gated on radio role -- a hub in the
+     * zigbee role (no ble_collector_start() call at all, main.c's
+     * want_ble == false) previously never got a live actor table: raw BSS
+     * meant every row's dev_idx read 0 instead of the -1 free sentinel, so
+     * bridge_task's actor_declare()/actor_set_device_key() calls further
+     * down (its DEVICE_ANNOUNCE case) mis-attributed against an
+     * uninitialised table. actor_init() is idempotent (its own doc
+     * comment), so a BLE-role hub's later ble_collector_start() ->
+     * actor_init() call is a harmless no-op, not a second wipe. */
+    actor_init();
 
     esp_err_t err = espnow_link_init(hub_rx_cb);
     if (err != ESP_OK) return err;
@@ -1876,10 +2017,10 @@ uint32_t swarm_frames_rx(void)
  * data_core_clear_node_attribution(mac) itself right alongside this call --
  * not duplicated here.
  *
- * Fix round 1 addendum: bridge_save() is called AFTER s_bridges_mutex is
- * released, not while held -- it re-takes s_bridges_mutex itself, briefly,
- * purely to serialise (see its own comment), and this mutex is not
- * recursive. */
+ * I2 fix: this no longer calls bridge_save() itself -- it marks the table
+ * dirty (mark_bridge_dirty(), under s_bridges_mutex, same as every other
+ * writer) and leaves the actual persist to bridge_task's own coalescing,
+ * so a forget cannot force an extra flash write outside that discipline. */
 void swarm_forget_node_stats(const uint8_t mac[6])
 {
     if (s_stats_mutex) {
@@ -1894,10 +2035,18 @@ void swarm_forget_node_stats(const uint8_t mac[6])
     }
 
     if (s_bridges_mutex) {
+        uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
         xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
         bridge_table_forget_node(&s_bridges, mac);
+        /* I2 fix: mark dirty instead of calling bridge_save() directly --
+         * this runs on the forget HTTP handler's own task, a different task
+         * from bridge_task, so it participates in the same dirty-flag
+         * coalescing (mark_bridge_dirty() is guarded by s_bridges_mutex,
+         * held here) rather than forcing an out-of-band flash write of its
+         * own. bridge_task picks it up on its very next pass (queue-drained
+         * or the 2 s cap, whichever is first). */
+        mark_bridge_dirty(now_s);
         xSemaphoreGive(s_bridges_mutex);
-        bridge_save();
     }
 }
 
@@ -2588,7 +2737,16 @@ static void forward_task(void *arg)
             n = swarm_encode_reading(&r.u.reading, buf, sizeof buf);
             break;
         case SWARM_OUT_MEASUREMENT:
-            if (from_backlog) r.u.meas.age_s = (uint16_t)swarm_buf_recompute_age(r.u.meas.age_s, captured_us, esp_timer_get_time()); /* data_core caps age at 30 min; fits uint16 */
+            /* I4 fix: this age_s is no longer a dead field on arrival -- the
+             * hub's bridged-MEASUREMENT ingest (bridge_task's
+             * SWARM_MSG_MEASUREMENT case) now recomputes total age from it
+             * and drops the reading via data_core_submit_cap_id_aged() when
+             * it exceeds DATA_CORE_MAX_AGE_S (1800 s), the same policy
+             * data_core_submit_from() already applies to the BLE relay
+             * path. 1800 s fits uint16 (max 65535) with room to spare, so
+             * this narrowing cast never truncates a value the hub would
+             * still accept. */
+            if (from_backlog) r.u.meas.age_s = (uint16_t)swarm_buf_recompute_age(r.u.meas.age_s, captured_us, esp_timer_get_time());
             n = swarm_encode_measurement(&r.u.meas, buf, sizeof buf);
             break;
         case SWARM_OUT_ANNOUNCE:
@@ -2857,7 +3015,7 @@ static void send_cmd_ack(uint16_t seq, uint8_t op, uint8_t status, uint8_t detai
  * and command_task runs at prio 3, so the stack task can never be preempted
  * by command_task mid-update. This priority relationship is an invariant;
  * add a critical section if either priority changes. */
-static struct { int dev_idx; uint16_t seq; bool active; } s_actuate_pending;
+static struct { int dev_idx; uint16_t seq; bool active; int64_t deadline_us; } s_actuate_pending;
 
 /* zigbee.h's zb_cmd_result_t -- zb_cmd_report()'s one registered consumer
  * (registered below, in swarm_start_node()'s zigbee block, before
@@ -2916,6 +3074,21 @@ static void command_task(void *arg)
     for (;;) {
         actor_service();
 
+        /* I1 fix: s_actuate_pending is a single-slot latch that would
+         * otherwise never clear if actor_service()'s TTL-drop or
+         * service-time-decline paths swallow the outcome without ever
+         * reaching on_zb_result() (see the struct's comment above) --
+         * every subsequent ACTUATE would then be refused (detail 0xfe)
+         * forever. A local 10 s deadline, checked every pass through this
+         * already-periodic loop, guarantees the slot always frees itself
+         * even if no zb_cmd result ever arrives. 0xfd marks a local
+         * timeout, distinct from zb_cmd.c's own 0xff wire timeout. */
+        if (s_actuate_pending.active && esp_timer_get_time() >= s_actuate_pending.deadline_us) {
+            uint16_t timed_out_seq = s_actuate_pending.seq;
+            s_actuate_pending.active = false;
+            send_cmd_ack(timed_out_seq, SWARM_CMD_ACTUATE, SWARM_ACK_FAILED, 0xfd);
+        }
+
         swarm_command_ack_t queued;
         if (xQueueReceive(s_ack_queue, &queued, 0) == pdTRUE) {
             send_cmd_ack(queued.seq, queued.op, queued.status, queued.detail);
@@ -2958,22 +3131,18 @@ static void command_task(void *arg)
             status = zigbee_permit_join() ? SWARM_ACK_DONE : SWARM_ACK_FAILED;
             break;
         case SWARM_CMD_DEVICE_REMOVE: {
-            zb_device_t list[ZB_STORE_MAX_DEVICES];
-            int n = zigbee_device_list(list, ZB_STORE_MAX_DEVICES);
-            int found = -1;
-            for (int i = 0; i < n; i++)
-                if (memcmp(list[i].eui64, c.dev.addr, 8) == 0) { found = i; break; }
-            if (found < 0) { detail = 1; break; }
+            /* I5 fix: this is a pure existence check -- zigbee_store_lookup()
+             * (already used by zb_cmd.c) answers it with no stack array at
+             * all, unlike a zb_device_t[ZB_STORE_MAX_DEVICES] copy (~1 KB)
+             * used only to linear-scan for a match. NULL out params: the
+             * short_addr/endpoint it could also return are not needed here. */
+            if (!zigbee_store_lookup(c.dev.addr, NULL, NULL)) { detail = 1; break; }
             status = zigbee_device_remove(c.dev.addr) ? SWARM_ACK_DONE : SWARM_ACK_FAILED;
             if (status != SWARM_ACK_DONE) detail = 2;
             break; }
         case SWARM_CMD_DEVICE_RENAME: {
-            zb_device_t list[ZB_STORE_MAX_DEVICES];
-            int n = zigbee_device_list(list, ZB_STORE_MAX_DEVICES);
-            int found = -1;
-            for (int i = 0; i < n; i++)
-                if (memcmp(list[i].eui64, c.dev.addr, 8) == 0) { found = i; break; }
-            if (found < 0) { detail = 1; break; }
+            /* I5 fix: same existence-check swap as DEVICE_REMOVE above. */
+            if (!zigbee_store_lookup(c.dev.addr, NULL, NULL)) { detail = 1; break; }
             char name[SWARM_DEV_NAME_MAX + 1];
             uint8_t name_len = c.name_len > SWARM_DEV_NAME_MAX ? SWARM_DEV_NAME_MAX : c.name_len;
             memcpy(name, c.name, name_len);
@@ -3004,7 +3173,8 @@ static void command_task(void *arg)
                 detail = 1;
                 break;
             }
-            s_actuate_pending = (typeof(s_actuate_pending)){ .dev_idx = idx, .seq = c.seq, .active = true };
+            s_actuate_pending = (typeof(s_actuate_pending)){ .dev_idx = idx, .seq = c.seq, .active = true,
+                                                              .deadline_us = esp_timer_get_time() + 10 * 1000000LL };
             bool queued_ok = actor_request(idx, (uint8_t)(c.arg & 0xff), (uint16_t)(c.arg >> 8),
                                             ACTOR_SRC_REMOTE, actor_now_s() + c.ttl_s);
             if (!queued_ok) {
@@ -3724,7 +3894,13 @@ esp_err_t swarm_start_node(void)
          * an unset callback. */
         zb_cmd_set_result_cb(on_zb_result);
 
-        if (xTaskCreate(command_task, "swarm_cmd", 3072, NULL, 3, NULL) != pdPASS) {
+        /* I5 fix: 4096, up from 3072 -- replay_announces() (SWARM_CMD_RESYNC)
+         * still allocates one zb_device_t[ZB_STORE_MAX_DEVICES] (~1 KB) on
+         * top of zb_observer()'s own frame plus ESP-IDF log formatting; the
+         * two existence-check arrays this task used to carry alongside it
+         * are gone (see DEVICE_REMOVE/DEVICE_RENAME above), but this stays a
+         * real margin rather than a recount back down to the old number. */
+        if (xTaskCreate(command_task, "swarm_cmd", 4096, NULL, 3, NULL) != pdPASS) {
             ESP_LOGE(TAG, "failed to create command task; hub-initiated permit-join/actuate/"
                           "remove/rename/resync will never be delivered this boot");
         }
