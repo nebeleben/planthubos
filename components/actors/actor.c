@@ -262,8 +262,20 @@ uint32_t actor_now_s(void)            { return 0; }
 
 #endif
 
+/* I6 fix: idempotent -- swarm_start_main() now calls this unconditionally
+ * (before the radio block, so a hub of any radio role gets a live actor
+ * table/queue), and ble_collector_start() still calls it too, for a
+ * BLE-role hub/node. Without this guard, a second call would re-run
+ * actor_table_init()/actor_queue_init() and silently wipe out every
+ * actor_declare()/actor_request() the first call's caller had already made
+ * -- a real hazard now that two independent start paths call this, not
+ * just one. */
+static bool s_inited;
+
 void actor_init(void)
 {
+    if (s_inited) return;
+    s_inited = true;
 #ifdef ESP_PLATFORM
     if (!s_lock) s_lock = xSemaphoreCreateMutexStatic(&s_lock_buf);
 #endif
