@@ -159,6 +159,20 @@ bool      data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value
  * wrapper over this one. */
 bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value);
 
+/* I4 fix: the age-aware sibling of data_core_submit_cap_id() above, for a
+ * producer that -- like data_core_submit_from()'s MiBeacon path -- can
+ * carry a reading that is already some seconds/minutes old by the time it
+ * reaches this call (a bridged Zigbee MEASUREMENT that sat in the node's
+ * backlog ring through a hub outage, replayed on reconnect). Mirrors
+ * data_core_submit_from()'s own age policy exactly: age_s > DATA_CORE_MAX_AGE_S
+ * drops the reading outright (logged, not silently) rather than recording
+ * it as current, and otherwise the registry's last_seen_s/cap updated_s is
+ * backdated by age_s so /api/v1/devices reports the reading's REAL age
+ * instead of zero. age_s == 0 behaves identically to
+ * data_core_submit_cap_id(). Same "false means nothing was stored"
+ * contract as that function. */
+bool data_core_submit_cap_id_aged(const device_id_t *id, uint8_t cap_id, float value, uint16_t age_s);
+
 /* Registry slot index for id (0..REGISTRY_MAX_DEVICES-1), or -1 when the
  * device is not (yet) registered. Never creates an entry -- a pure lookup,
  * thread-safe via the same s_mutex every other accessor here uses, no

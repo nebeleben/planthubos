@@ -312,7 +312,13 @@ bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)
     return true;
 }
 
-bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value)
+/* I4 fix: shared body of data_core_submit_cap_id() and
+ * data_core_submit_cap_id_aged() below, parameterised on the timestamp to
+ * stamp the registry with -- "now" for the un-aged caller,
+ * "now - age_s" (already range-checked by the caller) for the aged one, so
+ * a bridged measurement's real capture time survives into last_seen_s/
+ * caps[].updated_s instead of always reading as "just now". */
+static bool submit_cap_id_at(const device_id_t *id, uint8_t cap_id, float value, uint32_t ts_s)
 {
     /* Same "encode before taking the mutex, skip the write (not a clear) on
      * out-of-range" discipline as data_core_submit_battery() above -- see
@@ -371,10 +377,8 @@ bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value)
         return false;
     }
 
-    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
-
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    int idx = registry_set_cap(&s_registry, id, cap_id, raw, now_s);
+    int idx = registry_set_cap(&s_registry, id, cap_id, raw, ts_s);
     xSemaphoreGive(s_mutex);
 
     if (idx < 0) {
@@ -386,6 +390,31 @@ bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value)
     esp_event_post(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE,
                    (void *)id, sizeof(*id), 0 /* don't block the calling task (adv_decoder_task for BTHome) */);
     return true;
+}
+
+bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value)
+{
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    return submit_cap_id_at(id, cap_id, value, now_s);
+}
+
+/* I4 fix: mirrors data_core_submit_from()'s age policy (data_core.h's
+ * DATA_CORE_MAX_AGE_S doc comment) for a producer that isn't the MiBeacon
+ * BLE relay path -- currently swarm.c's bridged Zigbee MEASUREMENT ingest,
+ * which decodes an age_s off the wire and, before this fix, discarded it
+ * entirely (I4 in the whole-branch review). */
+bool data_core_submit_cap_id_aged(const device_id_t *id, uint8_t cap_id, float value, uint16_t age_s)
+{
+    if (age_s > DATA_CORE_MAX_AGE_S) {
+        ESP_LOGD(TAG, "dropping cap %u for " MACSTR_FMT ": age %us exceeds max %us (dropped_stale=%lu)",
+                 cap_id, MAC_ARG(id->addr), (unsigned)age_s, (unsigned)DATA_CORE_MAX_AGE_S,
+                 (unsigned long)++s_dropped_stale);
+        return false;
+    }
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    /* Same clamp-rather-than-underflow reasoning as data_core_submit_from(). */
+    uint32_t effective_s = (age_s <= now_s) ? now_s - age_s : 0;
+    return submit_cap_id_at(id, cap_id, value, effective_s);
 }
 
 bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)
