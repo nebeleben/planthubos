@@ -129,3 +129,14 @@ bool registry_attribute(registry_t *r, const device_id_t *id, uint32_t frame_cnt
  * attribution last CHANGED, and clearing to "no attribution" isn't a new
  * source claiming the device, just this one being taken away. */
 void registry_clear_attribution(registry_t *r, const uint8_t node_mac[6]);
+
+/* M7 Task 7: attributes an ALREADY-RESOLVED device (idx, from
+ * registry_find_or_create()/registry_find()) to node_mac -- a zigbee
+ * bridge's DEVICE_ANNOUNCE names its own reporting node directly and has no
+ * frame_cnt/rssi of its own to arbitrate with, unlike registry_attribute()'s
+ * MiBeacon contest above. Reuses set_attribution() with rssi 0 (meaningless
+ * here; a zigbee device never runs through registry_attribute()'s rssi
+ * comparison, so this never gets contested) and the entry's own
+ * last_seen_s as its timestamp. A no-op if idx is out of range or the slot
+ * isn't in_use. */
+void registry_set_via(registry_t *r, int idx, const uint8_t node_mac[6]);

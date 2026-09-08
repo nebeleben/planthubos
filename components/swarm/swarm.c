@@ -8,6 +8,7 @@
 #include "swarm.h"
 #include "swarm_store.h"
 #include "swarm_frame.h"
+#include "bridge_table.h"
 #include "swarm_rules.h"
 #include "radio_role.h"
 #include "swarm_buf.h"
@@ -48,6 +49,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdint.h>
@@ -545,9 +547,303 @@ esp_err_t swarm_request_node_config(const uint8_t mac[6])
     return ESP_OK;
 }
 
+/* ---------------- Hub side: bridge table + ingest (M7 Task 7) ----------------
+ *
+ * s_bridges is the hub's own bookkeeping of every zigbee-role node it has
+ * heard from: that node's last coordinator status, and every end device it
+ * has announced. Distinct from s_stats[] above (generic per-node ESP-NOW
+ * stats, every role) and from data_core's registry (capability readings,
+ * keyed by device_id_t, no notion of "which bridge node reports this") --
+ * a zigbee device lives in both, cross-referenced by (kind, addr).
+ *
+ * s_bridges_mutex guards every access: bridge_task (below) is its only
+ * writer under ordinary operation, serialised off s_bridge_queue same as
+ * checkin_task, but swarm_forget_node_stats() (called from the forget HTTP
+ * handler's task, api_v1.c) also writes it directly and synchronously
+ * (forgetting a node must take effect immediately, not queue behind
+ * whatever bridge_task is mid-processing) -- so unlike s_bridges itself,
+ * this needs an explicit mutex the brief's pseudocode doesn't spell out. */
+static bridge_table_t     s_bridges;
+static SemaphoreHandle_t  s_bridges_mutex;
+
+_Static_assert(BRIDGE_MAX_NODES == SWARM_MAX_NODES,
+               "bridge_table.h's BRIDGE_MAX_NODES duplicates SWARM_MAX_NODES's value "
+               "(pure-C header, cannot include swarm_store.h) -- keep them equal by hand");
+
+#define BRIDGE_STORE_PATH     "/storage/bridges.bin"
+#define BRIDGE_STORE_TMP_PATH "/storage/bridges.tmp"
+/* Sized the same way zb_store.h's ZB_STORE_IMAGE_MAX is: header/per-node
+ * overhead plus BRIDGE_MAX_DEVICES devices at a generous per-device ceiling
+ * (see bridge_table.c's own BRIDGE_DEV_ENCODE_MAX comment for the real,
+ * tighter worst case -- this stays a round, obviously-sufficient number). */
+#define BRIDGE_STORE_IMAGE_MAX (16 + BRIDGE_MAX_NODES * (16 + BRIDGE_MAX_DEVICES * 96))
+
+/* Caller must hold s_bridges_mutex. Same tmp+rename discipline as
+ * zigbee.c's zb_store_save() (that file's own comment has the full
+ * power-loss-atomicity reasoning); this omits the explicit fsync() that
+ * file adds -- the bridge table is reconstructible from the next RESYNC
+ * round-trip with every node, unlike the zigbee joined-device table, which
+ * has no such second source of truth if a torn write lost it. */
+static void bridge_save(void)
+{
+    uint8_t buf[BRIDGE_STORE_IMAGE_MAX];
+    size_t len = bridge_table_serialize(&s_bridges, buf, sizeof buf);
+    if (len == 0) {
+        ESP_LOGE(TAG, "bridge table serialize failed; not persisted");
+        return;
+    }
+    FILE *f = fopen(BRIDGE_STORE_TMP_PATH, "wb");
+    if (!f) {
+        ESP_LOGW(TAG, "could not open %s for write (errno=%d); a reboot now would lose the "
+                      "bridge table", BRIDGE_STORE_TMP_PATH, errno);
+        return;
+    }
+    size_t wrote = fwrite(buf, 1, len, f);
+    if (wrote != len || fclose(f) != 0) {
+        ESP_LOGW(TAG, "short write or close failure persisting the bridge table to %s",
+                 BRIDGE_STORE_TMP_PATH);
+        remove(BRIDGE_STORE_TMP_PATH);
+        return;
+    }
+    if (rename(BRIDGE_STORE_TMP_PATH, BRIDGE_STORE_PATH) != 0) {
+        ESP_LOGW(TAG, "rename %s -> %s failed (errno=%d); a reboot now would lose the bridge table",
+                 BRIDGE_STORE_TMP_PATH, BRIDGE_STORE_PATH, errno);
+        remove(BRIDGE_STORE_TMP_PATH);
+    }
+}
+
+/* Called once, from swarm_start_main(), before any other task can touch
+ * s_bridges -- no locking needed here (mirrors zb_store_load()'s own
+ * comment on the same point). */
+static void bridge_load(void)
+{
+    bridge_table_init(&s_bridges);
+
+    uint8_t buf[BRIDGE_STORE_IMAGE_MAX];
+    FILE *f = fopen(BRIDGE_STORE_PATH, "rb");
+    if (!f) {
+        ESP_LOGI(TAG, "%s: not present (first boot, or no bridge node has announced a device yet)",
+                 BRIDGE_STORE_PATH);
+        return;
+    }
+    size_t n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+
+    if (!bridge_table_deserialize(&s_bridges, buf, n)) {
+        ESP_LOGW(TAG, "%s: %u byte(s) unreadable (bad magic, version, length or count); "
+                      "starting this boot with an empty bridge table", BRIDGE_STORE_PATH, (unsigned)n);
+        bridge_table_init(&s_bridges);
+        return;
+    }
+    ESP_LOGI(TAG, "bridge table restored from before this boot");
+}
+
+/* Hub -> bridge node, unicast, encrypted (already-adopted peer). Sends a
+ * one-off SWARM_CMD_RESYNC so a zigbee bridge re-announces every device it
+ * currently knows about -- used both right after boot (every bridge node
+ * this hub has a stored status for) and whenever a live COORD_STATUS
+ * disagrees with what this hub's own bridge table currently holds (see
+ * bridge_task()'s COORD_STATUS case below). seq comes from a hub-side,
+ * per-boot counter -- not correlated to anything yet (this task's
+ * SWARM_MSG_COMMAND_ACK handling is log-only, see bridge_task()), but
+ * having a real, incrementing seq now costs nothing and is what Task 8's
+ * router will need once it starts tracking outstanding commands. Must be
+ * called from a task context -- espnow_link_send() blocks -- never from
+ * hub_rx_cb. Best-effort: a dropped RESYNC is retried the next time this
+ * node's COORD_STATUS still looks unsynced. */
+static uint16_t s_resync_seq;
+
+static void request_resync(const uint8_t mac[6])
+{
+    swarm_command_t cmd = { .seq = ++s_resync_seq, .ttl_s = 30, .op = SWARM_CMD_RESYNC };
+    uint8_t buf[32];
+    size_t n = swarm_encode_command(&cmd, buf, sizeof(buf));
+    if (n == 0) {
+        ESP_LOGE(TAG, "request_resync: failed to encode for " MACSTR, MAC2STR(mac));
+        return;
+    }
+    esp_err_t err = espnow_link_send(mac, buf, n);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RESYNC -> " MACSTR " failed (%s)", MAC2STR(mac), esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "RESYNC -> " MACSTR " (seq=%u)", MAC2STR(mac), cmd.seq);
+    }
+}
+
+/* One item per accepted v4 bridge frame, queued by hub_rx_cb and drained by
+ * bridge_task -- same "callback queues, task does the real work" shape as
+ * checkin_item_t/checkin_task above (hub_rx_cb must never block, and
+ * data_core_find_or_create_index()/espnow_link_send() below both can). type
+ * is one of the SWARM_MSG_* values this ingest handles; the matching union
+ * member is the frame this hub_rx_cb already decoded (decoding in the
+ * callback, not the task, means a malformed frame from a paired-but-buggy
+ * or spoofed-MAC sender is dropped immediately rather than filling the
+ * queue with garbage). */
+typedef struct {
+    uint8_t mac[6];
+    int     type;
+    union {
+        swarm_device_announce_t ann;
+        swarm_device_gone_t     gone;
+        swarm_measurement_t     meas;
+        swarm_coord_status_t    status;
+        swarm_command_ack_t     ack;
+    } u;
+} bridge_item_t;
+
+#define BRIDGE_QUEUE_LEN 8
+
+static QueueHandle_t s_bridge_queue;
+static TaskHandle_t  s_bridge_task;
+
+static void bridge_task(void *arg)
+{
+    (void)arg;
+    bridge_item_t it;
+    for (;;) {
+        if (xQueueReceive(s_bridge_queue, &it, portMAX_DELAY) != pdTRUE) continue;
+
+        xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
+        switch (it.type) {
+        case SWARM_MSG_DEVICE_ANNOUNCE: {
+            if (!bridge_table_upsert(&s_bridges, it.mac, &it.u.ann)) {
+                ESP_LOGW(TAG, "bridge table full for " MACSTR, MAC2STR(it.mac));
+                break;
+            }
+            device_id_t id = { .kind = (device_kind_t)it.u.ann.dev.kind };
+            memcpy(id.addr, it.u.ann.dev.addr, SWARM_ADDR_LEN);
+            uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+            int idx = data_core_find_or_create_index(&id, now_s);
+            if (idx < 0) break;   /* registry full: already counted/logged by data_core */
+            data_core_set_via(idx, it.mac);
+            /* param_max=0, no flags: every action a zigbee bridge announces
+             * today (On/Off, via zb_map.c on the bridge node's own side)
+             * takes no parameter -- same as zigbee.c's own actor_declare()
+             * call site (zb_register_restored_devices()). */
+            for (uint8_t i = 0; i < it.u.ann.action_count; i++) {
+                if (!actor_declare(idx, it.u.ann.action_ids[i], 0, 0)) {
+                    ESP_LOGW(TAG, "device %d: could not declare action %u from " MACSTR "'s announce",
+                             idx, (unsigned)it.u.ann.action_ids[i], MAC2STR(it.mac));
+                }
+            }
+            actor_set_device_key(idx, (const uint8_t *)&id);
+            bridge_save();
+            break;
+        }
+        case SWARM_MSG_DEVICE_GONE:
+            bridge_table_remove(&s_bridges, it.mac, &it.u.gone.dev);
+            bridge_save();
+            break;
+        case SWARM_MSG_MEASUREMENT: {
+            device_id_t id = { .kind = (device_kind_t)it.u.meas.dev.kind };
+            memcpy(id.addr, it.u.meas.dev.addr, SWARM_ADDR_LEN);
+            if (data_core_find_index(&id) < 0) {
+                /* Unknown device: this bridge is reporting a reading for
+                 * something it never announced (or this hub dropped/never
+                 * saw the announce, e.g. it booted after the device already
+                 * joined) -- ask it to resync rather than silently
+                 * dropping forever. */
+                ESP_LOGW(TAG, "MEASUREMENT for unannounced device from " MACSTR ", requesting resync",
+                         MAC2STR(it.mac));
+                request_resync(it.mac);
+                break;
+            }
+            data_core_submit_cap_id(&id, it.u.meas.cap_id, it.u.meas.value);
+            rules_notify_value_update();
+            break;
+        }
+        case SWARM_MSG_COORD_STATUS: {
+            bridge_node_t *b = bridge_table_node(&s_bridges, it.mac, true);
+            if (!b) {
+                ESP_LOGW(TAG, "bridge node table full, dropping COORD_STATUS from " MACSTR,
+                         MAC2STR(it.mac));
+                break;
+            }
+            swarm_note_node_radio(it.mac, it.u.status.radio_role);
+            bool mismatch = b->status_valid && it.u.status.device_count != b->count;
+            b->status = it.u.status;
+            b->status_valid = true;
+            bridge_save();
+            if (mismatch || !b->synced_once) {
+                request_resync(it.mac);
+                b->synced_once = true;
+            }
+            break;
+        }
+        case SWARM_MSG_COMMAND_ACK:
+            /* Log-only in this task -- Task 8's router (bridge_cmd_on_ack())
+             * takes over correlating this to an outstanding command and
+             * reporting the result via the actor/alert path. */
+            ESP_LOGI(TAG, "COMMAND_ACK from " MACSTR ": seq=%u op=%u status=%u detail=%u",
+                     MAC2STR(it.mac), it.u.ack.seq, it.u.ack.op, it.u.ack.status, it.u.ack.detail);
+            break;
+        default:
+            break;
+        }
+        xSemaphoreGive(s_bridges_mutex);
+    }
+}
+
+/* Idempotent; safe to call more than once. Must run before any bridge
+ * frame can be queued -- swarm_start_main() calls this right after
+ * ensure_checkin_task(), same eager-init reasoning as that function's own
+ * comment. */
+static esp_err_t ensure_bridge_task(void)
+{
+    if (s_bridge_task) return ESP_OK;
+    if (!s_bridges_mutex) s_bridges_mutex = xSemaphoreCreateMutex();
+    if (!s_bridges_mutex) return ESP_ERR_NO_MEM;
+    if (!s_bridge_queue) s_bridge_queue = xQueueCreate(BRIDGE_QUEUE_LEN, sizeof(bridge_item_t));
+    if (!s_bridge_queue) return ESP_ERR_NO_MEM;
+    BaseType_t ok = xTaskCreate(bridge_task, "swarm_bridge", 4096, NULL, 3, &s_bridge_task);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "ensure_bridge_task: xTaskCreate failed");
+        s_bridge_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, int rssi)
 {
     int type = swarm_frame_type(data, (size_t)len);
+    if (type == -1 && len >= 1 && data[0] == 3) {
+        /* M7 Task 7 (spec section 5.4): a node still running protocol v3
+         * (pre-M7) sends frames whose version byte is 3, which
+         * swarm_frame_type()'s version check above already rejects as -1 --
+         * indistinguishable, from that return value alone, from any other
+         * malformed/foreign frame. Give the operator an ACTIONABLE log
+         * instead of a silent, unexplained drop. Throttled per-sender (not
+         * globally), same bounded/allocation-free shape as
+         * data_core.c's s_unreg_warned: a persistently un-reflashed node
+         * shouldn't get lost among other WARNs, but also shouldn't flood
+         * the log on every one of its retransmits. */
+        static struct { uint8_t mac[6]; int64_t last_us; bool used; } s_v3_warn[4];
+        static uint8_t s_v3_warn_next;
+        int64_t now_us = esp_timer_get_time();
+        int slot = -1;
+        for (size_t i = 0; i < sizeof(s_v3_warn) / sizeof(s_v3_warn[0]); i++) {
+            if (s_v3_warn[i].used && memcmp(s_v3_warn[i].mac, src_mac, 6) == 0) { slot = (int)i; break; }
+        }
+        if (slot < 0) {
+            for (size_t i = 0; i < sizeof(s_v3_warn) / sizeof(s_v3_warn[0]); i++) {
+                if (!s_v3_warn[i].used) { slot = (int)i; break; }
+            }
+            if (slot < 0) {
+                slot = s_v3_warn_next;
+                s_v3_warn_next = (uint8_t)((s_v3_warn_next + 1) % (sizeof(s_v3_warn) / sizeof(s_v3_warn[0])));
+            }
+            memcpy(s_v3_warn[slot].mac, src_mac, 6);
+            s_v3_warn[slot].used = true;
+            s_v3_warn[slot].last_us = 0;
+        }
+        if (now_us - s_v3_warn[slot].last_us > 60000000) {
+            ESP_LOGW(TAG, "v3 frame from " MACSTR " dropped; reflash that node (protocol v4)",
+                     MAC2STR(src_mac));
+            s_v3_warn[slot].last_us = now_us;
+        }
+        return;
+    }
     if (type == SWARM_MSG_READING) {
         /* PlanV1 3.3 promises "unpaired frames are dropped, so a neighbour
          * cannot inject readings" -- ESP-NOW hands this callback ANY
@@ -702,6 +998,43 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
         }
         return;
     }
+    if (type == SWARM_MSG_DEVICE_ANNOUNCE || type == SWARM_MSG_DEVICE_GONE ||
+        type == SWARM_MSG_MEASUREMENT || type == SWARM_MSG_COORD_STATUS ||
+        type == SWARM_MSG_COMMAND_ACK) {
+        /* Bridge -> hub, unicast, encrypted (M7 Task 7) -- same pairing/
+         * spoofing reasoning as READING/CHECKIN above: is_paired_node() is
+         * the gate that keeps an unpaired device from injecting a fake
+         * device announce/measurement/status straight into the registry.
+         * Decoding happens HERE, not in bridge_task(), so a malformed frame
+         * from a paired-but-buggy sender never reaches the queue at all --
+         * only a successfully decoded item is queued. This callback only
+         * ever queues, never touches s_bridges or data_core directly: both
+         * data_core_find_or_create_index() and espnow_link_send()
+         * (bridge_task's request_resync()) can take a lock/block, neither
+         * of which belongs on the ESP-NOW receive callback (WiFi driver
+         * task) -- same "callback queues, task sends/writes" shape as
+         * CHECKIN above. */
+        if (!is_paired_node(src_mac)) return;
+        bridge_item_t item;
+        memset(&item, 0, sizeof(item));
+        memcpy(item.mac, src_mac, 6);
+        item.type = type;
+        bool ok;
+        switch (type) {
+        case SWARM_MSG_DEVICE_ANNOUNCE: ok = swarm_decode_device_announce(data, (size_t)len, &item.u.ann); break;
+        case SWARM_MSG_DEVICE_GONE:     ok = swarm_decode_device_gone(data, (size_t)len, &item.u.gone); break;
+        case SWARM_MSG_MEASUREMENT:     ok = swarm_decode_measurement(data, (size_t)len, &item.u.meas); break;
+        case SWARM_MSG_COORD_STATUS:    ok = swarm_decode_coord_status(data, (size_t)len, &item.u.status); break;
+        case SWARM_MSG_COMMAND_ACK:     ok = swarm_decode_command_ack(data, (size_t)len, &item.u.ack); break;
+        default:                        ok = false; break;   /* unreachable: the outer if() already narrowed type */
+        }
+        if (!ok) return;
+        if (!s_bridge_queue || xQueueSend(s_bridge_queue, &item, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "bridge frame (type=%d) from " MACSTR ": no bridge task/queue full, dropping",
+                     type, MAC2STR(src_mac));
+        }
+        return;
+    }
     /* PAIR_REQ/PAIR_ACK, PING/PONG, FORGET or anything unrecognised:
      * pairing_handle_frame already filters to the types it understands and
      * silently ignores everything else, so handing it anything that isn't a
@@ -777,6 +1110,43 @@ esp_err_t swarm_start_main(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "ensure_checkin_task failed: %s -- CHECKIN frames will go unanswered",
                  esp_err_to_name(err));
+    }
+
+    /* M7 Task 7: restores the bridge table BEFORE ensure_bridge_task() below
+     * can start bridge_task -- same "load before anything else can touch
+     * it" ordering as zigbee.c's zb_store_load(), and for the same reason:
+     * bridge_load() itself takes no lock (nothing else exists yet to race
+     * it against). */
+    bridge_load();
+
+    err = ensure_bridge_task();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ensure_bridge_task failed: %s -- bridge (zigbee) frames will go unanswered",
+                 esp_err_to_name(err));
+    } else if (s_bridges_mutex) {
+        /* A zigbee bridge only re-announces its devices on its OWN boot or
+         * RESYNC (Task 5/6); if THIS hub rebooted while a bridge stayed up,
+         * that bridge has no reason to re-send anything unprompted. Ask
+         * explicitly for every node this hub has a stored status for.
+         * synced_once is RAM-only (bridge_node_t's own doc comment) and
+         * starts false every boot regardless of what was persisted --
+         * marking it true here avoids a redundant second RESYNC the moment
+         * that node's first post-reboot COORD_STATUS arrives (bridge_task's
+         * COORD_STATUS case: "mismatch || !b->synced_once"). Snapshot the
+         * MAC list under the mutex, then send outside it -- espnow_link_send()
+         * blocks (up to 200ms each) and must not run while holding a mutex
+         * bridge_task/swarm_forget_node_stats() might otherwise need. */
+        uint8_t macs[BRIDGE_MAX_NODES][6];
+        int resync_n = 0;
+        xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
+        for (int i = 0; i < BRIDGE_MAX_NODES; i++) {
+            if (s_bridges.n[i].in_use && s_bridges.n[i].status_valid) {
+                memcpy(macs[resync_n++], s_bridges.n[i].mac, 6);
+                s_bridges.n[i].synced_once = true;
+            }
+        }
+        xSemaphoreGive(s_bridges_mutex);
+        for (int i = 0; i < resync_n; i++) request_resync(macs[i]);
     }
 
     ESP_LOGI(TAG, "swarm (main) started on channel %u", espnow_link_channel());
@@ -966,18 +1336,36 @@ uint32_t swarm_frames_rx(void)
  * hub_rx_cb/record_stat's path, so this adds nothing new that's reachable
  * from the ESP-NOW receive callback. Same short, bounded, allocation-free
  * scan over at most SWARM_MAX_NODES entries as record_stat(), under the
- * same mutex. */
+ * same mutex.
+ *
+ * M7 Task 7: also forgets mac's bridge table entry (its coordinator status
+ * and every device it announced) -- without this, a re-paired replacement
+ * node reusing the same registry attribution would find a stale bridge
+ * entry left behind by whichever node this MAC used to belong to. Runs
+ * under s_bridges_mutex, the same lock bridge_task uses, since this can run
+ * concurrently with it (unlike s_stats above, which only bridge_task and
+ * this function ever touch, this table has two writers). api_v1.c's forget
+ * handler already calls data_core_clear_node_attribution(mac) itself right
+ * alongside this call -- not duplicated here. */
 void swarm_forget_node_stats(const uint8_t mac[6])
 {
-    if (!s_stats_mutex) return;
-    xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
-    for (int i = 0; i < SWARM_MAX_NODES; i++) {
-        if (s_stats[i].in_use && memcmp(s_stats[i].mac, mac, 6) == 0) {
-            memset(&s_stats[i], 0, sizeof(s_stats[i]));
-            break;
+    if (s_stats_mutex) {
+        xSemaphoreTake(s_stats_mutex, portMAX_DELAY);
+        for (int i = 0; i < SWARM_MAX_NODES; i++) {
+            if (s_stats[i].in_use && memcmp(s_stats[i].mac, mac, 6) == 0) {
+                memset(&s_stats[i], 0, sizeof(s_stats[i]));
+                break;
+            }
         }
+        xSemaphoreGive(s_stats_mutex);
     }
-    xSemaphoreGive(s_stats_mutex);
+
+    if (s_bridges_mutex) {
+        xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
+        bridge_table_forget_node(&s_bridges, mac);
+        bridge_save();
+        xSemaphoreGive(s_bridges_mutex);
+    }
 }
 
 #define SWARM_FORGET_BROADCAST_COUNT 3

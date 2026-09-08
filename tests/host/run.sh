@@ -259,3 +259,10 @@ $CC -Wall -Wextra -Werror -I../../components/radio_role/include \
 $CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/radio_role/include \
     test_swarm_rules.c ../../components/swarm/swarm_rules.c -o test_swarm_rules
 ./test_swarm_rules
+
+# Hub-side bridge table (M7 Task 7): upsert/remove/find/serialize round
+# trip. Pure C, links swarm_frame.c for the device-announce codec its
+# serialize/deserialize reuse.
+$CC -Wall -Wextra -Werror -I../../components/swarm/include \
+    test_bridge_table.c ../../components/swarm/bridge_table.c ../../components/swarm/swarm_frame.c -o test_bridge_table
+./test_bridge_table

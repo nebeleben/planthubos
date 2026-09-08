@@ -79,6 +79,17 @@ bool      data_core_get_device(const device_id_t *id, device_entry_t *out);
  * data_core_snapshot() already use. */
 void      data_core_clear_node_attribution(const uint8_t node_mac[6]);
 
+/* M7 Task 7: attributes dev_idx (a registry index already resolved via
+ * data_core_find_or_create_index()) to node_mac -- swarm.c's bridge_task
+ * calls this right after a zigbee bridge's DEVICE_ANNOUNCE resolves/creates
+ * the device, so the registry (and GET /api/v1/devices' "via_node") shows
+ * which bridge node reports it, same as a BLE-relayed device already does.
+ * Takes s_mutex, same as every other registry accessor here; see
+ * registry_set_via()'s own doc comment for why this bypasses
+ * registry_attribute()'s frame_cnt/rssi contest entirely. A no-op if
+ * dev_idx is out of range or not currently in_use. */
+void      data_core_set_via(int dev_idx, const uint8_t node_mac[6]);
+
 /* A MiFlora battery poll result (battery_poll.c, M6): applies pct to mac's
  * CAP_BATTERY_LEVEL slot (creating the device if this is its first
  * appearance) via registry_set_cap(), NOT registry_attribute() -- a GATT

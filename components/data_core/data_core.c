@@ -262,6 +262,13 @@ void data_core_clear_node_attribution(const uint8_t node_mac[6])
     ESP_LOGI(TAG, "cleared via-node attribution for " MACSTR_FMT, MAC_ARG(node_mac));
 }
 
+void data_core_set_via(int dev_idx, const uint8_t node_mac[6])
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    registry_set_via(&s_registry, dev_idx, node_mac);
+    xSemaphoreGive(s_mutex);
+}
+
 bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)
 {
     /* capability_encode() is pure (no shared state), so this check happens
