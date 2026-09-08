@@ -11,6 +11,10 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "zb_store.h"
+#include "actor.h"   /* actor_cmd_t -- M7 Task 8's zb_cmd_local_dispatch() signature below.
+                       * "actors" is already a public REQUIRES of this component (zb_cmd.c's
+                       * own actor_set_dispatch_hook()/actor_device_key() calls), so this adds
+                       * no new dependency. */
 
 /* Starts the stack task. Returns ESP_OK once the task is created -- NOT
  * once a network exists; formation is asynchronous and reported through
@@ -150,6 +154,40 @@ uint8_t zigbee_coordinator_endpoint(void);
  * resolves its device through the same store zigbee_store_lookup() reads.
  * A safe no-op when Zigbee is disabled at build time. */
 void zb_cmd_start(void);
+
+/* M7 Task 8: set by swarm.c's swarm_start_main() (hub only, before
+ * zigbee_start()/zb_cmd_start() runs) to tell zb_cmd_start() a bridge
+ * router wrapper is about to claim (or has claimed) the DEV_KIND_ZIGBEE
+ * dispatch hook for itself, so zb_cmd_start() must not overwrite it with
+ * zb_cmd_local_dispatch -- see zb_cmd_start()'s own comment in zb_cmd.c
+ * for the boot-order reasoning. Never called on a node (a node never runs
+ * swarm_start_main()) and a safe no-op when Zigbee is disabled at build
+ * time. */
+void zb_cmd_set_router_active(bool active);
+
+/* M7 Task 8: the Zigbee command engine's own actor dispatch (was the
+ * file-static on_zb_dispatch()) -- exported so swarm.c's hub-side wrapper
+ * (swarm_zb_dispatch()) can fall through to it for any device the hub's
+ * bridge table does not attribute to a bridge node, i.e. a device on the
+ * hub's OWN zigbee coordinator. Identical behaviour to what
+ * actor_set_dispatch_hook(DEV_KIND_ZIGBEE, ...) always called on a node,
+ * or on a hub with no router wrapper registered. A safe no-op when Zigbee
+ * is disabled at build time. */
+void zb_cmd_local_dispatch(const actor_cmd_t *cmd);
+
+/* M7 Task 8: exports zb_cmd_report()'s exact confirmation/failure contract
+ * (alert on failure, log line, s_result_cb hand-off) for the hub's bridge
+ * router to report a bridge-routed ACTUATE's outcome (a DONE/FAILED ack
+ * from the owning bridge node, or this hub's own TTL expiry) through the
+ * same path a locally dispatched command already uses -- so the two are
+ * indistinguishable to whatever consumes alerts/logs/s_result_cb. `dev_idx`
+ * is `int`, not zb_cmd_report()'s own int8_t (bridge_cmd_t.actor_dev_idx,
+ * swarm/include/bridge_cmd.h, is a plain int); the same int8_t range every
+ * actor_cmd_t.dev_idx already lives in. `reason` is only logged when
+ * `ok` is false (zb_cmd_report()'s own contract) -- pass NULL when
+ * reporting success. A safe no-op when Zigbee is disabled at build time. */
+void zb_cmd_report_public(int dev_idx, uint8_t action_id, uint16_t param, bool ok,
+                           const char *reason, uint8_t zcl_status);
 
 /* M7 Task 6: reports how a dispatched Zigbee actuator command ended, to
  * whichever module cares about individual outcomes -- swarm.c's node-side

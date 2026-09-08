@@ -103,6 +103,32 @@ static zb_cmd_inflight_t s_inflight[ZB_CMD_MAX_INFLIGHT];
  * registrant ever exists. */
 static zb_cmd_result_t s_result_cb;
 
+/* M7 Task 8: whether the HUB's command router has claimed (or is about to
+ * claim) the DEV_KIND_ZIGBEE dispatch hook for itself. Plain file-static
+ * bool, set by swarm.c through zb_cmd_set_router_active() -- swarm.c
+ * already depends on this component (PRIV_REQUIRES zigbee), so this is an
+ * ordinary forward call, not the reverse; zigbee.c/zb_cmd.c themselves
+ * still never include or link anything from swarm, exactly as this
+ * header's top comment requires.
+ *
+ * Exists because of a boot-order wrinkle: main.c calls swarm_start_main()
+ * (which, on the hub, wants to register its own wrapper hook) BEFORE
+ * zigbee_start() (whose zb_cmd_start() would otherwise unconditionally
+ * overwrite whatever actor_set_dispatch_hook() slot already holds). Rather
+ * than have swarm_start_main() register its wrapper and then have
+ * zb_cmd_start() blindly clobber it moments later, swarm_start_main() sets
+ * this flag first (still ahead of zb_cmd_start() in main.c's call order),
+ * and zb_cmd_start() below checks it before ever registering on_zb_dispatch
+ * directly. Always false on a node (a node never calls swarm_start_main())
+ * and false-by-default until any hub sets it, so zb_cmd_start()'s own
+ * default (register directly) is unaffected everywhere else. */
+static bool s_router_active;
+
+void zb_cmd_set_router_active(bool active)
+{
+    s_router_active = active;
+}
+
 void zb_cmd_set_result_cb(zb_cmd_result_t fn)
 {
     s_result_cb = fn;
@@ -140,6 +166,25 @@ static void zb_cmd_report(int8_t dev_idx, uint8_t action_id, uint16_t param,
     ESP_LOGI(TAG, "command confirmed: dev=%d action=%u param=%u", (int)dev_idx,
              (unsigned)action_id, (unsigned)param);
     if (s_result_cb) s_result_cb(dev_idx, action_id, param, ok, zcl_status);
+}
+
+/* M7 Task 8: the hub's bridge router (swarm.c) needs the exact same
+ * confirmation contract for a command it routed to a bridge node's own
+ * zigbee coordinator (an ACTUATE's DONE/FAILED ack, or a TTL expiry) that
+ * zb_cmd_report() above already gives a LOCALLY dispatched command -- same
+ * alert on failure (ALERT_CODE_COMMAND_FAILED), same log line, same
+ * s_result_cb hand-off (a no-op on the hub, which never registers one;
+ * that registration is node-only -- swarm_start_node()'s own
+ * zb_cmd_set_result_cb(on_zb_result) call). Exported rather than
+ * duplicated so the two paths can never drift apart on what "confirmed"/
+ * "failed" means. `dev_idx` is `int`, not zb_cmd_report()'s own int8_t,
+ * because bridge_cmd_t.actor_dev_idx (bridge_cmd.h) is a plain int -- the
+ * cast back down is safe, the same range every actor_cmd_t.dev_idx already
+ * lives in (int8_t, capability.h's device table size). */
+void zb_cmd_report_public(int dev_idx, uint8_t action_id, uint16_t param, bool ok,
+                           const char *reason, uint8_t zcl_status)
+{
+    zb_cmd_report((int8_t)dev_idx, action_id, param, ok, reason, zcl_status);
 }
 
 /* esp_zb_scheduler_alarm() callback (esp_zb_callback_t: void(uint8_t)) --
@@ -236,7 +281,13 @@ void zb_cmd_on_default_resp(uint8_t tsn, uint16_t cluster, uint8_t resp_to_cmd,
  * there is no second chance for it and no other place its disappearance
  * would surface -- the same reasoning ble_collector.c's on_actor_dispatch()
  * gives for its own early returns. */
-static void on_zb_dispatch(const actor_cmd_t *cmd)
+/* M7 Task 8: exported (was `static void on_zb_dispatch`) so swarm.c's hub
+ * wrapper (swarm_zb_dispatch()) can fall through to it for a device this
+ * hub's bridge table does NOT attribute to any bridge node -- i.e. a
+ * device attached to the hub's OWN zigbee coordinator, exactly the
+ * dispatch this function has always performed. Behaviour is completely
+ * unchanged; only the linkage changed. */
+void zb_cmd_local_dispatch(const actor_cmd_t *cmd)
 {
     uint8_t on_off_cmd_id;
     switch (cmd->action_id) {
@@ -369,7 +420,19 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
 
 void zb_cmd_start(void)
 {
-    actor_set_dispatch_hook(DEV_KIND_ZIGBEE, on_zb_dispatch);
+    /* M7 Task 8: on a node, always register directly -- a node has no
+     * bridge router of its own; its own ACTUATE commands (from the hub,
+     * via swarm.c's command_task()/actor_request()) must dispatch straight
+     * to this file, exactly as before this task. On the hub, register
+     * directly ONLY when swarm_start_main() has not (or could not) claim
+     * the DEV_KIND_ZIGBEE hook for its own wrapper -- s_router_active is
+     * set by that function, ahead of this one in main.c's call order (see
+     * s_router_active's own comment above). When it HAS claimed it, this
+     * call is skipped entirely: overwriting the wrapper here would silently
+     * cut the bridge router out of every dispatch. */
+    if (zigbee_on_node() || !s_router_active) {
+        actor_set_dispatch_hook(DEV_KIND_ZIGBEE, zb_cmd_local_dispatch);
+    }
 }
 
 #else /* !CONFIG_PLANTHUB_ZB_ENABLED */
@@ -390,6 +453,22 @@ void zb_cmd_on_default_resp(uint8_t tsn, uint16_t cluster, uint8_t resp_to_cmd,
 void zb_cmd_set_result_cb(zb_cmd_result_t fn)
 {
     (void)fn;
+}
+
+void zb_cmd_set_router_active(bool active)
+{
+    (void)active;
+}
+
+void zb_cmd_local_dispatch(const actor_cmd_t *cmd)
+{
+    (void)cmd;
+}
+
+void zb_cmd_report_public(int dev_idx, uint8_t action_id, uint16_t param, bool ok,
+                           const char *reason, uint8_t zcl_status)
+{
+    (void)dev_idx; (void)action_id; (void)param; (void)ok; (void)reason; (void)zcl_status;
 }
 
 #endif /* CONFIG_PLANTHUB_ZB_ENABLED */

@@ -266,3 +266,12 @@ $CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/ra
 $CC -Wall -Wextra -Werror -I../../components/swarm/include \
     test_bridge_table.c ../../components/swarm/bridge_table.c ../../components/swarm/swarm_frame.c -o test_bridge_table
 ./test_bridge_table
+
+# Hub-side command router (M7 Task 8): per-node submit/in-flight refusal,
+# retry timing, ack correlation (ACCEPTED/DONE/FAILED, duplicate/unknown
+# seq ignored) and TTL expiry. Pure C -- links swarm_frame.c for
+# swarm_command_ack_t's SWARM_ACK_* values only (no encode/decode needed
+# here, bridge_cmd.c never touches the wire format itself).
+$CC -Wall -Wextra -Werror -I../../components/swarm/include \
+    test_bridge_cmd.c ../../components/swarm/bridge_cmd.c -o test_bridge_cmd
+./test_bridge_cmd

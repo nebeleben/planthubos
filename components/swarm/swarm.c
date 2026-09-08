@@ -9,6 +9,7 @@
 #include "swarm_store.h"
 #include "swarm_frame.h"
 #include "bridge_table.h"
+#include "bridge_cmd.h"
 #include "swarm_rules.h"
 #include "radio_role.h"
 #include "swarm_buf.h"
@@ -566,6 +567,18 @@ esp_err_t swarm_request_node_config(const uint8_t mac[6])
 static bridge_table_t     s_bridges;
 static SemaphoreHandle_t  s_bridges_mutex;
 
+/* M7 Task 8: the hub's command router -- tracks the one outstanding
+ * SWARM_MSG_COMMAND this hub may have in flight to each bridge node at a
+ * time (PERMIT_JOIN/DEVICE_REMOVE/DEVICE_RENAME/ACTUATE/RESYNC), from
+ * submission through retry, ack correlation and TTL expiry. Pure C
+ * (bridge_cmd.h/.c) -- s_router itself needs NO mutex of its own: unlike
+ * s_bridges above (which swarm_forget_node_stats() also writes, from a
+ * different task), bridge_task is s_router's ONLY caller, on every code
+ * path -- see bridge_task() below and this file's swarm_bridge_permit/
+ * remove/rename()/swarm_zb_dispatch(), all of which only ever POST an item
+ * onto s_bridge_queue rather than touch s_router directly. */
+static bridge_router_t s_router;
+
 _Static_assert(BRIDGE_MAX_NODES == SWARM_MAX_NODES,
                "bridge_table.h's BRIDGE_MAX_NODES duplicates SWARM_MAX_NODES's value "
                "(pure-C header, cannot include swarm_store.h) -- keep them equal by hand");
@@ -638,38 +651,6 @@ static void bridge_load(void)
     ESP_LOGI(TAG, "bridge table restored from before this boot");
 }
 
-/* Hub -> bridge node, unicast, encrypted (already-adopted peer). Sends a
- * one-off SWARM_CMD_RESYNC so a zigbee bridge re-announces every device it
- * currently knows about -- used both right after boot (every bridge node
- * this hub has a stored status for) and whenever a live COORD_STATUS
- * disagrees with what this hub's own bridge table currently holds (see
- * bridge_task()'s COORD_STATUS case below). seq comes from a hub-side,
- * per-boot counter -- not correlated to anything yet (this task's
- * SWARM_MSG_COMMAND_ACK handling is log-only, see bridge_task()), but
- * having a real, incrementing seq now costs nothing and is what Task 8's
- * router will need once it starts tracking outstanding commands. Must be
- * called from a task context -- espnow_link_send() blocks -- never from
- * hub_rx_cb. Best-effort: a dropped RESYNC is retried the next time this
- * node's COORD_STATUS still looks unsynced. */
-static uint16_t s_resync_seq;
-
-static void request_resync(const uint8_t mac[6])
-{
-    swarm_command_t cmd = { .seq = ++s_resync_seq, .ttl_s = 30, .op = SWARM_CMD_RESYNC };
-    uint8_t buf[32];
-    size_t n = swarm_encode_command(&cmd, buf, sizeof(buf));
-    if (n == 0) {
-        ESP_LOGE(TAG, "request_resync: failed to encode for " MACSTR, MAC2STR(mac));
-        return;
-    }
-    esp_err_t err = espnow_link_send(mac, buf, n);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "RESYNC -> " MACSTR " failed (%s)", MAC2STR(mac), esp_err_to_name(err));
-    } else {
-        ESP_LOGI(TAG, "RESYNC -> " MACSTR " (seq=%u)", MAC2STR(mac), cmd.seq);
-    }
-}
-
 /* One item per accepted v4 bridge frame, queued by hub_rx_cb and drained by
  * bridge_task -- same "callback queues, task does the real work" shape as
  * checkin_item_t/checkin_task above (hub_rx_cb must never block, and
@@ -678,7 +659,35 @@ static void request_resync(const uint8_t mac[6])
  * member is the frame this hub_rx_cb already decoded (decoding in the
  * callback, not the task, means a malformed frame from a paired-but-buggy
  * or spoofed-MAC sender is dropped immediately rather than filling the
- * queue with garbage). */
+ * queue with garbage).
+ *
+ * M7 Task 8 adds a second, purely-internal producer: BRIDGE_ITEM_SUBMIT,
+ * posted by request_resync() (below), swarm_bridge_permit/remove/rename()
+ * and swarm_zb_dispatch() -- never decoded off the wire, so its value
+ * (100) is deliberately well outside the SWARM_MSG_* range (1-20,
+ * swarm_frame.h) those come from. Routing it through this SAME queue/task,
+ * rather than a second one, is what makes bridge_task the router's only
+ * caller: every path that wants to submit a command funnels through here. */
+#define BRIDGE_ITEM_SUBMIT 100
+
+typedef struct {
+    uint8_t          op;             /* SWARM_CMD_* */
+    swarm_dev_addr_t dev;
+    uint16_t         arg;
+    char             name[SWARM_DEV_NAME_MAX];
+    uint8_t          name_len;
+    uint32_t         ttl_s;
+    int              actor_dev_idx;  /* -1: no actor to report to (every op but ACTUATE) */
+    uint8_t          actor_action;
+    uint16_t         actor_param;
+    bool             want_result;    /* true: a synchronous swarm_bridge_permit/remove/rename()
+                                       * caller is waiting on s_submit_done for s_submit_result --
+                                       * see submit_and_wait() below. False for request_resync()'s
+                                       * own fire-and-forget posts and for swarm_zb_dispatch()'s
+                                       * ACTUATE posts (which report a submit failure themselves,
+                                       * through actor_dev_idx, rather than blocking on an answer). */
+} bridge_submit_t;
+
 typedef struct {
     uint8_t mac[6];
     int     type;
@@ -688,6 +697,7 @@ typedef struct {
         swarm_measurement_t     meas;
         swarm_coord_status_t    status;
         swarm_command_ack_t     ack;
+        bridge_submit_t         submit;
     } u;
 } bridge_item_t;
 
@@ -696,91 +706,264 @@ typedef struct {
 static QueueHandle_t s_bridge_queue;
 static TaskHandle_t  s_bridge_task;
 
+/* M7 Task 8: signals a synchronous swarm_bridge_permit/remove/rename()
+ * call that bridge_task has finished processing its BRIDGE_ITEM_SUBMIT and
+ * s_submit_result now holds the answer -- see submit_and_wait() below.
+ * s_submit_call_mutex serialises concurrent callers of that function (at
+ * most one synchronous submit-and-wait may be outstanding at a time, so a
+ * second caller's own wait can never be satisfied by the wrong give()) --
+ * it does NOT protect s_router or s_bridges, which stay bridge_task-only/
+ * s_bridges_mutex-guarded exactly as before. Both created in
+ * ensure_bridge_task(), alongside s_bridge_queue/s_bridges_mutex. */
+static SemaphoreHandle_t s_submit_done;
+static SemaphoreHandle_t s_submit_call_mutex;
+static esp_err_t         s_submit_result;
+
+/* Hub -> bridge node, unicast, encrypted (already-adopted peer). Queues a
+ * one-off SWARM_CMD_RESYNC so a zigbee bridge re-announces every device it
+ * currently knows about -- used both right after boot (every bridge node
+ * this hub has a stored status for) and whenever a live COORD_STATUS
+ * disagrees with what this hub's own bridge table currently holds (see
+ * bridge_task()'s COORD_STATUS case below). M7 Task 8: routed through the
+ * same BRIDGE_ITEM_SUBMIT path as every other command this hub sends, so
+ * bridge_task's router (s_router) is the ONE place a seq is assigned and a
+ * frame is actually put on the wire -- this function no longer encodes or
+ * calls espnow_link_send() itself. Safe to call from bridge_task's own
+ * task (the COORD_STATUS/MEASUREMENT cases below -- it only enqueues,
+ * never blocks) or from swarm_start_main()'s startup task (the post-boot
+ * resync sweep). Best-effort/fire-and-forget: a full queue, or a node that
+ * already has a command in flight, just means this particular RESYNC
+ * request is dropped -- the next mismatched COORD_STATUS (or this node's
+ * next boot) asks again. */
+static void request_resync(const uint8_t mac[6])
+{
+    bridge_item_t item;
+    memset(&item, 0, sizeof(item));
+    memcpy(item.mac, mac, 6);
+    item.type = BRIDGE_ITEM_SUBMIT;
+    item.u.submit.op = SWARM_CMD_RESYNC;
+    item.u.submit.ttl_s = 30;
+    item.u.submit.actor_dev_idx = -1;
+    if (!s_bridge_queue || xQueueSend(s_bridge_queue, &item, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "RESYNC -> " MACSTR ": no bridge task/queue full, dropping", MAC2STR(mac));
+    }
+}
+
+/* M7 Task 8: reports a bridge-routed ACTUATE's outcome (a DONE/FAILED ack
+ * from the owning bridge node, or this hub's own TTL expiry) to the actor
+ * layer through EXACTLY the path a locally dispatched Zigbee command
+ * already uses -- zb_cmd.c's zb_cmd_report(), exported as
+ * zb_cmd_report_public() for this purpose (zigbee.h). Same alert on
+ * failure, same log line, same (here, always-NULL-registrant, hub-only)
+ * s_result_cb hand-off, so an operator/the UI cannot tell a bridged
+ * actuation's failure apart from a local one. A no-op for anything that
+ * isn't an ACTUATE -- c->actor_dev_idx is -1 for PERMIT_JOIN/
+ * DEVICE_REMOVE/DEVICE_RENAME/RESYNC (bridge_cmd_submit()'s callers above
+ * only ever pass a real dev_idx for SWARM_CMD_ACTUATE), so there is no
+ * actor command behind those to report against. */
+static void report_bridge_result(const bridge_cmd_t *c, bool ok, uint8_t zcl_status, const char *reason)
+{
+    if (c->actor_dev_idx < 0) return;
+    zb_cmd_report_public(c->actor_dev_idx, c->actor_action, c->actor_param, ok, reason, zcl_status);
+}
+
 static void bridge_task(void *arg)
 {
     (void)arg;
     bridge_item_t it;
     for (;;) {
-        if (xQueueReceive(s_bridge_queue, &it, portMAX_DELAY) != pdTRUE) continue;
+        BaseType_t got = xQueueReceive(s_bridge_queue, &it, pdMS_TO_TICKS(500));
+        /* Sampled once per pass, whether or not an item arrived -- shared
+         * by this pass's queue-item handling (if any) below AND the router
+         * tick that runs every pass regardless (see this loop's tail). */
+        uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
-        xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
-        switch (it.type) {
-        case SWARM_MSG_DEVICE_ANNOUNCE: {
-            if (!bridge_table_upsert(&s_bridges, it.mac, &it.u.ann)) {
-                ESP_LOGW(TAG, "bridge table full for " MACSTR, MAC2STR(it.mac));
-                break;
-            }
-            device_id_t id = { .kind = (device_kind_t)it.u.ann.dev.kind };
-            memcpy(id.addr, it.u.ann.dev.addr, SWARM_ADDR_LEN);
-            uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
-            int idx = data_core_find_or_create_index(&id, now_s);
-            if (idx < 0) break;   /* registry full: already counted/logged by data_core */
-            data_core_set_via(idx, it.mac);
-            /* param_max=0, no flags: every action a zigbee bridge announces
-             * today (On/Off, via zb_map.c on the bridge node's own side)
-             * takes no parameter -- same as zigbee.c's own actor_declare()
-             * call site (zb_register_restored_devices()). */
-            for (uint8_t i = 0; i < it.u.ann.action_count; i++) {
-                if (!actor_declare(idx, it.u.ann.action_ids[i], 0, 0)) {
-                    ESP_LOGW(TAG, "device %d: could not declare action %u from " MACSTR "'s announce",
-                             idx, (unsigned)it.u.ann.action_ids[i], MAC2STR(it.mac));
+        if (got == pdTRUE) {
+            xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
+            switch (it.type) {
+            case SWARM_MSG_DEVICE_ANNOUNCE: {
+                if (!bridge_table_upsert(&s_bridges, it.mac, &it.u.ann)) {
+                    ESP_LOGW(TAG, "bridge table full for " MACSTR, MAC2STR(it.mac));
+                    break;
                 }
-            }
-            actor_set_device_key(idx, (const uint8_t *)&id);
-            bridge_save();
-            break;
-        }
-        case SWARM_MSG_DEVICE_GONE:
-            bridge_table_remove(&s_bridges, it.mac, &it.u.gone.dev);
-            bridge_save();
-            break;
-        case SWARM_MSG_MEASUREMENT: {
-            device_id_t id = { .kind = (device_kind_t)it.u.meas.dev.kind };
-            memcpy(id.addr, it.u.meas.dev.addr, SWARM_ADDR_LEN);
-            if (data_core_find_index(&id) < 0) {
-                /* Unknown device: this bridge is reporting a reading for
-                 * something it never announced (or this hub dropped/never
-                 * saw the announce, e.g. it booted after the device already
-                 * joined) -- ask it to resync rather than silently
-                 * dropping forever. */
-                ESP_LOGW(TAG, "MEASUREMENT for unannounced device from " MACSTR ", requesting resync",
-                         MAC2STR(it.mac));
-                request_resync(it.mac);
+                device_id_t id = { .kind = (device_kind_t)it.u.ann.dev.kind };
+                memcpy(id.addr, it.u.ann.dev.addr, SWARM_ADDR_LEN);
+                int idx = data_core_find_or_create_index(&id, now_s);
+                if (idx < 0) break;   /* registry full: already counted/logged by data_core */
+                data_core_set_via(idx, it.mac);
+                /* param_max=0, no flags: every action a zigbee bridge announces
+                 * today (On/Off, via zb_map.c on the bridge node's own side)
+                 * takes no parameter -- same as zigbee.c's own actor_declare()
+                 * call site (zb_register_restored_devices()). */
+                for (uint8_t i = 0; i < it.u.ann.action_count; i++) {
+                    if (!actor_declare(idx, it.u.ann.action_ids[i], 0, 0)) {
+                        ESP_LOGW(TAG, "device %d: could not declare action %u from " MACSTR "'s announce",
+                                 idx, (unsigned)it.u.ann.action_ids[i], MAC2STR(it.mac));
+                    }
+                }
+                actor_set_device_key(idx, (const uint8_t *)&id);
+                bridge_save();
                 break;
             }
-            data_core_submit_cap_id(&id, it.u.meas.cap_id, it.u.meas.value);
-            rules_notify_value_update();
-            break;
-        }
-        case SWARM_MSG_COORD_STATUS: {
-            bridge_node_t *b = bridge_table_node(&s_bridges, it.mac, true);
-            if (!b) {
-                ESP_LOGW(TAG, "bridge node table full, dropping COORD_STATUS from " MACSTR,
-                         MAC2STR(it.mac));
+            case SWARM_MSG_DEVICE_GONE:
+                bridge_table_remove(&s_bridges, it.mac, &it.u.gone.dev);
+                bridge_save();
+                break;
+            case SWARM_MSG_MEASUREMENT: {
+                device_id_t id = { .kind = (device_kind_t)it.u.meas.dev.kind };
+                memcpy(id.addr, it.u.meas.dev.addr, SWARM_ADDR_LEN);
+                if (data_core_find_index(&id) < 0) {
+                    /* Unknown device: this bridge is reporting a reading for
+                     * something it never announced (or this hub dropped/never
+                     * saw the announce, e.g. it booted after the device already
+                     * joined) -- ask it to resync rather than silently
+                     * dropping forever. */
+                    ESP_LOGW(TAG, "MEASUREMENT for unannounced device from " MACSTR ", requesting resync",
+                             MAC2STR(it.mac));
+                    request_resync(it.mac);
+                    break;
+                }
+                data_core_submit_cap_id(&id, it.u.meas.cap_id, it.u.meas.value);
+                rules_notify_value_update();
                 break;
             }
-            swarm_note_node_radio(it.mac, it.u.status.radio_role);
-            bool mismatch = b->status_valid && it.u.status.device_count != b->count;
-            b->status = it.u.status;
-            b->status_valid = true;
-            bridge_save();
-            if (mismatch || !b->synced_once) {
-                request_resync(it.mac);
-                b->synced_once = true;
+            case SWARM_MSG_COORD_STATUS: {
+                bridge_node_t *b = bridge_table_node(&s_bridges, it.mac, true);
+                if (!b) {
+                    ESP_LOGW(TAG, "bridge node table full, dropping COORD_STATUS from " MACSTR,
+                             MAC2STR(it.mac));
+                    break;
+                }
+                swarm_note_node_radio(it.mac, it.u.status.radio_role);
+                bool mismatch = b->status_valid && it.u.status.device_count != b->count;
+                b->status = it.u.status;
+                b->status_valid = true;
+                bridge_save();
+                if (mismatch || !b->synced_once) {
+                    request_resync(it.mac);
+                    b->synced_once = true;
+                }
+                break;
             }
-            break;
+            case SWARM_MSG_COMMAND_ACK: {
+                bridge_cmd_t done;
+                if (!bridge_cmd_on_ack(&s_router, it.mac, &it.u.ack, now_s, &done)) {
+                    ESP_LOGD(TAG, "COMMAND_ACK from " MACSTR ": seq=%u op=%u status=%u detail=%u "
+                                  "(still in flight, or stale/unknown seq)",
+                             MAC2STR(it.mac), it.u.ack.seq, it.u.ack.op, it.u.ack.status, it.u.ack.detail);
+                    break;
+                }
+                bool ok = (it.u.ack.status == SWARM_ACK_DONE);
+                ESP_LOGI(TAG, "COMMAND_ACK from " MACSTR ": seq=%u op=%u status=%u detail=%u -- %s",
+                         MAC2STR(it.mac), it.u.ack.seq, it.u.ack.op, it.u.ack.status, it.u.ack.detail,
+                         ok ? "done" : "failed");
+                report_bridge_result(&done, ok, it.u.ack.detail,
+                                      ok ? NULL : "bridge node reported the command failed");
+                break;
+            }
+            case BRIDGE_ITEM_SUBMIT: {
+                /* ESP_ERR_NOT_FOUND (Task 9's contract) applies ONLY to a
+                 * synchronous caller (want_result -- swarm_bridge_permit/
+                 * remove/rename()): an operator asking this hub to command a
+                 * mac it has never heard a device announce/COORD_STATUS from
+                 * gets a clear "not a bridge" answer rather than a silently
+                 * queued command to what might not even be a zigbee node.
+                 * Fire-and-forget posts (request_resync(), swarm_zb_dispatch()'s
+                 * ACTUATEs) skip this check entirely -- gating THEM on a
+                 * bridge_table entry already existing would defeat the one
+                 * case request_resync() exists for (MEASUREMENT from a node
+                 * this hub has no announce/table entry for yet, asking it to
+                 * resync so one gets created), and swarm_zb_dispatch() only
+                 * ever submits a mac bridge_table_find_device() just returned
+                 * anyway, so the check would be a no-op there besides. */
+                esp_err_t res;
+                if (it.u.submit.want_result && !bridge_table_node(&s_bridges, it.mac, false)) {
+                    res = ESP_ERR_NOT_FOUND;
+                } else if (bridge_cmd_submit(&s_router, it.mac, it.u.submit.op, &it.u.submit.dev,
+                                              it.u.submit.arg, it.u.submit.name, it.u.submit.name_len,
+                                              it.u.submit.ttl_s, now_s, it.u.submit.actor_dev_idx,
+                                              it.u.submit.actor_action, it.u.submit.actor_param)) {
+                    res = ESP_OK;
+                } else {
+                    res = ESP_ERR_INVALID_STATE;   /* one already in flight for this node */
+                }
+
+                if (it.u.submit.want_result) {
+                    /* A synchronous swarm_bridge_permit/remove/rename() caller
+                     * is waiting on s_submit_done -- see submit_and_wait(). */
+                    s_submit_result = res;
+                    xSemaphoreGive(s_submit_done);
+                } else if (res != ESP_OK) {
+                    /* Fire-and-forget posts: request_resync() (actor_dev_idx
+                     * < 0, nothing to report) and swarm_zb_dispatch()'s ACTUATE
+                     * posts (actor_dev_idx >= 0 -- the dispatching task already
+                     * returned without knowing this outcome, so THIS is the
+                     * only place left to report a "too many commands already
+                     * outstanding for this node" failure back to the actor
+                     * layer, same 0xfe "busy" detail swarm_zb_dispatch() itself
+                     * uses when it can't even queue the request). */
+                    ESP_LOGW(TAG, "BRIDGE_ITEM_SUBMIT to " MACSTR " (op=%u) refused: %s",
+                             MAC2STR(it.mac), (unsigned)it.u.submit.op, esp_err_to_name(res));
+                    if (it.u.submit.actor_dev_idx >= 0) {
+                        zb_cmd_report_public(it.u.submit.actor_dev_idx, it.u.submit.actor_action,
+                                             it.u.submit.actor_param, false,
+                                             "bridge command already in flight for this node", 0xfe);
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+            }
+            xSemaphoreGive(s_bridges_mutex);
+        }   /* if (got == pdTRUE) */
+
+        /* Router tick (Task 8), driven every pass regardless of whether an
+         * item arrived this time -- the 500 ms queue-receive timeout above
+         * IS this task's periodic tick, so a quiet queue still retries a
+         * due command or expires an overdue one on roughly that cadence.
+         * s_router needs no lock: this task is its only caller (see
+         * s_router's own top comment). Encoding + espnow_link_send()
+         * deliberately run OUTSIDE s_bridges_mutex (already released just
+         * above) -- same "blocking send never held under a lock" discipline
+         * swarm_start_main()'s own post-boot resync sweep uses. */
+        const bridge_cmd_t *c;
+        while ((c = bridge_cmd_next_send(&s_router, now_s)) != NULL) {
+            swarm_command_t cmd = { .seq = c->seq, .op = c->op, .dev = c->dev, .arg = c->arg,
+                                     .name_len = c->name_len };
+            memcpy(cmd.name, c->name, c->name_len);
+            /* c->deadline_s was fixed at submit time (now + the caller's
+             * ttl_s); re-derive the REMAINING seconds for the wire so a
+             * retried send still tells the node an honestly-shrunk window,
+             * rather than replaying the original ttl_s as if no time had
+             * passed. Floored at 1: swarm_command_t.ttl_s == 0 would read,
+             * on the node side, as "deadline already passed" (command_task()
+             * derives actor_now_s() + ttl_s for ACTUATE) -- a command this
+             * router still considers live must never be sent as already-dead. */
+            cmd.ttl_s = (uint16_t)(c->deadline_s > now_s ? (c->deadline_s - now_s) : 1);
+            uint8_t buf[64];
+            size_t n = swarm_encode_command(&cmd, buf, sizeof(buf));
+            if (n == 0) {
+                ESP_LOGE(TAG, "bridge command encode failed for " MACSTR " (op=%u seq=%u)",
+                         MAC2STR(c->mac), (unsigned)c->op, (unsigned)c->seq);
+                continue;
+            }
+            esp_err_t err = espnow_link_send(c->mac, buf, n);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "command -> " MACSTR " (op=%u seq=%u) send failed: %s",
+                         MAC2STR(c->mac), (unsigned)c->op, (unsigned)c->seq, esp_err_to_name(err));
+            } else {
+                ESP_LOGI(TAG, "command -> " MACSTR " (op=%u seq=%u, send #%u)",
+                         MAC2STR(c->mac), (unsigned)c->op, (unsigned)c->seq, (unsigned)c->sends);
+            }
         }
-        case SWARM_MSG_COMMAND_ACK:
-            /* Log-only in this task -- Task 8's router (bridge_cmd_on_ack())
-             * takes over correlating this to an outstanding command and
-             * reporting the result via the actor/alert path. */
-            ESP_LOGI(TAG, "COMMAND_ACK from " MACSTR ": seq=%u op=%u status=%u detail=%u",
-                     MAC2STR(it.mac), it.u.ack.seq, it.u.ack.op, it.u.ack.status, it.u.ack.detail);
-            break;
-        default:
-            break;
+
+        bridge_cmd_t expired;
+        while (bridge_cmd_expire(&s_router, now_s, &expired)) {
+            ESP_LOGW(TAG, "command -> " MACSTR " (op=%u seq=%u) timed out with no DONE/FAILED ack",
+                     MAC2STR(expired.mac), (unsigned)expired.op, (unsigned)expired.seq);
+            report_bridge_result(&expired, false, 0xff, "bridge command timed out");
         }
-        xSemaphoreGive(s_bridges_mutex);
     }
 }
 
@@ -795,6 +978,12 @@ static esp_err_t ensure_bridge_task(void)
     if (!s_bridges_mutex) return ESP_ERR_NO_MEM;
     if (!s_bridge_queue) s_bridge_queue = xQueueCreate(BRIDGE_QUEUE_LEN, sizeof(bridge_item_t));
     if (!s_bridge_queue) return ESP_ERR_NO_MEM;
+    /* M7 Task 8: submit_and_wait()'s synchronous swarm_bridge_permit/
+     * remove/rename() answer path -- see s_submit_done's own top comment. */
+    if (!s_submit_done) s_submit_done = xSemaphoreCreateBinary();
+    if (!s_submit_done) return ESP_ERR_NO_MEM;
+    if (!s_submit_call_mutex) s_submit_call_mutex = xSemaphoreCreateMutex();
+    if (!s_submit_call_mutex) return ESP_ERR_NO_MEM;
     BaseType_t ok = xTaskCreate(bridge_task, "swarm_bridge", 4096, NULL, 3, &s_bridge_task);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "ensure_bridge_task: xTaskCreate failed");
@@ -802,6 +991,94 @@ static esp_err_t ensure_bridge_task(void)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+/* M7 Task 8: default TTL for a hub-initiated PERMIT_JOIN/DEVICE_REMOVE/
+ * DEVICE_RENAME (swarm_bridge_permit/remove/rename() below) -- same value
+ * request_resync() already used for RESYNC, generous over one ESP-NOW
+ * round trip plus this router's own one retry (BRIDGE_CMD_RETRY_S). */
+#define BRIDGE_API_TTL_S 30
+
+/* Posts a BRIDGE_ITEM_SUBMIT for `mac` and blocks (this caller's own task,
+ * never bridge_task or the ESP-NOW receive callback -- see swarm.h's
+ * swarm_bridge_permit/remove/rename() doc comments, Task 9's HTTP handler
+ * calls these directly and can afford to wait) up to 300 ms for
+ * bridge_task to answer through s_submit_done/s_submit_result.
+ * s_submit_call_mutex serialises concurrent callers so one caller's answer
+ * can never be mistaken for another's (see s_submit_done's own top
+ * comment). Returns ESP_ERR_INVALID_STATE when this hub has no bridge
+ * task/queue/semaphores at all (ensure_bridge_task() never ran or failed),
+ * when the queue was momentarily full, or when bridge_task never answered
+ * within 300 ms (a wedged/overloaded bridge_task, or -- in practice -- a
+ * test double with no bridge_task running at all); otherwise the result
+ * bridge_task itself computed (ESP_OK, ESP_ERR_NOT_FOUND, or
+ * ESP_ERR_INVALID_STATE for "one already in flight"). */
+static esp_err_t submit_and_wait(const uint8_t mac[6], uint8_t op, const swarm_dev_addr_t *dev,
+                                 uint16_t arg, const char *name, uint8_t name_len)
+{
+    if (!s_bridge_queue || !s_submit_done || !s_submit_call_mutex) return ESP_ERR_INVALID_STATE;
+
+    xSemaphoreTake(s_submit_call_mutex, portMAX_DELAY);
+
+    bridge_item_t item;
+    memset(&item, 0, sizeof(item));
+    memcpy(item.mac, mac, 6);
+    item.type = BRIDGE_ITEM_SUBMIT;
+    item.u.submit.op = op;
+    if (dev) item.u.submit.dev = *dev;
+    item.u.submit.arg = arg;
+    if (name && name_len > 0) {
+        uint8_t n = name_len > SWARM_DEV_NAME_MAX ? SWARM_DEV_NAME_MAX : name_len;
+        memcpy(item.u.submit.name, name, n);
+        item.u.submit.name_len = n;
+    }
+    item.u.submit.ttl_s = BRIDGE_API_TTL_S;
+    item.u.submit.actor_dev_idx = -1;
+    item.u.submit.want_result = true;
+
+    esp_err_t result;
+    if (xQueueSend(s_bridge_queue, &item, 0) != pdTRUE) {
+        result = ESP_ERR_INVALID_STATE;
+    } else if (xSemaphoreTake(s_submit_done, pdMS_TO_TICKS(300)) == pdTRUE) {
+        result = s_submit_result;
+    } else {
+        ESP_LOGW(TAG, "submit_and_wait: bridge_task did not answer within 300ms for " MACSTR
+                      " (op=%u)", MAC2STR(mac), (unsigned)op);
+        result = ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreGive(s_submit_call_mutex);
+    return result;
+}
+
+/* See swarm.h. */
+esp_err_t swarm_bridge_permit(const uint8_t mac[6])
+{
+    return submit_and_wait(mac, SWARM_CMD_PERMIT_JOIN, NULL, 0, NULL, 0);
+}
+
+/* See swarm.h. dev.kind is set for consistency with every other
+ * swarm_dev_addr_t this component builds (ANNOUNCE/ACTUATE alike all use
+ * DEV_KIND_ZIGBEE) even though the bridge node's own command_task()
+ * matches DEVICE_REMOVE/DEVICE_RENAME purely on the 8-byte eui64
+ * (memcmp(list[i].eui64, c.dev.addr, 8)) and never reads dev.kind for
+ * these two ops -- there is no OTHER kind a zigbee bridge's own joined
+ * devices could be, so leaving it unset would only be a false economy. */
+esp_err_t swarm_bridge_remove(const uint8_t mac[6], const uint8_t eui64[8])
+{
+    swarm_dev_addr_t dev = { .kind = DEV_KIND_ZIGBEE };
+    memcpy(dev.addr, eui64, SWARM_ADDR_LEN);
+    return submit_and_wait(mac, SWARM_CMD_DEVICE_REMOVE, &dev, 0, NULL, 0);
+}
+
+/* See swarm.h and swarm_bridge_remove()'s comment above on dev.kind. */
+esp_err_t swarm_bridge_rename(const uint8_t mac[6], const uint8_t eui64[8], const char *name)
+{
+    swarm_dev_addr_t dev = { .kind = DEV_KIND_ZIGBEE };
+    memcpy(dev.addr, eui64, SWARM_ADDR_LEN);
+    size_t len = name ? strlen(name) : 0;
+    return submit_and_wait(mac, SWARM_CMD_DEVICE_RENAME, &dev, 0, name,
+                           (uint8_t)(len > SWARM_DEV_NAME_MAX ? SWARM_DEV_NAME_MAX : len));
 }
 
 static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, int rssi)
@@ -1067,6 +1344,91 @@ static void log_effective_country(void *arg, esp_event_base_t base, int32_t id, 
     }
 }
 
+/* cmd->deadline_s (actor_cmd_t, actor.h) is absolute, actor_now_s()-scale
+ * (== esp_timer_get_time()/1e6, the same clock this file's now_s already
+ * uses throughout) -- bridge_cmd_submit() wants a duration instead, so
+ * this re-derives one. Floored at 1 for the same reason bridge_task's own
+ * retry-send re-derivation is (a command already past its actor-side
+ * deadline must still get SOME positive ttl_s here, rather than 0 reading
+ * as "already expired" once it reaches the node -- and this router's own
+ * bridge_cmd_expire() is the backstop that actually cuts off a truly
+ * overdue command, not this clamp). */
+static uint32_t deadline_to_ttl(uint32_t deadline_s)
+{
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    return deadline_s > now_s ? (deadline_s - now_s) : 1;
+}
+
+/* M7 Task 8: the hub's actor dispatch hook for DEV_KIND_ZIGBEE, registered
+ * below (swarm_start_main()) INSTEAD OF zb_cmd_start()'s own direct
+ * zb_cmd_local_dispatch() registration -- see zb_cmd_set_router_active()'s
+ * doc comment (zigbee.h) for the boot-order reasoning behind that swap.
+ *
+ * Looks the dispatched device up in the bridge table: one attributed to a
+ * bridge NODE's zigbee coordinator is routed there as a SWARM_CMD_ACTUATE,
+ * through the exact same BRIDGE_ITEM_SUBMIT/bridge_task path every other
+ * hub-initiated command already uses -- one place sends commands, per this
+ * task's brief. A device with no bridge attribution (overwhelmingly: it's
+ * on the HUB's OWN zigbee coordinator; also covers "no bridge table at
+ * all", e.g. ensure_bridge_task() never started) falls straight through to
+ * zb_cmd_local_dispatch() -- exactly the dispatch a hub with no router
+ * would have registered directly, so a non-bridged device's behaviour is
+ * byte-for-byte unchanged by this wrapper's existence.
+ *
+ * Never blocks actor_service()'s caller (ble_collector.c's
+ * adv_decoder_task, on the hub): the bridge-table lookup takes
+ * s_bridges_mutex only for a short, bounded scan (bridge_task, this
+ * mutex's only other holder, never sleeps while holding it either -- see
+ * s_bridges_mutex's own top comment), and the actual submit is a single
+ * non-blocking xQueueSend(). A queue that's momentarily full reports the
+ * failure itself, right here (0xfe "busy", same code swarm_zb_dispatch's
+ * own bridge_task-side "already in flight" case uses) -- there is no other
+ * place left to report it, since bridge_task never even saw this item. */
+static void swarm_zb_dispatch(const actor_cmd_t *cmd)
+{
+    uint8_t key[ACTOR_DEVICE_KEY_LEN];
+    if (!actor_device_key(cmd->dev_idx, key)) {
+        zb_cmd_local_dispatch(cmd);
+        return;
+    }
+    swarm_dev_addr_t dev = { .kind = key[0] };
+    memcpy(dev.addr, key + 1, SWARM_ADDR_LEN);
+
+    uint8_t owner_mac[6];
+    bool routed = false;
+    if (s_bridges_mutex) {
+        xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
+        const bridge_node_t *b = bridge_table_find_device(&s_bridges, &dev);
+        if (b) {
+            memcpy(owner_mac, b->mac, 6);
+            routed = true;
+        }
+        xSemaphoreGive(s_bridges_mutex);
+    }
+    if (!routed) {
+        zb_cmd_local_dispatch(cmd);
+        return;
+    }
+
+    bridge_item_t it;
+    memset(&it, 0, sizeof(it));
+    memcpy(it.mac, owner_mac, 6);
+    it.type = BRIDGE_ITEM_SUBMIT;
+    it.u.submit.op = SWARM_CMD_ACTUATE;
+    it.u.submit.dev = dev;
+    it.u.submit.arg = (uint16_t)((uint16_t)cmd->action_id | ((uint16_t)cmd->param << 8));
+    it.u.submit.ttl_s = deadline_to_ttl(cmd->deadline_s);
+    it.u.submit.actor_dev_idx = cmd->dev_idx;
+    it.u.submit.actor_action = cmd->action_id;
+    it.u.submit.actor_param = cmd->param;
+    it.u.submit.want_result = false;
+
+    if (!s_bridge_queue || xQueueSend(s_bridge_queue, &it, 0) != pdTRUE) {
+        zb_cmd_report_public(cmd->dev_idx, cmd->action_id, cmd->param, false,
+                             "bridge command queue full", 0xfe);
+    }
+}
+
 esp_err_t swarm_start_main(void)
 {
     if (!s_stats_mutex) s_stats_mutex = xSemaphoreCreateMutex();
@@ -1119,6 +1481,23 @@ esp_err_t swarm_start_main(void)
      * it against). */
     bridge_load();
 
+    /* M7 Task 8: claims the DEV_KIND_ZIGBEE actor dispatch hook for
+     * swarm_zb_dispatch() (this file's own wrapper, defined above) BEFORE
+     * zigbee_start()'s later zb_cmd_start() call (main.c calls
+     * swarm_start_main() well ahead of zigbee_start() -- see
+     * zb_cmd_set_router_active()'s own doc comment in zigbee.h for the
+     * full boot-order reasoning). Sets the flag first, then registers the
+     * hook -- either order is race-free here (both run on this same boot
+     * task, and zb_cmd_start() cannot run until zigbee_start() does, later
+     * still), but setting the flag first matches its own name: by the time
+     * anything could observe the hook, the flag already explains why. Runs
+     * unconditionally -- even if ensure_bridge_task() below fails,
+     * swarm_zb_dispatch() degrades gracefully to zb_cmd_local_dispatch()
+     * for every device (see its own top comment), which is no worse than
+     * what a router-less hub would have registered directly. */
+    zb_cmd_set_router_active(true);
+    actor_set_dispatch_hook(DEV_KIND_ZIGBEE, swarm_zb_dispatch);
+
     err = ensure_bridge_task();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "ensure_bridge_task failed: %s -- bridge (zigbee) frames will go unanswered",
@@ -1133,9 +1512,13 @@ esp_err_t swarm_start_main(void)
          * marking it true here avoids a redundant second RESYNC the moment
          * that node's first post-reboot COORD_STATUS arrives (bridge_task's
          * COORD_STATUS case: "mismatch || !b->synced_once"). Snapshot the
-         * MAC list under the mutex, then send outside it -- espnow_link_send()
-         * blocks (up to 200ms each) and must not run while holding a mutex
-         * bridge_task/swarm_forget_node_stats() might otherwise need. */
+         * MAC list under the mutex, then request outside it: request_resync()
+         * itself is a non-blocking queue post (M7 Task 8 -- it no longer
+         * calls espnow_link_send() directly, bridge_task's router does that
+         * later), but xQueueSend() still must not run while holding a mutex
+         * bridge_task/swarm_forget_node_stats() might otherwise need -- same
+         * "never call out while holding this lock" discipline as everywhere
+         * else in this file. */
         uint8_t macs[BRIDGE_MAX_NODES][6];
         int resync_n = 0;
         xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);

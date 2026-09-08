@@ -157,6 +157,29 @@ void swarm_broadcast_forget(const uint8_t mac[6]);
  * both, does the wiring. */
 void swarm_node_set_health_cb(void (*cb)(const char *reason));
 
+/* Hub (M7 Task 8): the command router's synchronous API for Task 9's HTTP
+ * handlers. Each posts one command to `mac`'s bridge node and waits (up to
+ * 300 ms) for the router (swarm.c's bridge_task) to accept or refuse it --
+ * see swarm.c's submit_and_wait() for the full contract. Common returns:
+ * ESP_OK (queued -- the actual PERMIT_JOIN/DEVICE_REMOVE/DEVICE_RENAME
+ * still completes asynchronously; watch for its SWARM_MSG_COMMAND_ACK/
+ * alert the same way an ACTUATE's outcome is watched), ESP_ERR_NOT_FOUND
+ * (mac is not a bridge node this hub has ever heard a COORD_STATUS/device
+ * announce from), ESP_ERR_INVALID_STATE (mac already has a command in
+ * flight, or this hub has no bridge task at all -- e.g. Zigbee disabled or
+ * ensure_bridge_task() failed at boot). Safe to call from any task except
+ * bridge_task itself (would deadlock waiting on its own answer) --
+ * intended caller is an HTTP handler's task. */
+esp_err_t swarm_bridge_permit(const uint8_t mac[6]);
+/* eui64 is the target device's 8-byte IEEE address, as already surfaced by
+ * GET /api/v1/nodes' zigbee device list. See swarm_bridge_permit() above
+ * for the return contract. */
+esp_err_t swarm_bridge_remove(const uint8_t mac[6], const uint8_t eui64[8]);
+/* `name` is copied (truncated to SWARM_DEV_NAME_MAX bytes, swarm_frame.h)
+ * before this function returns -- the caller's buffer need not outlive the
+ * call. See swarm_bridge_permit() above for the return contract. */
+esp_err_t swarm_bridge_rename(const uint8_t mac[6], const uint8_t eui64[8], const char *name);
+
 /* Battery-mode wake cycle (spec §4). Called from main.c's node-paired
  * branch INSTEAD OF returning to a plain always-on run, when
  * swarm_store_power_mode() != SWARM_PM_ALWAYS_ON. Runs the bounded wake
