@@ -3016,6 +3016,13 @@ static void send_cmd_ack(uint16_t seq, uint8_t op, uint8_t status, uint8_t detai
  * by command_task mid-update. This priority relationship is an invariant;
  * add a critical section if either priority changes. */
 static struct { int dev_idx; uint16_t seq; bool active; int64_t deadline_us; } s_actuate_pending;
+/* Since the local 10 s timeout below became a second writer of `active`
+ * (command_task, prio 3, doing a read-then-clear that the prio-5 stack task
+ * CAN preempt), the priority argument above no longer covers every path:
+ * both writers take this spinlock around their read-modify-write so a real
+ * result landing in the same microsecond as the timeout cannot produce two
+ * acks for one seq. */
+static portMUX_TYPE s_actuate_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* zigbee.h's zb_cmd_result_t -- zb_cmd_report()'s one registered consumer
  * (registered below, in swarm_start_node()'s zigbee block, before
@@ -3031,15 +3038,20 @@ static void on_zb_result(int dev_idx, uint8_t action_id, uint16_t param, bool ok
 {
     (void)action_id;
     (void)param;
-    if (!s_actuate_pending.active || s_actuate_pending.dev_idx != dev_idx) {
+    taskENTER_CRITICAL(&s_actuate_mux);
+    bool mine = s_actuate_pending.active && s_actuate_pending.dev_idx == dev_idx;
+    uint16_t seq = s_actuate_pending.seq;
+    if (mine) s_actuate_pending.active = false;
+    taskEXIT_CRITICAL(&s_actuate_mux);
+    if (!mine) {
         /* Not this node's one outstanding ACTUATE (already cleared by a
-         * duplicate/late report, or an outcome for some other dispatch
-         * entirely -- e.g. a rule/manual command against the same device,
-         * which this bridge does not track here). Nothing to ack. */
+         * duplicate/late report or the local timeout, or an outcome for
+         * some other dispatch entirely -- e.g. a rule/manual command
+         * against the same device, which this bridge does not track
+         * here). Nothing to ack. */
         return;
     }
-    s_actuate_pending.active = false;
-    swarm_command_ack_t a = { .seq = s_actuate_pending.seq, .op = SWARM_CMD_ACTUATE,
+    swarm_command_ack_t a = { .seq = seq, .op = SWARM_CMD_ACTUATE,
                               .status = ok ? SWARM_ACK_DONE : SWARM_ACK_FAILED, .detail = zcl_status };
     if (!s_ack_queue || xQueueSend(s_ack_queue, &a, 0) != pdTRUE)
         ESP_LOGW(TAG, "ack queue full/absent, dropping ACTUATE result (seq=%u)", (unsigned)a.seq);
@@ -3083,10 +3095,14 @@ static void command_task(void *arg)
          * already-periodic loop, guarantees the slot always frees itself
          * even if no zb_cmd result ever arrives. 0xfd marks a local
          * timeout, distinct from zb_cmd.c's own 0xff wire timeout. */
-        if (s_actuate_pending.active && esp_timer_get_time() >= s_actuate_pending.deadline_us) {
+        {
+            int64_t now_us = esp_timer_get_time();
+            taskENTER_CRITICAL(&s_actuate_mux);
+            bool timed_out = s_actuate_pending.active && now_us >= s_actuate_pending.deadline_us;
             uint16_t timed_out_seq = s_actuate_pending.seq;
-            s_actuate_pending.active = false;
-            send_cmd_ack(timed_out_seq, SWARM_CMD_ACTUATE, SWARM_ACK_FAILED, 0xfd);
+            if (timed_out) s_actuate_pending.active = false;
+            taskEXIT_CRITICAL(&s_actuate_mux);
+            if (timed_out) send_cmd_ack(timed_out_seq, SWARM_CMD_ACTUATE, SWARM_ACK_FAILED, 0xfd);
         }
 
         swarm_command_ack_t queued;
@@ -3173,12 +3189,16 @@ static void command_task(void *arg)
                 detail = 1;
                 break;
             }
+            taskENTER_CRITICAL(&s_actuate_mux);
             s_actuate_pending = (typeof(s_actuate_pending)){ .dev_idx = idx, .seq = c.seq, .active = true,
                                                               .deadline_us = esp_timer_get_time() + 10 * 1000000LL };
+            taskEXIT_CRITICAL(&s_actuate_mux);
             bool queued_ok = actor_request(idx, (uint8_t)(c.arg & 0xff), (uint16_t)(c.arg >> 8),
                                             ACTOR_SRC_REMOTE, actor_now_s() + c.ttl_s);
             if (!queued_ok) {
+                taskENTER_CRITICAL(&s_actuate_mux);
                 s_actuate_pending.active = false;
+                taskEXIT_CRITICAL(&s_actuate_mux);
                 detail = 2;
                 break;
             }

@@ -378,7 +378,20 @@ static bool submit_cap_id_at(const device_id_t *id, uint8_t cap_id, float value,
     }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    int idx = registry_set_cap(&s_registry, id, cap_id, raw, ts_s);
+    int idx = registry_find(&s_registry, id);
+    if (idx >= 0 && ts_s < s_registry.devices[idx].last_seen_s) {
+        /* Same "don't overwrite newer with older" guard as
+         * data_core_submit_from(): a back-dated (bridged, replayed) reading
+         * must not regress a device whose live view is already newer. A no-op
+         * for the un-aged callers, whose ts_s is "now". */
+        uint32_t stored_s = s_registry.devices[idx].last_seen_s;
+        xSemaphoreGive(s_mutex);
+        ESP_LOGD(TAG, "dropping stale cap %u for " MACSTR_FMT ": effective %us < last_seen %us (dropped_stale=%lu)",
+                 cap_id, MAC_ARG(id->addr), (unsigned)ts_s, (unsigned)stored_s,
+                 (unsigned long)++s_dropped_stale);
+        return false;
+    }
+    idx = registry_set_cap(&s_registry, id, cap_id, raw, ts_s);
     xSemaphoreGive(s_mutex);
 
     if (idx < 0) {
