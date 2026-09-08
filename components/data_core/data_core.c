@@ -269,6 +269,13 @@ void data_core_set_via(int dev_idx, const uint8_t node_mac[6])
     xSemaphoreGive(s_mutex);
 }
 
+void data_core_clear_via(int dev_idx)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    registry_clear_via(&s_registry, dev_idx);
+    xSemaphoreGive(s_mutex);
+}
+
 bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)
 {
     /* capability_encode() is pure (no shared state), so this check happens

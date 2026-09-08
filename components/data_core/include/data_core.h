@@ -90,6 +90,15 @@ void      data_core_clear_node_attribution(const uint8_t node_mac[6]);
  * dev_idx is out of range or not currently in_use. */
 void      data_core_set_via(int dev_idx, const uint8_t node_mac[6]);
 
+/* M7 Task 7 fix round 1 (critical #2): a zigbee bridge's DEVICE_GONE (that
+ * device left ITS network, not the whole bridge node) removes the device
+ * from swarm.c's bridge table, but the registry entry itself is never
+ * deleted (registry.h) -- without this, its via_node stays pointed at a
+ * bridge that no longer reports it. Takes s_mutex, same as every other
+ * registry accessor here; see registry_clear_via()'s own doc comment. A
+ * no-op if dev_idx is out of range or not currently in_use. */
+void      data_core_clear_via(int dev_idx);
+
 /* A MiFlora battery poll result (battery_poll.c, M6): applies pct to mac's
  * CAP_BATTERY_LEVEL slot (creating the device if this is its first
  * appearance) via registry_set_cap(), NOT registry_attribute() -- a GATT

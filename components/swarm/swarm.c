@@ -591,6 +591,21 @@ _Static_assert(BRIDGE_MAX_NODES == SWARM_MAX_NODES,
  * tighter worst case -- this stays a round, obviously-sufficient number). */
 #define BRIDGE_STORE_IMAGE_MAX (16 + BRIDGE_MAX_NODES * (16 + BRIDGE_MAX_DEVICES * 96))
 
+/* M7 Task 7 fix round 1 (critical #1): BRIDGE_STORE_IMAGE_MAX is ~9.3 KB --
+ * far too large for either call site's stack (bridge_save() runs on
+ * bridge_task, a 4096 B stack; bridge_load() runs once at boot, on
+ * swarm_start_main()'s caller's stack, smaller still) -- a stack-local
+ * array of this size (this function's original shape) is a guaranteed
+ * overflow on real hardware. static instead: no heap, and a single shared
+ * buffer for both functions is safe because they can never run
+ * concurrently -- every bridge_save() call site already holds
+ * s_bridges_mutex (this function's own "caller must hold" contract,
+ * below), and bridge_load() runs exactly once, at boot, strictly BEFORE
+ * ensure_bridge_task() ever creates that mutex or starts bridge_task (see
+ * swarm_start_main()) -- so there is only ever one writer to this buffer
+ * at any instant. */
+static uint8_t s_bridge_io_buf[BRIDGE_STORE_IMAGE_MAX];
+
 /* Caller must hold s_bridges_mutex. Same tmp+rename discipline as
  * zigbee.c's zb_store_save() (that file's own comment has the full
  * power-loss-atomicity reasoning); this omits the explicit fsync() that
@@ -599,8 +614,7 @@ _Static_assert(BRIDGE_MAX_NODES == SWARM_MAX_NODES,
  * has no such second source of truth if a torn write lost it. */
 static void bridge_save(void)
 {
-    uint8_t buf[BRIDGE_STORE_IMAGE_MAX];
-    size_t len = bridge_table_serialize(&s_bridges, buf, sizeof buf);
+    size_t len = bridge_table_serialize(&s_bridges, s_bridge_io_buf, sizeof s_bridge_io_buf);
     if (len == 0) {
         ESP_LOGE(TAG, "bridge table serialize failed; not persisted");
         return;
@@ -611,7 +625,7 @@ static void bridge_save(void)
                       "bridge table", BRIDGE_STORE_TMP_PATH, errno);
         return;
     }
-    size_t wrote = fwrite(buf, 1, len, f);
+    size_t wrote = fwrite(s_bridge_io_buf, 1, len, f);
     if (wrote != len || fclose(f) != 0) {
         ESP_LOGW(TAG, "short write or close failure persisting the bridge table to %s",
                  BRIDGE_STORE_TMP_PATH);
@@ -627,22 +641,23 @@ static void bridge_save(void)
 
 /* Called once, from swarm_start_main(), before any other task can touch
  * s_bridges -- no locking needed here (mirrors zb_store_load()'s own
- * comment on the same point). */
+ * comment on the same point), and strictly before ensure_bridge_task()
+ * ever runs, so s_bridge_io_buf (shared with bridge_save() above) has no
+ * concurrent writer yet either -- see that buffer's own comment. */
 static void bridge_load(void)
 {
     bridge_table_init(&s_bridges);
 
-    uint8_t buf[BRIDGE_STORE_IMAGE_MAX];
     FILE *f = fopen(BRIDGE_STORE_PATH, "rb");
     if (!f) {
         ESP_LOGI(TAG, "%s: not present (first boot, or no bridge node has announced a device yet)",
                  BRIDGE_STORE_PATH);
         return;
     }
-    size_t n = fread(buf, 1, sizeof buf, f);
+    size_t n = fread(s_bridge_io_buf, 1, sizeof s_bridge_io_buf, f);
     fclose(f);
 
-    if (!bridge_table_deserialize(&s_bridges, buf, n)) {
+    if (!bridge_table_deserialize(&s_bridges, s_bridge_io_buf, n)) {
         ESP_LOGW(TAG, "%s: %u byte(s) unreadable (bad magic, version, length or count); "
                       "starting this boot with an empty bridge table", BRIDGE_STORE_PATH, (unsigned)n);
         bridge_table_init(&s_bridges);
@@ -779,11 +794,41 @@ static void bridge_task(void *arg)
         uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
         if (got == pdTRUE) {
+            /* M7 Task 7 fix round 1 (important #3): request_resync() itself
+             * only enqueues (non-blocking, see its own comment) -- but the
+             * ruling is that no "send" (however cheap) runs while
+             * s_bridges_mutex is held, matching the router tick's and the
+             * boot-time resync sweep's own "release, then send" discipline
+             * just below/above. Set instead of calling directly inside the
+             * switch; sent once, after xSemaphoreGive(), further down. */
+            bool need_resync = false;
+
             xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
             switch (it.type) {
             case SWARM_MSG_DEVICE_ANNOUNCE: {
+                /* M7 Task 7 fix round 1 (minor #4): bridge_table_upsert()
+                 * can fail for two distinct reasons -- this node has never
+                 * been seen before and every BRIDGE_MAX_NODES slot is
+                 * already in use, or this node is already known but ITS
+                 * device table (BRIDGE_MAX_DEVICES) is full. Checked
+                 * BEFORE the upsert attempt (both still under
+                 * s_bridges_mutex, so this can't race the upsert's own
+                 * decision): if the node already existed, upsert() only
+                 * ever consults bridge_table_node(mac, true) again -- which
+                 * is guaranteed to find it, not fail -- so any upsert
+                 * failure here can only be its device table being full;
+                 * conversely, a brand-new node's device table starts at 0,
+                 * always room for its very first device, so a failure for
+                 * an unseen mac can only be the node table itself being full. */
+                bool node_existed = bridge_table_node(&s_bridges, it.mac, false) != NULL;
                 if (!bridge_table_upsert(&s_bridges, it.mac, &it.u.ann)) {
-                    ESP_LOGW(TAG, "bridge table full for " MACSTR, MAC2STR(it.mac));
+                    if (node_existed) {
+                        ESP_LOGW(TAG, "bridge node " MACSTR ": device table full (%d), dropping announce",
+                                 MAC2STR(it.mac), BRIDGE_MAX_DEVICES);
+                    } else {
+                        ESP_LOGW(TAG, "bridge node table full (%d), dropping announce from " MACSTR,
+                                 BRIDGE_MAX_NODES, MAC2STR(it.mac));
+                    }
                     break;
                 }
                 device_id_t id = { .kind = (device_kind_t)it.u.ann.dev.kind };
@@ -805,10 +850,23 @@ static void bridge_task(void *arg)
                 bridge_save();
                 break;
             }
-            case SWARM_MSG_DEVICE_GONE:
+            case SWARM_MSG_DEVICE_GONE: {
                 bridge_table_remove(&s_bridges, it.mac, &it.u.gone.dev);
                 bridge_save();
+                /* M7 Task 7 fix round 1 (critical #2): the registry never
+                 * deletes rows (registry.h), so the device entry survives
+                 * this device leaving its bridge's zigbee network -- but its
+                 * via_node attribution is now stale (this bridge no longer
+                 * reports it) and must not keep pointing at it. A later
+                 * re-ANNOUNCE (this device rejoining, here or elsewhere)
+                 * re-attributes via data_core_set_via() the same as any
+                 * first-time announce does. */
+                device_id_t id = { .kind = (device_kind_t)it.u.gone.dev.kind };
+                memcpy(id.addr, it.u.gone.dev.addr, SWARM_ADDR_LEN);
+                int idx = data_core_find_index(&id);
+                if (idx >= 0) data_core_clear_via(idx);
                 break;
+            }
             case SWARM_MSG_MEASUREMENT: {
                 device_id_t id = { .kind = (device_kind_t)it.u.meas.dev.kind };
                 memcpy(id.addr, it.u.meas.dev.addr, SWARM_ADDR_LEN);
@@ -820,7 +878,7 @@ static void bridge_task(void *arg)
                      * dropping forever. */
                     ESP_LOGW(TAG, "MEASUREMENT for unannounced device from " MACSTR ", requesting resync",
                              MAC2STR(it.mac));
-                    request_resync(it.mac);
+                    need_resync = true;
                     break;
                 }
                 data_core_submit_cap_id(&id, it.u.meas.cap_id, it.u.meas.value);
@@ -840,7 +898,7 @@ static void bridge_task(void *arg)
                 b->status_valid = true;
                 bridge_save();
                 if (mismatch || !b->synced_once) {
-                    request_resync(it.mac);
+                    need_resync = true;
                     b->synced_once = true;
                 }
                 break;
@@ -916,6 +974,15 @@ static void bridge_task(void *arg)
                 break;
             }
             xSemaphoreGive(s_bridges_mutex);
+
+            /* need_resync (fix round 1, important #3): request_resync()
+             * runs here, AFTER the mutex is released, never inside the
+             * switch above -- same discipline the router tick and
+             * swarm_start_main()'s boot sweep already use for their own
+             * sends. it.mac is a plain byte array copied into this local
+             * item, so it stays valid regardless of anything the mutex was
+             * protecting. */
+            if (need_resync) request_resync(it.mac);
         }   /* if (got == pdTRUE) */
 
         /* Router tick (Task 8), driven every pass regardless of whether an
@@ -1079,6 +1146,21 @@ esp_err_t swarm_bridge_rename(const uint8_t mac[6], const uint8_t eui64[8], cons
     size_t len = name ? strlen(name) : 0;
     return submit_and_wait(mac, SWARM_CMD_DEVICE_RENAME, &dev, 0, name,
                            (uint8_t)(len > SWARM_DEV_NAME_MAX ? SWARM_DEV_NAME_MAX : len));
+}
+
+/* See swarm.h. A plain memberwise copy under s_bridges_mutex -- bounded and
+ * cheap (BRIDGE_MAX_NODES * sizeof(bridge_node_t), the same table
+ * bridge_save()/bridge_load() already move through s_bridge_io_buf a whole
+ * serialised copy of), so unlike submit_and_wait() this never queues or
+ * waits on bridge_task; it just takes the mutex bridge_task itself holds
+ * only for the short, bounded span of one queue item's processing. */
+bool swarm_bridge_snapshot(bridge_table_t *out)
+{
+    if (!s_bridges_mutex) return false;
+    xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
+    *out = s_bridges;
+    xSemaphoreGive(s_bridges_mutex);
+    return true;
 }
 
 static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, int rssi)

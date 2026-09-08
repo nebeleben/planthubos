@@ -140,3 +140,16 @@ void registry_clear_attribution(registry_t *r, const uint8_t node_mac[6]);
  * last_seen_s as its timestamp. A no-op if idx is out of range or the slot
  * isn't in_use. */
 void registry_set_via(registry_t *r, int idx, const uint8_t node_mac[6]);
+
+/* M7 Task 7 fix round 1 (critical #2): a zigbee bridge's DEVICE_GONE means
+ * ITS device left, not that the whole reporting node is gone (that's
+ * registry_clear_attribution() above, driven by a FORGET) -- but the
+ * registry has no delete (see this header's own top comment), so the
+ * device entry stays; only its via-node attribution is stale once the
+ * device is no longer behind that bridge. Resets via_node_valid/via_node/
+ * best_rssi for idx alone, same fields registry_clear_attribution() resets
+ * per-entry, just scoped to one already-resolved index instead of a scan
+ * over every entry attributed to a mac. A later re-ANNOUNCE (of this
+ * device rejoining, here or on a different bridge) re-attributes via
+ * registry_set_via() above. A no-op if idx is out of range or not in_use. */
+void registry_clear_via(registry_t *r, int idx);
