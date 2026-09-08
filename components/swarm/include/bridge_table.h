@@ -17,7 +17,11 @@
  * Pure C, no ESP-IDF: swarm.c owns the tmp+rename persisted write (same
  * discipline as zigbee.c's zb_store.c) and every FreeRTOS/mutex concern.
  * This file only manipulates the in-memory table -- see
- * tests/host/test_bridge_table.c.
+ * tests/host/test_bridge_table.c. bridge_table_deserialize()'s internal
+ * scratch table is a file-static (too big for a stack frame) rather than a
+ * FreeRTOS/ESP-IDF primitive, so the pure-C contract still holds; callers
+ * must serialise access the same way swarm.c already does via
+ * s_bridge_io_mutex.
  *
  * BRIDGE_MAX_NODES intentionally duplicates SWARM_MAX_NODES's value (6)
  * rather than including swarm_store.h to get it: swarm_store.h pulls in

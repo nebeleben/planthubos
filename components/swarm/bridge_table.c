@@ -166,7 +166,11 @@ bool bridge_table_deserialize(bridge_table_t *t, const uint8_t *buf, size_t len)
     uint8_t node_count = br8(&r);
     if (!r.ok || node_count > BRIDGE_MAX_NODES) return false;
 
-    bridge_table_t tmp;
+    /* static: 5.3 KB is too big for a stack frame (see C1 in the whole-branch
+     * review). Safe because every caller is serialised by swarm.c's
+     * s_bridge_io_mutex (bridge_load() is the sole target call site and runs
+     * once, at boot) and the host test is single-threaded. */
+    static bridge_table_t tmp;
     bridge_table_init(&tmp);
 
     for (uint8_t i = 0; i < node_count; i++) {
