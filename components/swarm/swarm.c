@@ -2289,7 +2289,9 @@ static void node_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, i
         if (swarm_decode_command(data, (size_t)len, &cmd)) {
             uint8_t hub_mac[6];
             if (swarm_store_hub(hub_mac, NULL, NULL) && memcmp(src_mac, hub_mac, 6) == 0) {
-                if (s_cmd_queue) xQueueSend(s_cmd_queue, &cmd, 0);
+                if (s_cmd_queue && xQueueSend(s_cmd_queue, &cmd, 0) != pdTRUE) {
+                    ESP_LOGW(TAG, "command queue full, dropping seq %u op %u", cmd.seq, cmd.op);
+                }
             }
         }
         return;
@@ -2586,7 +2588,7 @@ static void forward_task(void *arg)
             n = swarm_encode_reading(&r.u.reading, buf, sizeof buf);
             break;
         case SWARM_OUT_MEASUREMENT:
-            if (from_backlog) r.u.meas.age_s = swarm_buf_recompute_age(r.u.meas.age_s, captured_us, esp_timer_get_time());
+            if (from_backlog) r.u.meas.age_s = (uint16_t)swarm_buf_recompute_age(r.u.meas.age_s, captured_us, esp_timer_get_time()); /* data_core caps age at 30 min; fits uint16 */
             n = swarm_encode_measurement(&r.u.meas, buf, sizeof buf);
             break;
         case SWARM_OUT_ANNOUNCE:
@@ -2599,6 +2601,7 @@ static void forward_task(void *arg)
             n = swarm_encode_coord_status(&r.u.status, buf, sizeof buf);
             break;
         default:
+            ESP_LOGW(TAG, "forward: unknown out tag %u, dropped", r.tag);
             continue;
         }
         if (n == 0) continue;
@@ -2848,7 +2851,12 @@ static void send_cmd_ack(uint16_t seq, uint8_t op, uint8_t status, uint8_t detai
  * to actor_service() below), except for the async completion path, which
  * only ever CLEARS `active`, never anything else -- so there is no real
  * race to guard here even though on_zb_result() can also run on the
- * Zigbee stack task. */
+ * Zigbee stack task.
+ *
+ * Unlocked on purpose: on_zb_result() runs on the Zigbee stack task (prio 5)
+ * and command_task runs at prio 3, so the stack task can never be preempted
+ * by command_task mid-update. This priority relationship is an invariant;
+ * add a critical section if either priority changes. */
 static struct { int dev_idx; uint16_t seq; bool active; } s_actuate_pending;
 
 /* zigbee.h's zb_cmd_result_t -- zb_cmd_report()'s one registered consumer
