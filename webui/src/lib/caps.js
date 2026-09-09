@@ -10,8 +10,8 @@
 // PlantScript compiler's own frozen, hand-written ids-0-4 table (compiler
 // literal/unit checking, source-derived) -- a different concern with a
 // similar name purely by coincidence. This file is the live, server-served
-// M2 capability table (all 8 ids, id 5-7 included) and must never be
-// merged with or read by the compiler.
+// capability table (all 10 ids, 0-9, through button.action) and must never
+// be merged with or read by the compiler.
 let capsPromise = null
 
 // button.action (id 9, spec's zigbee-button-support amendment) reports a

@@ -5,7 +5,7 @@
 
 int main(void) {
     data_core_init();
-    device_id_t b = { .kind = 1 /* DEV_KIND_ZIGBEE */ };
+    device_id_t b = { .kind = 2 /* DEV_KIND_ZIGBEE */ };
     b.addr[0] = 0xAB;
 
     /* no event pending initially */

@@ -99,6 +99,18 @@ typedef struct {
     psvm_prog_t prog;           /* meaningful iff loaded_ok */
     bool        all_ready;
     char        reason[48];     /* first not-ready reason, meaningful iff !all_ready */
+    /* True when at least one ref this rule references is a momentary EVENT
+     * capability (button.action, capability.h's cdef->event) that RESOLVED
+     * READY this pass -- i.e. a press is pending. Threaded into
+     * rules_fsm_should_fire() (zigbee-button-support) so a `mode edge` button
+     * rule fires once per pending press instead of latching after the first.
+     * Gated on the ref resolving ready: a non-pending event resolves not-ready
+     * -> all_ready false -> the rule never reaches should_fire anyway, so this
+     * stays precise. Read the ref's capability id straight from st->prog via
+     * psvm_get_ref() (no rules_resolve() signature change -- that resolver is
+     * shared with the action-dev path and several not-ready-reason callers;
+     * the cap id is already on the ref layout here). */
+    bool        has_event;
 } resolve_state_t;
 
 /* Loads rule_id's bytecode, validates it, and resolves every ref into
@@ -139,9 +151,16 @@ static void resolve_all(uint32_t rule_id, resolve_state_t *st,
             st->all_ready = false;
             strlcpy(st->reason, why, sizeof(st->reason));
         }
+        psvm_ref_t pr = psvm_get_ref(&st->prog, i);
+        /* Momentary event cap that resolved ready => a press is pending; the
+         * fsm treats each such press as a discrete edge (see resolve_state_t
+         * and rules_fsm_should_fire()). */
+        if (ok) {
+            const capability_t *cd = capability_get(pr.capability);
+            if (cd && cd->event) st->has_event = true;
+        }
         if (refs_out && nrefs && *nrefs < refs_cap) {
             rules_test_ref_t *ro = &refs_out[*nrefs];
-            psvm_ref_t pr = psvm_get_ref(&st->prog, i);
             uint16_t nlen = 0;
             const char *nm = psvm_get_str(&st->prog, pr.name_const, &nlen);
             char namebuf[40];
@@ -323,7 +342,7 @@ static void evaluate_real(const rule_t *snap, uint32_t now_uptime_s, eval_outcom
     out->last_err = PSVM_OK;
 
     bool fire = rules_fsm_should_fire(&out->fsm, (rules_mode_t)snap->mode, snap->cooldown_s,
-                                      now_uptime_s, cres.cond);
+                                      now_uptime_s, cres.cond, st.has_event);
     if (!fire) return;
 
     real_sink_ctx_t ctx = { .rule_id = snap->id };
@@ -630,6 +649,6 @@ int rules_test(uint32_t id, bool *ready, bool *cond, bool *would_fire,
     rules_fsm_state_t tmp = snapshot.fsm;
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
     *would_fire = rules_fsm_should_fire(&tmp, (rules_mode_t)snapshot.mode, snapshot.cooldown_s,
-                                       now_uptime_s, res.cond);
+                                       now_uptime_s, res.cond, st.has_event);
     return ESP_OK;
 }

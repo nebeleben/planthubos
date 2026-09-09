@@ -9,6 +9,7 @@
 #include "rules.h"
 #include "rules_fsm.h"
 #include "psvm.h"
+#include "capability.h"    /* CAPABILITY_COUNT, for RULES_CAP_MAX_ID below */
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_timer.h"
@@ -16,14 +17,21 @@
 
 #define RULES_STORAGE_DIR "/storage/rules"
 
-/* PSBC validation limits this firmware implements, spec §2: capability ids
- * 0..4 (battery.level is the highest M1 knows), builtins bitmap bit0 log /
- * bit1 notify. Shared by rules_store.c (rules_upsert()'s psvm_validate()
- * call at upload) and rules_engine.c (re-validating a rule's .psbc after
- * loading it back off LittleFS, since a psvm_prog_t's section pointers must
- * point into whichever buffer just read the blob -- they can't be cached
- * across calls). */
-#define RULES_CAP_MAX_ID    4
+/* PSBC validation limits this firmware implements, spec §2: the highest
+ * capability id a rule condition may reference, and the builtins bitmap
+ * (bit0 log / bit1 notify). Tracks the LIVE capability table -- exactly as
+ * the wrapper dialect does (wrapper_store.c passes CAPABILITY_COUNT - 1) --
+ * so every capability the firmware actually knows can be named in a rule
+ * condition: button.action (id 9, the momentary event cap this branch adds)
+ * as well as caps 5-8 (air.humidity, air.pressure, signal.rssi,
+ * switch.state), which were latently unusable as conditions while this was
+ * frozen at 4. Deriving it from CAPABILITY_COUNT means appending the next
+ * capability needs no edit here. Shared by rules_store.c (rules_upsert()'s
+ * psvm_validate() call at upload) and rules_engine.c (re-validating a rule's
+ * .psbc after loading it back off LittleFS, since a psvm_prog_t's section
+ * pointers must point into whichever buffer just read the blob -- they can't
+ * be cached across calls). */
+#define RULES_CAP_MAX_ID    (CAPABILITY_COUNT - 1)
 #define RULES_BUILTINS_IMPL 0x3u
 
 /* One in-RAM rule entry. Deliberately does NOT hold the source text or
