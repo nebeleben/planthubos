@@ -1192,6 +1192,16 @@ static void zb_iv_send_config_report(void)
  * actor table. */
 static void zb_iv_handle_store(void)
 {
+    /* Task 3: a device whose caps include CAP_BUTTON_ACTION (Multistate
+     * Input) is an INPUT device, not a controllable switch -- Aqara/
+     * Xiaomi buttons non-compliantly list On/Off without implementing it,
+     * which the auto-map otherwise turns into a phantom switch.state +
+     * switch.on/off. Run the suppression once, here, on the completed
+     * interview record, before it is upserted into the store and the
+     * observer below announces it -- so the stored+forwarded record
+     * never carries the phantom switch. */
+    zb_interview_finalize(&s_iv);
+
     zb_device_t *dev = &s_iv.dev;
 
     xSemaphoreTake(s_store_mutex, portMAX_DELAY);
