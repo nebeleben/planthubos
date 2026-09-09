@@ -84,12 +84,18 @@ int main(void)
     assert(data_core_submit_event(&b, CAP_BUTTON_ACTION, 1));
     uint32_t seq_first = data_core_events_peek_seq();
     assert(data_core_submit_event(&b, CAP_BUTTON_ACTION, 2));
+    uint32_t seq_second = data_core_events_peek_seq();   /* high-water of the later press */
     int16_t code_after_consume;
     data_core_events_consume_through(seq_first);   /* consume through the earlier press's seq */
     /* the earlier press (code 1, seq_first) is consumed; the later one (code 2, seq > seq_first)
      * survives; data_core_events_for() returns the most-recent, so code is 2 */
     assert(data_core_events_for(&b, CAP_BUTTON_ACTION, &code_after_consume));
     assert(code_after_consume == 2);
+    /* consuming through the later press's seq is INCLUSIVE (<=, not <): it clears
+     * that press too, so the ref re-arms. A < off-by-one would leave code 2 and
+     * fail this assert -- this is what actually pins the consume boundary. */
+    data_core_events_consume_through(seq_second);
+    assert(!data_core_events_for(&b, CAP_BUTTON_ACTION, &code_after_consume));
 
     printf("test_rules_events: OK\n");
     return 0;
