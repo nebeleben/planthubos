@@ -3,27 +3,30 @@
 #include "action.h"
 #include <math.h>
 
-#define CL_POWER_CONFIG  0x0001
-#define CL_ON_OFF        0x0006
-#define CL_ILLUMINANCE   0x0400
-#define CL_TEMPERATURE   0x0402
-#define CL_PRESSURE      0x0403
-#define CL_HUMIDITY      0x0405
-#define CL_SOIL_MOISTURE 0x0408
+#define CL_POWER_CONFIG     0x0001
+#define CL_ON_OFF           0x0006
+#define CL_MULTISTATE_INPUT 0x0012
+#define CL_ILLUMINANCE      0x0400
+#define CL_TEMPERATURE      0x0402
+#define CL_PRESSURE         0x0403
+#define CL_HUMIDITY         0x0405
+#define CL_SOIL_MOISTURE    0x0408
 
-#define AT_BATTERY_VOLTAGE  0x0020  /* Power Config: uint8, 100 mV units */
-#define AT_BATTERY_PERCENT  0x0021  /* Power Config: uint8, 0.5 % units  */
+#define AT_BATTERY_VOLTAGE   0x0020  /* Power Config: uint8, 100 mV units */
+#define AT_BATTERY_PERCENT   0x0021  /* Power Config: uint8, 0.5 % units  */
+#define AT_MULTISTATE_PRESENT 0x0055  /* PresentValue, uint16 */
 
 uint8_t zb_map_cluster_to_cap(uint16_t cluster) {
     switch (cluster) {
-        case CL_TEMPERATURE:   return CAP_AIR_TEMPERATURE;
-        case CL_HUMIDITY:      return CAP_AIR_HUMIDITY;
-        case CL_PRESSURE:      return CAP_AIR_PRESSURE;
-        case CL_ILLUMINANCE:   return CAP_LIGHT_ILLUMINANCE;
-        case CL_SOIL_MOISTURE: return CAP_SOIL_MOISTURE;
-        case CL_POWER_CONFIG:  return CAP_BATTERY_LEVEL;
-        case CL_ON_OFF:        return CAP_SWITCH_STATE;
-        default:               return ZB_MAP_NONE;
+        case CL_TEMPERATURE:      return CAP_AIR_TEMPERATURE;
+        case CL_HUMIDITY:         return CAP_AIR_HUMIDITY;
+        case CL_PRESSURE:         return CAP_AIR_PRESSURE;
+        case CL_ILLUMINANCE:      return CAP_LIGHT_ILLUMINANCE;
+        case CL_SOIL_MOISTURE:    return CAP_SOIL_MOISTURE;
+        case CL_POWER_CONFIG:     return CAP_BATTERY_LEVEL;
+        case CL_ON_OFF:           return CAP_SWITCH_STATE;
+        case CL_MULTISTATE_INPUT: return CAP_BUTTON_ACTION;
+        default:                  return ZB_MAP_NONE;
     }
 }
 
@@ -46,11 +49,13 @@ uint16_t zb_map_report_attr(uint16_t cluster) {
         case CL_PRESSURE:
         case CL_ILLUMINANCE:
         case CL_SOIL_MOISTURE:
-        case CL_ON_OFF:        return 0x0000;
+        case CL_ON_OFF:           return 0x0000;
         /* BatteryPercentageRemaining, not BatteryVoltage: percentage is
          * what CAP_BATTERY_LEVEL stores and it needs no chemistry curve. */
-        case CL_POWER_CONFIG:  return 0x0021;
-        default:               return ZB_MAP_NO_ATTR;
+        case CL_POWER_CONFIG:     return 0x0021;
+        /* Multistate Input: PresentValue */
+        case CL_MULTISTATE_INPUT: return AT_MULTISTATE_PRESENT;
+        default:                  return ZB_MAP_NO_ATTR;
     }
 }
 
@@ -147,6 +152,11 @@ bool zb_map_zcl_attr_to_value(uint16_t cluster, uint16_t attr, int32_t raw, floa
             return true;
         }
         return false;
+    }
+    if (cluster == CL_MULTISTATE_INPUT) {
+        if (attr != AT_MULTISTATE_PRESENT) return false;
+        *out = (float)raw;   /* raw press code, passed through; no ZCL sentinel here */
+        return true;
     }
     if (attr != zb_map_report_attr(cluster))
         return false;

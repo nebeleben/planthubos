@@ -714,6 +714,7 @@ static uint8_t zb_report_attr_type(uint16_t cluster)
     case 0x0405: /* Relative Humidity: MeasuredValue, uint16 */
     case 0x0400: /* Illuminance Measurement: MeasuredValue, uint16 */
     case 0x0408: /* Soil Moisture: MeasuredValue, uint16 */
+    case 0x0012: /* Multistate Input: PresentValue, uint16 */
         return ESP_ZB_ZCL_ATTR_TYPE_U16;
     case 0x0001: /* Power Configuration: BatteryPercentageRemaining, uint8 */
         return ESP_ZB_ZCL_ATTR_TYPE_U8;
