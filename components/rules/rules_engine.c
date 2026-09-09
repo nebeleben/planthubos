@@ -37,6 +37,7 @@
 #include "alert.h"
 #include "action.h"
 #include "actor.h"
+#include "data_core.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -363,6 +364,19 @@ static void evaluate_real(const rule_t *snap, uint32_t now_uptime_s, eval_outcom
 static void evaluate_all(bool only_due)
 {
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    /* Momentary event caps (Task 5, zigbee-button-support): only the
+     * value-update sweep (only_due == false) walks every enabled rule, so
+     * it's the only pass where every rule watching button.action is
+     * guaranteed to see a pending press before it's consumed -- a periodic
+     * (only_due == true) pass only touches rules whose `every` timer just
+     * ticked, so it must never consume on their behalf. ev_seq snapshots the
+     * pending high-water BEFORE this sweep's resolves run; consuming through
+     * it (not "whatever's pending now") AFTER the loop means a press that
+     * arrives mid-sweep (seq > ev_seq) is left pending -- its
+     * data_core_submit_event() already re-set the value-update bit, so it
+     * survives to the next sweep rather than being silently eaten by this
+     * one. */
+    uint32_t ev_seq = only_due ? 0 : data_core_events_peek_seq();
     for (int i = 0; i < RULES_MAX; i++) {
         xSemaphoreTake(g_rules_mutex, portMAX_DELAY);
         rule_t *slot = &g_rules[i];
@@ -418,6 +432,7 @@ static void evaluate_all(bool only_due)
             ESP_LOGI(TAG, "rule %u (\"%s\") fired", (unsigned)snap.id, snap.name);
         }
     }
+    if (!only_due && ev_seq) data_core_events_consume_through(ev_seq);
 }
 
 /* esp_timer task callback (one per rule with every_s > 0): marks the rule

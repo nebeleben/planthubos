@@ -108,6 +108,30 @@ $CC -Wall -Wextra -Werror -I../../components/rules/include \
     test_rules_fsm.c ../../components/rules/rules_fsm.c -o test_rules_fsm
 ./test_rules_fsm
 
+# rules_resolver.c's momentary event-cap branch (Task 5, zigbee-button-support):
+# links rules_resolver.c itself (-DHOST_TEST, for its resolve_button_test()
+# shim -- see test_rules_events.c's own top comment for why a host harness
+# needs one), which pulls in psvm.c+action.c (rules_resolve()'s
+# psvm_get_ref()/psvm_get_str() calls), registry.c+data_core.c+capability.c+
+# device_id.c (all ESP-IDF-free already, same as test_data_core_events above,
+# hence -Iesp_shims), and two stubbed-out callees (plants_snapshot()/
+# plants_cap_value()/plants_table_action_slot(), app_config_get_sensor_name())
+# that the event-cap branch itself never reaches but the linker still needs
+# resolved, defined right in test_rules_events.c rather than dragging in the
+# real plants.c/app_config.c (NVS/esp_mac/storage.c-shaped, well beyond this
+# test's scope).
+$CC -Wall -Wextra -Werror -DHOST_TEST -Iesp_shims -I../../components/rules/include \
+    -I../../components/rules -I../../components/psvm/include \
+    -I../../components/actions/include -I../../components/capability/include \
+    -I../../components/data_core/include -I../../components/plants/include \
+    -I../../components/app_config/include -I../../components/mibeacon/include \
+    test_rules_events.c ../../components/rules/rules_resolver.c \
+    ../../components/psvm/psvm.c ../../components/actions/action.c \
+    ../../components/data_core/data_core.c ../../components/data_core/registry.c \
+    ../../components/capability/capability.c ../../components/capability/device_id.c \
+    -o test_rules_events -lm
+./test_rules_events
+
 $CC -Wall -Wextra -Werror -I../../components/event_log/include \
     test_event_ring.c ../../components/event_log/event_ring.c -o test_event_ring
 ./test_event_ring
