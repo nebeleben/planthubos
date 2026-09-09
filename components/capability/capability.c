@@ -67,6 +67,11 @@ static const capability_t CAP_TABLE[CAPABILITY_COUNT] = {
         .ha_device_class = NULL, .influx_field = "switch",
         .scale = 1.0f, .offset = 0.0f, .precision = 0,
     },
+    [CAP_BUTTON_ACTION] = {
+        .id = CAP_BUTTON_ACTION, .name = "button.action", .unit = "",
+        .ha_device_class = NULL, .influx_field = "button",
+        .scale = 1.0f, .offset = 0.0f, .precision = 0, .event = true,
+    },
 };
 
 const capability_t *capability_get(uint8_t id) {
