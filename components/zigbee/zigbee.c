@@ -831,6 +831,42 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
     bool accepted = data_core_submit_cap_id(&id, cap, value);
     ESP_LOGI(TAG, "report: cap %u value %.3f -> data_core %s", cap, (double)value,
              accepted ? "accepted" : "rejected (device not in registry?)");
+
+    /* Cap-list backfill (2026-09-10): a device can stream a real value on a
+     * mapped cluster the interview never enumerated -- Xiaomi's older
+     * temp/humidity sensors answer the simple-descriptor query with zero
+     * clusters, yet report temperature/humidity fine. When an ACCEPTED
+     * reading proves a capability the stored record is missing, add it (up
+     * to ZB_STORE_MAX_CAPS) and re-announce, so the hub's device list shows
+     * what the device actually sends. Gated on `accepted`, so a sentinel or
+     * a rejected value never invents a capability; fires at most once per
+     * (device, cap) since the presence check then finds it. The observer,
+     * like every s_observer call in this file, only queues (Task 5). */
+    if (accepted) {
+        bool cap_added = false;
+        zb_device_t dev_copy = {0};
+        xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+        int bi = zb_store_find(&s_store, eui64);
+        if (bi >= 0) {
+            zb_device_t *d = &s_store.dev[bi];
+            bool present = false;
+            for (int k = 0; k < d->cap_count; k++)
+                if (d->caps[k] == cap) { present = true; break; }
+            if (!present && d->cap_count < ZB_STORE_MAX_CAPS) {
+                d->caps[d->cap_count] = cap;
+                d->cap_clusters[d->cap_count] = msg->cluster;
+                d->cap_count++;
+                zb_store_save();
+                dev_copy = *d;
+                cap_added = true;
+            }
+        }
+        xSemaphoreGive(s_store_mutex);
+        if (cap_added) {
+            ESP_LOGI(TAG, "backfilled cap %u (cluster 0x%04x) from a report; re-announcing", cap, msg->cluster);
+            if (s_observer) s_observer(&dev_copy, false);
+        }
+    }
 }
 
 /* Task 8: the SDK allows exactly one ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID
