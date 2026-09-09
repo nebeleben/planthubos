@@ -63,7 +63,11 @@ typedef struct {
     uint32_t nonce;
 } pending_pong_t;
 
-#define PONG_QUEUE_LEN 4
+/* Deep enough to absorb a node's whole channel-resync sweep (up to 13 PINGs,
+ * one per 2.4 GHz channel) landing while pong_task is still broadcasting an
+ * earlier reply -- each broadcast can take a coex-delayed send-window, so a
+ * shallow queue overflowed and dropped PINGs. Bench finding (M7, 2026-09-09). */
+#define PONG_QUEUE_LEN 16
 
 static QueueHandle_t s_pong_queue;
 static TaskHandle_t s_pong_task;
@@ -800,9 +804,20 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
         pending_pong_t item;
         memcpy(item.mac, src, 6);
         item.nonce = ping.nonce;
-        if (!s_pong_queue || xQueueSend(s_pong_queue, &item, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "PING from " MACSTR ": no pong responder available, dropping",
+        if (!s_pong_queue) {
+            ESP_LOGW(TAG, "PING from " MACSTR ": no pong responder (pairing_hub_init not run yet)",
                      MAC2STR(src));
+            return;
+        }
+        if (xQueueSend(s_pong_queue, &item, 0) != pdTRUE) {
+            /* Full: a node matches a PONG to its CURRENT nonce, so an old
+             * queued PING is worthless to it while this fresh one is what it
+             * is waiting on. Drop the oldest and enqueue this one instead of
+             * dropping the newest. */
+            pending_pong_t drop;
+            (void)xQueueReceive(s_pong_queue, &drop, 0);
+            if (xQueueSend(s_pong_queue, &item, 0) != pdTRUE)
+                ESP_LOGW(TAG, "PING from " MACSTR ": pong queue full, dropped", MAC2STR(src));
         }
         return;
     }
