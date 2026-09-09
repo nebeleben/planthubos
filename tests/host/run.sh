@@ -19,6 +19,20 @@ $CC -Wall -Wextra -Werror -I../../components/capability/include -I../../componen
     ../../components/capability/device_id.c -o test_registry -lm
 ./test_registry
 
+# data_core.c's momentary-event path (Task 4, zigbee-button-support). Unlike
+# test_registry above, this links data_core.c itself, which (unlike
+# registry.c/capability.c/device_id.c) unconditionally includes a handful of
+# real ESP-IDF headers (esp_log.h, esp_timer.h, esp_event.h, freertos/*) --
+# esp_shims/ provides just enough of those for a plain `cc` host link; see
+# esp_shims/esp_err.h's comment for why this exists instead of retrofitting
+# data_core.c with `#ifdef ESP_PLATFORM` gates.
+$CC -Wall -Wextra -Werror -Iesp_shims -I../../components/capability/include \
+    -I../../components/data_core/include -I../../components/mibeacon/include \
+    test_data_core_events.c ../../components/data_core/data_core.c ../../components/data_core/registry.c \
+    ../../components/capability/capability.c ../../components/capability/device_id.c \
+    -o test_data_core_events -lm
+./test_data_core_events
+
 $CC -Wall -Wextra -Werror -I../../components/timekeeper/include \
     test_boottab.c ../../components/timekeeper/boottab.c -o test_boottab
 ./test_boottab

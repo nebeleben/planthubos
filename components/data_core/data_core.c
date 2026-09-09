@@ -15,6 +15,26 @@ static const char *TAG = "data_core";
 static registry_t s_registry;
 static SemaphoreHandle_t s_mutex;
 
+/* Task 4 (zigbee-button-support): the momentary-event path. A button
+ * press (button.action, CAP_BUTTON_ACTION -- capability.h's `event` flag)
+ * must reach rules as a discrete occurrence, not a sticky registry value:
+ * two presses in a row are two events, not "the value didn't change so
+ * nothing happened". This ring is that occurrence log -- separate from
+ * s_registry's per-(device,capability) last-value slots, which
+ * data_core_submit_event() below still writes to (display-only: the UI/
+ * devices JSON wants "last press", rules read this ring instead). Guarded
+ * by s_mutex, the same lock every other s_registry access in this file
+ * uses -- there is no reason for a second lock over a structure this small
+ * that is touched by the same callers. Capacity 8, evicted oldest-slot-
+ * first on overflow (slot = seq % DATA_CORE_EVENT_RING): generous for a
+ * button (rules are expected to drain the ring well before 8 presses
+ * queue up), small enough that a producer that never gets consumed cannot
+ * grow this unbounded. */
+#define DATA_CORE_EVENT_RING 8
+typedef struct { device_id_t id; uint8_t cap_id; int16_t code; uint32_t seq; bool pending; } dc_event_t;
+static dc_event_t s_events_ring[DATA_CORE_EVENT_RING];
+static uint32_t   s_event_seq;      /* monotonic; 0 means "none issued" sentinel via peek */
+
 /* Task 5 review FINDING 3: data_core_submit_cap()'s out-of-range WARN used
  * to fire unthrottled on every single skip. Advertisements arrive several
  * times a second and Task 7 is about to let arbitrary user-authored
@@ -312,6 +332,100 @@ bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)
     return true;
 }
 
+/* Task 4: the momentary-event producer. Always accepts (no no-regress --
+ * unlike submit_cap_id_at() below, a button press has no "older than what's
+ * already stored" to compare against; every press is its own occurrence)
+ * except when the registry itself is full, matching submit_cap_id_at()'s
+ * own "registry full" failure mode. Writes the display-only last-press
+ * value via registry_set_cap() directly -- deliberately NOT through
+ * data_core_submit_cap_id(), which (Step 4 below) now refuses an event
+ * capability outright -- then appends to the pending ring under the same
+ * s_mutex, and posts DATA_EVENT_SENSOR_UPDATE same as every other
+ * successful write in this file. */
+bool data_core_submit_event(const device_id_t *id, uint8_t cap_id, int16_t code)
+{
+    const capability_t *c = capability_get(cap_id);
+    if (!c || !c->event) {
+        ESP_LOGW(TAG, "submit_event on non-event cap %u", cap_id);
+        return false;
+    }
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    /* display-only last-press value (UI/devices JSON); rules read the ring, not this */
+    int idx = registry_set_cap(&s_registry, id, cap_id, code, now_s);
+    if (idx < 0) {
+        xSemaphoreGive(s_mutex);
+        ESP_LOGW(TAG, "registry full, dropping button event");
+        return false;
+    }
+    /* append to the ring, evicting the oldest slot */
+    int slot = (int)(s_event_seq % DATA_CORE_EVENT_RING);
+    s_events_ring[slot].id = *id;
+    s_events_ring[slot].cap_id = cap_id;
+    s_events_ring[slot].code = code;
+    s_events_ring[slot].seq = ++s_event_seq;
+    s_events_ring[slot].pending = true;
+    xSemaphoreGive(s_mutex);
+    esp_event_post(PLANTHUB_DATA_EVENT, DATA_EVENT_SENSOR_UPDATE,
+                   (void *)id, sizeof(*id), 0 /* don't block the calling task */);
+    return true;
+}
+
+/* Highest pending seq across the whole ring (0 if none pending) -- lets a
+ * caller (the rules engine, Task 5) snapshot "everything up to here" before
+ * evaluating a pass, then consume_through() that exact bound afterwards
+ * without racing a press that arrives mid-pass (see data_core.h's doc
+ * comment on data_core_events_consume_through()). */
+uint32_t data_core_events_peek_seq(void)
+{
+    uint32_t hi = 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < DATA_CORE_EVENT_RING; i++) {
+        if (s_events_ring[i].pending && s_events_ring[i].seq > hi) hi = s_events_ring[i].seq;
+    }
+    xSemaphoreGive(s_mutex);
+    return hi;
+}
+
+/* True when a pending (not yet consumed) event exists for (id,cap_id);
+ * *code_out gets the MOST RECENT (highest seq) one when more than one is
+ * still pending for the same (id,cap_id). Does not consume -- a caller
+ * that wants to drain the ring calls data_core_events_consume_through()
+ * separately, after acting on what it found (Task 5's rules engine: resolve
+ * every device's pending event in one pass, then consume through the seq
+ * peeked at the start of that pass). */
+bool data_core_events_for(const device_id_t *id, uint8_t cap_id, int16_t *code_out)
+{
+    bool found = false;
+    uint32_t best = 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < DATA_CORE_EVENT_RING; i++) {
+        dc_event_t *e = &s_events_ring[i];
+        if (e->pending && e->cap_id == cap_id && e->id.kind == id->kind
+            && memcmp(e->id.addr, id->addr, 8) == 0 && e->seq >= best) {
+            best = e->seq;
+            if (code_out) *code_out = e->code;
+            found = true;
+        }
+    }
+    xSemaphoreGive(s_mutex);
+    return found;
+}
+
+/* Drops (marks not-pending) every event with seq <= seq -- the ring slot
+ * itself is left as-is (still holds its last id/cap_id/code) since
+ * data_core_submit_event() only reads `pending` to decide whether it's
+ * safe to overwrite a slot going forward; `pending=false` is the entire
+ * "consumed" contract. */
+void data_core_events_consume_through(uint32_t seq)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < DATA_CORE_EVENT_RING; i++) {
+        if (s_events_ring[i].pending && s_events_ring[i].seq <= seq) s_events_ring[i].pending = false;
+    }
+    xSemaphoreGive(s_mutex);
+}
+
 /* I4 fix: shared body of data_core_submit_cap_id() and
  * data_core_submit_cap_id_aged() below, parameterised on the timestamp to
  * stamp the registry with -- "now" for the un-aged caller,
@@ -320,6 +434,17 @@ bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)
  * caps[].updated_s instead of always reading as "just now". */
 static bool submit_cap_id_at(const device_id_t *id, uint8_t cap_id, float value, uint32_t ts_s)
 {
+    /* Task 4: an event capability (button.action) has no sticky value --
+     * data_core_submit_event() above is its only legitimate entry point.
+     * Rejecting here closes both public callers (data_core_submit_cap_id()
+     * and its _aged() sibling) in one place, before either one's own
+     * no-regress/registry-write logic runs. */
+    const capability_t *ec = capability_get(cap_id);
+    if (ec && ec->event) {
+        ESP_LOGW(TAG, "cap %u is an event cap; use data_core_submit_event", cap_id);
+        return false;
+    }
+
     /* Same "encode before taking the mutex, skip the write (not a clear) on
      * out-of-range" discipline as data_core_submit_battery() above -- see
      * its comment and set_cap_or_warn()'s, both of which this mirrors. */
