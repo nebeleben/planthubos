@@ -420,17 +420,15 @@ void zb_cmd_local_dispatch(const actor_cmd_t *cmd)
 
 void zb_cmd_start(void)
 {
-    /* M7 Task 8: on a node, always register directly -- a node has no
-     * bridge router of its own; its own ACTUATE commands (from the hub,
-     * via swarm.c's command_task()/actor_request()) must dispatch straight
-     * to this file, exactly as before this task. On the hub, register
-     * directly ONLY when swarm_start_main() has not (or could not) claim
-     * the DEV_KIND_ZIGBEE hook for its own wrapper -- s_router_active is
-     * set by that function, ahead of this one in main.c's call order (see
-     * s_router_active's own comment above). When it HAS claimed it, this
-     * call is skipped entirely: overwriting the wrapper here would silently
-     * cut the bridge router out of every dispatch. */
-    if (zigbee_on_node() || !s_router_active) {
+    /* M7 Task 8: a node has no bridge router of its own -- its ACTUATE
+     * commands (from the hub, via swarm.c's command_task()/actor_request())
+     * dispatch straight to this file, so register the local hook here. The
+     * coordinator only runs on a bridge NODE now (a hub runs WiFi+BLE, so
+     * zb_cmd_start() is never reached on the hub), and a node never sets
+     * s_router_active, so this condition is effectively always true; it is
+     * kept as the guard so that if a router is ever active in this process
+     * (swarm_start_main() sets it) its wrapper is not overwritten here. */
+    if (!s_router_active) {
         actor_set_dispatch_hook(DEV_KIND_ZIGBEE, zb_cmd_local_dispatch);
     }
 }

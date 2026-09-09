@@ -15,8 +15,9 @@ const CHOICES = [
     body: 'No sensor radio. For a hub that only serves this UI, runs rules over swarm nodes, or feeds integrations.' },
   { id: 'ble', title: 'Bluetooth (BLE)',
     body: 'MiFlora, BTHome and other Bluetooth sensors. The classic PlantHub.' },
-  { id: 'zigbee', title: 'Zigbee',
-    body: '802.15.4 sensors and plugs through the built-in Zigbee coordinator.' },
+  // Zigbee is a bridge-NODE role, not a hub radio: to add Zigbee sensors,
+  // set up a spare board as a Zigbee bridge (Nodes tab) rather than switching
+  // this hub's radio. The hub runs WiFi + BLE.
 ]
 
 export function RadioTab({ onChosen }) {

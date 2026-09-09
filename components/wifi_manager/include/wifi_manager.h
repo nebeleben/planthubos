@@ -10,8 +10,6 @@ ESP_EVENT_DECLARE_BASE(PLANTHUB_EVENT);
 
 enum {
     PLANTHUB_EVENT_APPLY_CREDS,
-    PLANTHUB_EVENT_RADIO_PAUSE,   /* stop the STA for a Zigbee permit-join window */
-    PLANTHUB_EVENT_RADIO_RESUME,  /* bring it back once the window closes */
 };
 
 esp_err_t wifi_manager_start(void);
@@ -27,7 +25,5 @@ void      wifi_manager_apply_new_creds(void);
  * default event loop. Pause is a no-op in AP/portal mode and when already
  * paused; resume is a no-op when not paused. Resume re-runs the boot
  * pre-scan so the reconnect does not hit the start-then-connect race. */
-void      wifi_manager_radio_pause(void);
-void      wifi_manager_radio_resume(void);
 bool      wifi_manager_is_ap_mode(void);
 void      wifi_manager_get_ip(char out[16]);

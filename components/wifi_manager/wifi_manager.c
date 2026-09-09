@@ -22,7 +22,6 @@ static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
 static char s_ip[16] = "0.0.0.0";
 static bool s_boot_prescan_done = false;
-static bool s_paused = false;   /* STA stopped for a Zigbee permit-join window */
 
 static void do_action(wifi_action_t act);
 
@@ -149,11 +148,6 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
         ESP_LOGW(TAG, "STA disconnected: reason=%d rssi=%d", d ? d->reason : -1, d ? d->rssi : 0);
-        if (s_paused) {
-            /* Expected: esp_wifi_stop() for a permit-join window. Not a
-             * retry, not a strike against MAX_RETRIES. */
-            return;
-        }
         do_action(wifi_fsm_step(&s_fsm, WIFI_EV_DISCONNECTED));
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
@@ -170,23 +164,6 @@ static void on_planthub_event(void *arg, esp_event_base_t base, int32_t id, void
     if (base != PLANTHUB_EVENT) return;
     switch (id) {
     case PLANTHUB_EVENT_APPLY_CREDS:
-        do_action(wifi_fsm_step(&s_fsm, WIFI_EV_NEW_CREDS));
-        break;
-    case PLANTHUB_EVENT_RADIO_PAUSE:
-        /* Never take the setup portal down -- that is the only way in. */
-        if (s_paused || s_fsm.state == WIFI_ST_AP_MODE) return;
-        s_paused = true;
-        ESP_LOGW(TAG, "WiFi paused for the Zigbee permit-join window; hub off the LAN until it closes");
-        esp_wifi_stop();
-        break;
-    case PLANTHUB_EVENT_RADIO_RESUME:
-        if (!s_paused) return;
-        s_paused = false;
-        /* Same path a credentials change takes: esp_wifi_stop() (already
-         * stopped, harmless) + start_sta(). Re-arm the pre-scan so this
-         * start-then-connect does not race a cold receiver (Task 2b). */
-        s_boot_prescan_done = false;
-        ESP_LOGI(TAG, "WiFi resuming after the Zigbee permit-join window");
         do_action(wifi_fsm_step(&s_fsm, WIFI_EV_NEW_CREDS));
         break;
     default:
@@ -239,16 +216,6 @@ void wifi_manager_apply_new_creds(void)
      * timer daemon task): post onto the default event loop instead of
      * touching s_fsm directly, so it's serialized with on_wifi_event. */
     esp_event_post(PLANTHUB_EVENT, PLANTHUB_EVENT_APPLY_CREDS, NULL, 0, portMAX_DELAY);
-}
-
-void wifi_manager_radio_pause(void)
-{
-    esp_event_post(PLANTHUB_EVENT, PLANTHUB_EVENT_RADIO_PAUSE, NULL, 0, portMAX_DELAY);
-}
-
-void wifi_manager_radio_resume(void)
-{
-    esp_event_post(PLANTHUB_EVENT, PLANTHUB_EVENT_RADIO_RESUME, NULL, 0, portMAX_DELAY);
 }
 
 bool wifi_manager_is_ap_mode(void)

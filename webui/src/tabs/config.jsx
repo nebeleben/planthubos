@@ -428,7 +428,6 @@ export function ConfigTab() {
               <select value={radioRole} onChange={(e) => setRadioRole(e.currentTarget.value)} disabled={!cfgLoaded}>
                 <option value="wifi_only">WiFi only (no sensor radio)</option>
                 <option value="ble">Bluetooth (BLE)</option>
-                <option value="zigbee">Zigbee</option>
               </select>
             </label>
             {' '}
@@ -438,9 +437,9 @@ export function ConfigTab() {
             </button>
           </p>
           <p class="infobox">
-            One radio per hub: BLE and Zigbee cannot share the antenna, so this hub runs
-            exactly one of them. Switching reboots the hub. Paired Zigbee devices and BLE
-            device records are kept while the other radio runs; they simply stop updating.
+            This hub runs WiFi + BLE. Zigbee is a bridge-node role: to add Zigbee sensors,
+            pair a spare board as a Zigbee bridge from the Nodes tab. Switching between
+            WiFi-only and BLE here reboots the hub.
           </p>
           {radioMsg && <p class="hint">{radioMsg}</p>}
         </div>

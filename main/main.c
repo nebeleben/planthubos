@@ -445,10 +445,17 @@ void app_main(void)
      * its stored radio role; with none stored it is the BLE relay it always
      * was. wifi_only is refused on nodes at set time, so it cannot show up
      * here. */
-    zigbee_set_on_node(role == SWARM_ROLE_NODE);
     bool on_node = (role == SWARM_ROLE_NODE);
     radio_role_t rr = radio_role_is_set() ? radio_role_get()
                                           : (on_node ? RADIO_ROLE_BLE : radio_role_default());
+    /* Zigbee is a bridge-NODE role: only a paired node runs the coordinator;
+     * a hub runs WiFi + BLE. A hub that somehow has zigbee stored (a retired
+     * config or a leftover) falls back to BLE rather than starting a
+     * coordinator it has no supported role for. */
+    if (!on_node && rr == RADIO_ROLE_ZIGBEE) {
+        ESP_LOGW(TAG, "zigbee radio role is not valid on a hub; using BLE");
+        rr = RADIO_ROLE_BLE;
+    }
     bool want_ble    = (rr == RADIO_ROLE_BLE);
     /* Bench finding (M7 gate 1, 2026-09-08): a node that is still sweeping
      * channels for its hub must NOT have the 802.15.4 coordinator up -- with
@@ -457,10 +464,10 @@ void app_main(void)
      * stack came up; none in the following 120 s). An unpaired node has no
      * hub to bridge to anyway, and pairing success reboots the node
      * (pair_watch_task), so the coordinator starts on that next boot. */
-    bool want_zigbee = (rr == RADIO_ROLE_ZIGBEE) && (!on_node || node_paired);
+    bool want_zigbee = (rr == RADIO_ROLE_ZIGBEE) && node_paired;  /* on_node implied by the remap above */
     ESP_LOGW(TAG, "radio role: %s (%s)%s%s", radio_role_str(rr),
              radio_role_is_set() ? "nvs" : "default", on_node ? " [node]" : "",
-             (rr == RADIO_ROLE_ZIGBEE && on_node && !node_paired) ? " -- coordinator deferred until paired" : "");
+             (rr == RADIO_ROLE_ZIGBEE && !node_paired) ? " -- coordinator deferred until paired" : "");
 
     esp_err_t ble_err = ESP_OK;
     if (want_ble) {

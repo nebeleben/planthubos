@@ -31,7 +31,6 @@
 #include "esp_zigbee_core.h"
 #include "esp_coexist.h"
 #include "esp_ieee802154.h"
-#include "wifi_manager.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -54,15 +53,6 @@
 
 static const char *TAG = "zigbee";
 
-/* M7 Task 3: set once by main.c (zigbee_set_on_node()) right before the
- * radio block, from swarm_role_t -- deliberately a plain file-static bool
- * rather than a call into the swarm component (swarm_store_role()), which
- * would create a CMake dependency cycle once swarm depends on zigbee
- * (Task 5). Defaults to false (hub) until main.c calls the setter. */
-static bool s_on_node = false;
-
-void zigbee_set_on_node(bool on_node) { s_on_node = on_node; }
-bool zigbee_on_node(void) { return s_on_node; }
 
 /* M7 Task 5: swarm.c's bridge into the device/status tables -- see this
  * file's header comment on zigbee_set_device_observer()/
@@ -141,9 +131,7 @@ static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
  * radio hold is released. */
 #define ZB_PERMIT_ALARM_PARAM 0u
 #define ZB_POST_JOIN_RELEASE_MS 15000u
-#define ZB_PERMIT_PAUSE_DELAY_MS 800u
 static void zb_permit_expiry_cb(uint8_t param);
-static void zb_permit_wifi_pause_cb(uint8_t param);
 static bool     s_started;                 /* zigbee_start() created the task */
 static bool     s_formed;                  /* a network exists (formed or restored) */
 static uint8_t  s_channel;
@@ -322,37 +310,20 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
              * outside measurement noise. Full numbers and the open
              * trade-off note are in the radio-role-config spec, section 8. */
             esp_err_t coex_err = esp_coex_wifi_i154_enable();
-            /* Keep WiFi in modem sleep for as long as this role runs.
-             * Measured on the C6 with the C5 sniffer (radio-role-config
-             * spec section 8): with arbitration on and WiFi awake, the
-             * coordinator answers beacons but cannot return the antenna
-             * fast enough to ACK a sleepy end device's ~1 Hz keep-alive
-             * polls; a freshly joined Xiaomi sensor saw 4x4 unanswered
-             * polls and left within a minute. With the WiFi radio parked
-             * between the router's DTIM beacons the 802.15.4 radio owns
-             * the air almost all the time. HTTP latency ~200 ms. Costs
-             * ESP-NOW receive on this hub while it runs Zigbee -- the
-             * target bridge has no STA at all, so this is the transitional
-             * zigbee-on-hub trade-off, made explicitly. Overrides
-             * espnow_link_init()'s WIFI_PS_NONE, which ran earlier in
-             * boot; the setting survives the permit-window stop/start. */
-            if (!zigbee_on_node()) {
-                esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-                ESP_LOGI(TAG, "zigbee role: WiFi modem sleep on (%s)", esp_err_to_name(ps_err));
-            } else {
-                /* A Zigbee-role node runs ESP-NOW (not a web UI/portal) on
-                 * its WiFi radio -- modem sleep would delay/drop the
-                 * unicast forward traffic swarm.c depends on, so this
-                 * hub-only power trick stays off on a node. */
-                ESP_LOGI(TAG, "zigbee role on a node: WiFi power save stays off for ESP-NOW");
-            }
+            /* The coordinator only ever runs on a bridge NODE now (a hub
+             * runs WiFi + BLE -- see main.c's radio block). A node's WiFi
+             * carries ESP-NOW, not a web UI, so power save stays OFF:
+             * modem sleep would delay or drop the unicast forward traffic
+             * swarm.c depends on. (The old hub-in-zigbee-role modem-sleep
+             * trade-off was retired with that role, 2026-09-09.) */
+            ESP_LOGI(TAG, "zigbee role on a node: WiFi power save stays off for ESP-NOW");
             if (coex_err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_coex_wifi_i154_enable failed (%s); WiFi and "
                               "802.15.4 will contend unarbitrated",
                          esp_err_to_name(coex_err));
             } else {
                 ESP_LOGI(TAG, "WiFi/802.15.4 coexistence enabled");
-                if (zigbee_on_node()) {
+                {
                     /* Bench finding (M7 gate 2, 2026-09-08): with the stack's
                      * default arbitration a bridge node stopped MAC-acking the
                      * hub's ESP-NOW unicasts as soon as its coordinator was up
@@ -1445,31 +1416,6 @@ bool zigbee_net_info(uint8_t *channel, uint16_t *pan_id, bool *formed)
  * out the full window costs nothing in security: the early close already
  * called esp_zb_bdb_close_network(), so nothing can join in the meantime
  * whatever this setting says. */
-/* Deferred WiFi pause for a hub-in-zigbee-role permit window. Pausing WiFi
- * kills the hub's STA for the window (measured; see the radio-role-config
- * spec section 8: with coex arbitration on, a joining device's MAC ACK
- * never gets through while WiFi holds the antenna), and doing it
- * synchronously inside the permit POST handler made the HTTP response race
- * the WiFi death -- sometimes the operator's own "pairing started" reply
- * never arrived. Deferring by ZB_PERMIT_PAUSE_DELAY_MS lets the response
- * out first; the window is already open, and 0.8 s at the very start of a
- * 180 s window costs nothing. The deadline guard keeps a stale alarm from
- * pausing WiFi after the window it belonged to has already closed. */
-static void zb_permit_wifi_pause_cb(uint8_t param)
-{
-    (void)param;
-    int64_t deadline;
-    portENTER_CRITICAL(&s_mux);
-    deadline = s_permit_join_deadline_us;
-    portEXIT_CRITICAL(&s_mux);
-    if (deadline == 0) return;
-    /* A zigbee-role node's WiFi radio carries ESP-NOW, not a hub's STA/AP
-     * pair -- wifi_manager owns none of it there, so pausing it would be a
-     * no-op at best and a wrong call into an unrelated radio at worst. So
-     * this fires only on a hub that itself runs the zigbee role. */
-    if (!zigbee_on_node()) wifi_manager_radio_pause();
-}
-
 static void zb_permit_expiry_cb(uint8_t param)
 {
     (void)param;
@@ -1480,12 +1426,6 @@ static void zb_permit_expiry_cb(uint8_t param)
     portENTER_CRITICAL(&s_mux);
     s_permit_join_deadline_us = 0;
     portEXIT_CRITICAL(&s_mux);
-    /* A pause alarm still pending (window closed within its 0.8 s defer)
-     * is cancelled so it cannot re-pause a radio nobody will resume. */
-    esp_zb_scheduler_alarm_cancel(zb_permit_wifi_pause_cb, ZB_PERMIT_ALARM_PARAM);
-    /* Give WiFi its air back (see zigbee_permit_join / wifi_manager.h). See
-     * zb_permit_wifi_pause_cb's matching guard for why a node skips this. */
-    if (!zigbee_on_node()) wifi_manager_radio_resume();
     ESP_LOGI(TAG, "permit-join window over; TC link key exchange required again");
     /* M7 Task 5: the window just closed (expiry, or the post-join grace
      * period above) -- report the now-zero permit_s promptly rather than
@@ -1527,21 +1467,6 @@ bool zigbee_permit_join(void)
     esp_zb_scheduler_alarm(zb_permit_expiry_cb, ZB_PERMIT_ALARM_PARAM,
                            (uint32_t)CONFIG_PLANTHUB_ZB_PERMIT_JOIN_S * 1000u);
     esp_zb_lock_release();
-
-    /* Pause WiFi for the window (hub-in-zigbee-role only; a bridge node
-     * keeps WiFi for ESP-NOW -- see zb_permit_wifi_pause_cb's guard).
-     * Scheduled rather than called so this HTTP response beats the pause
-     * (STA stop) onto the wire. */
-    esp_zb_scheduler_alarm_cancel(zb_permit_wifi_pause_cb, ZB_PERMIT_ALARM_PARAM);
-    esp_zb_scheduler_alarm(zb_permit_wifi_pause_cb, ZB_PERMIT_ALARM_PARAM, ZB_PERMIT_PAUSE_DELAY_MS);
-
-    /* The pause stops the STA for the window. See wifi_manager.h for the
-     * measurement behind it: with coex
-     * arbitration on, beacons still go out but the MAC ACK a joining
-     * device needs never does, so association is impossible while WiFi
-     * holds any claim on the antenna. Modem sleep was tried first and
-     * measured no better (8/12 beacon replies, association still
-     * unanswered). */
 
     /* Closes on expiry (zigbee_permit_join_remaining() below), on reboot
      * (this deadline lives in RAM only, so a reboot resets it to closed
