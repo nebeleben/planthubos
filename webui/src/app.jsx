@@ -86,6 +86,15 @@ export function App() {
   const [radioRole, setRadioRole] = useState('ble')
   const [radioRoleSet, setRadioRoleSet] = useState(true)
 
+  // Task 10: the Zigbee tab is also shown when a node bridge exists, even
+  // on a hub whose own radio isn't zigbee (wifi_only hub, bridge nodes
+  // only). Derived from the same GET /api/v1/zigbee shape the tab itself
+  // polls -- kept as a separate cheap 30s poll here (rather than lifting
+  // ZigbeeTab's own poll state up into App) so this file doesn't need to
+  // know anything about ZigbeeTab's countdown/stale internals, just
+  // whether the coordinators list is non-empty.
+  const [hasBridges, setHasBridges] = useState(false)
+
   // Day/night state, purely presentational (drives the toggle icon and the
   // theme state -- the actual palette is CSS, keyed off the same
   // data-theme attribute this mirrors). No stored preference means "follow
@@ -151,6 +160,24 @@ export function App() {
     }
     poll()
     const id = setInterval(poll, 15000)
+    return () => { clearInterval(id); controller.abort() }
+  }, [role])
+
+  // Zigbee tab-gating poll: GET /api/v1/zigbee is a hub-only route (the
+  // coordinator/bridge registry lives on the hub, same reasoning as the
+  // Rules/Wrappers/Nodes tabs above), so skip it for a node or a
+  // not-yet-configured device, same guard as the rulesUnseen poll.
+  useEffect(() => {
+    if (role === 'node' || role === 'unset') return
+    const controller = new AbortController()
+    function poll() {
+      fetch('/api/v1/zigbee', { signal: controller.signal })
+        .then((r) => r.json())
+        .then((d) => setHasBridges((d.coordinators || []).length > 0))
+        .catch(() => {})
+    }
+    poll()
+    const id = setInterval(poll, 30000)
     return () => { clearInterval(id); controller.abort() }
   }, [role])
 
@@ -245,14 +272,15 @@ export function App() {
   // whole event feed is event_log_init()/rules_init() (main.c, inside the
   // `role != SWARM_ROLE_NODE` block) -- neither ever runs on a paired node,
   // so GET /api/v1/events has nothing meaningful to serve there either.
-  // Zigbee (M6b) is hub-only too: the coordinator and its device registry
-  // are owned by the hub, never a paired node. Zigbee is additionally
-  // gated on the radio role (Config → Radio).
+  // Zigbee (M6b/M7) is hub-only too: the coordinator and bridge-device
+  // registry are owned by the hub, never a paired node. Zigbee is
+  // additionally gated on either this hub's own radio role (Config →
+  // Radio) OR having at least one Zigbee-bridge node (Task 10: a
+  // wifi_only/BLE hub with a bridge node still needs somewhere to see and
+  // manage that bridge's coordinator/devices).
   const TABS = ALL_TABS.filter((t) => {
     if (role === 'node' && (t === 'Nodes' || t === 'Rules' || t === 'Wrappers' || t === 'Alerts' || t === 'Zigbee')) return false
-    // Zigbee is only meaningful while the coordinator runs; the Config
-    // tab's Radio panel is where it gets turned on.
-    if (t === 'Zigbee' && radioRole !== 'zigbee') return false
+    if (t === 'Zigbee' && radioRole !== 'zigbee' && !hasBridges) return false
     return true
   })
 

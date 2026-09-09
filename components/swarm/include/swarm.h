@@ -1,5 +1,7 @@
 #pragma once
 #include "esp_err.h"
+#include "radio_role_str.h"
+#include "bridge_table.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -62,6 +64,55 @@ uint32_t swarm_frames_rx(void);
  * from any task. */
 bool swarm_node_reported_mode(const uint8_t mac[6], uint8_t *mode_out);
 
+/* Hub (M7 Task 4): the given node's last self-reported radio role
+ * (RADIO_ROLE_*, radio_role_str.h), learned from its most recent PAIR_REQ
+ * (pairing.c, via swarm_note_node_radio() below) or COORD_STATUS (Task 7)
+ * this boot -- the same RAM stats slot GET /api/v1/nodes'
+ * "reported_radio_role"/"radio_role_pending" fields come from
+ * (swarm_node_list_json()). Returns false (role_out untouched) if this
+ * node has never reported a radio role this boot -- callers (api_v1.c's
+ * node_update_post(), reconciling a power_mode change against
+ * swarm_rules_node_power_ok()) must fall back to
+ * swarm_store_node_desired_radio() in that case, same "unknown, not a
+ * guess" reasoning as swarm_node_reported_mode() above. Safe to call from
+ * any task. */
+bool swarm_node_reported_radio(const uint8_t mac[6], uint8_t *role_out);
+
+/* Hub (M7 Task 4): records a node's self-reported radio role into its RAM
+ * stats slot -- a no-op if that node has no slot yet (e.g. a PAIR_REQ from
+ * a node that has never sent a READING/CHECKIN this boot; see swarm.c's
+ * record_reported_radio()). Called from pairing.c right after a hub-side
+ * PAIR_REQ is decoded (the frame's own radio_role field), and from Task 7's
+ * COORD_STATUS handling. Safe to call from the ESP-NOW receive callback:
+ * same short, bounded, allocation-free s_stats_mutex critical section as
+ * record_stat()/record_checkin_mode(). */
+void swarm_note_node_radio(const uint8_t mac[6], uint8_t r);
+
+/* Hub (M7 Task 4): encodes and sends a NODE_CONFIG directing `mac` to run
+ * radio role `r`, with a fresh per-node sequence number (node_stat_t.cfg_seq)
+ * so the NODE_CONFIG_ACK the node replies with (hub_rx_cb) can be matched
+ * to it in the log. Must be called from a task context (checkin_task, or
+ * the HTTP handler's own task via swarm_request_node_config() below) --
+ * never from the ESP-NOW receive callback, since espnow_link_send() can
+ * block. Returns ESP_ERR_NO_MEM if this node has no RAM stats slot and none
+ * is free (SWARM_MAX_NODES exceeded, the same corner case record_stat()
+ * itself tolerates), or whatever espnow_link_send() returns on a send
+ * failure -- either way this is best-effort: a dropped NODE_CONFIG is
+ * retried the next time checkin_task notices desired != reported. */
+esp_err_t swarm_send_node_config(const uint8_t mac[6], radio_role_t r);
+
+/* Hub (M7 Task 4): queues an immediate NODE_CONFIG for `mac`, drained by
+ * checkin_task (a config_only checkin_item_t, sent with no CHECKIN_ACK --
+ * see checkin_task()'s own comment) rather than waiting for that node's
+ * next CHECKIN. Called from api_v1.c's node_update_post() right after a
+ * POST /api/v1/nodes/{MAC12} {"radio_role":...} persists a new desired
+ * role, so an awake node gets it without a full checkin round-trip.
+ * ESP_ERR_INVALID_STATE if the checkin queue doesn't exist yet (hub not
+ * started as main), ESP_ERR_NO_MEM if it's momentarily full -- both
+ * best-effort, same reasoning as swarm_send_node_config() above: a missed
+ * request is just picked up by this node's next ordinary checkin. */
+esp_err_t swarm_request_node_config(const uint8_t mac[6]);
+
 /* Hub: called when a node is forgotten (api_v1.c's DELETE handler) -- clears
  * that MAC's per-node RAM stats slot (frames_rx/last_seen_s/rssi), if it has
  * one, under the same mutex record_stat() uses. Without this, a forgotten
@@ -106,6 +157,42 @@ void swarm_broadcast_forget(const uint8_t mac[6]);
  * so the reverse dependency would be circular -- main.c, which depends on
  * both, does the wiring. */
 void swarm_node_set_health_cb(void (*cb)(const char *reason));
+
+/* Hub (M7 Task 8): the command router's synchronous API for Task 9's HTTP
+ * handlers. Each posts one command to `mac`'s bridge node and waits (up to
+ * 300 ms) for the router (swarm.c's bridge_task) to accept or refuse it --
+ * see swarm.c's submit_and_wait() for the full contract. Common returns:
+ * ESP_OK (queued -- the actual PERMIT_JOIN/DEVICE_REMOVE/DEVICE_RENAME
+ * still completes asynchronously; watch for its SWARM_MSG_COMMAND_ACK/
+ * alert the same way an ACTUATE's outcome is watched), ESP_ERR_NOT_FOUND
+ * (mac is not a bridge node this hub has ever heard a COORD_STATUS/device
+ * announce from), ESP_ERR_INVALID_STATE (mac already has a command in
+ * flight, or this hub has no bridge task at all -- e.g. Zigbee disabled or
+ * ensure_bridge_task() failed at boot). Safe to call from any task except
+ * bridge_task itself (would deadlock waiting on its own answer) --
+ * intended caller is an HTTP handler's task. */
+esp_err_t swarm_bridge_permit(const uint8_t mac[6]);
+/* eui64 is the target device's 8-byte IEEE address, as already surfaced by
+ * GET /api/v1/nodes' zigbee device list. See swarm_bridge_permit() above
+ * for the return contract. */
+esp_err_t swarm_bridge_remove(const uint8_t mac[6], const uint8_t eui64[8]);
+/* `name` is copied (truncated to SWARM_DEV_NAME_MAX bytes, swarm_frame.h)
+ * before this function returns -- the caller's buffer need not outlive the
+ * call. See swarm_bridge_permit() above for the return contract. */
+esp_err_t swarm_bridge_rename(const uint8_t mac[6], const uint8_t eui64[8], const char *name);
+
+/* Hub (M7 Task 9): copies the hub's own bridge-node bookkeeping into *out
+ * under s_bridges_mutex (swarm.c), for GET /api/v1/zigbee's coordinator
+ * list and the device remove/rename routes' bridge_table_find_device()
+ * lookup. Returns false (out left untouched) only when this hub has no
+ * bridge machinery at all (s_bridges_mutex never created -- Zigbee
+ * disabled at build time or ensure_bridge_task() never ran), the same
+ * "nothing to report" posture the rest of this surface uses -- callers
+ * should treat that the same as an empty/all-absent table. Safe to call
+ * from any task, including bridge_task's own (unlike swarm_bridge_permit/
+ * remove/rename() above, this never waits on bridge_task -- it just takes
+ * the mutex bridge_task already yields whenever it isn't mid-tick). */
+bool swarm_bridge_snapshot(bridge_table_t *out);
 
 /* Battery-mode wake cycle (spec §4). Called from main.c's node-paired
  * branch INSTEAD OF returning to a plain always-on run, when

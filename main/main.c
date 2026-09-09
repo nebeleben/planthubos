@@ -439,15 +439,28 @@ void app_main(void)
      * default choice. Both stacks are compiled in; only the chosen one
      * initializes, so the other costs flash + static .bss but no heap.
      * A role change is applied by reboot -- the BT vs 802.15.4 controllers
-     * cannot be cleanly re-inited live. */
-    radio_role_t rr = radio_role_get();
-    /* A paired swarm node is a BLE relay by definition today; node radio
-     * roles are M7 work. Everything else follows the stored role. */
-    bool want_ble    = node_paired || (rr == RADIO_ROLE_BLE);
-    bool want_zigbee = !node_paired && (rr == RADIO_ROLE_ZIGBEE);
-    ESP_LOGW(TAG, "radio role: %s (%s)%s", radio_role_str(rr),
-             radio_role_is_set() ? "nvs" : "default",
-             node_paired ? " [paired node: BLE forced]" : "");
+     * cannot be cleanly re-inited live.
+     *
+     * One radio per node (spec 2026-09-07 M7 bridge §4.1): a paired node runs
+     * its stored radio role; with none stored it is the BLE relay it always
+     * was. wifi_only is refused on nodes at set time, so it cannot show up
+     * here. */
+    zigbee_set_on_node(role == SWARM_ROLE_NODE);
+    bool on_node = (role == SWARM_ROLE_NODE);
+    radio_role_t rr = radio_role_is_set() ? radio_role_get()
+                                          : (on_node ? RADIO_ROLE_BLE : radio_role_default());
+    bool want_ble    = (rr == RADIO_ROLE_BLE);
+    /* Bench finding (M7 gate 1, 2026-09-08): a node that is still sweeping
+     * channels for its hub must NOT have the 802.15.4 coordinator up -- with
+     * the Zigbee stack running, the sweep's PAIR_REQ broadcasts stopped
+     * reaching the hub entirely (one frame got through, 200 ms before the
+     * stack came up; none in the following 120 s). An unpaired node has no
+     * hub to bridge to anyway, and pairing success reboots the node
+     * (pair_watch_task), so the coordinator starts on that next boot. */
+    bool want_zigbee = (rr == RADIO_ROLE_ZIGBEE) && (!on_node || node_paired);
+    ESP_LOGW(TAG, "radio role: %s (%s)%s%s", radio_role_str(rr),
+             radio_role_is_set() ? "nvs" : "default", on_node ? " [node]" : "",
+             (rr == RADIO_ROLE_ZIGBEE && on_node && !node_paired) ? " -- coordinator deferred until paired" : "");
 
     esp_err_t ble_err = ESP_OK;
     if (want_ble) {
@@ -486,7 +499,8 @@ void app_main(void)
      * node_paired -- see node_started's own comment above: only a node
      * whose swarm_start_node() actually succeeded satisfies
      * swarm_node_battery_cycle()'s precondition. */
-    if (node_started && swarm_store_power_mode() != SWARM_PM_ALWAYS_ON) {
+    if (node_started && swarm_store_power_mode() != SWARM_PM_ALWAYS_ON
+        && rr != RADIO_ROLE_ZIGBEE /* a coordinator cannot sleep; swarm_rules enforces the pair */) {
         if (xTaskCreate(batt_cycle_task, "batt_cycle", 4096, NULL, 2, NULL) != pdPASS) {
             /* Code review fix (issue 5): without this, the node keeps
              * running (nothing else here fails), but sends no CHECKIN at

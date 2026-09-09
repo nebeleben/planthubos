@@ -79,6 +79,26 @@ bool      data_core_get_device(const device_id_t *id, device_entry_t *out);
  * data_core_snapshot() already use. */
 void      data_core_clear_node_attribution(const uint8_t node_mac[6]);
 
+/* M7 Task 7: attributes dev_idx (a registry index already resolved via
+ * data_core_find_or_create_index()) to node_mac -- swarm.c's bridge_task
+ * calls this right after a zigbee bridge's DEVICE_ANNOUNCE resolves/creates
+ * the device, so the registry (and GET /api/v1/devices' "via_node") shows
+ * which bridge node reports it, same as a BLE-relayed device already does.
+ * Takes s_mutex, same as every other registry accessor here; see
+ * registry_set_via()'s own doc comment for why this bypasses
+ * registry_attribute()'s frame_cnt/rssi contest entirely. A no-op if
+ * dev_idx is out of range or not currently in_use. */
+void      data_core_set_via(int dev_idx, const uint8_t node_mac[6]);
+
+/* M7 Task 7 fix round 1 (critical #2): a zigbee bridge's DEVICE_GONE (that
+ * device left ITS network, not the whole bridge node) removes the device
+ * from swarm.c's bridge table, but the registry entry itself is never
+ * deleted (registry.h) -- without this, its via_node stays pointed at a
+ * bridge that no longer reports it. Takes s_mutex, same as every other
+ * registry accessor here; see registry_clear_via()'s own doc comment. A
+ * no-op if dev_idx is out of range or not currently in_use. */
+void      data_core_clear_via(int dev_idx);
+
 /* A MiFlora battery poll result (battery_poll.c, M6): applies pct to mac's
  * CAP_BATTERY_LEVEL slot (creating the device if this is its first
  * appearance) via registry_set_cap(), NOT registry_attribute() -- a GATT
@@ -138,6 +158,20 @@ bool      data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value
  * same "false means nothing was stored" contract. That function is now a
  * wrapper over this one. */
 bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value);
+
+/* I4 fix: the age-aware sibling of data_core_submit_cap_id() above, for a
+ * producer that -- like data_core_submit_from()'s MiBeacon path -- can
+ * carry a reading that is already some seconds/minutes old by the time it
+ * reaches this call (a bridged Zigbee MEASUREMENT that sat in the node's
+ * backlog ring through a hub outage, replayed on reconnect). Mirrors
+ * data_core_submit_from()'s own age policy exactly: age_s > DATA_CORE_MAX_AGE_S
+ * drops the reading outright (logged, not silently) rather than recording
+ * it as current, and otherwise the registry's last_seen_s/cap updated_s is
+ * backdated by age_s so /api/v1/devices reports the reading's REAL age
+ * instead of zero. age_s == 0 behaves identically to
+ * data_core_submit_cap_id(). Same "false means nothing was stored"
+ * contract as that function. */
+bool data_core_submit_cap_id_aged(const device_id_t *id, uint8_t cap_id, float value, uint16_t age_s);
 
 /* Registry slot index for id (0..REGISTRY_MAX_DEVICES-1), or -1 when the
  * device is not (yet) registered. Never creates an entry -- a pure lookup,

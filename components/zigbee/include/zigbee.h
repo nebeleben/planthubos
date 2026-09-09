@@ -11,12 +11,75 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "zb_store.h"
+#include "actor.h"   /* actor_cmd_t -- M7 Task 8's zb_cmd_local_dispatch() signature below.
+                       * "actors" is already a public REQUIRES of this component (zb_cmd.c's
+                       * own actor_set_dispatch_hook()/actor_device_key() calls), so this adds
+                       * no new dependency. */
 
 /* Starts the stack task. Returns ESP_OK once the task is created -- NOT
  * once a network exists; formation is asynchronous and reported through
  * zigbee_net_info(). Safe to call when CONFIG_PLANTHUB_ZB_ENABLED is off:
  * it returns ESP_OK and does nothing. */
 esp_err_t zigbee_start(void);
+
+/* M7 Task 3: whether THIS device is a paired swarm node, set once by
+ * main.c right before the radio block (from swarm_role_t, not read here
+ * directly -- zigbee.c must not link the swarm component, which would
+ * create a CMake dependency cycle once swarm depends on zigbee (Task 5)).
+ * Backed by a plain file-static bool; call zigbee_set_on_node() exactly
+ * once, before zigbee_start() and before wifi_manager's power-save/pause/
+ * resume calls that zigbee_on_node() below gates. */
+void zigbee_set_on_node(bool on_node);
+/* See zigbee_set_on_node() above. Defaults to false until that is called. */
+bool zigbee_on_node(void);
+
+/* M7 Task 5: a zigbee-role node's bridge into swarm.c's forwarder. zigbee.c
+ * must not link the swarm component (see this header's own top comment on
+ * that CMake-cycle constraint), so it cannot queue an ANNOUNCE/GONE frame
+ * itself -- instead it reports every device-table change through this
+ * plain function pointer, and swarm.c supplies the one that actually
+ * builds the frame and queues it (swarm_start_node()'s zb_observer()).
+ *
+ * Fires on the CALLER's task, never a dedicated one: end of
+ * zb_iv_handle_store() (the stack task, after a live interview/re-
+ * interview), zigbee_device_rename() and zigbee_device_remove() (both a
+ * webserver task). An observer must therefore do nothing but a non-
+ * blocking queue send -- no flash I/O, no Zigbee SDK call, nothing that
+ * could stall whichever of those callers happens to be running it. Does
+ * NOT fire from zb_register_restored_devices() (zigbee_start()'s own
+ * store-restore loop, on the caller's boot task): the boot-time replay of
+ * already-known devices is deliberately the CONSUMER's job, not this
+ * producer's -- see swarm.c's zb_boot_replay_task(), which reads the
+ * finished list back out through zigbee_device_list() once zigbee_start()
+ * returns, the same way any other reader of that list would, rather than
+ * this component reaching into a boot-ordering policy that belongs to
+ * whichever radio role is running it. gone=true means the device argument
+ * describes a device that just left (zigbee_device_remove()); gone=false
+ * covers every other case (new join, re-interview, rename), where the
+ * argument is that device's current, complete record.
+ *
+ * A plain file-static function pointer, not a list: exactly one consumer
+ * ever exists (this device runs at most one radio role, so at most one
+ * swarm.c registers itself), and a second zigbee_set_device_observer()
+ * call simply replaces the first -- there is no unregister because nothing
+ * in this codebase ever needs one (a node's radio role is fixed for the
+ * life of a boot). */
+typedef void (*zigbee_device_observer_t)(const zb_device_t *dev, bool gone);
+void zigbee_set_device_observer(zigbee_device_observer_t fn);
+
+/* M7 Task 5: same shape as zigbee_set_device_observer() above, but for
+ * coordinator-status changes rather than device-table changes -- fired
+ * (no arguments; the observer re-reads current state via
+ * zigbee_net_info()/zigbee_permit_join_remaining()/zigbee_device_count())
+ * when the permit-join window opens or closes and when the network forms
+ * or is restored from flash. swarm.c uses it to send an up-to-date
+ * COORD_STATUS the moment any of those happen, on top of the one it
+ * already sends after every CHECKIN and at boot. Same non-blocking-queue-
+ * only contract as the device observer: this can fire from the stack task
+ * (formation/restore, permit-window close) or a webserver task
+ * (zigbee_permit_join()'s window-open path). */
+typedef void (*zigbee_status_observer_t)(void);
+void zigbee_set_status_observer(zigbee_status_observer_t fn);
 
 /* Current network state for the UI. Returns false when Zigbee is disabled
  * at build time or the stack has not started. */
@@ -35,6 +98,12 @@ uint8_t zigbee_permit_join_remaining(void);
  * disabled at build time, the stack has not started, or the table is
  * empty. */
 int zigbee_device_list(zb_device_t *out, size_t max);
+
+/* M7 Task 5: the joined-device count only, for swarm.c's COORD_STATUS
+ * (swarm_coord_status_t.device_count) -- cheaper than zigbee_device_list()
+ * into a throwaway array when the caller only needs the count. Same
+ * "0 when disabled/not started/empty" contract as zigbee_device_list(). */
+int zigbee_device_count(void);
 
 /* Renames a stored device (its user-facing name only; every other field is
  * untouched) and persists the change. False when eui64 is not in the
@@ -85,6 +154,62 @@ uint8_t zigbee_coordinator_endpoint(void);
  * resolves its device through the same store zigbee_store_lookup() reads.
  * A safe no-op when Zigbee is disabled at build time. */
 void zb_cmd_start(void);
+
+/* M7 Task 8: set by swarm.c's swarm_start_main() (hub only, before
+ * zigbee_start()/zb_cmd_start() runs) to tell zb_cmd_start() a bridge
+ * router wrapper is about to claim (or has claimed) the DEV_KIND_ZIGBEE
+ * dispatch hook for itself, so zb_cmd_start() must not overwrite it with
+ * zb_cmd_local_dispatch -- see zb_cmd_start()'s own comment in zb_cmd.c
+ * for the boot-order reasoning. Never called on a node (a node never runs
+ * swarm_start_main()) and a safe no-op when Zigbee is disabled at build
+ * time. */
+void zb_cmd_set_router_active(bool active);
+
+/* M7 Task 8: the Zigbee command engine's own actor dispatch (was the
+ * file-static on_zb_dispatch()) -- exported so swarm.c's hub-side wrapper
+ * (swarm_zb_dispatch()) can fall through to it for any device the hub's
+ * bridge table does not attribute to a bridge node, i.e. a device on the
+ * hub's OWN zigbee coordinator. Identical behaviour to what
+ * actor_set_dispatch_hook(DEV_KIND_ZIGBEE, ...) always called on a node,
+ * or on a hub with no router wrapper registered. A safe no-op when Zigbee
+ * is disabled at build time. */
+void zb_cmd_local_dispatch(const actor_cmd_t *cmd);
+
+/* M7 Task 8: exports zb_cmd_report()'s exact confirmation/failure contract
+ * (alert on failure, log line, s_result_cb hand-off) for the hub's bridge
+ * router to report a bridge-routed ACTUATE's outcome (a DONE/FAILED ack
+ * from the owning bridge node, or this hub's own TTL expiry) through the
+ * same path a locally dispatched command already uses -- so the two are
+ * indistinguishable to whatever consumes alerts/logs/s_result_cb. `dev_idx`
+ * is `int`, not zb_cmd_report()'s own int8_t (bridge_cmd_t.actor_dev_idx,
+ * swarm/include/bridge_cmd.h, is a plain int); the same int8_t range every
+ * actor_cmd_t.dev_idx already lives in. `reason` is only logged when
+ * `ok` is false (zb_cmd_report()'s own contract) -- pass NULL when
+ * reporting success. A safe no-op when Zigbee is disabled at build time. */
+void zb_cmd_report_public(int dev_idx, uint8_t action_id, uint16_t param, bool ok,
+                           const char *reason, uint8_t zcl_status);
+
+/* M7 Task 6: reports how a dispatched Zigbee actuator command ended, to
+ * whichever module cares about individual outcomes -- swarm.c's node-side
+ * command_task() on a zigbee-role bridge node, which acks ACCEPTED/DONE/
+ * FAILED back to the hub for a SWARM_CMD_ACTUATE. Called from zb_cmd.c's
+ * zb_cmd_report() on BOTH branches (confirmed and failed alike): `ok`
+ * mirrors zb_cmd_report()'s own outcome, and `zcl_status` is the ZCL
+ * Default Response's status code when one arrived (ESP_ZB_ZCL_STATUS_*) or
+ * 0xff when there is no real status to report -- a timeout
+ * (zb_cmd_timeout_cb()) or a failure before the command was ever sent
+ * (on_zb_dispatch()'s own early returns). Fires on whichever task produced
+ * the outcome -- the Zigbee stack task for a Default Response or a
+ * timeout, but the dispatching task itself (actor_service()'s caller) for
+ * a pre-dispatch failure -- so a registered callback must do nothing but a
+ * non-blocking queue send, the same contract as
+ * zigbee_device_observer_t/zigbee_status_observer_t above. A plain
+ * file-static function pointer, not a list, for the same "at most one
+ * radio role, at most one consumer" reason those two use. A safe no-op
+ * (the setter simply does nothing) when Zigbee is disabled at build time. */
+typedef void (*zb_cmd_result_t)(int dev_idx, uint8_t action_id, uint16_t param,
+                                 bool ok, uint8_t zcl_status);
+void zb_cmd_set_result_cb(zb_cmd_result_t fn);
 
 /* Forwards one Default Response's outcome from zigbee.c's single ZCL core
  * action handler (the SDK allows exactly one, network-wide) to zb_cmd.c,

@@ -18,11 +18,19 @@
  * module intentionally has no opinion on that, which is also what makes it
  * trivial to construct fresh, independent instances in a host test. */
 
+/* M7 Task 5: the ring now holds a swarm_out_t (see swarm_frame.h) rather
+ * than a bare swarm_reading_t -- a zigbee-role node buffers announces/
+ * measurements/status the same way a BLE-role node always buffered
+ * readings, through the same push/pop/evict mechanics. The union is ~60
+ * bytes (swarm_device_announce_t is the largest member, plus the 1-byte
+ * tag), so a swarm_buf_entry_t (union + captured_us) is ~72 bytes and 32
+ * entries is still a modest ~2.3 KB ring, well within what this was
+ * already sized for. */
 #define SWARM_NODE_BUFFER_LEN 32
 
 typedef struct {
-    swarm_reading_t r;
-    int64_t         captured_us;  /* esp_timer_get_time() (or, in a host test,
+    swarm_out_t r;
+    int64_t     captured_us;  /* esp_timer_get_time() (or, in a host test,
                                     * whatever monotonic clock the caller
                                     * chooses) when this entry was last
                                     * (re)buffered; age_s is recomputed from
@@ -48,7 +56,7 @@ void swarm_buf_init(swarm_buf_t *b);
  * SWARM_NODE_BUFFER_LEN) and increments `dropped` -- callers that want a
  * log line for the eviction should check swarm_buf_dropped() themselves
  * before and after, or just log unconditionally at DEBUG (see swarm.c). */
-void swarm_buf_push(swarm_buf_t *b, const swarm_reading_t *r, int64_t now_us);
+void swarm_buf_push(swarm_buf_t *b, const swarm_out_t *r, int64_t now_us);
 
 /* Pops the oldest buffered entry (FIFO), if any. Returns false and leaves
  * *out untouched when the buffer is empty. Does NOT recompute age_s -- call

@@ -109,6 +109,17 @@ static void start_ap(void)
     /* APSTA so /api/v1/wifi/scan works while the portal is open */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &cfg));
+    /* Bench finding (2026-09-08): a Mac associated once to the portal AP and
+     * then failed auth/assoc on every later attempt ("removing station ...
+     * after unsuccessful auth/assoc") with the C6 defaults of 802.11ax +
+     * HT40 on the soft-AP. Apple clients are known to be picky about ESP32
+     * soft-APs in that mode; a plain b/g/n 20 MHz AP is what a captive
+     * portal needs anyway. Set after the config, before start; failures are
+     * logged, not fatal (the AP still comes up with the defaults). */
+    esp_err_t perr = esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    if (perr != ESP_OK) ESP_LOGW(TAG, "AP set_protocol(b/g/n) failed: %s", esp_err_to_name(perr));
+    esp_err_t berr = esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+    if (berr != ESP_OK) ESP_LOGW(TAG, "AP set_bandwidth(HT20) failed: %s", esp_err_to_name(berr));
     ESP_ERROR_CHECK(esp_wifi_start());
     strlcpy(s_ip, "192.168.4.1", sizeof(s_ip));
     ESP_LOGI(TAG, "AP mode: SSID=%s ip=%s", name, s_ip);

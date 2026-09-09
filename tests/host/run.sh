@@ -252,3 +252,26 @@ $CC -Wall -Wextra -Werror -I../../components/zigbee/include \
 $CC -Wall -Wextra -Werror -I../../components/radio_role/include \
     test_radio_role.c ../../components/radio_role/radio_role_str.c -o test_radio_role
 ./test_radio_role
+
+# Node radio/power compatibility rules (M7 Task 3) -- pure so they run here
+# without NVS. swarm_rules.h pulls swarm_power_mode.h, not swarm_store.h
+# (esp_err.h isn't available under plain cc).
+$CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/radio_role/include \
+    test_swarm_rules.c ../../components/swarm/swarm_rules.c -o test_swarm_rules
+./test_swarm_rules
+
+# Hub-side bridge table (M7 Task 7): upsert/remove/find/serialize round
+# trip. Pure C, links swarm_frame.c for the device-announce codec its
+# serialize/deserialize reuse.
+$CC -Wall -Wextra -Werror -I../../components/swarm/include \
+    test_bridge_table.c ../../components/swarm/bridge_table.c ../../components/swarm/swarm_frame.c -o test_bridge_table
+./test_bridge_table
+
+# Hub-side command router (M7 Task 8): per-node submit/in-flight refusal,
+# retry timing, ack correlation (ACCEPTED/DONE/FAILED, duplicate/unknown
+# seq ignored) and TTL expiry. Pure C -- links swarm_frame.c for
+# swarm_command_ack_t's SWARM_ACK_* values only (no encode/decode needed
+# here, bridge_cmd.c never touches the wire format itself).
+$CC -Wall -Wextra -Werror -I../../components/swarm/include \
+    test_bridge_cmd.c ../../components/swarm/bridge_cmd.c -o test_bridge_cmd
+./test_bridge_cmd

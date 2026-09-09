@@ -46,3 +46,6 @@ tests/host/test_pending_close
 tests/host/test_alert_ring
 tests/host/test_actor_persist
 tests/host/test_events_json_escape
+tests/host/test_swarm_rules
+tests/host/test_bridge_table
+tests/host/test_bridge_cmd

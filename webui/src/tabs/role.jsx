@@ -8,6 +8,12 @@ export function RoleTab({ onMainChosen }) {
   const [busy, setBusy] = useState('')          // '' | 'main' | 'node'
   const [nodePhase, setNodePhase] = useState('') // '' | 'pairing' | 'gone'
   const [error, setError] = useState('')
+  // M7: which radio a soon-to-be node should run -- BLE relay (default) or
+  // Zigbee bridge. Sent via POST /api/v1/config on THIS device's own portal
+  // API (same shape/endpoint as radio.jsx's hub-radio picker, but here it's
+  // the unclaimed node itself answering, not a hub) before POST /api/v1/role
+  // claims the "node" role.
+  const [radio, setRadio] = useState('ble')
   // Same latent shape as radio.jsx's picker: a claimed hub 401s this
   // screen's POST too, and until now there was no way back in short of
   // physical recovery. Offer the key here, in place, so the user can
@@ -52,6 +58,24 @@ export function RoleTab({ onMainChosen }) {
   async function chooseNode() {
     setBusy('node'); setError(''); setNeedKey(false)
     try {
+      // Set the radio choice first: it must persist before the device
+      // reboots into pairing (postRole below), and a rules/write failure
+      // here must stop the flow rather than silently pairing as the wrong
+      // radio. `rebooting` in the response is deliberately ignored -- the
+      // node reboots into pairing anyway once postRole('node') lands, so
+      // there is nothing extra to wait for here.
+      const res = await fetch('/api/v1/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ radio_role: radio }),
+      })
+      if (!res.ok) {
+        if (res.status === 401) {
+          setNeedKey(true)
+          throw new Error('This hub is claimed — enter its key to continue.')
+        }
+        throw new Error('Request failed — is the hub reachable?')
+      }
       await postRole('node')
       setNodePhase('pairing')
       // The device leaves AP mode / reboots into radio-only node mode once
@@ -102,7 +126,15 @@ export function RoleTab({ onMainChosen }) {
         </div>
         <div class="role-card">
           <h2>Node</h2>
-          <p>Extends BLE range. Never joins WiFi; forwards readings to your main hub over its own radio link.</p>
+          <p>Extends range. Never joins WiFi; forwards readings to your main hub over its own radio link.</p>
+          <label class="keyrow">
+            Radio
+            <select value={radio} disabled={busy !== ''} onChange={(e) => setRadio(e.currentTarget.value)}>
+              <option value="ble">BLE relay</option>
+              <option value="zigbee">Zigbee bridge</option>
+            </select>
+          </label>
+          <p class="hint">A bridge runs its own Zigbee network and needs power; a relay can run on battery.</p>
           <p class="hint">
             Two steps: first open pairing on your main hub (Nodes &rarr; Add node),
             <em> then</em> press Continue here.

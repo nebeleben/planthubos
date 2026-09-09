@@ -4,21 +4,22 @@
 #include <string.h>
 #include "swarm_buf.h"
 
-static swarm_reading_t make_reading(uint8_t tag, uint16_t age_s)
+static swarm_out_t make_reading(uint8_t tag, uint16_t age_s)
 {
-    swarm_reading_t r;
-    memset(&r, 0, sizeof(r));
-    r.version = SWARM_PROTO_VERSION;
-    r.type = SWARM_MSG_READING;
-    r.frame_cnt = tag;
-    r.mac[5] = tag;         /* distinguishes entries for the FIFO-order check */
-    r.temp_dc = INT16_MIN;
-    r.moisture_pct = 0xFF;
-    r.battery_pct = 0xFF;
-    r.lux = 0xFFFFFFFFu;
-    r.conductivity_us = 0xFFFF;
-    r.age_s = age_s;
-    return r;
+    swarm_out_t o;
+    memset(&o, 0, sizeof(o));
+    o.tag = SWARM_OUT_READING;
+    o.u.reading.version = SWARM_PROTO_VERSION;
+    o.u.reading.type = SWARM_MSG_READING;
+    o.u.reading.frame_cnt = tag;
+    o.u.reading.mac[5] = tag;         /* distinguishes entries for the FIFO-order check */
+    o.u.reading.temp_dc = INT16_MIN;
+    o.u.reading.moisture_pct = 0xFF;
+    o.u.reading.battery_pct = 0xFF;
+    o.u.reading.lux = 0xFFFFFFFFu;
+    o.u.reading.conductivity_us = 0xFFFF;
+    o.u.reading.age_s = age_s;
+    return o;
 }
 
 int main(void)
@@ -30,7 +31,7 @@ int main(void)
     assert(swarm_buf_dropped(&b) == 0);
 
     for (int i = 0; i < SWARM_NODE_BUFFER_LEN; i++) {
-        swarm_reading_t r = make_reading((uint8_t)i, 0);
+        swarm_out_t r = make_reading((uint8_t)i, 0);
         swarm_buf_push(&b, &r, 1000);
     }
     assert(swarm_buf_count(&b) == SWARM_NODE_BUFFER_LEN);
@@ -40,8 +41,8 @@ int main(void)
     for (int i = 0; i < SWARM_NODE_BUFFER_LEN; i++) {
         swarm_buf_entry_t e;
         assert(swarm_buf_pop(&b, &e));
-        assert(e.r.frame_cnt == (uint8_t)i);
-        assert(e.r.mac[5] == (uint8_t)i);
+        assert(e.r.u.reading.frame_cnt == (uint8_t)i);
+        assert(e.r.u.reading.mac[5] == (uint8_t)i);
     }
     assert(swarm_buf_count(&b) == 0);
     {
@@ -53,13 +54,13 @@ int main(void)
     /* --- overwrite-oldest at capacity --- */
     swarm_buf_init(&b);
     for (int i = 0; i < SWARM_NODE_BUFFER_LEN; i++) {
-        swarm_reading_t r = make_reading((uint8_t)i, 0);
+        swarm_out_t r = make_reading((uint8_t)i, 0);
         swarm_buf_push(&b, &r, 1000);
     }
     assert(swarm_buf_count(&b) == SWARM_NODE_BUFFER_LEN);
     /* One more push while full: must evict entry 0 (the oldest), not any
      * other slot, and count must NOT grow past capacity. */
-    swarm_reading_t overflow = make_reading(0xAA, 0);
+    swarm_out_t overflow = make_reading(0xAA, 0);
     swarm_buf_push(&b, &overflow, 2000);
     assert(swarm_buf_count(&b) == SWARM_NODE_BUFFER_LEN);
     assert(swarm_buf_dropped(&b) == 1);
@@ -69,18 +70,18 @@ int main(void)
     for (int i = 1; i < SWARM_NODE_BUFFER_LEN; i++) {
         swarm_buf_entry_t e;
         assert(swarm_buf_pop(&b, &e));
-        assert(e.r.frame_cnt == (uint8_t)i);
+        assert(e.r.u.reading.frame_cnt == (uint8_t)i);
     }
     swarm_buf_entry_t last;
     assert(swarm_buf_pop(&b, &last));
-    assert(last.r.frame_cnt == 0xAA);
+    assert(last.r.u.reading.frame_cnt == 0xAA);
     assert(swarm_buf_count(&b) == 0);
 
     /* A second overflow push, immediately after the first, confirms the
      * dropped counter keeps accumulating rather than resetting. */
     swarm_buf_init(&b);
     for (int i = 0; i < SWARM_NODE_BUFFER_LEN + 3; i++) {
-        swarm_reading_t r = make_reading((uint8_t)i, 0);
+        swarm_out_t r = make_reading((uint8_t)i, 0);
         swarm_buf_push(&b, &r, 1000);
     }
     assert(swarm_buf_count(&b) == SWARM_NODE_BUFFER_LEN);
@@ -90,7 +91,7 @@ int main(void)
     {
         swarm_buf_entry_t e;
         assert(swarm_buf_pop(&b, &e));
-        assert(e.r.frame_cnt == 3);
+        assert(e.r.u.reading.frame_cnt == 3);
     }
 
     /* --- age recomputation --- */
@@ -112,6 +113,16 @@ int main(void)
         int64_t now = ((int64_t)20) * 1000000;  /* +20s */
         uint16_t got = swarm_buf_recompute_age((uint16_t)(UINT16_MAX - 5), captured, now);
         assert(got == UINT16_MAX);
+    }
+
+    /* --- the union carries a MEASUREMENT frame too, not just READING --- */
+    {
+        swarm_buf_t bm; swarm_buf_init(&bm);
+        swarm_out_t m = { .tag = SWARM_OUT_MEASUREMENT, .u.meas = { .dev = { .kind = 2, .addr = {1} }, .cap_id = 2, .value = 3.5f, .age_s = 0 } };
+        swarm_buf_push(&bm, &m, 1000000);
+        swarm_buf_entry_t e; assert(swarm_buf_pop(&bm, &e));
+        assert(e.r.tag == SWARM_OUT_MEASUREMENT && e.r.u.meas.value == 3.5f);
+        assert(swarm_buf_recompute_age(e.r.u.meas.age_s, e.captured_us, 4000000) == 3);
     }
 
     printf("test_swarm_buf: OK\n");

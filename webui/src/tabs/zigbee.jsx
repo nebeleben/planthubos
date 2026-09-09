@@ -127,16 +127,109 @@ function DeviceCard({ d, open, onToggle, onRenamed, onRemoved, onRetryPairing, r
   )
 }
 
-export function ZigbeeTab() {
-  const [data, setData] = useState(null)   // last GET /api/v1/zigbee response in full
-  const [error, setError] = useState(false)
-  const [busy, setBusy] = useState('')     // '' | permit
+// Task 9's coordinator key: null for the hub's own local coordinator, the
+// bridge node's mac12 otherwise. Used both as the poll/permit request body
+// value and as this tab's per-card React key / busy-tracking key (with
+// 'local' standing in for null wherever a plain string key is needed, e.g.
+// object property names and React `key`s, which can't be null).
+function keyOf(node) {
+  return node ?? 'local'
+}
+
+// One coordinator's card -- the local hub radio (c.node === null) or one
+// Zigbee-bridge node (c.node === mac12). Same body shape either way
+// (network line, permit control, device list); only the pairing-outage
+// countdown/stale-connection treatment is local-only, since only the
+// local coordinator shares an antenna with the hub's own WiFi (a bridge's
+// permit window is just a queued ESP-NOW command -- see radio-architecture
+// findings). `busyKey` is the tab-wide "which card's permit POST is in
+// flight" tracker; this card is busy iff busyKey === keyOf(c.node).
+function CoordinatorCard({ c, busyKey, onPermit, onRenamed, onRemoved, stale, pairingOutage }) {
   const [openMap, setOpenMap] = useState({})
+  const isLocal = c.node === null
+  const busy = busyKey === keyOf(c.node)
+  const label = c.name || c.node
+
+  function toggle(id) {
+    setOpenMap((prev) => ({ ...prev, [id]: !prev[id] }))
+  }
+
+  // Defensive only: app.jsx/ZigbeeTab gate on radioRole/hasBridges, so a
+  // local entry with enabled=false shouldn't normally reach here -- but if
+  // it does (coordinator failed to start this boot), say so plainly rather
+  // than rendering a permit button that can only 409.
+  if (isLocal && !c.enabled) {
+    return (
+      <div class="panel">
+        <h2>Zigbee — this hub</h2>
+        <p class="placeholder">Zigbee radio is not running. Check the hub log; the Radio panel in Config selects it.</p>
+      </div>
+    )
+  }
+
+  return (
+    <div class="panel">
+      <h2>{isLocal ? 'Zigbee — this hub' : `Zigbee bridge — ${label}`}</h2>
+      {c.reported_role !== 'zigbee' && (
+        <p class="hint">bridge reports role {c.reported_role}, waiting for reboot</p>
+      )}
+      <div class="node-card-row">
+        <span class="hint">
+          {c.formed
+            ? `Network formed — channel ${c.channel}, PAN 0x${c.pan_id.toString(16)}`
+            : 'Network not formed yet.'}
+        </span>
+      </div>
+      <p>
+        {c.permit_s > 0 ? (
+          <span class="hint">
+            {isLocal
+              ? `Pairing open — put the device into pairing mode now (${c.permit_s}s left).`
+              : `Pairing open on ${label} — ${c.permit_s}s left`}
+            {isLocal && pairingOutage && !stale && (
+              <span class="hint">
+                {' '}(hub briefly unreachable while pairing — this is normal)
+              </span>
+            )}
+            {isLocal && stale && (
+              <span class="level-badge level-alert">
+                connection lost — this countdown may be stale
+              </span>
+            )}
+          </span>
+        ) : (
+          <button class="btn-primary" onClick={() => onPermit(c.node)} disabled={busy}>
+            {busy ? 'Opening…' : isLocal ? 'Pair a device' : `Pair a device on ${label}`}
+          </button>
+        )}
+      </p>
+      {c.devices.length === 0 ? (
+        <p class="placeholder">No Zigbee devices paired yet.</p>
+      ) : (
+        <div class="node-cards">
+          {c.devices.map((d) => (
+            <DeviceCard key={d.id} d={d} open={!!openMap[d.id]} onToggle={() => toggle(d.id)}
+                        onRenamed={(id, name) => onRenamed(c.node, id, name)}
+                        onRemoved={(id) => onRemoved(c.node, id)}
+                        onRetryPairing={() => onPermit(c.node)} retryBusy={busy} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export function ZigbeeTab() {
+  const [data, setData] = useState(null)   // last GET /api/v1/zigbee response's `coordinators` array
+  const [error, setError] = useState(false)
+  const [busyKey, setBusyKey] = useState('')  // '' | keyOf(node) of the card whose permit POST is in flight
   const pollTimerRef = useRef(null)
   const controllerRef = useRef(null)
-  // Mirrors the last-known permit_s outside React state so a poll FAILURE
-  // (no fresh d.permit_s to read) can still pick the right retry cadence --
-  // see poll()'s catch branch.
+  // Mirrors the LOCAL coordinator's last-known permit_s outside React state
+  // so a poll FAILURE (no fresh data to read) can still pick the right
+  // retry cadence -- see poll()'s catch branch. Only the local coordinator
+  // matters here: it's the only one whose pairing window can make the hub
+  // itself briefly unreachable (see windowEndRef below).
   const lastPermitRef = useRef(0)
   // Fix round 1: a poll failure used to leave `data` (and the countdown it
   // drives) untouched and silently retry -- fine for one dropped request at
@@ -151,29 +244,27 @@ export function ZigbeeTab() {
   // going at the same cadence throughout -- this only changes what's shown.
   const consecFailsRef = useRef(0)
   const [stale, setStale] = useState(false)
-  // M6b UX: while a pairing window is open the hub's WiFi is expected to be
-  // unreachable (the radio is deliberately handed to Zigbee -- see the
-  // radio-role-config spec section 8). A window THIS tab opened is
-  // therefore not a connection loss: windowEndRef records (client clock)
-  // when that window closes, poll failures before that instant drive a
-  // client-side countdown instead of the stale marker, and pairingOutage
-  // swaps the alarming badge for a calm explanation. Only windows this tab
-  // opened get the treatment -- a failure outside one is still a real
-  // connection problem and keeps the fix-round-1 stale semantics.
+  // M6b UX: while a pairing window is open on the LOCAL coordinator, the
+  // hub's WiFi is expected to be unreachable (the radio is deliberately
+  // handed to Zigbee -- see the radio-role-config spec section 8). A window
+  // THIS tab opened is therefore not a connection loss: windowEndRef
+  // records (client clock) when that window closes, poll failures before
+  // that instant drive a client-side countdown instead of the stale
+  // marker, and pairingOutage swaps the alarming badge for a calm
+  // explanation. Only windows this tab opened on the LOCAL coordinator get
+  // the treatment -- a bridge's permit window never blocks the hub's own
+  // WiFi, and a failure outside a local window is still a real connection
+  // problem and keeps the fix-round-1 stale semantics.
   const windowEndRef = useRef(0)
   const [pairingOutage, setPairingOutage] = useState(false)
 
-  function toggle(id) {
-    setOpenMap((prev) => ({ ...prev, [id]: !prev[id] }))
-  }
-
   // Self-rescheduling poll (recursive setTimeout, not setInterval): the
-  // cadence must flip the INSTANT a pairing window opens or closes, not
-  // wait for whichever interval happens to be running. 2s while permit_s >
-  // 0 (design point 1 -- a stale countdown that says 40s after the window
-  // already shut is worse than no countdown, since the operator keeps
-  // holding a device to a network that stopped listening), 10s otherwise,
-  // matching nodes.jsx's background cadence.
+  // cadence must flip the INSTANT any pairing window opens or closes, not
+  // wait for whichever interval happens to be running. 2s while ANY
+  // coordinator's permit_s > 0 (design point 1 -- a stale countdown that
+  // says 40s after the window already shut is worse than no countdown,
+  // since the operator keeps holding a device to a network that stopped
+  // listening), 10s otherwise, matching nodes.jsx's background cadence.
   //
   // A failed fetch does not clear already-loaded data or force the
   // disabled/error screen -- only the very first load (data still null)
@@ -183,23 +274,29 @@ export function ZigbeeTab() {
     fetch('/api/v1/zigbee', { signal: controllerRef.current.signal })
       .then((r) => r.json())
       .then((d) => {
-        setData(d)
+        const coordinators = d.coordinators || []
+        setData(coordinators)
         setError(false)
         consecFailsRef.current = 0
         setStale(false)
         setPairingOutage(false)
-        lastPermitRef.current = d.permit_s || 0
-        pollTimerRef.current = setTimeout(poll, d.permit_s > 0 ? 2000 : 10000)
+        const local = coordinators.find((c) => c.node === null)
+        lastPermitRef.current = local ? local.permit_s || 0 : 0
+        const anyOpen = coordinators.some((c) => c.permit_s > 0)
+        pollTimerRef.current = setTimeout(poll, anyOpen ? 2000 : 10000)
       })
       .catch((err) => {
         if (err.name === 'AbortError') return
         const windowRemainingS = Math.ceil((windowEndRef.current - Date.now()) / 1000)
         if (windowRemainingS > 0) {
-          // Expected pairing outage: keep the countdown running off the
-          // client clock (the server can't answer to run it for us) and do
-          // NOT count this toward the stale threshold.
+          // Expected pairing outage (local coordinator only): keep the
+          // countdown running off the client clock (the server can't
+          // answer to run it for us) and do NOT count this toward the
+          // stale threshold.
           setPairingOutage(true)
-          setData((prev) => (prev ? { ...prev, permit_s: windowRemainingS } : prev))
+          setData((prev) => (prev
+            ? prev.map((c) => (c.node === null ? { ...c, permit_s: windowRemainingS } : c))
+            : prev))
           lastPermitRef.current = windowRemainingS
           pollTimerRef.current = setTimeout(poll, 2000)
           return
@@ -223,23 +320,35 @@ export function ZigbeeTab() {
     }
   }, [])
 
-  async function doPermit() {
-    setBusy('permit')
+  // node: null for the local coordinator, mac12 for a bridge -- Task 9's
+  // POST /api/v1/zigbee/permit body shape. The response differs (local:
+  // {ok,permit_s}; bridge: {ok,queued,node}), so only the local branch can
+  // reflect the new window immediately client-side; a bridge's window
+  // shows up once the hub hears back over ESP-NOW and the next poll picks
+  // it up -- polling is restarted at the fast cadence right away either
+  // way so that's at most 2s off.
+  async function doPermit(node) {
+    setBusyKey(keyOf(node))
     try {
-      const res = await fetch('/api/v1/zigbee/permit', { method: 'POST', headers: authHeaders() })
+      const res = await fetch('/api/v1/zigbee/permit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ node }),
+      })
       const body = await res.json().catch(() => ({}))
       if (res.ok && body.ok) {
-        // Reflect the new window immediately instead of waiting for the
-        // next scheduled tick, and restart the poll loop right now so it
-        // switches onto the 2s cadence straight away.
-        setData((prev) => (prev ? { ...prev, permit_s: body.permit_s } : prev))
-        lastPermitRef.current = body.permit_s || 0
-        windowEndRef.current = Date.now() + (body.permit_s || 0) * 1000
-        // This POST just succeeded, so the hub is reachable right now --
-        // clear any stale-countdown state immediately rather than waiting
-        // for poll()'s own next success to do it.
-        consecFailsRef.current = 0
-        setStale(false)
+        if (node === null) {
+          setData((prev) => (prev
+            ? prev.map((c) => (c.node === null ? { ...c, permit_s: body.permit_s } : c))
+            : prev))
+          lastPermitRef.current = body.permit_s || 0
+          windowEndRef.current = Date.now() + (body.permit_s || 0) * 1000
+          // This POST just succeeded, so the hub is reachable right now --
+          // clear any stale-countdown state immediately rather than
+          // waiting for poll()'s own next success to do it.
+          consecFailsRef.current = 0
+          setStale(false)
+        }
         clearTimeout(pollTimerRef.current)
         poll()
       } else {
@@ -248,73 +357,43 @@ export function ZigbeeTab() {
     } catch {
       alert('hub not reachable')
     }
-    setBusy('')
+    setBusyKey('')
   }
 
-  function onRenamed(id, name) {
-    setData((prev) => ({ ...prev, devices: prev.devices.map((d) => (d.id === id ? { ...d, name } : d)) }))
+  function onRenamed(node, id, name) {
+    setData((prev) => prev.map((c) => (c.node === node
+      ? { ...c, devices: c.devices.map((d) => (d.id === id ? { ...d, name } : d)) }
+      : c)))
   }
 
-  function onRemoved(id) {
-    setData((prev) => ({ ...prev, devices: prev.devices.filter((d) => d.id !== id) }))
+  function onRemoved(node, id) {
+    setData((prev) => prev.map((c) => (c.node === node
+      ? { ...c, devices: c.devices.filter((d) => d.id !== id) }
+      : c)))
   }
 
   if (error && !data) return <p class="error">Hub not reachable.</p>
   if (!data) return <p class="placeholder">Loading…</p>
 
-  // Defensive only: app.jsx hides this tab unless the radio role is
-  // zigbee, so reaching here means the coordinator failed to start.
-  if (!data.enabled) {
+  if (data.length === 0) {
     return (
       <div class="panel">
         <h2>Zigbee</h2>
-        <p class="placeholder">Zigbee radio is not running. Check the hub log; the Radio panel in Config selects it.</p>
+        <p class="placeholder">
+          No Zigbee coordinator: switch this hub's radio to Zigbee in Config, or make a node a
+          Zigbee bridge in Nodes.
+        </p>
       </div>
     )
   }
 
   return (
-    <div class="panel">
-      <h2>Zigbee</h2>
-      <div class="node-card-row">
-        <span class="hint">
-          {data.formed
-            ? `Network formed — channel ${data.channel}, PAN 0x${data.pan_id.toString(16)}`
-            : 'Network not formed yet.'}
-        </span>
-      </div>
-      <p>
-        {data.permit_s > 0 ? (
-          <span class="hint">
-            Pairing open — put the device into pairing mode now ({data.permit_s}s left).
-            {pairingOutage && !stale && (
-              <span class="hint">
-                {' '}(hub briefly unreachable while pairing — this is normal)
-              </span>
-            )}
-            {stale && (
-              <span class="level-badge level-alert">
-                connection lost — this countdown may be stale
-              </span>
-            )}
-          </span>
-        ) : (
-          <button class="btn-primary" onClick={doPermit} disabled={busy === 'permit'}>
-            {busy === 'permit' ? 'Opening…' : 'Pair a device'}
-          </button>
-        )}
-      </p>
-      {data.devices.length === 0 ? (
-        <p class="placeholder">No Zigbee devices paired yet.</p>
-      ) : (
-        <div class="node-cards">
-          {data.devices.map((d) => (
-            <DeviceCard key={d.id} d={d} open={!!openMap[d.id]} onToggle={() => toggle(d.id)}
-                        onRenamed={onRenamed} onRemoved={onRemoved}
-                        onRetryPairing={doPermit} retryBusy={busy === 'permit'} />
-          ))}
-        </div>
-      )}
-    </div>
+    <>
+      {data.map((c) => (
+        <CoordinatorCard key={keyOf(c.node)} c={c} busyKey={busyKey} onPermit={doPermit}
+                          onRenamed={onRenamed} onRemoved={onRemoved}
+                          stale={stale} pairingOutage={pairingOutage} />
+      ))}
+    </>
   )
 }

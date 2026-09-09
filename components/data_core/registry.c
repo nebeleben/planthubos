@@ -137,3 +137,21 @@ void registry_clear_attribution(registry_t *r, const uint8_t node_mac[6])
         d->best_rssi = 0;
     }
 }
+
+void registry_set_via(registry_t *r, int idx, const uint8_t node_mac[6])
+{
+    if (idx < 0 || idx >= REGISTRY_MAX_DEVICES || !node_mac) return;
+    device_entry_t *d = &r->devices[idx];
+    if (!d->in_use) return;
+    set_attribution(d, node_mac, 0, d->last_seen_s);
+}
+
+void registry_clear_via(registry_t *r, int idx)
+{
+    if (idx < 0 || idx >= REGISTRY_MAX_DEVICES) return;
+    device_entry_t *d = &r->devices[idx];
+    if (!d->in_use) return;
+    d->via_node_valid = false;
+    memset(d->via_node, 0, 6);
+    d->best_rssi = 0;
+}

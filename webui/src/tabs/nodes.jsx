@@ -274,12 +274,60 @@ function PowerModeControl({ n, onSaved }) {
   )
 }
 
+// Task 4/10's node radio-role select: mirrors PowerModeControl's shape
+// (the select's onChange IS the save -- no separate Save button), but
+// unlike power_mode there's no client-side optimistic update of the
+// desired value here; a successful POST just triggers onSaved(), which
+// NodesTab wires to a full refreshNodes() so radio_role/radio_role_pending
+// both come back from the one source that actually computes the pending
+// flag (swarm_node_list_json -- see api_v1.c's node-JSON comment). A 409
+// rules refusal (e.g. battery power mode vs zigbee, swarm_rules.h) surfaces
+// its `error` string inline rather than as an alert().
+const RADIO_LABELS = { ble: 'BLE relay', zigbee: 'Zigbee bridge' }
+function RadioRoleControl({ n, onSaved }) {
+  const [state, setState] = useState('idle') // idle | saving
+  const [msg, setMsg] = useState('')
+
+  async function onChange(e) {
+    const role = e.currentTarget.value
+    setState('saving'); setMsg('')
+    try {
+      const res = await fetch(`/api/v1/nodes/${macPath(n.mac)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ radio_role: role }),
+      })
+      if (res.ok) { onSaved(); setState('idle') }
+      else {
+        let m = 'save failed'
+        try { const d = await res.json(); if (d.error) m = d.error } catch {}
+        setMsg(m); setState('idle')
+      }
+    } catch {
+      setMsg('hub not reachable'); setState('idle')
+    }
+  }
+
+  const battery = n.power_mode !== 'always_on'
+  return (
+    <label>Radio{' '}
+      <select value={n.radio_role} disabled={state === 'saving' || battery} onChange={onChange}>
+        <option value="ble">{RADIO_LABELS.ble}</option>
+        <option value="zigbee">{RADIO_LABELS.zigbee}</option>
+      </select>
+      {battery && <span class="hint">set the node to always-on to make it a bridge</span>}
+      {n.radio_role_pending && <span class="hint">reported: {n.reported_radio_role ? RADIO_LABELS[n.reported_radio_role] : 'unknown'} — reboot pending</span>}
+      {msg && <span class="hint">{msg}</span>}
+    </label>
+  )
+}
+
 // Collapsible per-node card. `open`/`onToggle` are lifted to NodesTab (keyed by
 // mac) rather than kept as local state here, so a node whose OTA goes active
 // can be forced open from the parent without this component needing to know
 // why -- see NodesTab's `isOpen`, which ORs the operator's own toggle state
 // with the OTA poll's `active` flag (reported back up via onOtaActive below).
-function NodeCard({ n, fwVersion, open, onToggle, onSaved, onForgotten, onPowerModeSaved, onOtaActive }) {
+function NodeCard({ n, fwVersion, open, onToggle, onSaved, onForgotten, onPowerModeSaved, onRadioRoleSaved, onOtaActive }) {
   const [name, setName] = useState(n.name || '')
   const [state, setState] = useState('idle') // idle | saving | saved | error | unauth
   const [forgetting, setForgetting] = useState(false)
@@ -352,6 +400,9 @@ function NodeCard({ n, fwVersion, open, onToggle, onSaved, onForgotten, onPowerM
         <div class="node-card-row">
           <PowerModeControl n={n} onSaved={onPowerModeSaved} />
           <span class="hint">reported: {n.reported_mode_valid ? (REPORTED_MODE_LABELS[n.reported_mode] || n.reported_mode) : '—'}</span>
+        </div>
+        <div class="node-card-row">
+          <RadioRoleControl n={n} onSaved={onRadioRoleSaved} />
         </div>
         <div class="node-card-row">
           <span class="hint">{n.rssi != null ? `${n.rssi} dBm` : '–'}</span>
@@ -471,6 +522,16 @@ export function NodesTab() {
     setNodes((prev) => prev.map((n) => (n.mac === mac ? { ...n, power_mode, power_mode_pending: true } : n)))
   }
 
+  // Unlike onPowerModeSaved above, there's no client-side optimistic update
+  // of radio_role here -- a full refetch is cheap (10s background poll
+  // already does one) and swarm_node_list_json is the only place that
+  // actually computes radio_role_pending against the node's last reported
+  // radio (record_reported_radio()), so re-fetching is simpler and more
+  // honest than guessing that value client-side.
+  function onRadioRoleSaved() {
+    refreshNodes()
+  }
+
   async function doAddNode() {
     setBusy('pair')
     try {
@@ -508,13 +569,17 @@ export function NodesTab() {
     <div class="panel">
       <h2>Nodes</h2>
       {nodes.length === 0 ? (
-        <p class="placeholder">No nodes paired yet — nodes extend BLE range by relaying readings to this hub over ESP-NOW.</p>
+        <p class="placeholder">
+          Nodes extend range: a BLE relay forwards Bluetooth sensors, a Zigbee bridge runs a
+          Zigbee network and forwards its devices — both over ESP-NOW.
+        </p>
       ) : (
         <div class="node-cards">
           {nodes.map((n) => (
             <NodeCard key={n.mac} n={n} fwVersion={fwVersion} open={isOpen(n.mac)}
                       onToggle={() => toggleNode(n.mac)} onSaved={onSaved} onForgotten={onForgotten}
-                      onPowerModeSaved={onPowerModeSaved} onOtaActive={onOtaActive} />
+                      onPowerModeSaved={onPowerModeSaved} onRadioRoleSaved={onRadioRoleSaved}
+                      onOtaActive={onOtaActive} />
           ))}
         </div>
       )}

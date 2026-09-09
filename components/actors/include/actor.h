@@ -191,8 +191,11 @@ typedef struct {
  * actually handed onward. */
 actor_service_result_t actor_service_step(actor_table_t *t, actor_queue_t *q, uint32_t now_s);
 
-/* Sets up the shared table and queue this file owns. Call once at boot,
- * before any actor_request()/actor_service() call. */
+/* Sets up the shared table and queue this file owns. Call before any
+ * actor_request()/actor_service() call. Idempotent (I6 fix): a second and
+ * later call is a no-op, so both swarm_start_main() (unconditionally, on
+ * every radio role) and ble_collector_start() (BLE role only) can call
+ * this without either one wiping out state the other already set up. */
 void actor_init(void);
 
 /* actor_now_s(): the single clock actor_request()'s callers (Tasks 9, 10,

@@ -39,6 +39,14 @@ typedef enum {
     ACTOR_SRC_RULE = 0,
     ACTOR_SRC_MANUAL,
     ACTOR_SRC_SAFETY,
+    /* M7 Task 6: a command relayed from the paired hub through a
+     * zigbee-role bridge node's command task (swarm.c's SWARM_CMD_ACTUATE
+     * handling). Treated exactly like ACTOR_SRC_RULE everywhere this table
+     * checks `source` -- see actor_table_check()'s own comment below and
+     * actor_table.c's lockout check -- because nobody pressed anything
+     * locally: an operator lockout, cooldown or hourly cap must still
+     * apply to a remote command the same as it would to a rule. */
+    ACTOR_SRC_REMOTE,
 } actor_source_t;
 
 /* actor_table_check()'s verdict. The refusal reason is part of the
@@ -157,15 +165,18 @@ bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id,
  *   bound    -> refuses every source, ACTOR_SRC_SAFETY included -- it is a
  *               correctness check, not a rate limit, and a close carries
  *               no parameter, so it never blocks a legitimate close
- *   lockout  -> refuses ACTOR_SRC_RULE; permits MANUAL and SAFETY
- *   cooldown -> refuses RULE and MANUAL; permits SAFETY
- *   rate     -> refuses RULE and MANUAL; permits SAFETY
+ *   lockout  -> refuses ACTOR_SRC_RULE and ACTOR_SRC_REMOTE; permits MANUAL
+ *               and SAFETY
+ *   cooldown -> refuses RULE, REMOTE and MANUAL; permits SAFETY
+ *   rate     -> refuses RULE, REMOTE and MANUAL; permits SAFETY
  *
  * The principle behind the last three: ACTOR_SRC_SAFETY is exempt from
  * every rate-shaping guard (lockout, cooldown, rate), because its job is
  * to close something already open -- a lockout, a close-retry storm, or a
  * user-configured cooldown/rate cap on switch.off must never be able to
- * strand an actuator open, which is the opposite of safe.
+ * strand an actuator open, which is the opposite of safe. ACTOR_SRC_REMOTE
+ * gets no such exemption -- it is rule-class, not safety-class (see
+ * actor_source_t's own comment).
  *
  * Read-only: does not record a fire. Callers that decide to proceed must
  * call actor_table_record() themselves once the command is actually sent. */

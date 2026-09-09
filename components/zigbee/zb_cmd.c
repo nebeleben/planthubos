@@ -96,6 +96,44 @@ typedef struct {
 static portMUX_TYPE s_inflight_mux = portMUX_INITIALIZER_UNLOCKED;
 static zb_cmd_inflight_t s_inflight[ZB_CMD_MAX_INFLIGHT];
 
+/* M7 Task 6: the one registered consumer of zb_cmd_report()'s per-command
+ * outcome -- see zb_cmd_result_t's doc comment in zigbee.h. Plain
+ * file-static pointer, same convention as zigbee.c's own device/status
+ * observers: at most one radio role runs per boot, so at most one
+ * registrant ever exists. */
+static zb_cmd_result_t s_result_cb;
+
+/* M7 Task 8: whether the HUB's command router has claimed (or is about to
+ * claim) the DEV_KIND_ZIGBEE dispatch hook for itself. Plain file-static
+ * bool, set by swarm.c through zb_cmd_set_router_active() -- swarm.c
+ * already depends on this component (PRIV_REQUIRES zigbee), so this is an
+ * ordinary forward call, not the reverse; zigbee.c/zb_cmd.c themselves
+ * still never include or link anything from swarm, exactly as this
+ * header's top comment requires.
+ *
+ * Exists because of a boot-order wrinkle: main.c calls swarm_start_main()
+ * (which, on the hub, wants to register its own wrapper hook) BEFORE
+ * zigbee_start() (whose zb_cmd_start() would otherwise unconditionally
+ * overwrite whatever actor_set_dispatch_hook() slot already holds). Rather
+ * than have swarm_start_main() register its wrapper and then have
+ * zb_cmd_start() blindly clobber it moments later, swarm_start_main() sets
+ * this flag first (still ahead of zb_cmd_start() in main.c's call order),
+ * and zb_cmd_start() below checks it before ever registering on_zb_dispatch
+ * directly. Always false on a node (a node never calls swarm_start_main())
+ * and false-by-default until any hub sets it, so zb_cmd_start()'s own
+ * default (register directly) is unaffected everywhere else. */
+static bool s_router_active;
+
+void zb_cmd_set_router_active(bool active)
+{
+    s_router_active = active;
+}
+
+void zb_cmd_set_result_cb(zb_cmd_result_t fn)
+{
+    s_result_cb = fn;
+}
+
 /* Reports how a dispatched command ended -- the completion contract
  * on_gatt_cmd_done() (ble_collector.c) already satisfies for GATT, applied
  * here. A FAILED command alerts, with the same code on_gatt_cmd_done()
@@ -116,16 +154,37 @@ static zb_cmd_inflight_t s_inflight[ZB_CMD_MAX_INFLIGHT];
  * has, so `ok` below already means "confirmed" -- there is nothing weaker
  * to distinguish it from. */
 static void zb_cmd_report(int8_t dev_idx, uint8_t action_id, uint16_t param,
-                           bool ok, const char *reason)
+                           bool ok, const char *reason, uint8_t zcl_status)
 {
     if (!ok) {
         ESP_LOGW(TAG, "command failed: dev=%d action=%u param=%u (%s)", (int)dev_idx,
                  (unsigned)action_id, (unsigned)param, reason ? reason : "unknown");
         alert_post(EVENT_LEVEL_ALERT, ALERT_CODE_COMMAND_FAILED, dev_idx, action_id, param);
+        if (s_result_cb) s_result_cb(dev_idx, action_id, param, ok, zcl_status);
         return;
     }
     ESP_LOGI(TAG, "command confirmed: dev=%d action=%u param=%u", (int)dev_idx,
              (unsigned)action_id, (unsigned)param);
+    if (s_result_cb) s_result_cb(dev_idx, action_id, param, ok, zcl_status);
+}
+
+/* M7 Task 8: the hub's bridge router (swarm.c) needs the exact same
+ * confirmation contract for a command it routed to a bridge node's own
+ * zigbee coordinator (an ACTUATE's DONE/FAILED ack, or a TTL expiry) that
+ * zb_cmd_report() above already gives a LOCALLY dispatched command -- same
+ * alert on failure (ALERT_CODE_COMMAND_FAILED), same log line, same
+ * s_result_cb hand-off (a no-op on the hub, which never registers one;
+ * that registration is node-only -- swarm_start_node()'s own
+ * zb_cmd_set_result_cb(on_zb_result) call). Exported rather than
+ * duplicated so the two paths can never drift apart on what "confirmed"/
+ * "failed" means. `dev_idx` is `int`, not zb_cmd_report()'s own int8_t,
+ * because bridge_cmd_t.actor_dev_idx (bridge_cmd.h) is a plain int -- the
+ * cast back down is safe, the same range every actor_cmd_t.dev_idx already
+ * lives in (int8_t, capability.h's device table size). */
+void zb_cmd_report_public(int dev_idx, uint8_t action_id, uint16_t param, bool ok,
+                           const char *reason, uint8_t zcl_status)
+{
+    zb_cmd_report((int8_t)dev_idx, action_id, param, ok, reason, zcl_status);
 }
 
 /* esp_zb_scheduler_alarm() callback (esp_zb_callback_t: void(uint8_t)) --
@@ -156,7 +215,7 @@ static void zb_cmd_timeout_cb(uint8_t slot_idx)
     if (!was_used) return;
 
     zb_cmd_report(cmd.dev_idx, cmd.action_id, cmd.param, false,
-                  "no Default Response within the timeout");
+                  "no Default Response within the timeout", 0xff);
 }
 
 void zb_cmd_on_default_resp(uint8_t tsn, uint16_t cluster, uint8_t resp_to_cmd,
@@ -211,7 +270,8 @@ void zb_cmd_on_default_resp(uint8_t tsn, uint16_t cluster, uint8_t resp_to_cmd,
 
     bool ok = (status_code == ESP_ZB_ZCL_STATUS_SUCCESS);
     zb_cmd_report(cmd.dev_idx, cmd.action_id, cmd.param, ok,
-                  ok ? NULL : "device returned a non-success Default Response status");
+                  ok ? NULL : "device returned a non-success Default Response status",
+                  status_code);
 }
 
 /* actor_service()'s DEV_KIND_ZIGBEE dispatch hook (actor_dispatch_fn_t,
@@ -221,7 +281,13 @@ void zb_cmd_on_default_resp(uint8_t tsn, uint16_t cluster, uint8_t resp_to_cmd,
  * there is no second chance for it and no other place its disappearance
  * would surface -- the same reasoning ble_collector.c's on_actor_dispatch()
  * gives for its own early returns. */
-static void on_zb_dispatch(const actor_cmd_t *cmd)
+/* M7 Task 8: exported (was `static void on_zb_dispatch`) so swarm.c's hub
+ * wrapper (swarm_zb_dispatch()) can fall through to it for a device this
+ * hub's bridge table does NOT attribute to any bridge node -- i.e. a
+ * device attached to the hub's OWN zigbee coordinator, exactly the
+ * dispatch this function has always performed. Behaviour is completely
+ * unchanged; only the linkage changed. */
+void zb_cmd_local_dispatch(const actor_cmd_t *cmd)
 {
     uint8_t on_off_cmd_id;
     switch (cmd->action_id) {
@@ -232,7 +298,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
          * (ACT_IRRIGATION_OPEN, ACT_PUMP_RUN -- action.h) must post an
          * alert and never be silently dropped. */
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "the Zigbee command engine does not implement this action");
+                      "the Zigbee command engine does not implement this action", 0xff);
         return;
     }
 
@@ -247,7 +313,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
     uint8_t key[ACTOR_DEVICE_KEY_LEN];
     if (!actor_device_key(cmd->dev_idx, key) || key[0] != DEV_KIND_ZIGBEE) {
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "no stable Zigbee identity for this device");
+                      "no stable Zigbee identity for this device", 0xff);
         return;
     }
     const uint8_t *eui64 = key + 1;
@@ -258,7 +324,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
     uint8_t  endpoint;
     if (!zigbee_store_lookup(eui64, &short_addr, &endpoint)) {
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "device not present in the Zigbee store");
+                      "device not present in the Zigbee store", 0xff);
         return;
     }
     if (short_addr == 0xFFFF) {
@@ -267,7 +333,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
          * response that carries one) -- never a real joined device's short
          * address. */
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "device has no usable short address");
+                      "device has no usable short address", 0xff);
         return;
     }
 
@@ -296,7 +362,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
         ESP_LOGW(TAG, "%u Zigbee command(s) already outstanding; dev=%d action=%u dropped",
                  (unsigned)ZB_CMD_MAX_INFLIGHT, (int)cmd->dev_idx, (unsigned)cmd->action_id);
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "too many Zigbee commands already outstanding");
+                      "too many Zigbee commands already outstanding", 0xff);
         return;
     }
 
@@ -309,7 +375,7 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
         s_inflight[slot].used = false;
         portEXIT_CRITICAL(&s_inflight_mux);
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
-                      "could not acquire the Zigbee stack lock");
+                      "could not acquire the Zigbee stack lock", 0xff);
         return;
     }
 
@@ -354,7 +420,19 @@ static void on_zb_dispatch(const actor_cmd_t *cmd)
 
 void zb_cmd_start(void)
 {
-    actor_set_dispatch_hook(DEV_KIND_ZIGBEE, on_zb_dispatch);
+    /* M7 Task 8: on a node, always register directly -- a node has no
+     * bridge router of its own; its own ACTUATE commands (from the hub,
+     * via swarm.c's command_task()/actor_request()) must dispatch straight
+     * to this file, exactly as before this task. On the hub, register
+     * directly ONLY when swarm_start_main() has not (or could not) claim
+     * the DEV_KIND_ZIGBEE hook for its own wrapper -- s_router_active is
+     * set by that function, ahead of this one in main.c's call order (see
+     * s_router_active's own comment above). When it HAS claimed it, this
+     * call is skipped entirely: overwriting the wrapper here would silently
+     * cut the bridge router out of every dispatch. */
+    if (zigbee_on_node() || !s_router_active) {
+        actor_set_dispatch_hook(DEV_KIND_ZIGBEE, zb_cmd_local_dispatch);
+    }
 }
 
 #else /* !CONFIG_PLANTHUB_ZB_ENABLED */
@@ -370,6 +448,27 @@ void zb_cmd_on_default_resp(uint8_t tsn, uint16_t cluster, uint8_t resp_to_cmd,
     (void)cluster;
     (void)resp_to_cmd;
     (void)status_code;
+}
+
+void zb_cmd_set_result_cb(zb_cmd_result_t fn)
+{
+    (void)fn;
+}
+
+void zb_cmd_set_router_active(bool active)
+{
+    (void)active;
+}
+
+void zb_cmd_local_dispatch(const actor_cmd_t *cmd)
+{
+    (void)cmd;
+}
+
+void zb_cmd_report_public(int dev_idx, uint8_t action_id, uint16_t param, bool ok,
+                           const char *reason, uint8_t zcl_status)
+{
+    (void)dev_idx; (void)action_id; (void)param; (void)ok; (void)reason; (void)zcl_status;
 }
 
 #endif /* CONFIG_PLANTHUB_ZB_ENABLED */

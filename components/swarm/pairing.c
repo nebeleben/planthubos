@@ -13,8 +13,10 @@
  * blocked on. That task does every flash write and every send. */
 #include "pairing.h"
 #include "espnow_link.h"
+#include "swarm.h"
 #include "swarm_frame.h"
 #include "swarm_store.h"
+#include "radio_role.h"
 
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -36,6 +38,7 @@ static const char *TAG = "pairing";
 typedef struct {
     uint8_t  mac[6];
     uint32_t nonce;
+    uint8_t  radio_role;  /* the node's self-reported role from its PAIR_REQ */
 } pending_adopt_t;
 
 static SemaphoreHandle_t s_window_lock;   /* guards s_window_open / s_window_deadline_us / s_adopt_in_progress */
@@ -362,6 +365,21 @@ static void hub_task(void *arg)
                     break;
                 }
                 ESP_LOGI(TAG, "adopted node " MACSTR " on channel %u", MAC2STR(item.mac), channel);
+                /* Bench finding (M7 gate 1, 2026-09-08): a freshly adopted node
+                 * got the store's BLE default as its desired role while its
+                 * PAIR_REQ said zigbee, so radio_role_pending was true from
+                 * the first second and the next checkin would have pushed a
+                 * NODE_CONFIG(ble) -- silently undoing the operator's portal
+                 * choice. The node's self-reported role IS the desired role
+                 * at adoption; the operator changes it later via the Nodes
+                 * tab. Only the two node roles are accepted; anything else
+                 * keeps the default. */
+                if (item.radio_role == (uint8_t)RADIO_ROLE_BLE || item.radio_role == (uint8_t)RADIO_ROLE_ZIGBEE) {
+                    esp_err_t rerr = swarm_store_set_node_desired_radio(item.mac, (radio_role_t)item.radio_role);
+                    if (rerr != ESP_OK)
+                        ESP_LOGW(TAG, "adopt " MACSTR ": could not persist desired radio role %u (%s)",
+                                 MAC2STR(item.mac), item.radio_role, esp_err_to_name(rerr));
+                }
             }
         } while (0);
 
@@ -471,9 +489,19 @@ static void node_task(void *arg)
             }
             ESP_LOGD(TAG, "sweep: dwelling on channel %u", ch);
 
+            /* M7 Task 4: this node's own current radio role, so the hub can
+             * populate reported_radio_role (swarm.c's swarm_note_node_radio())
+             * before this node has ever sent a CHECKIN/COORD_STATUS -- see
+             * swarm_frame.h's doc comment on swarm_pair_req_t.radio_role.
+             * radio_role_is_set() == false means this device predates
+             * radio_role entirely (never persisted one) or was just
+             * factory-reset; RADIO_ROLE_BLE is the same "every node
+             * defaults to running the V1 hub's NimBLE collector" default
+             * swarm_store's own desired_radio getter uses. */
             swarm_pair_req_t req = {
                 .version = SWARM_PROTO_VERSION,
                 .type = SWARM_MSG_PAIR_REQ,
+                .radio_role = (uint8_t)(radio_role_is_set() ? radio_role_get() : RADIO_ROLE_BLE),
                 .nonce = nonce,
             };
             uint8_t buf[sizeof(req)];
@@ -665,6 +693,19 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
         swarm_pair_req_t req;
         if (!swarm_decode_pair_req(data, (size_t)len, &req)) return;
 
+        /* M7 Task 4: note this node's self-reported radio role regardless
+         * of whether the adoption below actually proceeds (a re-PAIR_REQ
+         * from an already-known node during a busy window still carries a
+         * truthful, worth-recording radio_role) -- see swarm.h's doc
+         * comment on swarm_note_node_radio() for why a miss (no RAM stats
+         * slot yet for a node that has never sent a READING/CHECKIN) is
+         * the expected common case here, not an error. A no-op when this
+         * device is itself a node (s_stats_mutex is NULL, never created --
+         * see swarm_note_node_radio()'s own guard), which in practice never
+         * reaches this branch anyway since a node never opens a pairing
+         * window (win_open above is always false for it). */
+        swarm_note_node_radio(src, req.radio_role);
+
         /* At most one adoption in flight at a time. The window is never
          * closed here (or anywhere on a successful adoption -- see
          * hub_task()): it stays open for its full configured duration so a
@@ -679,6 +720,7 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
         pending_adopt_t item;
         memcpy(item.mac, src, 6);
         item.nonce = req.nonce;
+        item.radio_role = req.radio_role;
 
         if (!s_adopt_queue || xQueueSend(s_adopt_queue, &item, 0) != pdTRUE) {
             /* Could not hand off to hub_task (queue missing, or somehow

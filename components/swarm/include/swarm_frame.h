@@ -3,8 +3,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SWARM_PROTO_VERSION 3
+#define SWARM_PROTO_VERSION 4
+#define SWARM_HDR_LEN 4      /* version(1) + type(1) + len(2) */
 #define SWARM_LMK_LEN 16
+
+/* Protocol v4: every frame on the wire starts with this 4-byte header:
+ *   version (1), type (1), len (2, little-endian).
+ * len = number of bytes after the 4-byte header, little-endian; filled by
+ * the encoder, checked by swarm_frame_type(). Every swarm_*_t struct below
+ * carries this header as its first three fields (version, type, len) --
+ * swarm_ota_chunk_t is the one exception: it already had a field named
+ * `len` for its own data-byte count, so its v4 header-length field is
+ * named `hdr_len` instead (see its definition below). */
 
 typedef enum {
     SWARM_MSG_PAIR_REQ   = 1,
@@ -19,6 +29,25 @@ typedef enum {
     SWARM_MSG_OTA_ABORT  = 10,
     SWARM_MSG_CHECKIN    = 11,
     SWARM_MSG_CHECKIN_ACK = 12,
+    /* M7 zigbee bridge frame types; bodies land in Task 2, but the enum
+     * values must exist now for swarm_frame_type()'s version-check range
+     * to compile. */
+    SWARM_MSG_DEVICE_ANNOUNCE  = 13,
+    SWARM_MSG_DEVICE_GONE      = 14,
+    SWARM_MSG_MEASUREMENT      = 15,
+    SWARM_MSG_COORD_STATUS     = 16,
+    SWARM_MSG_COMMAND          = 17,
+    SWARM_MSG_COMMAND_ACK      = 18,
+    SWARM_MSG_NODE_CONFIG      = 19,
+    SWARM_MSG_NODE_CONFIG_ACK  = 20,
+    /* Node -> hub, header-only (no body). A zigbee-role bridge's WiFi
+     * receive path is only reliably open right after the node's OWN
+     * transmit (bench finding, M7 zigbee bridge follow-up) -- this frame
+     * exists purely so a node with nothing else to report still transmits
+     * every couple of seconds, giving the hub a window to push a stuck
+     * command through (see swarm.c's poll_task and hub_rx_cb's
+     * BRIDGE_ITEM_FLUSH handling). No ack, no fields; len must be 0. */
+    SWARM_MSG_POLL             = 21,
 } swarm_msg_t;
 
 /* Checkin commands (CHECKIN_ACK.command) */
@@ -29,10 +58,21 @@ enum {
 };
 
 /* Node -> broadcast, plaintext. Sender MAC comes from the ESP-NOW receive
- * metadata, so it is deliberately not repeated in the payload. */
+ * metadata, so it is deliberately not repeated in the payload.
+ *
+ * radio_role (M7): the node's own current radio role (RADIO_ROLE_*, see
+ * radio_role.h), reported so the hub can populate reported_radio_role
+ * before the node ever sends a CHECKIN/COORD_STATUS. Added after `len`,
+ * ahead of `nonce` -- nonce itself is untouched and still load-bearing:
+ * pairing.c's pairing_handle_frame() reads req.nonce off every decoded
+ * PAIR_REQ and echoes it in PAIR_ACK, which is how a node tells a genuine
+ * reply to ITS broadcast apart from another node's concurrent pairing
+ * attempt (see the PAIR_ACK comment below). Do not remove it. */
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
+    uint8_t  radio_role;  /* M7: RADIO_ROLE_* the node currently runs */
     uint32_t nonce;      /* echoed in the ack so a node ignores stale replies */
 } swarm_pair_req_t;
 
@@ -47,6 +87,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint8_t  channel;    /* the hub's current wifi channel, 1..13 */
     uint8_t  lmk[SWARM_LMK_LEN];
     uint32_t nonce;
@@ -77,6 +118,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint8_t  frame_cnt;      /* sensor's MiBeacon counter, for hub-side dedup */
     uint8_t  mac[6];         /* sensor MAC, human order */
     int16_t  temp_dc;
@@ -98,6 +140,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint32_t nonce;   /* echoed in the PONG so the node matches the reply to this probe */
 } swarm_ping_t;
 
@@ -113,6 +156,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint32_t nonce;   /* copied verbatim from the PING that triggered this reply */
 } swarm_pong_t;
 
@@ -133,9 +177,10 @@ typedef struct __attribute__((packed)) {
  * so every paired node still receives every FORGET; target_mac is what
  * makes only the intended one act on it. */
 typedef struct __attribute__((packed)) {
-    uint8_t version;
-    uint8_t type;
-    uint8_t target_mac[6];
+    uint8_t  version;
+    uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
+    uint8_t  target_mac[6];
 } swarm_forget_t;
 
 /* Node -> hub, unicast, encrypted. Battery nodes report their current power mode
@@ -143,18 +188,20 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;      /* SWARM_PROTO_VERSION */
     uint8_t  type;         /* SWARM_MSG_CHECKIN */
+    uint16_t len;          /* v4 header: bytes after the 4-byte header, LE */
     uint8_t  power_mode;   /* SWARM_PM_*: the node's CURRENT (reported) mode */
     uint32_t wake_counter; /* monotonic per NVS, diagnostic only */
-} swarm_checkin_t;         /* 7 bytes */
+} swarm_checkin_t;         /* 9 bytes */
 
 /* Hub -> node, unicast, encrypted. Hub's reply to CHECKIN; carries command/arg
  * for the node to execute (e.g., change power mode, stay awake). */
 typedef struct __attribute__((packed)) {
-    uint8_t version;
-    uint8_t type;          /* SWARM_MSG_CHECKIN_ACK */
-    uint8_t command;       /* SWARM_CHECKIN_CMD_* */
-    uint8_t arg;
-} swarm_checkin_ack_t;     /* 4 bytes */
+    uint8_t  version;
+    uint8_t  type;          /* SWARM_MSG_CHECKIN_ACK */
+    uint16_t len;           /* v4 header: bytes after the 4-byte header, LE */
+    uint8_t  command;       /* SWARM_CHECKIN_CMD_* */
+    uint8_t  arg;
+} swarm_checkin_ack_t;     /* 6 bytes */
 
 /* Hub -> node, unicast, encrypted (an OTA session only ever targets an
  * already-adopted node, i.e. an existing encrypted peer -- unlike pairing
@@ -178,6 +225,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint32_t session_id;
     uint32_t total_len;
     uint8_t  sha256[32];
@@ -191,13 +239,13 @@ typedef struct __attribute__((packed)) {
  * byte, which is exactly what lets swarm_frame_type() reject anything of
  * the wrong length before a single field is read. This frame instead
  * carries `len` <= SWARM_OTA_CHUNK_DATA data bytes, and the encoded size on
- * the wire is ONLY header (8 bytes: version+type+offset+len) + len -- a
- * short final chunk is never padded out to SWARM_OTA_CHUNK_DATA.
+ * the wire is ONLY header (10 bytes: version+type+hdr_len+offset+len) + len
+ * -- a short final chunk is never padded out to SWARM_OTA_CHUNK_DATA.
  *
  * Consequence for the decoder contract: swarm_frame_type() cannot demand an
  * exact length for this type the way it does for every other frame -- it
  * only knows the buffer is *plausibly* an OTA_CHUNK if its length falls in
- * [8, 8+SWARM_OTA_CHUNK_DATA]. The real check -- that the `len` field
+ * [10, 10+SWARM_OTA_CHUNK_DATA]. The real check -- that the `len` field
  * embedded in the buffer exactly accounts for the buffer's actual length,
  * and that len itself is <= SWARM_OTA_CHUNK_DATA -- is swarm_decode_ota_chunk()'s
  * job, and it MUST run before any byte of `data` is touched. Get either
@@ -211,6 +259,15 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t hdr_len;                   /* v4 header: bytes after the 4-byte
+                                            header (offset + len + data), LE.
+                                            Distinct from `len` below, which
+                                            counts only the data bytes --
+                                            this struct already used that
+                                            name before v4, so the new
+                                            generic header field could not
+                                            reuse it. Filled by the encoder,
+                                            checked by swarm_frame_type(). */
     uint32_t offset;
     uint16_t len;                       /* <= SWARM_OTA_CHUNK_DATA */
     uint8_t  data[SWARM_OTA_CHUNK_DATA];
@@ -249,6 +306,7 @@ enum {
 typedef struct __attribute__((packed)) {
     uint8_t  version;
     uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
     uint32_t session_id;  /* echoed from the OTA_BEGIN that started this session */
     uint8_t  state;
     uint8_t  err;
@@ -260,10 +318,111 @@ typedef struct __attribute__((packed)) {
 /* Hub -> node, unicast, encrypted. Ends a session early: hub-initiated
  * abort, or the hub giving up after too many stalls/timeouts. */
 typedef struct __attribute__((packed)) {
-    uint8_t version;
-    uint8_t type;
-    uint8_t reason;
+    uint8_t  version;
+    uint8_t  type;
+    uint16_t len;         /* v4 header: bytes after the 4-byte header, LE */
+    uint8_t  reason;
 } swarm_ota_abort_t;
+
+/* M7 zigbee bridge frames (v4, types 13-20). Unlike every frame above,
+ * these are variable-length: each carries one or more counted arrays
+ * (name, cap list, action list) whose actual length depends on the data,
+ * not the struct layout. So none of these are __attribute__((packed)) wire
+ * structs copied byte for byte -- they are plain in-memory structs with NO
+ * header fields at all; their wire form is produced field-by-field by the
+ * matching swarm_encode_device_announce() / swarm_decode_device_announce()
+ * style function pair in swarm_frame.c (see its wr_t/rd_t cursor helpers),
+ * the same way swarm_ota_chunk_t's `data` payload already has to be handled
+ * specially. Keep it that way: do not add __attribute__((packed)) or a
+ * version/type/len header to these -- the header only exists on the wire,
+ * written by whdr()/wfinish(). */
+
+#define SWARM_ADDR_LEN 8
+#define SWARM_DEV_NAME_MAX 24
+#define SWARM_DEV_MAX_CAPS 4
+#define SWARM_DEV_MAX_ACTIONS 2
+
+/* Command ops (swarm_command_t.op) */
+enum { SWARM_CMD_PERMIT_JOIN = 1, SWARM_CMD_DEVICE_REMOVE = 2, SWARM_CMD_DEVICE_RENAME = 3,
+       SWARM_CMD_ACTUATE = 4, SWARM_CMD_RESYNC = 5 };
+/* Ack status (swarm_command_ack_t.status, swarm_node_config_ack_t.status) */
+enum { SWARM_ACK_ACCEPTED = 1, SWARM_ACK_DONE = 2, SWARM_ACK_FAILED = 3 };
+
+/* A zigbee end device's address: its short/group "kind" byte plus its
+ * 8-byte IEEE address. Shared by every M7 frame that names a device. */
+typedef struct { uint8_t kind; uint8_t addr[SWARM_ADDR_LEN]; } swarm_dev_addr_t;
+
+/* Bridge -> hub. A newly interviewed (or re-announced) zigbee end device:
+ * its address, endpoint, interview state, human name, and the capabilities
+ * (cap_id + zigbee cluster id pairs) and actions it exposes. */
+typedef struct {                       /* in-memory form; wire form is field-serialised */
+    swarm_dev_addr_t dev;
+    uint8_t  endpoint;
+    uint8_t  interviewed;
+    uint8_t  name_len;  char name[SWARM_DEV_NAME_MAX];
+    uint8_t  cap_count; uint8_t cap_ids[SWARM_DEV_MAX_CAPS]; uint16_t cap_clusters[SWARM_DEV_MAX_CAPS];
+    uint8_t  action_count; uint8_t action_ids[SWARM_DEV_MAX_ACTIONS];
+} swarm_device_announce_t;
+
+/* Bridge -> hub. A previously announced device has left the network. */
+typedef struct { swarm_dev_addr_t dev; } swarm_device_gone_t;
+
+/* Bridge -> hub. One capability reading from one zigbee end device. */
+typedef struct { swarm_dev_addr_t dev; uint8_t cap_id; float value; uint32_t age_s; } swarm_measurement_t;
+
+/* Bridge -> hub. The bridge node's zigbee coordinator status (network
+ * formed, channel/PAN, permit-join countdown, device count). */
+typedef struct { uint8_t radio_role; uint8_t formed; uint8_t channel; uint16_t pan_id; uint8_t permit_s; uint8_t device_count; } swarm_coord_status_t;
+
+/* Hub -> bridge. Directs the bridge's zigbee coordinator to act on a
+ * device (permit-join, remove, rename, actuate) or resync its state. */
+typedef struct { uint16_t seq; uint16_t ttl_s; uint8_t op; swarm_dev_addr_t dev; uint16_t arg; uint8_t name_len; char name[SWARM_DEV_NAME_MAX]; } swarm_command_t;
+
+/* Bridge -> hub. Reply to a COMMAND, correlated by seq. */
+typedef struct { uint16_t seq; uint8_t op; uint8_t status; uint8_t detail; } swarm_command_ack_t;
+
+/* Hub -> node. Directs a node to switch its radio_role (BLE relay <->
+ * zigbee bridge) and reboot into it; see radio_role.h. */
+typedef struct { uint16_t seq; uint8_t radio_role; } swarm_node_config_t;
+
+/* Node -> hub. Reply to a NODE_CONFIG, correlated by seq. */
+typedef struct { uint16_t seq; uint8_t status; } swarm_node_config_ack_t;
+
+/* M7 Task 5: the tagged union a node's forwarder (swarm.c's forward_task(),
+ * and its RAM backlog, swarm_buf.c) actually queues and buffers. Before
+ * this task the node only ever forwarded one shape (swarm_reading_t, the
+ * BLE relay path); a zigbee-role node now also forwards device announces/
+ * goodbyes, per-capability measurements and its own coordinator status --
+ * four more outgoing shapes that all share the same queue, the same RAM
+ * backlog ring and the same "encode and espnow_link_send()" tail end of
+ * forward_task(). A tagged union is what lets one queue element type and
+ * one ring-entry type carry any of the five without forward_task() having
+ * to special-case its plumbing per shape -- only its encode switch (see
+ * swarm.c) needs to know the tag.
+ *
+ * Defined here, not in swarm.h/swarm_buf.h, specifically so a host test
+ * (tests/host/test_swarm_buf.c) that only pulls in swarm_buf.h -> this
+ * header can see it too, with no FreeRTOS/ESP-IDF dependency -- exactly
+ * the same reasoning swarm_buf.c/.h's own header comments give for why
+ * that ring is pure C in the first place. */
+typedef enum {
+    SWARM_OUT_READING     = 1,
+    SWARM_OUT_MEASUREMENT = 2,
+    SWARM_OUT_ANNOUNCE    = 3,
+    SWARM_OUT_GONE        = 4,
+    SWARM_OUT_STATUS      = 5,
+} swarm_out_tag_t;
+
+typedef struct {
+    uint8_t tag; /* SWARM_OUT_* above */
+    union {
+        swarm_reading_t          reading;
+        swarm_measurement_t      meas;
+        swarm_device_announce_t  ann;
+        swarm_device_gone_t      gone;
+        swarm_coord_status_t     status;
+    } u;
+} swarm_out_t;
 
 int  swarm_frame_type(const uint8_t *buf, size_t len);
 bool swarm_decode_pair_req(const uint8_t *buf, size_t len, swarm_pair_req_t *out);
@@ -290,3 +449,27 @@ size_t swarm_encode_ota_begin(const swarm_ota_begin_t *in, uint8_t *out, size_t 
 size_t swarm_encode_ota_chunk(const swarm_ota_chunk_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_ota_status(const swarm_ota_status_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_ota_abort(const swarm_ota_abort_t *in, uint8_t *out, size_t cap);
+
+/* M7 zigbee bridge frames (variable-length, field-serialised -- see the
+ * comment above swarm_device_announce_t). */
+bool swarm_decode_device_announce(const uint8_t *buf, size_t len, swarm_device_announce_t *out);
+bool swarm_decode_device_gone(const uint8_t *buf, size_t len, swarm_device_gone_t *out);
+bool swarm_decode_measurement(const uint8_t *buf, size_t len, swarm_measurement_t *out);
+bool swarm_decode_coord_status(const uint8_t *buf, size_t len, swarm_coord_status_t *out);
+bool swarm_decode_command(const uint8_t *buf, size_t len, swarm_command_t *out);
+bool swarm_decode_command_ack(const uint8_t *buf, size_t len, swarm_command_ack_t *out);
+bool swarm_decode_node_config(const uint8_t *buf, size_t len, swarm_node_config_t *out);
+bool swarm_decode_node_config_ack(const uint8_t *buf, size_t len, swarm_node_config_ack_t *out);
+size_t swarm_encode_device_announce(const swarm_device_announce_t *in, uint8_t *out, size_t cap);
+size_t swarm_encode_device_gone(const swarm_device_gone_t *in, uint8_t *out, size_t cap);
+size_t swarm_encode_measurement(const swarm_measurement_t *in, uint8_t *out, size_t cap);
+size_t swarm_encode_coord_status(const swarm_coord_status_t *in, uint8_t *out, size_t cap);
+size_t swarm_encode_command(const swarm_command_t *in, uint8_t *out, size_t cap);
+size_t swarm_encode_command_ack(const swarm_command_ack_t *in, uint8_t *out, size_t cap);
+size_t swarm_encode_node_config(const swarm_node_config_t *in, uint8_t *out, size_t cap);
+size_t swarm_encode_node_config_ack(const swarm_node_config_ack_t *in, uint8_t *out, size_t cap);
+
+/* Node -> hub liveness poll (see SWARM_MSG_POLL above): header only, no
+ * in-memory struct to encode from -- unlike every other encoder in this
+ * file, this one just writes the 4-byte v4 header with len = 0. */
+size_t swarm_encode_poll(uint8_t *out, size_t cap);

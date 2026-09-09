@@ -30,6 +30,7 @@
 #include "freertos/semphr.h"
 #include "esp_zigbee_core.h"
 #include "esp_coexist.h"
+#include "esp_ieee802154.h"
 #include "wifi_manager.h"
 #include "esp_wifi.h"
 #include "ble_collector.h"
@@ -53,6 +54,32 @@
 #include "actor_persist.h"
 
 static const char *TAG = "zigbee";
+
+/* M7 Task 3: set once by main.c (zigbee_set_on_node()) right before the
+ * radio block, from swarm_role_t -- deliberately a plain file-static bool
+ * rather than a call into the swarm component (swarm_store_role()), which
+ * would create a CMake dependency cycle once swarm depends on zigbee
+ * (Task 5). Defaults to false (hub) until main.c calls the setter. */
+static bool s_on_node = false;
+
+void zigbee_set_on_node(bool on_node) { s_on_node = on_node; }
+bool zigbee_on_node(void) { return s_on_node; }
+
+/* M7 Task 5: swarm.c's bridge into the device/status tables -- see this
+ * file's header comment on zigbee_set_device_observer()/
+ * zigbee_set_status_observer() for the calling contract (non-blocking
+ * queue send only, runs on the caller's own task). Plain file-static
+ * function pointers: at most one consumer ever registers (a device runs
+ * one radio role for the life of a boot), so there is no list and no
+ * unregister. NULL until swarm_start_node() sets them, which is a safe
+ * default -- a hub, or a node not running the zigbee role, never sets
+ * either, and every call site below already guards on `if (s_observer)`/
+ * `if (s_status_observer)`. */
+static zigbee_device_observer_t s_observer;
+static zigbee_status_observer_t s_status_observer;
+
+void zigbee_set_device_observer(zigbee_device_observer_t fn) { s_observer = fn; }
+void zigbee_set_status_observer(zigbee_status_observer_t fn) { s_status_observer = fn; }
 
 /* Whole-branch review, FIX 6: main.c's log_heap("after ble_collector_start")
  * fires before zigbee_start() is even called, and this stack forms/restores
@@ -227,6 +254,12 @@ static void record_net_info(uint8_t *out_channel, uint16_t *out_pan_id)
     portEXIT_CRITICAL(&s_mux);
     if (out_channel) *out_channel = channel;
     if (out_pan_id) *out_pan_id = pan_id;
+    /* M7 Task 5: covers both signal handler callers of this function --
+     * ESP_ZB_BDB_SIGNAL_FORMATION (first-start) and the restore branch of
+     * ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START/_REBOOT -- so a zigbee-role
+     * node's COORD_STATUS goes out the moment its network actually exists,
+     * not just after its next CHECKIN. */
+    if (s_status_observer) s_status_observer();
 }
 
 /* Required by the esp-zigbee-lib SDK: every signal the stack raises (BDB
@@ -304,14 +337,44 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
              * zigbee-on-hub trade-off, made explicitly. Overrides
              * espnow_link_init()'s WIFI_PS_NONE, which ran earlier in
              * boot; the setting survives the permit-window stop/start. */
-            esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-            ESP_LOGI(TAG, "zigbee role: WiFi modem sleep on (%s)", esp_err_to_name(ps_err));
+            if (!zigbee_on_node()) {
+                esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+                ESP_LOGI(TAG, "zigbee role: WiFi modem sleep on (%s)", esp_err_to_name(ps_err));
+            } else {
+                /* A Zigbee-role node runs ESP-NOW (not a web UI/portal) on
+                 * its WiFi radio -- modem sleep would delay/drop the
+                 * unicast forward traffic swarm.c depends on, so this
+                 * hub-only power trick stays off on a node. */
+                ESP_LOGI(TAG, "zigbee role on a node: WiFi power save stays off for ESP-NOW");
+            }
             if (coex_err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_coex_wifi_i154_enable failed (%s); WiFi and "
                               "802.15.4 will contend unarbitrated",
                          esp_err_to_name(coex_err));
             } else {
                 ESP_LOGI(TAG, "WiFi/802.15.4 coexistence enabled");
+                if (zigbee_on_node()) {
+                    /* Bench finding (M7 gate 2, 2026-09-08): with the stack's
+                     * default arbitration a bridge node stopped MAC-acking the
+                     * hub's ESP-NOW unicasts as soon as its coordinator was up
+                     * (the hub's PERMIT command failed twice at the link layer
+                     * and timed out; only a RESYNC sent 1 s after the node's
+                     * own frame got through). The coordinator's idle listening
+                     * must yield to WiFi on a node -- ESP-NOW is its only link
+                     * to the hub -- so lower the 802.15.4 idle/txrx priority.
+                     * The zigbee side pays with retransmissions (measured
+                     * tolerable on the hub in the radio-role work). */
+                    esp_ieee802154_coex_config_t cc = esp_ieee802154_get_coex_config();
+                    ESP_LOGI(TAG, "802.15.4 coex config default: idle=%d txrx=%d txrx_at=%d",
+                             (int)cc.idle, (int)cc.txrx, (int)cc.txrx_at);
+                    cc.idle = IEEE802154_IDLE;
+                    cc.txrx = IEEE802154_LOW;
+                    cc.txrx_at = IEEE802154_MIDDLE;
+                    esp_ieee802154_set_coex_config(cc);
+                    cc = esp_ieee802154_get_coex_config();
+                    ESP_LOGI(TAG, "802.15.4 coex config on node: idle=%d txrx=%d txrx_at=%d",
+                             (int)cc.idle, (int)cc.txrx, (int)cc.txrx_at);
+                }
             }
         }
 #else
@@ -1222,6 +1285,11 @@ static void zb_iv_handle_store(void)
 
     ESP_LOGI(TAG, "device %d interviewed: %u capability(ies), %u action(s)", dev_idx,
              (unsigned)dev->cap_count, (unsigned)dev->action_count);
+
+    /* M7 Task 5: a zigbee-role node's forwarder announces this device to
+     * the hub now that its interview succeeded. `dev` is s_iv.dev, a
+     * complete record -- the same shape zigbee_device_list() hands out. */
+    if (s_observer) s_observer(dev, false);
 }
 
 /* The stack task. Owns esp_zb_stack_main_loop() for the life of the
@@ -1392,7 +1460,10 @@ static void zb_scan_hold_cb(uint8_t param)
     deadline = s_permit_join_deadline_us;
     portEXIT_CRITICAL(&s_mux);
     if (deadline == 0) return;
-    wifi_manager_radio_pause();
+    /* A zigbee-role node's WiFi radio carries ESP-NOW, not a hub's STA/AP
+     * pair -- wifi_manager owns none of it there, so pausing it would be a
+     * no-op at best and a wrong call into an unrelated radio at worst. */
+    if (!zigbee_on_node()) wifi_manager_radio_pause();
     esp_err_t err = ble_collector_scan_hold(true);
     if (err == ESP_ERR_INVALID_STATE) {
         /* One radio per node: this hub never started the BLE collector, so
@@ -1419,8 +1490,9 @@ static void zb_permit_expiry_cb(uint8_t param)
      * A hold alarm still pending (window closed within its 0.8 s defer)
      * is cancelled so it cannot re-hold a radio nobody will release. */
     esp_zb_scheduler_alarm_cancel(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM);
-    /* Give WiFi its air back (see zigbee_permit_join / wifi_manager.h). */
-    wifi_manager_radio_resume();
+    /* Give WiFi its air back (see zigbee_permit_join / wifi_manager.h). See
+     * zb_scan_hold_cb's matching guard above for why a node skips this. */
+    if (!zigbee_on_node()) wifi_manager_radio_resume();
     esp_err_t err = ble_collector_scan_hold(false);
     if (err == ESP_ERR_INVALID_STATE) {
         /* No BLE collector in this role -- nothing was held, so there is no
@@ -1429,6 +1501,10 @@ static void zb_permit_expiry_cb(uint8_t param)
     } else {
         ESP_LOGI(TAG, "permit-join window over; BLE scan released, TC link key exchange required again");
     }
+    /* M7 Task 5: the window just closed (expiry, or the post-join grace
+     * period above) -- report the now-zero permit_s promptly rather than
+     * waiting for the node's next periodic CHECKIN. */
+    if (s_status_observer) s_status_observer();
 }
 
 bool zigbee_permit_join(void)
@@ -1495,6 +1571,9 @@ bool zigbee_permit_join(void)
     portENTER_CRITICAL(&s_mux);
     s_permit_join_deadline_us = esp_timer_get_time() + (int64_t)CONFIG_PLANTHUB_ZB_PERMIT_JOIN_S * 1000000;
     portEXIT_CRITICAL(&s_mux);
+    /* M7 Task 5: the window just opened -- see zb_permit_expiry_cb() for
+     * the matching close-side call. */
+    if (s_status_observer) s_status_observer();
     return true;
 }
 
@@ -1535,6 +1614,20 @@ int zigbee_device_list(zb_device_t *out, size_t max)
     return (int)n;
 }
 
+int zigbee_device_count(void)
+{
+    bool started;
+    portENTER_CRITICAL(&s_mux);
+    started = s_started;
+    portEXIT_CRITICAL(&s_mux);
+    if (!started) return 0;
+
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+    int n = s_store.count;
+    xSemaphoreGive(s_store_mutex);
+    return n;
+}
+
 bool zigbee_device_rename(const uint8_t eui64[8], const char *name)
 {
     bool started;
@@ -1545,6 +1638,7 @@ bool zigbee_device_rename(const uint8_t eui64[8], const char *name)
 
     xSemaphoreTake(s_store_mutex, portMAX_DELAY);
     bool ok = false;
+    zb_device_t renamed;
     int idx = zb_store_find(&s_store, eui64);
     if (idx >= 0) {
         zb_device_t d = s_store.dev[idx];
@@ -1552,10 +1646,20 @@ bool zigbee_device_rename(const uint8_t eui64[8], const char *name)
         d.name[ZB_STORE_NAME_MAX - 1] = '\0';
         /* Same EUI-64: zb_store_upsert() replaces this entry in place
          * rather than appending a second one. */
-        ok = zb_store_upsert(&s_store, &d) >= 0;
-        if (ok) zb_store_save();
+        int new_idx = zb_store_upsert(&s_store, &d);
+        ok = new_idx >= 0;
+        if (ok) {
+            zb_store_save();
+            /* M7 Task 5: copy the record out under the mutex before
+             * releasing it and calling the observer, per this function's
+             * own contract (see zigbee_set_device_observer()'s header
+             * comment) -- the observer must never see s_store touched
+             * concurrently. */
+            renamed = s_store.dev[new_idx];
+        }
     }
     xSemaphoreGive(s_store_mutex);
+    if (ok && s_observer) s_observer(&renamed, false);
     return ok;
 }
 
@@ -1570,10 +1674,18 @@ bool zigbee_device_remove(const uint8_t eui64[8])
     xSemaphoreTake(s_store_mutex, portMAX_DELAY);
     int idx = zb_store_find(&s_store, eui64);
     uint16_t short_addr = (idx >= 0) ? s_store.dev[idx].short_addr : 0;
+    /* M7 Task 5: copy the record out BEFORE it is erased -- the observer
+     * (fired after the removal, below) needs to report which device is
+     * gone, and there is nothing left in s_store to read from once
+     * zb_store_remove() has compacted it away. */
+    zb_device_t removed_copy;
+    bool have_copy = idx >= 0;
+    if (have_copy) removed_copy = s_store.dev[idx];
     bool removed = zb_store_remove(&s_store, eui64);
     if (removed) zb_store_save();
     xSemaphoreGive(s_store_mutex);
     if (!removed) return false;
+    if (have_copy && s_observer) s_observer(&removed_copy, true);
 
     /* registry.h has no delete (Task 6 brief): the registry entry this
      * device may have had -- its capability readings, and, if it was an
@@ -1679,6 +1791,21 @@ int zigbee_device_list(zb_device_t *out, size_t max)
     (void)out;
     (void)max;
     return 0;
+}
+
+int zigbee_device_count(void)
+{
+    return 0;
+}
+
+void zigbee_set_device_observer(zigbee_device_observer_t fn)
+{
+    (void)fn;
+}
+
+void zigbee_set_status_observer(zigbee_status_observer_t fn)
+{
+    (void)fn;
 }
 
 bool zigbee_device_rename(const uint8_t eui64[8], const char *name)
