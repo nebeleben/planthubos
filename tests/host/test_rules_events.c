@@ -80,14 +80,16 @@ int main(void)
     assert(resolve_button_test(&b) == 0);
 
     /* a press arriving after that pass's high-water mark survives a
-     * consume_through() bounded below it (mid-pass press, next pass sees it) */
+     * consume_through() bounded at its earlier seq (mid-pass press, next pass sees it) */
     assert(data_core_submit_event(&b, CAP_BUTTON_ACTION, 1));
-    uint32_t seq_before = data_core_events_peek_seq();
-    assert(data_core_submit_event(&b, CAP_BUTTON_ACTION, 1));
-    uint32_t seq_after = data_core_events_peek_seq();
-    assert(seq_after > seq_before);
-    data_core_events_consume_through(seq_before - 1);   /* an earlier snapshot's bound */
-    assert(resolve_button_test(&b) == 1);
+    uint32_t seq_first = data_core_events_peek_seq();
+    assert(data_core_submit_event(&b, CAP_BUTTON_ACTION, 2));
+    int16_t code_after_consume;
+    data_core_events_consume_through(seq_first);   /* consume through the earlier press's seq */
+    /* the earlier press (code 1, seq_first) is consumed; the later one (code 2, seq > seq_first)
+     * survives; data_core_events_for() returns the most-recent, so code is 2 */
+    assert(data_core_events_for(&b, CAP_BUTTON_ACTION, &code_after_consume));
+    assert(code_after_consume == 2);
 
     printf("test_rules_events: OK\n");
     return 0;
