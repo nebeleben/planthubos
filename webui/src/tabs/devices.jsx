@@ -13,6 +13,24 @@ function fmtAge(ageS) {
   return `${Math.round(ageS / 3600)}h ago`
 }
 
+// button.action (id 9, spec's zigbee-button-support amendment) reports a
+// press-code enum, not a numeric+unit reading -- capability.c's own
+// PRESS_LABEL values, mirrored here the same way actuators.js's
+// switchStateLabel() mirrors switch.state's ON/OFF encoding rather than
+// printing a raw 0/1. Unknown code (a firmware ahead of this UI) still
+// shows the raw number instead of disappearing; a never-reported cap
+// (value null, e.g. the button hasn't been pressed since pairing) reads as
+// "waiting for a press" rather than fmtCap's usual "–", since "no data"
+// undersells "this is a button, it just hasn't fired yet".
+const PRESS_LABEL = { 0: 'hold', 1: 'single', 2: 'double', 3: 'triple', 255: 'release' }
+function fmtCapValue(caps, c) {
+  const meta = caps && caps.get(c.id)
+  if (meta && meta.name === 'button.action') {
+    return c.value == null ? 'waiting for a press' : `last: ${PRESS_LABEL[c.value] ?? `code ${c.value}`}`
+  }
+  return fmtCap(caps, c.id, c.value)
+}
+
 const KIND_LABEL = { ble: 'Bluetooth', espnow: 'ESP-NOW', zb: 'Zigbee' }
 // Fixed display order regardless of which kinds are actually present --
 // stable groupings read better than "whatever order the registry happened
@@ -429,7 +447,7 @@ function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, f
                 {d.caps.map((c) => (
                   <tr key={c.id}>
                     <td>{capLabel(caps, c.id)}</td>
-                    <td>{fmtCap(caps, c.id, c.value)}</td>
+                    <td>{fmtCapValue(caps, c)}</td>
                     <td class="hint">{fmtAge(c.age_s)}</td>
                   </tr>
                 ))}

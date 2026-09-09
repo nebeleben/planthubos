@@ -659,6 +659,17 @@ export function RulesTab() {
         )}
         <textarea class="rule-source mono" rows={12} value={source} spellcheck={false}
                   onInput={(e) => onSourceChange(e.currentTarget.value)} />
+        {/* button.action's value is a press-code enum, not a plain reading --
+            this doesn't fit in the compiler's own error/hint surface (no
+            compiler change here), so it's a plain source-text sniff: any
+            rule referencing button.action gets the decode table right
+            under the editor, regardless of where in the source it appears. */}
+        {source.includes('button.action') && (
+          <p class="hint">
+            Press codes: 1 single · 2 double · 3 triple · 0 hold · 255 release. Use edge mode, e.g.{' '}
+            device("zb:...").button.action == 1
+          </p>
+        )}
         <p>
           <button type="button" class="btn-primary" onClick={onCompile}>Compile</button>
           {' '}
