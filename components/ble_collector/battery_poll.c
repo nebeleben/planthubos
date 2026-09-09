@@ -225,17 +225,6 @@ static void handle_tick(void)
         return;
     }
 
-    /* M6b: a Zigbee permit-join window owns the antenna. This poller does
-     * not merely scan -- it ble_gap_connect()s, which is exactly the
-     * airtime that stops the coordinator answering beacon requests inside
-     * a joining device's window. Deferred on the same terms as the GATT
-     * case above: last_attempt_s is NOT advanced, so the poll happens
-     * once the window closes rather than being skipped for an hour. */
-    if (ble_collector_scan_is_held()) {
-        ESP_LOGD(TAG, "skipping this poll tick: Zigbee permit-join holds the radio");
-        return;
-    }
-
     uint32_t now = now_s();
 
     xSemaphoreTake(s_batt_mutex, portMAX_DELAY);

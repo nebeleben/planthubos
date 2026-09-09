@@ -33,7 +33,6 @@
 #include "esp_ieee802154.h"
 #include "wifi_manager.h"
 #include "esp_wifi.h"
-#include "ble_collector.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -142,9 +141,9 @@ static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
  * radio hold is released. */
 #define ZB_PERMIT_ALARM_PARAM 0u
 #define ZB_POST_JOIN_RELEASE_MS 15000u
-#define ZB_SCAN_HOLD_DELAY_MS 800u
+#define ZB_PERMIT_PAUSE_DELAY_MS 800u
 static void zb_permit_expiry_cb(uint8_t param);
-static void zb_scan_hold_cb(uint8_t param);
+static void zb_permit_wifi_pause_cb(uint8_t param);
 static bool     s_started;                 /* zigbee_start() created the task */
 static bool     s_formed;                  /* a network exists (formed or restored) */
 static uint8_t  s_channel;
@@ -1446,16 +1445,17 @@ bool zigbee_net_info(uint8_t *channel, uint16_t *pan_id, bool *formed)
  * out the full window costs nothing in security: the early close already
  * called esp_zb_bdb_close_network(), so nothing can join in the meantime
  * whatever this setting says. */
-/* Deferred entry to the BLE hold. Holding the scan kills the hub's WiFi
- * for the window (measured; see the radio-role-config spec section 8), and
- * doing it synchronously inside the permit POST handler made the HTTP
- * response race the WiFi death -- sometimes the operator's own "pairing
- * started" reply never arrived. Deferring by ZB_SCAN_HOLD_DELAY_MS lets
- * the response out first; the window itself is already open, and 0.8 s of
- * un-held beacons at the very start of a 180 s window costs nothing. The
- * deadline guard keeps a stale alarm from holding the radio after the
- * window it belonged to has already closed. */
-static void zb_scan_hold_cb(uint8_t param)
+/* Deferred WiFi pause for a hub-in-zigbee-role permit window. Pausing WiFi
+ * kills the hub's STA for the window (measured; see the radio-role-config
+ * spec section 8: with coex arbitration on, a joining device's MAC ACK
+ * never gets through while WiFi holds the antenna), and doing it
+ * synchronously inside the permit POST handler made the HTTP response race
+ * the WiFi death -- sometimes the operator's own "pairing started" reply
+ * never arrived. Deferring by ZB_PERMIT_PAUSE_DELAY_MS lets the response
+ * out first; the window is already open, and 0.8 s at the very start of a
+ * 180 s window costs nothing. The deadline guard keeps a stale alarm from
+ * pausing WiFi after the window it belonged to has already closed. */
+static void zb_permit_wifi_pause_cb(uint8_t param)
 {
     (void)param;
     int64_t deadline;
@@ -1465,16 +1465,9 @@ static void zb_scan_hold_cb(uint8_t param)
     if (deadline == 0) return;
     /* A zigbee-role node's WiFi radio carries ESP-NOW, not a hub's STA/AP
      * pair -- wifi_manager owns none of it there, so pausing it would be a
-     * no-op at best and a wrong call into an unrelated radio at worst. */
+     * no-op at best and a wrong call into an unrelated radio at worst. So
+     * this fires only on a hub that itself runs the zigbee role. */
     if (!zigbee_on_node()) wifi_manager_radio_pause();
-    esp_err_t err = ble_collector_scan_hold(true);
-    if (err == ESP_ERR_INVALID_STATE) {
-        /* One radio per node: this hub never started the BLE collector, so
-         * there is nothing to hold. Expected in the zigbee role -- a DEBUG
-         * breadcrumb, not the INFO ble_collector.c logs when it actually
-         * held a live scan. */
-        ESP_LOGD(TAG, "BLE scan hold skipped: no BLE in this role");
-    }
 }
 
 static void zb_permit_expiry_cb(uint8_t param)
@@ -1487,23 +1480,13 @@ static void zb_permit_expiry_cb(uint8_t param)
     portENTER_CRITICAL(&s_mux);
     s_permit_join_deadline_us = 0;
     portEXIT_CRITICAL(&s_mux);
-    /* Give the BLE radio back. Released here and only here, for the same
-     * reason the link-key requirement is restored here: the window is over,
-     * so nothing further depends on the 802.15.4 radio having priority.
-     * A hold alarm still pending (window closed within its 0.8 s defer)
-     * is cancelled so it cannot re-hold a radio nobody will release. */
-    esp_zb_scheduler_alarm_cancel(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM);
+    /* A pause alarm still pending (window closed within its 0.8 s defer)
+     * is cancelled so it cannot re-pause a radio nobody will resume. */
+    esp_zb_scheduler_alarm_cancel(zb_permit_wifi_pause_cb, ZB_PERMIT_ALARM_PARAM);
     /* Give WiFi its air back (see zigbee_permit_join / wifi_manager.h). See
-     * zb_scan_hold_cb's matching guard above for why a node skips this. */
+     * zb_permit_wifi_pause_cb's matching guard for why a node skips this. */
     if (!zigbee_on_node()) wifi_manager_radio_resume();
-    esp_err_t err = ble_collector_scan_hold(false);
-    if (err == ESP_ERR_INVALID_STATE) {
-        /* No BLE collector in this role -- nothing was held, so there is no
-         * resume to report, loud or otherwise (see zb_scan_hold_cb above). */
-        ESP_LOGD(TAG, "BLE scan release skipped: no BLE in this role");
-    } else {
-        ESP_LOGI(TAG, "permit-join window over; BLE scan released, TC link key exchange required again");
-    }
+    ESP_LOGI(TAG, "permit-join window over; TC link key exchange required again");
     /* M7 Task 5: the window just closed (expiry, or the post-join grace
      * period above) -- report the now-zero permit_s promptly rather than
      * waiting for the node's next periodic CHECKIN. */
@@ -1545,17 +1528,15 @@ bool zigbee_permit_join(void)
                            (uint32_t)CONFIG_PLANTHUB_ZB_PERMIT_JOIN_S * 1000u);
     esp_zb_lock_release();
 
-    /* Quiet BLE for the window. Measured on both a C5 and a C6: with this
-     * scan running the coordinator answers 0 of ~15 beacon requests, and a
-     * joining device gets MAC_NO_BEACON and gives up. Scheduled rather
-     * than called: see zb_scan_hold_cb for why the HTTP response must beat
-     * the hold onto the wire. */
-    esp_zb_scheduler_alarm_cancel(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM);
-    esp_zb_scheduler_alarm(zb_scan_hold_cb, ZB_PERMIT_ALARM_PARAM, ZB_SCAN_HOLD_DELAY_MS);
+    /* Pause WiFi for the window (hub-in-zigbee-role only; a bridge node
+     * keeps WiFi for ESP-NOW -- see zb_permit_wifi_pause_cb's guard).
+     * Scheduled rather than called so this HTTP response beats the pause
+     * (STA stop) onto the wire. */
+    esp_zb_scheduler_alarm_cancel(zb_permit_wifi_pause_cb, ZB_PERMIT_ALARM_PARAM);
+    esp_zb_scheduler_alarm(zb_permit_wifi_pause_cb, ZB_PERMIT_ALARM_PARAM, ZB_PERMIT_PAUSE_DELAY_MS);
 
-    /* WiFi itself is paused (STA stopped) from zb_scan_hold_cb, on the
-     * same 0.8 s defer as the BLE hold, so this HTTP response gets out
-     * first. See wifi_manager.h for the measurement behind it: with coex
+    /* The pause stops the STA for the window. See wifi_manager.h for the
+     * measurement behind it: with coex
      * arbitration on, beacons still go out but the MAC ACK a joining
      * device needs never does, so association is impossible while WiFi
      * holds any claim on the antenna. Modem sleep was tried first and
