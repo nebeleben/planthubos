@@ -1041,10 +1041,18 @@ static void bridge_task(void *arg)
                 /* data_core_submit_cap_id_aged() already logs its own
                  * reason (too old, out-of-range value, or registry full)
                  * on a false return -- nothing further to log here. */
-                bool ok = data_core_submit_cap_id_aged(&id, it.u.meas.cap_id, it.u.meas.value, age_for_data_core);
-                ESP_LOGI(TAG, "bridge: measurement from " MACSTR " cap %u value %.3f age %us -> %s",
-                         MAC2STR(it.mac), it.u.meas.cap_id, (double)it.u.meas.value, (unsigned)age_for_data_core,
-                         ok ? "accepted" : "rejected");
+                const capability_t *mc = capability_get(it.u.meas.cap_id);
+                bool ok;
+                if (mc && mc->event) {
+                    ok = data_core_submit_event(&id, it.u.meas.cap_id, (int16_t)it.u.meas.value);
+                    ESP_LOGI(TAG, "bridge: event from " MACSTR " cap %u code %d -> %s",
+                             MAC2STR(it.mac), it.u.meas.cap_id, (int)it.u.meas.value, ok ? "queued" : "dropped");
+                } else {
+                    ok = data_core_submit_cap_id_aged(&id, it.u.meas.cap_id, it.u.meas.value, age_for_data_core);
+                    ESP_LOGI(TAG, "bridge: measurement from " MACSTR " cap %u value %.3f age %us -> %s",
+                             MAC2STR(it.mac), it.u.meas.cap_id, (double)it.u.meas.value, (unsigned)age_for_data_core,
+                             ok ? "accepted" : "rejected");
+                }
                 if (ok) rules_notify_value_update();
                 break;
             }

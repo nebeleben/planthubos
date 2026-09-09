@@ -829,9 +829,16 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
 
     device_id_t id = { .kind = DEV_KIND_ZIGBEE };
     memcpy(id.addr, eui64, 8);
-    bool accepted = data_core_submit_cap_id(&id, cap, value);
-    ESP_LOGI(TAG, "report: cap %u value %.3f -> data_core %s", cap, (double)value,
-             accepted ? "accepted" : "rejected (device not in registry?)");
+    const capability_t *cdef = capability_get(cap);
+    bool accepted;
+    if (cdef && cdef->event) {
+        accepted = data_core_submit_event(&id, cap, (int16_t)value);
+        ESP_LOGI(TAG, "report: event cap %u code %d -> %s", cap, (int)value, accepted ? "queued" : "dropped");
+    } else {
+        accepted = data_core_submit_cap_id(&id, cap, value);
+        ESP_LOGI(TAG, "report: cap %u value %.3f -> data_core %s", cap, (double)value,
+                 accepted ? "accepted" : "rejected (device not in registry?)");
+    }
 
     /* Cap-list backfill (2026-09-10): a device can stream a real value on a
      * mapped cluster the interview never enumerated -- Xiaomi's older
