@@ -45,6 +45,9 @@ static const uint8_t ESPNOW_PMK[16] = "planthub-pmk-v1";
 static espnow_rx_cb_t s_rx_cb;
 static SemaphoreHandle_t s_send_lock;   /* serializes espnow_link_send/broadcast callers */
 static SemaphoreHandle_t s_send_done;   /* signalled by the ESP-NOW send callback */
+static uint32_t s_send_wait_ms = 200;   /* see espnow_link_set_send_wait_ms() */
+
+void espnow_link_set_send_wait_ms(uint32_t ms) { s_send_wait_ms = ms ? ms : 200; }
 static volatile esp_now_send_status_t s_last_status;
 
 /* Ticket numbers used to attribute a send completion to the call that
@@ -348,7 +351,7 @@ static esp_err_t send_blocking(const uint8_t *mac, const uint8_t *data, size_t l
 
     esp_err_t err = esp_now_send(mac, data, len);
     if (err == ESP_OK) {
-        if (xSemaphoreTake(s_send_done, pdMS_TO_TICKS(200)) == pdTRUE &&
+        if (xSemaphoreTake(s_send_done, pdMS_TO_TICKS(s_send_wait_ms)) == pdTRUE &&
             s_send_complete_seq == my_ticket) {
             err = (s_last_status == ESP_NOW_SEND_SUCCESS) ? ESP_OK : ESP_FAIL;
         } else {

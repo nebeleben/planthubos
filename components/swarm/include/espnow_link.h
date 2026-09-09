@@ -50,6 +50,13 @@ esp_err_t espnow_link_remove_peer(const uint8_t mac[6]);
  * espnow_rx_cb_t callback (see header note above). */
 esp_err_t espnow_link_send(const uint8_t mac[6], const uint8_t *data, size_t len);
 
+/* How long espnow_link_send() waits for the ESP-NOW send-done callback before
+ * reporting ESP_ERR_TIMEOUT. Default 200 ms. A node running the 802.15.4
+ * coordinator next to WiFi (zigbee radio role) sees the callback arrive far
+ * later than that even for delivered frames -- it sets 1000 ms at start.
+ * Bench finding, M7 gate 5 (2026-09-08). */
+void espnow_link_set_send_wait_ms(uint32_t ms);
+
 /* Sends to the broadcast peer. Same blocking/threading rules as
  * espnow_link_send(); note ESP-NOW broadcast has no MAC-layer ACK, so
  * ESP_OK here only means the frame was queued and handed to the radio, not

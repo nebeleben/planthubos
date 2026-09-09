@@ -938,6 +938,7 @@ static void bridge_task(void *arg)
              * s_bridges_mutex. */
             bool need_resync = false;
             const bridge_cmd_t *flush_cmd = NULL;
+            bool do_cfg_flush = false;
             /* I2 fix: bridge_save() is no longer called per item -- ANNOUNCE/
              * GONE/STATUS-with-change below call mark_bridge_dirty(now_s)
              * instead (defined above, next to s_bridge_dirty), and this
@@ -1040,8 +1041,11 @@ static void bridge_task(void *arg)
                 /* data_core_submit_cap_id_aged() already logs its own
                  * reason (too old, out-of-range value, or registry full)
                  * on a false return -- nothing further to log here. */
-                if (data_core_submit_cap_id_aged(&id, it.u.meas.cap_id, it.u.meas.value, age_for_data_core))
-                    rules_notify_value_update();
+                bool ok = data_core_submit_cap_id_aged(&id, it.u.meas.cap_id, it.u.meas.value, age_for_data_core);
+                ESP_LOGI(TAG, "bridge: measurement from " MACSTR " cap %u value %.3f age %us -> %s",
+                         MAC2STR(it.mac), it.u.meas.cap_id, (double)it.u.meas.value, (unsigned)age_for_data_core,
+                         ok ? "accepted" : "rejected");
+                if (ok) rules_notify_value_update();
                 break;
             }
             case SWARM_MSG_COORD_STATUS: {
@@ -1154,6 +1158,7 @@ static void bridge_task(void *arg)
                  * pointer now (peek only; no mutation) -- sent further
                  * down, outside s_bridges_mutex, same as need_resync. */
                 flush_cmd = bridge_cmd_peek_pending(&s_router, it.mac);
+                do_cfg_flush = true;   /* also flush a pending NODE_CONFIG (below, outside the mutex) */
                 break;
             }
             default:
@@ -1209,6 +1214,28 @@ static void bridge_task(void *arg)
                                  (unsigned)flush_cmd->sends + 1);
                     }
                     bridge_cmd_mark_sent(&s_router, it.mac, now_s);
+                }
+            }
+
+            /* NODE_CONFIG flush (bench finding, M7 gate 7, 2026-09-08): a
+             * radio-role change reaches the node over the SAME cold-send path
+             * as router commands, so it needs the SAME open-RX window. If this
+             * node's desired radio role differs from what it last reported,
+             * send a NODE_CONFIG here, in the window its own frame just opened,
+             * instead of waiting for its next 5-minute CHECKIN. The node acks
+             * DONE and reboots; the ack clears "pending" (record_reported_radio
+             * on a seq match), so this stops firing after the first delivery.
+             * swarm_send_node_config() takes only s_stats_mutex (already
+             * released s_bridges_mutex above), so no lock-order issue. */
+            if (do_cfg_flush) {
+                radio_role_t desired = swarm_store_node_desired_radio(it.mac);
+                uint8_t rep; bool have_rep = swarm_node_reported_radio(it.mac, &rep);
+                bool pending = have_rep ? ((uint8_t)desired != rep)
+                                        : ((uint8_t)desired != (uint8_t)RADIO_ROLE_BLE);
+                if (pending) {
+                    esp_err_t err = swarm_send_node_config(it.mac, desired);
+                    ESP_LOGI(TAG, "NODE_CONFIG flush -> " MACSTR " radio_role=%s: %s",
+                             MAC2STR(it.mac), radio_role_str(desired), esp_err_to_name(err));
                 }
             }
         }   /* if (got == pdTRUE) */
@@ -2927,6 +2954,24 @@ static void forward_task(void *arg)
             continue;
         }
 
+        if (err == ESP_ERR_TIMEOUT && radio_role_get() == RADIO_ROLE_ZIGBEE) {
+            /* Bench finding (M7 gate 5, 2026-09-08): with the 802.15.4
+             * coordinator up, the ESP-NOW send-done callback regularly lands
+             * after the wait even for frames the hub did ingest. Re-queueing
+             * on timeout replayed every reading 5-10x and tripped the resync
+             * sweep (PING storm, node off-channel, hub commands failing). A
+             * timeout is "delivered-unknown" on a bridge node. The damage in
+             * the first storm was NOT the re-queued duplicates (the hub's
+             * no-regress guard drops those) but the channel-resync sweep they
+             * tripped, which took the node off-channel and starved hub->node
+             * commands. So re-queue the reading (don't lose it) but do NOT
+             * count it toward the resync threshold. Only an explicit ESP_FAIL
+             * (the MAC reported no ACK) is a real failure that counts below. */
+            ESP_LOGD(TAG, "frame send timed out (tag=%u); re-queued, not counted toward resync", (unsigned)r.tag);
+            buffer_push(&r, esp_timer_get_time());
+            continue;
+        }
+
         consec_fail++;
         ESP_LOGW(TAG, "frame send failed (%s), tag=%u, consecutive=%d", esp_err_to_name(err), (unsigned)r.tag, consec_fail);
         /* Buffer whatever just failed -- live or a backlog entry that failed
@@ -3517,7 +3562,8 @@ static bool running_image_pending_verify(void)
 static void poll_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "poll task started, 2 s");
+    espnow_link_set_send_wait_ms(1000);  /* see espnow_link.h: 802.15.4 coex delays the send-done callback */
+    ESP_LOGI(TAG, "poll task started, 2 s; send-done wait 1000 ms");
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(SWARM_POLL_INTERVAL_US / 1000));
 

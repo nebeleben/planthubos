@@ -30,6 +30,7 @@
 #include "freertos/semphr.h"
 #include "esp_zigbee_core.h"
 #include "esp_coexist.h"
+#include "esp_ieee802154.h"
 #include "wifi_manager.h"
 #include "esp_wifi.h"
 #include "ble_collector.h"
@@ -352,6 +353,28 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                          esp_err_to_name(coex_err));
             } else {
                 ESP_LOGI(TAG, "WiFi/802.15.4 coexistence enabled");
+                if (zigbee_on_node()) {
+                    /* Bench finding (M7 gate 2, 2026-09-08): with the stack's
+                     * default arbitration a bridge node stopped MAC-acking the
+                     * hub's ESP-NOW unicasts as soon as its coordinator was up
+                     * (the hub's PERMIT command failed twice at the link layer
+                     * and timed out; only a RESYNC sent 1 s after the node's
+                     * own frame got through). The coordinator's idle listening
+                     * must yield to WiFi on a node -- ESP-NOW is its only link
+                     * to the hub -- so lower the 802.15.4 idle/txrx priority.
+                     * The zigbee side pays with retransmissions (measured
+                     * tolerable on the hub in the radio-role work). */
+                    esp_ieee802154_coex_config_t cc = esp_ieee802154_get_coex_config();
+                    ESP_LOGI(TAG, "802.15.4 coex config default: idle=%d txrx=%d txrx_at=%d",
+                             (int)cc.idle, (int)cc.txrx, (int)cc.txrx_at);
+                    cc.idle = IEEE802154_IDLE;
+                    cc.txrx = IEEE802154_LOW;
+                    cc.txrx_at = IEEE802154_MIDDLE;
+                    esp_ieee802154_set_coex_config(cc);
+                    cc = esp_ieee802154_get_coex_config();
+                    ESP_LOGI(TAG, "802.15.4 coex config on node: idle=%d txrx=%d txrx_at=%d",
+                             (int)cc.idle, (int)cc.txrx, (int)cc.txrx_at);
+                }
             }
         }
 #else
