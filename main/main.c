@@ -450,9 +450,17 @@ void app_main(void)
     radio_role_t rr = radio_role_is_set() ? radio_role_get()
                                           : (on_node ? RADIO_ROLE_BLE : radio_role_default());
     bool want_ble    = (rr == RADIO_ROLE_BLE);
-    bool want_zigbee = (rr == RADIO_ROLE_ZIGBEE);
-    ESP_LOGW(TAG, "radio role: %s (%s)%s", radio_role_str(rr),
-             radio_role_is_set() ? "nvs" : "default", on_node ? " [node]" : "");
+    /* Bench finding (M7 gate 1, 2026-09-08): a node that is still sweeping
+     * channels for its hub must NOT have the 802.15.4 coordinator up -- with
+     * the Zigbee stack running, the sweep's PAIR_REQ broadcasts stopped
+     * reaching the hub entirely (one frame got through, 200 ms before the
+     * stack came up; none in the following 120 s). An unpaired node has no
+     * hub to bridge to anyway, and pairing success reboots the node
+     * (pair_watch_task), so the coordinator starts on that next boot. */
+    bool want_zigbee = (rr == RADIO_ROLE_ZIGBEE) && (!on_node || node_paired);
+    ESP_LOGW(TAG, "radio role: %s (%s)%s%s", radio_role_str(rr),
+             radio_role_is_set() ? "nvs" : "default", on_node ? " [node]" : "",
+             (rr == RADIO_ROLE_ZIGBEE && on_node && !node_paired) ? " -- coordinator deferred until paired" : "");
 
     esp_err_t ble_err = ESP_OK;
     if (want_ble) {

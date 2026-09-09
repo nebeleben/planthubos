@@ -38,6 +38,7 @@ static const char *TAG = "pairing";
 typedef struct {
     uint8_t  mac[6];
     uint32_t nonce;
+    uint8_t  radio_role;  /* the node's self-reported role from its PAIR_REQ */
 } pending_adopt_t;
 
 static SemaphoreHandle_t s_window_lock;   /* guards s_window_open / s_window_deadline_us / s_adopt_in_progress */
@@ -364,6 +365,21 @@ static void hub_task(void *arg)
                     break;
                 }
                 ESP_LOGI(TAG, "adopted node " MACSTR " on channel %u", MAC2STR(item.mac), channel);
+                /* Bench finding (M7 gate 1, 2026-09-08): a freshly adopted node
+                 * got the store's BLE default as its desired role while its
+                 * PAIR_REQ said zigbee, so radio_role_pending was true from
+                 * the first second and the next checkin would have pushed a
+                 * NODE_CONFIG(ble) -- silently undoing the operator's portal
+                 * choice. The node's self-reported role IS the desired role
+                 * at adoption; the operator changes it later via the Nodes
+                 * tab. Only the two node roles are accepted; anything else
+                 * keeps the default. */
+                if (item.radio_role == (uint8_t)RADIO_ROLE_BLE || item.radio_role == (uint8_t)RADIO_ROLE_ZIGBEE) {
+                    esp_err_t rerr = swarm_store_set_node_desired_radio(item.mac, (radio_role_t)item.radio_role);
+                    if (rerr != ESP_OK)
+                        ESP_LOGW(TAG, "adopt " MACSTR ": could not persist desired radio role %u (%s)",
+                                 MAC2STR(item.mac), item.radio_role, esp_err_to_name(rerr));
+                }
             }
         } while (0);
 
@@ -704,6 +720,7 @@ void pairing_handle_frame(const uint8_t src[6], const uint8_t *data, int len, in
         pending_adopt_t item;
         memcpy(item.mac, src, 6);
         item.nonce = req.nonce;
+        item.radio_role = req.radio_role;
 
         if (!s_adopt_queue || xQueueSend(s_adopt_queue, &item, 0) != pdTRUE) {
             /* Could not hand off to hub_task (queue missing, or somehow
