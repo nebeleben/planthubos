@@ -832,12 +832,14 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
      * same cluster (e.g. Power Configuration's BatteryVoltage, 0x0020, 100
      * mV units, instead of BatteryPercentageRemaining, 0x0021) would
      * otherwise have its raw units silently reinterpreted as the wrong
-     * capability's units and land in history as a fabricated reading --
-     * exactly what zb_map.c's own sentinel checks exist to prevent, just
-     * from outside the file where that guarantee is enforced. */
-    if (msg->attribute.id != zb_map_report_attr(msg->cluster)) {
-        ESP_LOGI(TAG, "report: attr 0x%04x is not the mapped attr 0x%04x for cluster 0x%04x; dropped",
-                 msg->attribute.id, zb_map_report_attr(msg->cluster), msg->cluster);
+     * capability's units and land in history as a fabricated reading.
+     * zb_map_accepts_attr()/zb_map_zcl_attr_to_value() now gate and convert
+     * per (cluster, attribute): BatteryVoltage 0x0020 is ACCEPTED and mapped
+     * to a percentage (Xiaomi coin-cell sensors report only voltage), while
+     * an unrelated attribute on a mapped cluster is still dropped. */
+    if (!zb_map_accepts_attr(msg->cluster, msg->attribute.id)) {
+        ESP_LOGI(TAG, "report: attr 0x%04x not a mapped reading for cluster 0x%04x; dropped",
+                 msg->attribute.id, msg->cluster);
         return;
     }
 
@@ -848,8 +850,9 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
     }
 
     float value;
-    if (!zb_map_zcl_to_value(msg->cluster, raw, &value)) {
-        ESP_LOGI(TAG, "report: raw %ld is a ZCL sentinel for cluster 0x%04x; dropped", (long)raw, msg->cluster);
+    if (!zb_map_zcl_attr_to_value(msg->cluster, msg->attribute.id, raw, &value)) {
+        ESP_LOGI(TAG, "report: raw %ld is a ZCL sentinel for cluster 0x%04x attr 0x%04x; dropped",
+                 (long)raw, msg->cluster, msg->attribute.id);
         return;
     }
 

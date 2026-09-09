@@ -11,6 +11,9 @@
 #define CL_HUMIDITY      0x0405
 #define CL_SOIL_MOISTURE 0x0408
 
+#define AT_BATTERY_VOLTAGE  0x0020  /* Power Config: uint8, 100 mV units */
+#define AT_BATTERY_PERCENT  0x0021  /* Power Config: uint8, 0.5 % units  */
+
 uint8_t zb_map_cluster_to_cap(uint16_t cluster) {
     switch (cluster) {
         case CL_TEMPERATURE:   return CAP_AIR_TEMPERATURE;
@@ -112,4 +115,40 @@ bool zb_map_zcl_to_value(uint16_t cluster, int32_t raw, float *out) {
         default:
             return false;
     }
+}
+
+bool zb_map_accepts_attr(uint16_t cluster, uint16_t attr) {
+    if (cluster == CL_POWER_CONFIG)
+        return attr == AT_BATTERY_PERCENT || attr == AT_BATTERY_VOLTAGE;
+    uint16_t mapped = zb_map_report_attr(cluster);
+    return mapped != ZB_MAP_NO_ATTR && attr == mapped;
+}
+
+bool zb_map_zcl_attr_to_value(uint16_t cluster, uint16_t attr, int32_t raw, float *out) {
+    if (!out)
+        return false;
+    if (cluster == CL_POWER_CONFIG) {
+        if (attr == AT_BATTERY_PERCENT)
+            return zb_map_zcl_to_value(cluster, raw, out);  /* 0.5 % units, 0xFF sentinel */
+        if (attr == AT_BATTERY_VOLTAGE) {
+            /* ZCL sentinel: 0xFF (unknown voltage). */
+            if (raw == 0xFF)
+                return false;
+            /* BatteryVoltage is uint8 in 100 mV units, so mV = raw * 100.
+             * Map a coin cell linearly, 2.5 V -> 0 %, 3.0 V -> 100 %:
+             * pct = (mV - 2500) / (3000 - 2500) * 100 = raw * 20 - 500.
+             * This is an approximation (no per-chemistry curve), documented
+             * as such -- a battery LEVEL derived from voltage, not a
+             * fabricated sentinel. Clamp to [0, 100]. */
+            float pct = (float)raw * 20.0f - 500.0f;
+            if (pct < 0.0f)   pct = 0.0f;
+            if (pct > 100.0f) pct = 100.0f;
+            *out = pct;
+            return true;
+        }
+        return false;
+    }
+    if (attr != zb_map_report_attr(cluster))
+        return false;
+    return zb_map_zcl_to_value(cluster, raw, out);
 }

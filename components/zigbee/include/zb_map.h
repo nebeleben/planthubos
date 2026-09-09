@@ -34,3 +34,18 @@ uint16_t zb_map_report_attr(uint16_t cluster);
  * raw value is one of ZCL's not-a-reading sentinels, in which case *out is
  * untouched: a sentinel must never be stored as a measurement. */
 bool zb_map_zcl_to_value(uint16_t cluster, int32_t raw, float *out);
+
+/* Does (cluster, attr) carry a reading this mapper can convert? True for the
+ * cluster's own reportable attribute, and additionally -- for Power
+ * Configuration (0x0001) -- for BOTH BatteryPercentageRemaining (0x0021) and
+ * BatteryVoltage (0x0020), since many devices (e.g. Xiaomi coin-cell sensors)
+ * only report voltage. The report handler drops any pair this rejects. */
+bool zb_map_accepts_attr(uint16_t cluster, uint16_t attr);
+
+/* Attribute-aware value conversion. Like zb_map_zcl_to_value(), but also
+ * knows how to read Power Configuration's BatteryVoltage (0x0020, 100 mV
+ * units) and turn it into a battery percentage with a coin-cell curve; every
+ * other (cluster, attr) delegates to zb_map_zcl_to_value() for its one mapped
+ * attribute. Returns false (and leaves *out untouched) for an unaccepted pair
+ * or a ZCL not-a-reading sentinel. */
+bool zb_map_zcl_attr_to_value(uint16_t cluster, uint16_t attr, int32_t raw, float *out);

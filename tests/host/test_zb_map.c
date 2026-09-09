@@ -83,6 +83,29 @@ int main(void) {
     /* An unmapped cluster yields no value. */
     assert(!zb_map_zcl_to_value(0xEF00, 1234, &v));
 
+    /* --- attribute-aware acceptance --- */
+    assert(zb_map_accepts_attr(0x0001, 0x0021));   /* battery percentage */
+    assert(zb_map_accepts_attr(0x0001, 0x0020));   /* battery voltage */
+    assert(!zb_map_accepts_attr(0x0001, 0x0000));  /* not a battery reading */
+    assert(zb_map_accepts_attr(0x0400, 0x0000));   /* illuminance MeasuredValue */
+    assert(!zb_map_accepts_attr(0x0400, 0x0021));  /* wrong attr on a sensor cluster */
+
+    /* --- battery percentage (0x0021, 0.5% units) via the attr-aware path --- */
+    assert(zb_map_zcl_attr_to_value(0x0001, 0x0021, 190, &v) && close_to(v, 95.0f));
+    assert(!zb_map_zcl_attr_to_value(0x0001, 0x0021, 0xFF, &v));  /* sentinel */
+
+    /* --- battery voltage (0x0020, 100 mV units) -> coin-cell percentage --- */
+    assert(zb_map_zcl_attr_to_value(0x0001, 0x0020, 30, &v) && close_to(v, 100.0f)); /* 3.0 V */
+    assert(zb_map_zcl_attr_to_value(0x0001, 0x0020, 28, &v) && close_to(v, 60.0f));  /* 2.8 V */
+    assert(zb_map_zcl_attr_to_value(0x0001, 0x0020, 25, &v) && close_to(v, 0.0f));   /* 2.5 V */
+    assert(zb_map_zcl_attr_to_value(0x0001, 0x0020, 20, &v) && close_to(v, 0.0f));   /* 2.0 V, clamped */
+    assert(zb_map_zcl_attr_to_value(0x0001, 0x0020, 33, &v) && close_to(v, 100.0f)); /* 3.3 V, clamped */
+    assert(!zb_map_zcl_attr_to_value(0x0001, 0x0020, 0xFF, &v));  /* unknown-voltage sentinel */
+
+    /* --- a sensor cluster still delegates and rejects a wrong attr --- */
+    assert(zb_map_zcl_attr_to_value(0x0402, 0x0000, 2500, &v) && close_to(v, 25.0f)); /* temp 25 C */
+    assert(!zb_map_zcl_attr_to_value(0x0402, 0x0021, 2500, &v));  /* wrong attr -> dropped */
+
     printf("test_zb_map: OK\n");
     return 0;
 }
