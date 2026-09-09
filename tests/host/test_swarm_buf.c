@@ -125,6 +125,43 @@ int main(void)
         assert(swarm_buf_recompute_age(e.r.u.meas.age_s, e.captured_us, 4000000) == 3);
     }
 
+    /* --- coalesce: same MEASUREMENT (device+cap) collapses to one, newest value --- */
+    {
+        swarm_buf_t bc; swarm_buf_init(&bc);
+        swarm_out_t m1 = { .tag = SWARM_OUT_MEASUREMENT, .u.meas = { .dev = { .kind = 2, .addr = {9} }, .cap_id = 2, .value = 10.0f, .age_s = 0 } };
+        swarm_out_t m2 = m1; m2.u.meas.value = 20.0f;   /* same dev+cap, newer value */
+        assert(swarm_buf_push_coalesce(&bc, &m1, 1000) == false);  /* first: appended */
+        assert(swarm_buf_push_coalesce(&bc, &m2, 2000) == true);   /* second: coalesced */
+        assert(swarm_buf_count(&bc) == 1);
+        swarm_buf_entry_t e; assert(swarm_buf_pop(&bc, &e));
+        assert(e.r.u.meas.value == 20.0f && e.captured_us == 2000);
+        assert(swarm_buf_count(&bc) == 0);
+    }
+    /* --- coalesce keys on cap_id and on the device address --- */
+    {
+        swarm_buf_t bc; swarm_buf_init(&bc);
+        swarm_out_t a = { .tag = SWARM_OUT_MEASUREMENT, .u.meas = { .dev = { .kind = 2, .addr = {9} }, .cap_id = 2, .value = 1.0f } };
+        swarm_out_t b_cap = a; b_cap.u.meas.cap_id = 3;          /* different cap */
+        swarm_out_t c_dev = a; c_dev.u.meas.dev.addr[0] = 8;     /* different device */
+        assert(swarm_buf_push_coalesce(&bc, &a, 1) == false);
+        assert(swarm_buf_push_coalesce(&bc, &b_cap, 2) == false); /* not coalesced */
+        assert(swarm_buf_push_coalesce(&bc, &c_dev, 3) == false); /* not coalesced */
+        assert(swarm_buf_count(&bc) == 3);
+    }
+    /* --- coalesce: same sensor READING (by MAC) collapses to one --- */
+    {
+        swarm_buf_t bc; swarm_buf_init(&bc);
+        swarm_out_t r1 = make_reading(7, 0); r1.u.reading.temp_dc = 100;
+        swarm_out_t r2 = make_reading(7, 0); r2.u.reading.temp_dc = 200; /* same mac[5]=7 */
+        swarm_out_t r3 = make_reading(8, 0);                             /* different mac */
+        assert(swarm_buf_push_coalesce(&bc, &r1, 1) == false);
+        assert(swarm_buf_push_coalesce(&bc, &r2, 2) == true);
+        assert(swarm_buf_push_coalesce(&bc, &r3, 3) == false);
+        assert(swarm_buf_count(&bc) == 2);
+        swarm_buf_entry_t e; assert(swarm_buf_pop(&bc, &e));   /* oldest slot = the coalesced r1/r2 */
+        assert(e.r.u.reading.temp_dc == 200);
+    }
+
     printf("test_swarm_buf: OK\n");
     return 0;
 }

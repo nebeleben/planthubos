@@ -58,6 +58,19 @@ void swarm_buf_init(swarm_buf_t *b);
  * before and after, or just log unconditionally at DEBUG (see swarm.c). */
 void swarm_buf_push(swarm_buf_t *b, const swarm_out_t *r, int64_t now_us);
 
+/* Like swarm_buf_push, but first looks for an entry already in the ring that
+ * carries the SAME logical value and, if found, overwrites it in place
+ * (fresher value + captured_us) instead of appending a second copy. Returns
+ * true if it coalesced onto an existing entry, false if it appended a new one
+ * (in which case it evicts the oldest when the ring was full, exactly like
+ * swarm_buf_push). Identity: a READING by sensor MAC, a MEASUREMENT by
+ * device + capability, a COORD_STATUS as a singleton, an ANNOUNCE/GONE by
+ * device (the newest of the two wins). Used by a bridge node whose sends time
+ * out under 802.15.4 coexistence: it re-queues on timeout, and without
+ * coalescing the same reading would pile up and be delivered to the hub many
+ * times over (each rejected by the hub's no-regress guard). */
+bool swarm_buf_push_coalesce(swarm_buf_t *b, const swarm_out_t *r, int64_t now_us);
+
 /* Pops the oldest buffered entry (FIFO), if any. Returns false and leaves
  * *out untouched when the buffer is empty. Does NOT recompute age_s -- call
  * swarm_buf_recompute_age() with the popped captured_us at actual transmit

@@ -2274,6 +2274,9 @@ void swarm_broadcast_forget(const uint8_t mac[6])
 
 #define SWARM_FWD_QUEUE_LEN     8
 #define SWARM_FWD_FAIL_THRESHOLD 5
+/* Bench finding (M7, 2026-09-08): min spacing between backlog retries on a
+ * bridge node whose sends time out under coex -- see forward_task(). */
+#define BACKLOG_RETRY_GAP_MS 3000
 
 static QueueHandle_t s_fwd_queue;
 static uint8_t       s_hub_mac[6];   /* set once in swarm_start_node(); MAC never
@@ -2815,22 +2818,27 @@ static swarm_buf_t s_buf;
  * a bespoke log line at DEBUG). */
 static void buffer_push(const swarm_out_t *r, int64_t now_us)
 {
+    /* Coalesce onto an existing same-identity entry when possible (a bridge
+     * node re-queues on every coex send timeout -- without this the same
+     * reading piles up and is delivered to the hub many times, each rejected
+     * by its no-regress guard; see swarm_buf_push_coalesce()). Only an
+     * APPEND that finds the ring already full evicts the oldest, so the
+     * "full" log belongs on that path alone. */
     bool was_full = swarm_buf_count(&s_buf) == SWARM_NODE_BUFFER_LEN;
-    if (was_full) {
-        const swarm_out_t *oldest = &s_buf.entries[s_buf.head].r;
-        if (oldest->tag == SWARM_OUT_READING) {
-            ESP_LOGD(TAG, "forward buffer full (%d), dropping oldest READING for " MACSTR
-                          " (dropped=%" PRIu32 " total, about to become %" PRIu32 ")",
-                     SWARM_NODE_BUFFER_LEN, MAC2STR(oldest->u.reading.mac),
-                     swarm_buf_dropped(&s_buf), swarm_buf_dropped(&s_buf) + 1);
+    const swarm_out_t oldest = was_full ? s_buf.entries[s_buf.head].r : (swarm_out_t){0};
+    bool coalesced = swarm_buf_push_coalesce(&s_buf, r, now_us);
+    if (was_full && !coalesced) {
+        if (oldest.tag == SWARM_OUT_READING) {
+            ESP_LOGD(TAG, "forward buffer full (%d), dropped oldest READING for " MACSTR
+                          " (dropped=%" PRIu32 " total)",
+                     SWARM_NODE_BUFFER_LEN, MAC2STR(oldest.u.reading.mac),
+                     swarm_buf_dropped(&s_buf));
         } else {
-            ESP_LOGD(TAG, "forward buffer full (%d), dropping oldest entry (tag=%u) "
-                          "(dropped=%" PRIu32 " total, about to become %" PRIu32 ")",
-                     SWARM_NODE_BUFFER_LEN, (unsigned)oldest->tag,
-                     swarm_buf_dropped(&s_buf), swarm_buf_dropped(&s_buf) + 1);
+            ESP_LOGD(TAG, "forward buffer full (%d), dropped oldest entry (tag=%u) "
+                          "(dropped=%" PRIu32 " total)",
+                     SWARM_NODE_BUFFER_LEN, (unsigned)oldest.tag, swarm_buf_dropped(&s_buf));
         }
     }
-    swarm_buf_push(&s_buf, r, now_us);
 }
 
 /* Owns every espnow_link_send() the node makes for readings, so a slow or
@@ -2969,6 +2977,17 @@ static void forward_task(void *arg)
              * (the MAC reported no ACK) is a real failure that counts below. */
             ESP_LOGD(TAG, "frame send timed out (tag=%u); re-queued, not counted toward resync", (unsigned)r.tag);
             buffer_push(&r, esp_timer_get_time());
+            /* Pace retries. A timed-out send on a bridge node is very likely
+             * delivered (slow ACK under coex), so re-draining the backlog in
+             * a tight loop just re-delivers the same reading 2-3x/s. Wait up
+             * to BACKLOG_RETRY_GAP_MS for a FRESH reading -- which coalesces
+             * onto the same backlog entry (swarm_buf_push_coalesce), so the
+             * next drain sends the newest value, not a stale duplicate. An
+             * actively-reporting sensor thus delivers at its own rate; a
+             * quiet one retries every few seconds instead of continuously. */
+            swarm_out_t fresh;
+            if (xQueueReceive(s_fwd_queue, &fresh, pdMS_TO_TICKS(BACKLOG_RETRY_GAP_MS)) == pdTRUE)
+                buffer_push(&fresh, esp_timer_get_time());
             continue;
         }
 
