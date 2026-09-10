@@ -150,6 +150,32 @@ static bool find_device_id(const char *id, device_id_t *out)
  * two-step lookup -- exactly what an unmodified M1 device() ref (always
  * BLE, the only kind that existed then) needs to keep resolving
  * unchanged. */
+/* Momentary event-cap resolution (Task 5, zigbee-button-support: button.action,
+ * capability.h's cdef->event == true). Unlike every other capability, this one
+ * has no stored registry slot to read -- resolve_device() below never reaches
+ * the s_reg_snap slot lookup for it -- it reads data_core's LIVE pending-event
+ * store (data_core_events_for(), Task 4) directly, which is deliberate: the
+ * engine consumes a pass's presses only once, at the END of its own
+ * value-update sweep (rules_engine.c's evaluate_all()), so every rule
+ * resolving this ref during that same sweep must still see the press, not a
+ * registry snapshot that could have gone stale the instant it was consumed.
+ * age_s is always 0 (a press has no "age" -- it either is or isn't pending)
+ * and the .age field (field == 1) is defined as 0.0f for the same reason.
+ * Factored out of resolve_device() so a HOST_TEST build can exercise this
+ * exact branch (resolve_button_test() below) without needing a live registry
+ * entry -- data_core_events_for() matches purely on device_id_t + cap_id, not
+ * on anything registry_find() would need to have seen first. */
+static bool resolve_event_cap(const device_id_t *dev, uint8_t capability, uint8_t field,
+                              psvm_ref_val_t *out)
+{
+    int16_t code;
+    if (!data_core_events_for(dev, capability, &code)) return false;
+    out->ready = true;
+    out->age_s = 0;
+    out->value = (field == 1) ? 0.0f : capability_decode(capability, code);
+    return true;
+}
+
 static bool resolve_device(const char *id, uint8_t capability, uint8_t field,
                            uint32_t now_uptime_s, psvm_ref_val_t *out, char *why, size_t whylen)
 {
@@ -157,6 +183,18 @@ static bool resolve_device(const char *id, uint8_t capability, uint8_t field,
 
     device_id_t dev = {0};
     bool have_dev = find_device_id(id, &dev);
+
+    const capability_t *cdef = (capability < CAPABILITY_COUNT) ? capability_get(capability) : NULL;
+    if (cdef && cdef->event) {
+        if (have_dev && resolve_event_cap(&dev, capability, field, out)) {
+            return true;
+        }
+        ref_not_ready(out);
+        if (why && whylen) {
+            snprintf(why, whylen, "device \"%s\" %s: no press", id, rules_cap_name(capability));
+        }
+        return false;
+    }
 
     int ridx = have_dev ? registry_find(&s_reg_snap, &dev) : -1;
     if (ridx < 0 || capability >= CAPABILITY_COUNT) {
@@ -252,3 +290,25 @@ int rules_resolve_action_dev(uint8_t kind, const char *name, uint8_t action_id)
     }
     return registry_find(&s_reg_snap, &dev);
 }
+
+#ifdef HOST_TEST
+/* Host-test-only shim (Task 5, zigbee-button-support): a plain `cc` host
+ * harness has no way to make a device "live" the way find_device_id()/
+ * registry_find() require (that needs a real ingest path, e.g. BLE/Zigbee
+ * decode, registering the id in the device registry first) -- this repo has
+ * no host-side "fake a zigbee join" helper. This calls the SAME
+ * resolve_event_cap() branch resolve_device() runs above (not a
+ * reimplementation of its logic), directly against data_core's live
+ * pending-event store, which is all that branch ever reads. Returns 1 when
+ * ready with code 1 (CAP_BUTTON_ACTION's single-press code, tests/host/
+ * test_rules_events.c), 0 otherwise (not ready, or ready with some other
+ * code -- this shim's callers only ever submit code 1). */
+int resolve_button_test(const device_id_t *id)
+{
+    psvm_ref_val_t out;
+    if (resolve_event_cap(id, CAP_BUTTON_ACTION, 0, &out) && out.value == capability_decode(CAP_BUTTON_ACTION, 1)) {
+        return 1;
+    }
+    return 0;
+}
+#endif

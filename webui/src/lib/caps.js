@@ -10,9 +10,18 @@
 // PlantScript compiler's own frozen, hand-written ids-0-4 table (compiler
 // literal/unit checking, source-derived) -- a different concern with a
 // similar name purely by coincidence. This file is the live, server-served
-// M2 capability table (all 8 ids, id 5-7 included) and must never be
-// merged with or read by the compiler.
+// capability table (all 10 ids, 0-9, through button.action) and must never
+// be merged with or read by the compiler.
 let capsPromise = null
+
+// button.action (id 9, spec's zigbee-button-support amendment) reports a
+// press-code enum, not a numeric+unit reading -- capability.c's own encoding.
+// Lives at module scope (not inside fmtCapParts) so every tab that renders a
+// capability value through the shared fmtCap/fmtCapParts below -- Devices,
+// Plants, Dashboard -- decodes it the same way instead of showing a bare
+// integer. Unknown code (a firmware ahead of this UI) still shows the raw
+// number via fmtCapParts' `code ${value}` fallback instead of disappearing.
+const PRESS_LABEL = { 0: 'hold', 1: 'single', 2: 'double', 3: 'triple', 255: 'release' }
 
 // Returns a Map<id, {id, name, unit, precision, ha_device_class}>, fetched
 // once and cached for the lifetime of the page. A failed fetch clears the
@@ -77,8 +86,16 @@ export function capLabel(caps, id) {
 // unit, matching every other tab's existing "no data" convention (fmtAge's
 // "never", etc.).
 export function fmtCapParts(caps, id, value) {
-  if (value == null || Number.isNaN(value)) return { text: '–', unit: '' }
   const c = caps && caps.get(id)
+  // button.action is a press-code enum, not a numeric+unit reading, so it
+  // gets its own branch ahead of the generic null-check and toFixed() paths
+  // below -- decoded here (rather than per-tab) so Devices, Plants and
+  // Dashboard all show the same label instead of a bare integer.
+  if (c && c.name === 'button.action') {
+    if (value == null || Number.isNaN(value)) return { text: 'waiting for a press', unit: '' }
+    return { text: PRESS_LABEL[value] ?? `code ${value}`, unit: '' }
+  }
+  if (value == null || Number.isNaN(value)) return { text: '–', unit: '' }
   if (!c) return { text: String(value), unit: '' }
   return { text: value.toFixed(c.precision ?? 0), unit: c.unit }
 }

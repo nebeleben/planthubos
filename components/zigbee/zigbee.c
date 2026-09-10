@@ -714,6 +714,7 @@ static uint8_t zb_report_attr_type(uint16_t cluster)
     case 0x0405: /* Relative Humidity: MeasuredValue, uint16 */
     case 0x0400: /* Illuminance Measurement: MeasuredValue, uint16 */
     case 0x0408: /* Soil Moisture: MeasuredValue, uint16 */
+    case 0x0012: /* Multistate Input: PresentValue, uint16 */
         return ESP_ZB_ZCL_ATTR_TYPE_U16;
     case 0x0001: /* Power Configuration: BatteryPercentageRemaining, uint8 */
         return ESP_ZB_ZCL_ATTR_TYPE_U8;
@@ -828,9 +829,16 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
 
     device_id_t id = { .kind = DEV_KIND_ZIGBEE };
     memcpy(id.addr, eui64, 8);
-    bool accepted = data_core_submit_cap_id(&id, cap, value);
-    ESP_LOGI(TAG, "report: cap %u value %.3f -> data_core %s", cap, (double)value,
-             accepted ? "accepted" : "rejected (device not in registry?)");
+    const capability_t *cdef = capability_get(cap);
+    bool accepted;
+    if (cdef && cdef->event) {
+        accepted = data_core_submit_event(&id, cap, (int16_t)value);
+        ESP_LOGI(TAG, "report: event cap %u code %d -> %s", cap, (int)value, accepted ? "queued" : "dropped");
+    } else {
+        accepted = data_core_submit_cap_id(&id, cap, value);
+        ESP_LOGI(TAG, "report: cap %u value %.3f -> data_core %s", cap, (double)value,
+                 accepted ? "accepted" : "rejected (device not in registry?)");
+    }
 
     /* Cap-list backfill (2026-09-10): a device can stream a real value on a
      * mapped cluster the interview never enumerated -- Xiaomi's older
@@ -1191,6 +1199,16 @@ static void zb_iv_send_config_report(void)
  * actor table. */
 static void zb_iv_handle_store(void)
 {
+    /* Task 3: a device whose caps include CAP_BUTTON_ACTION (Multistate
+     * Input) is an INPUT device, not a controllable switch -- Aqara/
+     * Xiaomi buttons non-compliantly list On/Off without implementing it,
+     * which the auto-map otherwise turns into a phantom switch.state +
+     * switch.on/off. Run the suppression once, here, on the completed
+     * interview record, before it is upserted into the store and the
+     * observer below announces it -- so the stored+forwarded record
+     * never carries the phantom switch. */
+    zb_interview_finalize(&s_iv);
+
     zb_device_t *dev = &s_iv.dev;
 
     xSemaphoreTake(s_store_mutex, portMAX_DELAY);

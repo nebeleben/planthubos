@@ -7,6 +7,26 @@
 #include "capability.h"
 #include "action.h"
 
+/* The file has no zb_iv_init_for_test(); zb_interview_on_clusters() only
+ * touches iv->dev/report bookkeeping, so a plain zero-init is enough for
+ * the finalize tests below, which drive on_clusters() directly rather
+ * than the full begin/step state machine. */
+static void zb_iv_init_for_test(zb_iv_t *iv) {
+    memset(iv, 0, sizeof(*iv));
+}
+
+static bool dev_has_cap(const zb_device_t *dev, uint8_t cap) {
+    for (int i = 0; i < dev->cap_count; i++)
+        if (dev->caps[i] == cap) return true;
+    return false;
+}
+
+static bool dev_has_action(const zb_device_t *dev, uint8_t act) {
+    for (int i = 0; i < dev->action_count; i++)
+        if (dev->actions[i] == act) return true;
+    return false;
+}
+
 int main(void) {
     static const uint8_t EUI[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
     zb_iv_t iv;
@@ -180,6 +200,32 @@ int main(void) {
     assert(iv.dev.unmapped_count == ZB_STORE_MAX_UNMAPPED);
     for (int i = 0; i < ZB_STORE_MAX_UNMAPPED; i++) {
         assert(iv.dev.unmapped_clusters[i] == (uint16_t)(0xFC00 + i));
+    }
+
+    /* --- Task 3: finalize() suppresses the phantom switch on an input
+     * device (Aqara/Xiaomi buttons non-compliantly list On/Off without
+     * implementing it). --- */
+
+    /* Button: On/Off + Multistate Input + Power -> button.action + battery, NO switch */
+    {
+        zb_iv_t iv; zb_iv_init_for_test(&iv);   /* use the file's existing init helper */
+        const uint16_t clusters[] = { 0x0000, 0x0001, 0x0006, 0x0012 };
+        zb_interview_on_clusters(&iv, 1, clusters, 4);
+        zb_interview_finalize(&iv);              /* the new pass (Step 4) */
+        assert(dev_has_cap(&iv.dev, CAP_BUTTON_ACTION));
+        assert(dev_has_cap(&iv.dev, CAP_BATTERY_LEVEL));
+        assert(!dev_has_cap(&iv.dev, CAP_SWITCH_STATE));
+        assert(!dev_has_action(&iv.dev, ACT_SWITCH_ON));
+        assert(!dev_has_action(&iv.dev, ACT_SWITCH_OFF));
+    }
+    /* Real switch: On/Off only, no Multistate -> switch kept */
+    {
+        zb_iv_t iv; zb_iv_init_for_test(&iv);
+        const uint16_t clusters[] = { 0x0000, 0x0006 };
+        zb_interview_on_clusters(&iv, 1, clusters, 2);
+        zb_interview_finalize(&iv);
+        assert(dev_has_cap(&iv.dev, CAP_SWITCH_STATE));
+        assert(dev_has_action(&iv.dev, ACT_SWITCH_ON));
     }
 
     printf("test_zb_interview: OK\n");

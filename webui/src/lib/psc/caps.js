@@ -25,6 +25,7 @@ export const CAPS = {
   // block that reads a switch/valve's reported state both emit this.
   // Unitless (capability.c's .unit is ""), so no alias suffix applies.
   'switch.state': { id: 8, unit: '', aliases: [] },
+  'button.action': { id: 9, unit: '', aliases: [] },
 }
 
 export const CAPS_BY_ID = Object.fromEntries(

@@ -106,6 +106,16 @@ int main(void) {
     assert(zb_map_zcl_attr_to_value(0x0402, 0x0000, 2500, &v) && close_to(v, 25.0f)); /* temp 25 C */
     assert(!zb_map_zcl_attr_to_value(0x0402, 0x0021, 2500, &v));  /* wrong attr -> dropped */
 
+    /* --- Multistate Input (0x0012) -> button.action --- */
+    assert(zb_map_cluster_to_cap(0x0012) == CAP_BUTTON_ACTION);
+    assert(zb_map_report_attr(0x0012) == 0x0055);
+    assert(zb_map_accepts_attr(0x0012, 0x0055));
+    assert(!zb_map_accepts_attr(0x0012, 0x0000));   /* only present-value */
+    /* identity passthrough, incl. hold(0) and release(255); no sentinel */
+    assert(zb_map_zcl_attr_to_value(0x0012, 0x0055, 1, &v) && close_to(v, 1.0f));
+    assert(zb_map_zcl_attr_to_value(0x0012, 0x0055, 0, &v) && close_to(v, 0.0f));
+    assert(zb_map_zcl_attr_to_value(0x0012, 0x0055, 255, &v) && close_to(v, 255.0f));
+
     printf("test_zb_map: OK\n");
     return 0;
 }

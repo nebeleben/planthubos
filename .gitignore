@@ -49,3 +49,4 @@ tests/host/test_events_json_escape
 tests/host/test_swarm_rules
 tests/host/test_bridge_table
 tests/host/test_bridge_cmd
+tests/host/test_data_core_events

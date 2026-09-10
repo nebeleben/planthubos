@@ -77,3 +77,11 @@ void zb_interview_on_endpoints(zb_iv_t *iv, const uint8_t *eps, uint8_t n);
 /* Simple-descriptor response for one endpoint: runs the auto-map. */
 void zb_interview_on_clusters(zb_iv_t *iv, uint8_t endpoint,
                               const uint16_t *clusters, uint8_t n);
+
+/* Finalization pass: call once after ALL endpoints are mapped (cluster
+ * order across endpoints is not guaranteed), before the record is handed
+ * to the store. A device whose caps include CAP_BUTTON_ACTION is an INPUT
+ * device -- drop any phantom CAP_SWITCH_STATE (and its parallel
+ * cap_clusters entry) and any ACT_SWITCH_ON/ACT_SWITCH_OFF actions. A
+ * device without CAP_BUTTON_ACTION is untouched. */
+void zb_interview_finalize(zb_iv_t *iv);

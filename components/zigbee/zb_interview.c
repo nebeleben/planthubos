@@ -22,6 +22,8 @@
  */
 #include "zb_interview.h"
 #include "zb_map.h"
+#include "capability.h"
+#include "action.h"
 #include <string.h>
 
 void zb_interview_begin(zb_iv_t *iv, const uint8_t eui64[8],
@@ -198,4 +200,35 @@ void zb_interview_on_clusters(zb_iv_t *iv, uint8_t endpoint,
     iv->endpoint_cursor++;
     iv->request_sent = false;
     iv->progressed = true;
+}
+
+/* After all endpoints are mapped: a device that exposes Multistate Input
+ * (button.action) is an INPUT device. Aqara/Xiaomi buttons non-compliantly
+ * list On/Off (0x0006) as an input cluster without implementing the OnOff
+ * attribute, so the auto-map gave them a phantom switch.state + switch.on/off.
+ * Drop those: an input device is not a controllable switch. */
+void zb_interview_finalize(zb_iv_t *iv) {
+    bool is_button = false;
+    for (int i = 0; i < iv->dev.cap_count; i++)
+        if (iv->dev.caps[i] == CAP_BUTTON_ACTION) { is_button = true; break; }
+    if (!is_button) return;
+
+    /* Remove CAP_SWITCH_STATE (and its parallel cap_clusters entry). */
+    for (int i = 0; i < iv->dev.cap_count; ) {
+        if (iv->dev.caps[i] == CAP_SWITCH_STATE) {
+            for (int k = i; k < iv->dev.cap_count - 1; k++) {
+                iv->dev.caps[k] = iv->dev.caps[k + 1];
+                iv->dev.cap_clusters[k] = iv->dev.cap_clusters[k + 1];
+            }
+            iv->dev.cap_count--;
+        } else i++;
+    }
+    /* Remove the switch actions. */
+    for (int i = 0; i < iv->dev.action_count; ) {
+        if (iv->dev.actions[i] == ACT_SWITCH_ON || iv->dev.actions[i] == ACT_SWITCH_OFF) {
+            for (int k = i; k < iv->dev.action_count - 1; k++)
+                iv->dev.actions[k] = iv->dev.actions[k + 1];
+            iv->dev.action_count--;
+        } else i++;
+    }
 }

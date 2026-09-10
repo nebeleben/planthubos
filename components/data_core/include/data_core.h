@@ -173,6 +173,59 @@ bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value)
  * contract as that function. */
 bool data_core_submit_cap_id_aged(const device_id_t *id, uint8_t cap_id, float value, uint16_t age_s);
 
+/* Task 4 (zigbee-button-support): as of this task, data_core_submit_cap_id()
+ * and data_core_submit_cap_id_aged() above both return false (logged WARN,
+ * nothing stored) when cap_id is an `event` capability (capability_get()->
+ * event, Task 1 -- currently only CAP_BUTTON_ACTION/button.action). An
+ * event capability has no sticky value to submit through the ordinary
+ * value path; data_core_submit_event() below is its only legitimate
+ * producer. */
+
+/* Task 4: submits one momentary event (a button press) for id's cap_id --
+ * cap_id MUST be an `event` capability (capability_get()->event); any other
+ * cap_id is refused (logged WARN, false, nothing stored). Unlike every
+ * submit_* above, there is no no-regress/out-of-range comparison against a
+ * previous value: every call is its own occurrence, appended to a small
+ * (capacity 8) pending-event ring that data_core_events_peek_seq()/
+ * data_core_events_for()/data_core_events_consume_through() below read and
+ * drain. Also writes code as the capability's display-only last-press
+ * value via registry_set_cap() (bypassing data_core_submit_cap_id()'s own,
+ * now cap-rejecting, path) so /api/v1/devices can still show "last press"
+ * -- rules and any other event-driven logic must read the ring, not this
+ * value, since it does not indicate a NEW occurrence, only the most recent
+ * one. Posts DATA_EVENT_SENSOR_UPDATE on success, same as every other
+ * submit_* here. Returns false only when the registry is full and id is
+ * unknown (nothing created or modified). */
+bool data_core_submit_event(const device_id_t *id, uint8_t cap_id, int16_t code);
+
+/* The highest seq among currently-pending events across every device and
+ * capability, or 0 when none are pending. Intended to be snapshotted by a
+ * caller (Task 5's rules engine) BEFORE evaluating a pass over
+ * data_core_events_for(), then handed back to
+ * data_core_events_consume_through() AFTER that pass, so an event that
+ * arrives mid-pass (seq greater than the snapshot) is left pending for the
+ * next pass rather than being silently swallowed by a consume_through()
+ * bound that was computed before it existed. */
+uint32_t data_core_events_peek_seq(void);
+
+/* True when a pending (not yet consumed by data_core_events_consume_through())
+ * event exists for (id, cap_id); on true, *code_out receives the MOST
+ * RECENT (highest seq) such event's code when more than one is pending for
+ * the same (id, cap_id) -- e.g. two presses queued back to back before a
+ * rules pass drains them. Does not consume -- repeated calls keep
+ * returning the same pending event(s) until data_core_events_consume_through()
+ * is called. code_out may be NULL to just test presence. */
+bool data_core_events_for(const device_id_t *id, uint8_t cap_id, int16_t *code_out);
+
+/* Marks every pending event with seq <= seq as consumed (no longer
+ * reported by data_core_events_for()/data_core_events_peek_seq()). Intended
+ * to be called with a seq previously obtained from
+ * data_core_events_peek_seq(), so a press that arrives AFTER that snapshot
+ * (seq greater than the bound passed here) survives untouched for the next
+ * pass -- see data_core_events_peek_seq()'s own doc comment for why this
+ * ordering matters. */
+void data_core_events_consume_through(uint32_t seq);
+
 /* Registry slot index for id (0..REGISTRY_MAX_DEVICES-1), or -1 when the
  * device is not (yet) registered. Never creates an entry -- a pure lookup,
  * thread-safe via the same s_mutex every other accessor here uses, no
