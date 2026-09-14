@@ -52,8 +52,13 @@ CONFIG_MBEDTLS_HARDWARE_SHA=n
 CONFIG_SPIRAM=y
 # Default 16384 sends every allocation under 16K to internal RAM, which
 # starves it while 8 MB sits idle (measured: internal largest block 7K,
-# BLE still ESP_ERR_NO_MEM). 2K keeps only small hot allocations internal.
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
+# BLE still ESP_ERR_NO_MEM). 512 keeps only the smallest hot allocations
+# internal and pushes the rest (httpd/portal buffers, general malloc) to
+# PSRAM, leaving the ~79 KiB internal heap for WiFi/DMA -- without it the
+# softAP beacon buffer (752 B, internal) cannot allocate once the portal
+# webserver is up and the driver NULL-derefs the failed alloc (Load access
+# fault on the 8 MB-PSRAM board, 2026-09-14).
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512
 # WiFi/lwIP buffers are the single biggest movable block (~43K on this
 # chip's dual-band driver).
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
@@ -68,7 +73,26 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # C5's internal RAM alongside everything else ("Expected to init 16 rx
 # buffer, actual is 10" -> boot loop). Static RX buffers are DMA memory
 # and can never move to PSRAM; dynamic ones can (TRY_ALLOCATE_WIFI_LWIP
-# above), so shift the balance: fewer static, more dynamic.
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+# above), so shift the balance: fewer static, more dynamic. 8 still did not
+# fit on the 8 MB-PSRAM board with the portal webserver up ("Expected to
+# init 8 rx buffer, actual is 4" -> esp_wifi_init NO_MEM, 2026-09-14): the
+# C5 has only ~79 KiB internal DRAM total (~27 KiB free after
+# webserver_start), so RX(8*1.7K)+TX(6*1.6K)+mgmt overflow it. Cut static
+# RX to 4 (what the driver could actually place); 24 dynamic RX (PSRAM-
+# capable) carry the throughput.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=24
 CONFIG_ESP_WIFI_RX_BA_WIN=6
+# The dual-band driver ALSO reserves 16 STATIC TX buffers (DMA, internal-
+# only, ~1.6K each = ~26K) up front at esp_wifi_init(). On an UNCLAIMED node
+# the portal webserver is already running when the driver initialises, and
+# static RX(8)+TX(16) together no longer fit the internal DMA budget PSRAM
+# leaves (largest internal block ~27K after webserver_start ->
+# "esf_buf_setup_static: alloc eb fail" -> esp_wifi_init ESP_ERR_NO_MEM ->
+# boot loop; first seen on the 8 MB-PSRAM board 2026-09-14, which unlike the
+# no-PSRAM bring-up units actually initialises PSRAM and shifts the budget).
+# TX buffers CANNOT be made dynamic here: ESP_WIFI_DYNAMIC_TX_BUFFER depends
+# on !SPIRAM_TRY_ALLOCATE_WIFI_LWIP, and IDF recommends Static with PSRAM.
+# So keep them static but cut the count 16->6 (~10K), which with static
+# RX(8) fits the internal DMA budget with headroom.
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=6
