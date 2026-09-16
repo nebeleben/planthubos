@@ -3361,6 +3361,9 @@ static esp_err_t unknown_get(httpd_req_t *req)
         cJSON_AddNumberToObject(o, "rssi", d->s[d->n - 1].rssi);   /* newest sample's rssi (s[] is oldest-first, newest-last) */
         cJSON_AddNumberToObject(o, "last_seen_s",
                                 (now_uptime_s >= d->last_seen_s) ? (now_uptime_s - d->last_seen_s) : 0);
+        /* BLE manufacturer company id (0 = none advertised), for the Devices
+         * tab's best-effort vendor label. */
+        cJSON_AddNumberToObject(o, "company_id", d->company_id);
 
         cJSON *samples = cJSON_AddArrayToObject(o, "samples");
         if (!samples) { cJSON_Delete(o); oom = true; oom_at = i; break; }
