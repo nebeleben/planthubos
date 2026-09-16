@@ -1452,9 +1452,10 @@ static void knob_reclassify(const uint8_t eui64[8], uint8_t cap)
     if (s_observer) s_observer(&dev_copy, false);
 }
 
-/* The debounce flush callback (esp_zb_scheduler_alarm, 250 ms -- re-armed
- * on every rotation step, so it fires once per burst rather than once per
- * step). Runs on the Zigbee stack task. Takes the net accumulated delta
+/* The debounce flush callback (esp_zb_scheduler_alarm, 250 ms). Each
+ * rotation step cancels the pending alarm and re-arms it (see the arm site),
+ * so a multi-detent turn flushes once, 250 ms after its LAST step, rather
+ * than once per step. Runs on the Zigbee stack task. Takes the net delta
  * for the knob slot the alarm was armed for and submits one dim.rotate
  * event; a net of exactly zero (equal steps each way) submits nothing. */
 static void knob_rotate_flush(uint8_t slot)
@@ -1514,6 +1515,13 @@ static bool zb_rawcmd_handler(uint8_t bufid)
     } else if (kind == ZBCMD_ROTATE) {
         zb_rot_acc_add(&k->acc, v);
         int slot = (int)(k - s_knobs);
+        /* Re-arm, don't stack: esp_zb_scheduler_alarm() ENQUEUES a fresh
+         * alarm on every call (ZBOSS lets the same callback be scheduled
+         * more than once), so without the cancel each rotation step would
+         * leave its own 250 ms alarm and a multi-detent turn would flush in
+         * several pieces instead of once. Cancel-then-arm is this file's own
+         * idiom for the permit timer (see zb_permit_expiry_cb above). */
+        esp_zb_scheduler_alarm_cancel(knob_rotate_flush, (uint8_t)slot);
         esp_zb_scheduler_alarm(knob_rotate_flush, (uint8_t)slot, 250);
         knob_reclassify(eui64, CAP_DIM_ROTATE);
     }
