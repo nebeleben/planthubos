@@ -289,22 +289,18 @@ void data_core_persist_snapshot(void)
 
 void data_core_restore_snapshot(void)
 {
-    registry_t restored;
+    /* Boot-only, before any other task or the webserver starts, so the
+     * registry is empty and single-threaded here: load the snapshot DIRECTLY
+     * into s_registry rather than into a stack-local registry_t and merging.
+     * A 2 KB registry_t on the main-task stack overflowed it (stack
+     * protection fault, boot loop) -- registry_persist_load() uses its own
+     * static read buffer and writes rows in place, so this adds no large
+     * local. Restored rows carry snapshot_only = true; the first live report
+     * clears it. On absent/corrupt (returns -1) load leaves s_registry empty,
+     * exactly as registry_init() did a moment ago. */
     uint32_t epoch = 0;
-    if (registry_persist_load(&restored, &epoch) < 0) return;   /* absent/corrupt */
-
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    /* Merge, never clobber: only fill a device the live registry does not
-     * already hold (at boot it holds none). A restored row keeps its
-     * snapshot_only flag; the first live report clears it. */
-    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
-        if (!restored.devices[i].in_use) continue;
-        if (registry_find(&s_registry, &restored.devices[i].id) >= 0) continue;
-        int idx = registry_find_or_create(&s_registry, &restored.devices[i].id, 0);
-        if (idx < 0) break;   /* registry full */
-        s_registry.devices[idx] = restored.devices[i];
-    }
-    s_snapshot_epoch = epoch;
+    if (registry_persist_load(&s_registry, &epoch) >= 0) s_snapshot_epoch = epoch;
     xSemaphoreGive(s_mutex);
 }
 #else
