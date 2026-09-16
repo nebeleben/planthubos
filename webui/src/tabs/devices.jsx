@@ -363,7 +363,11 @@ function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, f
           <span class="node-card-name">{d.name || d.id}</span>
           {d.name && <span class="node-card-mac mono">{d.id}</span>}
         </span>
-        <span class="node-card-age hint">{fmtAge(d.last_seen_s)}</span>
+        <span class="node-card-age hint">
+          {d.stale
+            ? `last known${d.last_seen_s == null ? '' : ' · ' + fmtAge(d.last_seen_s)}`
+            : fmtAge(d.last_seen_s)}
+        </span>
       </button>
       <div class="node-card-body">
         {/* Only a BLE device's addr is mac-keyed, which is the only key the

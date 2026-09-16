@@ -218,6 +218,15 @@ void app_main(void)
     if (tk_err != ESP_OK) ESP_LOGE(TAG, "timekeeper_init failed (%s); time sync unavailable", esp_err_to_name(tk_err));
 
     ESP_ERROR_CHECK(data_core_init());
+    /* Seed the registry with each device's last-known values from the boot
+     * snapshot (registry_persist.h), so /api/v1/devices isn't blank after a
+     * reboot until every sleepy sensor reports again. Restored rows are
+     * marked stale (aged from the snapshot epoch) and overwritten the moment
+     * a device reports live. Only when /storage mounted -- the snapshot lives
+     * there; without it this is a no-op and the list simply repopulates live.
+     * Runs before webserver_start() below so the API serves the values at
+     * once. */
+    if (storage_ok) data_core_restore_snapshot();
     log_heap("after data_core_init");
 
     /* swarm_store_init() loads role + paired-peer state from NVS into RAM;

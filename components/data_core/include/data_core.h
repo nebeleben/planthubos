@@ -60,6 +60,17 @@ void data_core_submit_from(const mibeacon_t *m, const uint8_t via_node[6],
 
 void      data_core_snapshot(registry_t *out);
 
+/* Latest-value persistence (registry_persist.h). persist writes a snapshot of
+ * every device's latest cap values to flash (called on the sampler tick);
+ * restore loads it back into the registry at boot, marking restored rows
+ * snapshot_only so /api/v1/devices shows last-known readings (aged from
+ * snapshot_epoch, not their reset uptime) until each device reports live.
+ * snapshot_epoch is the wall-clock epoch the loaded snapshot was written at,
+ * 0 when none was loaded or time was unknown when it was written. */
+void      data_core_persist_snapshot(void);
+void      data_core_restore_snapshot(void);
+uint32_t  data_core_snapshot_epoch(void);
+
 /* Single-device lookup, for a caller that only needs one entry rather than
  * the full ~2KB registry_t (e.g. swarm.c's and webserver/sse.c's own
  * on_sensor_update(), both of which run on the default event-loop task's

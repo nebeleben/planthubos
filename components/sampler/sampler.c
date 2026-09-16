@@ -308,6 +308,12 @@ static void sampler_task(void *arg)
     while (1) {
         xSemaphoreTake(s_wake, portMAX_DELAY);
         sample_once();
+        /* Piggyback the plant-history tick to persist each device's LATEST
+         * values (registry_persist.h) -- one small flash file so the device
+         * list survives a reboot. Runs after sample_once() returns (not
+         * nested), and serializes into a data_core-owned static buffer, so it
+         * adds no worst-case depth to this tuned stack. */
+        data_core_persist_snapshot();
         UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL);
         if (free_bytes < lowest_free) {
             lowest_free = free_bytes;

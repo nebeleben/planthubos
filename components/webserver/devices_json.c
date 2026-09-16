@@ -5,6 +5,7 @@
 #include "plants.h"
 #include "bthome.h"
 #include "data_core.h"
+#include "timekeeper.h"
 #include "ble_collector.h"
 #include "gatt_sched.h"
 #include "gatt_engine.h"
@@ -15,6 +16,24 @@
 /* now_uptime_s - last_seen_s, both esp_timer uptime seconds off the same
  * monotonic clock -- floor-at-zero clamp, same defensive spirit as
  * swarm.c's identical age conversion. */
+/* Emit an age field. A live row ages off its uptime timestamp; a row
+ * restored from the boot snapshot (snapshot_only) has uptime timestamps that
+ * reset on reboot, so it ages off the snapshot's wall-clock epoch instead --
+ * rendered JSON null (fmtAge => "never") when the clock was never learned, so
+ * it never masquerades as just-seen. */
+static void add_age(cJSON *o, const char *key, const device_entry_t *e,
+                    uint32_t now_uptime_s, uint32_t uptime_stamp,
+                    bool snap_have, uint32_t snap_age)
+{
+    if (e->snapshot_only) {
+        if (snap_have) cJSON_AddNumberToObject(o, key, snap_age);
+        else cJSON_AddNullToObject(o, key);
+    } else {
+        cJSON_AddNumberToObject(o, key,
+            (now_uptime_s >= uptime_stamp) ? (now_uptime_s - uptime_stamp) : 0);
+    }
+}
+
 static uint32_t age_s(uint32_t now_uptime_s, uint32_t last_seen_s)
 {
     return (now_uptime_s >= last_seen_s) ? (now_uptime_s - last_seen_s) : 0;
@@ -89,7 +108,21 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
     device_id_format(&e->id, idbuf, sizeof(idbuf));
     cJSON_AddStringToObject(o, "id", idbuf);
     cJSON_AddStringToObject(o, "kind", device_kind_str(e->id.kind));
-    cJSON_AddNumberToObject(o, "last_seen_s", age_s(now_uptime_s, e->last_seen_s));
+
+    /* Restored-from-snapshot rows: mark stale and age off the snapshot epoch
+     * (add_age), since their uptime timestamps reset on reboot. Computed once
+     * for the whole row. */
+    bool snap_have = false;
+    uint32_t snap_age = 0;
+    if (e->snapshot_only) {
+        cJSON_AddBoolToObject(o, "stale", true);
+        uint32_t se = data_core_snapshot_epoch();
+        if (timekeeper_synced() && se) {
+            uint32_t now_ep = timekeeper_now();
+            if (now_ep >= se) { snap_have = true; snap_age = now_ep - se; }
+        }
+    }
+    add_age(o, "last_seen_s", e, now_uptime_s, e->last_seen_s, snap_have, snap_age);
     /* M3 Task 7 (spec §4): "Keys are never returned by any GET -- the API
      * reports only has_key: true|false." bindkey_has() takes the SAME
      * dev_id string device_id_format() just built (bindkey.c's own
@@ -133,7 +166,7 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
         cJSON_AddStringToObject(co, "name", cap->name);
         cJSON_AddStringToObject(co, "unit", cap->unit);
         cJSON_AddNumberToObject(co, "value", capability_decode(c, e->caps[c].raw));
-        cJSON_AddNumberToObject(co, "age_s", age_s(now_uptime_s, e->caps[c].updated_s));
+        add_age(co, "age_s", e, now_uptime_s, e->caps[c].updated_s, snap_have, snap_age);
         cJSON_AddItemToArray(caps, co);
     }
 

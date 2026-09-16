@@ -1,5 +1,15 @@
 #include "data_core.h"
 #include "capability.h"
+#ifdef ESP_PLATFORM
+/* Latest-value persistence integration -- flash I/O + wall clock, real only
+ * on-target. The host build (tests/host) links data_core.c to exercise the
+ * event ring; the pure serialize/deserialize core is covered separately by
+ * test_registry_persist, so these two integration functions compile to
+ * no-ops off-target rather than dragging timekeeper/registry_persist and
+ * their file I/O into the host link. */
+#include "registry_persist.h"
+#include "timekeeper.h"
+#endif
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -255,6 +265,48 @@ void data_core_snapshot(registry_t *out)
     memcpy(out, &s_registry, sizeof(*out));
     xSemaphoreGive(s_mutex);
 }
+
+/* Latest-value persistence (registry_persist.h). Epoch the restored snapshot
+ * was written at, 0 when unknown -- devices_json uses it to age restored
+ * (snapshot_only) rows, since their uptime timestamps reset on reboot. */
+static uint32_t s_snapshot_epoch;
+
+uint32_t data_core_snapshot_epoch(void) { return s_snapshot_epoch; }
+
+#ifdef ESP_PLATFORM
+/* Serialize target for the save path: filled under s_mutex, written to flash
+ * OUTSIDE the lock so the registry mutex is never held across I/O. */
+static uint8_t  s_persist_buf[REGISTRY_PERSIST_MAX_BYTES];
+
+void data_core_persist_snapshot(void)
+{
+    uint32_t epoch = timekeeper_synced() ? timekeeper_now() : 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    size_t len = registry_persist_serialize(&s_registry, epoch, s_persist_buf, sizeof s_persist_buf);
+    xSemaphoreGive(s_mutex);
+    if (len > 0) registry_persist_write(s_persist_buf, len);
+}
+
+void data_core_restore_snapshot(void)
+{
+    /* Boot-only, before any other task or the webserver starts, so the
+     * registry is empty and single-threaded here: load the snapshot DIRECTLY
+     * into s_registry rather than into a stack-local registry_t and merging.
+     * A 2 KB registry_t on the main-task stack overflowed it (stack
+     * protection fault, boot loop) -- registry_persist_load() uses its own
+     * static read buffer and writes rows in place, so this adds no large
+     * local. Restored rows carry snapshot_only = true; the first live report
+     * clears it. On absent/corrupt (returns -1) load leaves s_registry empty,
+     * exactly as registry_init() did a moment ago. */
+    uint32_t epoch = 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (registry_persist_load(&s_registry, &epoch) >= 0) s_snapshot_epoch = epoch;
+    xSemaphoreGive(s_mutex);
+}
+#else
+void data_core_persist_snapshot(void) { }
+void data_core_restore_snapshot(void) { }
+#endif
 
 /* Single-device lookup -- see data_core.h's doc comment. Deliberately NOT
  * implemented as "take a full registry_t snapshot via data_core_snapshot(),

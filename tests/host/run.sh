@@ -19,6 +19,12 @@ $CC -Wall -Wextra -Werror -I../../components/capability/include -I../../componen
     ../../components/capability/device_id.c -o test_registry -lm
 ./test_registry
 
+$CC -Wall -Wextra -Werror -I../../components/capability/include -I../../components/data_core/include \
+    test_registry_persist.c ../../components/data_core/registry_persist.c \
+    ../../components/data_core/registry.c ../../components/capability/capability.c \
+    ../../components/capability/device_id.c -o test_registry_persist -lm
+./test_registry_persist
+
 # data_core.c's momentary-event path (Task 4, zigbee-button-support). Unlike
 # test_registry above, this links data_core.c itself, which (unlike
 # registry.c/capability.c/device_id.c) unconditionally includes a handful of
