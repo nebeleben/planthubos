@@ -81,6 +81,18 @@ const bridge_node_t *bridge_table_find_device(const bridge_table_t *t, const swa
     return NULL;
 }
 
+const swarm_device_announce_t *bridge_table_device(const bridge_table_t *t,
+                                                   const swarm_dev_addr_t *dev)
+{
+    for (int i = 0; i < BRIDGE_MAX_NODES; i++) {
+        const bridge_node_t *n = &t->n[i];
+        if (!n->in_use) continue;
+        int idx = find_device_idx(n, dev);
+        if (idx >= 0) return &n->dev[idx];
+    }
+    return NULL;
+}
+
 /* ---- serialize/deserialize: magic 'B','T',1 + node_count, then per
  * in-use node: mac[6], status_valid, status (7 raw bytes, same field order
  * as swarm_coord_status_t -- NOT swarm_encode_coord_status(), which would

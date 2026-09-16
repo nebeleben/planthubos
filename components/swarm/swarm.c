@@ -1477,6 +1477,27 @@ bool swarm_bridge_snapshot(bridge_table_t *out)
     return true;
 }
 
+bool swarm_bridge_device_name(const device_id_t *id, char *out, size_t cap)
+{
+    if (!s_bridges_mutex || !id || !out || cap == 0) return false;
+    swarm_dev_addr_t dev = { .kind = id->kind };
+    memcpy(dev.addr, id->addr, SWARM_ADDR_LEN);
+
+    bool ok = false;
+    xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
+    const swarm_device_announce_t *d = bridge_table_device(&s_bridges, &dev);
+    if (d) {
+        uint8_t nlen = d->name_len > SWARM_DEV_NAME_MAX ? SWARM_DEV_NAME_MAX : d->name_len;
+        if (nlen > 0 && (size_t)nlen < cap) {
+            memcpy(out, d->name, nlen);
+            out[nlen] = '\0';
+            ok = true;   /* only a non-empty stored name counts; else caller falls back to the id */
+        }
+    }
+    xSemaphoreGive(s_bridges_mutex);
+    return ok;
+}
+
 static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, int rssi)
 {
     int type = swarm_frame_type(data, (size_t)len);

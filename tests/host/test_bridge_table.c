@@ -16,6 +16,12 @@ int main(void)
     assert(bridge_table_node(&t, m1, false)->count == 1 && bridge_table_node(&t, m1, false)->dev[0].name_len == 2);
     const bridge_node_t *owner = bridge_table_find_device(&t, &a.dev);
     assert(owner && memcmp(owner->mac, m1, 6) == 0);
+    /* bridge_table_device(): the device RECORD itself (carrying its name), or
+     * NULL when no node has it. */
+    const swarm_device_announce_t *rec = bridge_table_device(&t, &a.dev);
+    assert(rec && rec->name_len == 2 && rec->name[0] == 'A' && rec->name[1] == 'B');
+    swarm_dev_addr_t missing = { .kind = 9, .addr = {9,9,9,9,9,9,9,9} };
+    assert(bridge_table_device(&t, &missing) == NULL);
     assert(bridge_table_remove(&t, m1, &a.dev) && bridge_table_node(&t, m1, false)->count == 0);
     assert(!bridge_table_remove(&t, m1, &a.dev));
     for (int i = 0; i < BRIDGE_MAX_DEVICES; i++) { a.dev.addr[0] = (uint8_t)i; assert(bridge_table_upsert(&t, m2, &a)); }
