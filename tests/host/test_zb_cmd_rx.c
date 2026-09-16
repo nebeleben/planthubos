@@ -8,6 +8,8 @@ int main(void) {
     assert(!zb_cmd_rx_is_knob_sig(0x01));
     assert(!zb_cmd_rx_is_knob_sig(0x02));
     assert(!zb_cmd_rx_is_knob_sig(0x40));
+    assert(!zb_cmd_rx_is_knob_sig(0x41));
+    assert(!zb_cmd_rx_is_knob_sig(0x42));
     /* non-standard ids ARE the signature */
     assert(zb_cmd_rx_is_knob_sig(0x03));
     assert(zb_cmd_rx_is_knob_sig(0x04));
@@ -19,8 +21,8 @@ int main(void) {
     assert(zb_cmd_rx_knob_decode(0x02, &v) == ZBCMD_PRESS && v == 2);
     assert(zb_cmd_rx_knob_decode(0x03, &v) == ZBCMD_ROTATE && v == 1);
     assert(zb_cmd_rx_knob_decode(0x04, &v) == ZBCMD_ROTATE && v == -1);
-    assert(zb_cmd_rx_knob_decode(0xfc, &v) == ZBCMD_IGNORE);
-    assert(zb_cmd_rx_knob_decode(0x01, &v) == ZBCMD_IGNORE);
+    assert(zb_cmd_rx_knob_decode(0xfc, &v) == ZBCMD_IGNORE && v == -1);
+    assert(zb_cmd_rx_knob_decode(0x01, &v) == ZBCMD_IGNORE && v == -1);
 
     /* accumulator: a CW turn of 6 detents nets +6; mixed nets the sum */
     zb_rot_acc_t a = {0};
