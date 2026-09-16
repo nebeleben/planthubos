@@ -439,6 +439,67 @@ static void test_lockout_undeclared(void) {
     assert(!actor_table_lockout(&T, -1, &on));  /* negative dev_idx */
 }
 
+/* Reconcile/prune: a device announce carries the device's full current
+ * action set, so an action previously declared but absent from the latest
+ * announce must be dropped -- while a surviving action keeps its guards and
+ * spent budget (the whole reason actor_table_add re-declares in place).
+ * This is the fix for a runtime-reclassified Zigbee knob that shed its
+ * phantom switch.on/off actions after interviewing as a switch. */
+static void test_prune_absent_drops_and_keeps_guards(void) {
+    actor_table_init(&T);
+    assert(actor_table_add(&T, 3, ACT_IRRIGATION_OPEN, 300, 0x01));
+    assert(actor_table_add(&T, 3, ACT_SWITCH_ON, 0, 0));
+    assert(actor_table_add(&T, 3, ACT_SWITCH_OFF, 0, 0));
+    actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, /*cooldown*/ 60, /*rate*/ 10);
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 100);
+
+    const uint8_t keep[] = { ACT_IRRIGATION_OPEN };
+    assert(actor_table_prune_absent(&T, 3, keep, 1));   /* something removed */
+
+    /* The two switch actions are gone... */
+    assert(actor_table_check(&T, 3, ACT_SWITCH_ON, 0, ACTOR_SRC_RULE, 200) == ACTOR_REFUSED_UNKNOWN);
+    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 0, ACTOR_SRC_RULE, 200) == ACTOR_REFUSED_UNKNOWN);
+    /* ...the survivor is still declared AND still inside its cooldown: guard
+     * and spent budget preserved, not reset to a fresh slot (a reset would
+     * read as OK at 150). */
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 150) == ACTOR_REFUSED_COOLDOWN);
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 160) == ACTOR_OK);
+}
+
+/* Pruning to an empty set frees the whole device row (like a remove): its
+ * actions become UNKNOWN and its capacity is reclaimed. */
+static void test_prune_to_empty_frees_row(void) {
+    actor_table_init(&T);
+    assert(actor_table_add(&T, 5, ACT_SWITCH_ON, 0, 0));
+    assert(actor_table_add(&T, 5, ACT_SWITCH_OFF, 0, 0));
+    assert(actor_table_prune_absent(&T, 5, NULL, 0));   /* everything removed */
+    assert(actor_table_check(&T, 5, ACT_SWITCH_ON, 0, ACTOR_SRC_RULE, 100) == ACTOR_REFUSED_UNKNOWN);
+    assert(actor_table_check(&T, 5, ACT_SWITCH_OFF, 0, ACTOR_SRC_RULE, 100) == ACTOR_REFUSED_UNKNOWN);
+    /* Capacity reclaimed: every row free again, so a full table's worth of
+     * fresh devices all fit (the last would be refused if row 5 lingered). */
+    for (int i = 0; i < ACTOR_MAX_DEVICES; i++) assert(actor_table_add(&T, 100 + i, ACT_SWITCH_ON, 0, 0));
+}
+
+/* No-op when the announce still lists every declared action: nothing
+ * removed (returns false), everything stays declared. */
+static void test_prune_absent_noop_when_all_present(void) {
+    actor_table_init(&T);
+    assert(actor_table_add(&T, 3, ACT_SWITCH_ON, 0, 0));
+    assert(actor_table_add(&T, 3, ACT_SWITCH_OFF, 0, 0));
+    const uint8_t keep[] = { ACT_SWITCH_ON, ACT_SWITCH_OFF };
+    assert(!actor_table_prune_absent(&T, 3, keep, 2));  /* nothing to remove */
+    assert(actor_table_check(&T, 3, ACT_SWITCH_ON, 0, ACTOR_SRC_RULE, 100) == ACTOR_OK);
+    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 0, ACTOR_SRC_RULE, 100) == ACTOR_OK);
+}
+
+/* A negative dev_idx and an undeclared device both prune nothing. */
+static void test_prune_absent_negative_or_unknown(void) {
+    actor_table_init(&T);
+    const uint8_t one[] = { ACT_SWITCH_ON };
+    assert(!actor_table_prune_absent(&T, -1, one, 1));
+    assert(!actor_table_prune_absent(&T, 7, one, 1));   /* no such row */
+}
+
 int main(void) {
     test_bound_enforced(); test_wrapper_bound_tightens(); test_cooldown();
     test_rate_limit_fixed_window(); test_one_budget_across_sources(); test_lockout();
@@ -462,6 +523,10 @@ int main(void) {
     test_pair_state_lockout_does_not_appear_as_live_verdict();
     test_lockout_read_back();
     test_lockout_undeclared();
+    test_prune_absent_drops_and_keeps_guards();
+    test_prune_to_empty_frees_row();
+    test_prune_absent_noop_when_all_present();
+    test_prune_absent_negative_or_unknown();
     printf("test_actor_table: OK\n");
     return 0;
 }
