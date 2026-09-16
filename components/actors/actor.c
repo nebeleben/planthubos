@@ -379,6 +379,22 @@ bool actor_guards_apply(int dev_idx, const actor_guard_row_t *row)
     return ok;
 }
 
+bool actor_prune_absent(int dev_idx, const uint8_t *action_ids, uint8_t count)
+{
+    actor_lock();
+    bool removed = actor_table_prune_absent(&s_table, dev_idx, action_ids, count);
+    /* Only a real removal touches persisted state; this runs on every
+     * device announce (the common case declares in place and removes
+     * nothing), so marking dirty unconditionally would write the guard
+     * image to flash on every routine re-announce. */
+    if (removed) s_guards_dirty = true;
+    actor_unlock();
+    /* Like actor_undeclare(): a command still queued for a now-undeclared
+     * action is left in place -- actor_service_step() re-checks the table
+     * before dispatch and refuses it as UNKNOWN with a named alert. */
+    return removed;
+}
+
 bool actor_undeclare(int dev_idx)
 {
     actor_lock();

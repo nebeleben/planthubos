@@ -223,6 +223,25 @@ void actor_table_set_lockout(actor_table_t *t, int dev_idx, bool on);
  * their lockout every time any unrelated wrapper was installed. */
 bool actor_table_remove(actor_table_t *t, int dev_idx);
 
+/* Reconcile a device's declared actions against the full set carried by a
+ * fresh device announce/interview: remove every declared action for
+ * dev_idx that is NOT among action_ids[0..count), and free the whole row
+ * if that empties it. A surviving action is left in place with its guards
+ * and spent budget intact (the counterpart of actor_table_add()'s in-place
+ * re-declare). Returns true iff at least one action was removed; false for
+ * a negative dev_idx, an undeclared device, or when every declared action
+ * is still present.
+ *
+ * This is the "on evidence" removal actor_table_remove()'s own contract
+ * calls for, applied at the (device, action) grain: a device announce
+ * carries the device's true current action set, so an action missing from
+ * it has genuinely gone -- the case that made this necessary is a Zigbee
+ * knob that interviews as a switch, registers switch.on/off, then is
+ * runtime-reclassified and re-announces with those actions stripped. count
+ * may be 0 (action_ids is then unread), which prunes every action. */
+bool actor_table_prune_absent(actor_table_t *t, int dev_idx,
+                              const uint8_t *action_ids, uint8_t count);
+
 uint32_t actor_table_full_drops(const actor_table_t *t);
 
 /* M5b Task 9: read-only accessor for a declared pair's stored `flags` (see

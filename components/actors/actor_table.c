@@ -263,6 +263,56 @@ bool actor_table_remove(actor_table_t *t, int dev_idx)
     return true;
 }
 
+bool actor_table_prune_absent(actor_table_t *t, int dev_idx,
+                              const uint8_t *action_ids, uint8_t count)
+{
+    if (dev_idx < 0) return false;
+
+    actor_device_t *row = find_row(t, dev_idx);
+    if (!row) return false;
+
+    /* Free every declared slot whose action is NOT in the announced set.
+     * A survivor is left completely untouched -- its guards, spent hourly
+     * budget and window state are preserved, the same in-place contract
+     * actor_table_add() keeps for a re-declare, so reconciling a device's
+     * action list never costs an operator their cooldown/rate limits on
+     * the actions that remain. Only genuinely-dropped actions lose their
+     * state, and they must: a freed slot is reused by the next
+     * actor_table_add(), so it is reset to exactly what actor_table_init()
+     * leaves, matching actor_table_remove()'s reasoning. */
+    bool removed = false;
+    for (int j = 0; j < ACTOR_MAX_ACTIONS; j++) {
+        actor_slot_t *s = &row->actions[j];
+        if (s->action_id == ACTION_NONE) continue;
+        bool listed = false;
+        for (uint8_t i = 0; i < count; i++)
+            if (action_ids[i] == s->action_id) { listed = true; break; }
+        if (listed) continue;
+        s->action_id = ACTION_NONE;
+        s->flags = 0;
+        s->param_max = 0;
+        s->cooldown_s = 0;
+        s->max_per_hour = 0;
+        s->window_count = 0;
+        s->last_fire_s = 0;
+        s->window_start_s = 0;
+        removed = true;
+    }
+    if (!removed) return false;
+
+    /* If nothing is left declared, free the whole row like
+     * actor_table_remove() -- including the device key and lockout -- so a
+     * device that shed all its actions leaves no half-populated row for a
+     * later actor_table_add() to reuse with stale identity or a stuck stop
+     * button. */
+    for (int j = 0; j < ACTOR_MAX_ACTIONS; j++)
+        if (row->actions[j].action_id != ACTION_NONE) return true;
+    row->dev_idx = -1;
+    row->lockout = false;
+    memset(row->key, 0, ACTOR_DEVICE_KEY_LEN);
+    return true;
+}
+
 uint32_t actor_table_full_drops(const actor_table_t *t)
 {
     return t->full_drops;

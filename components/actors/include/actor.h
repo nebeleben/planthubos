@@ -227,6 +227,13 @@ void     actor_set_lockout(int dev_idx, bool on);
  * evidence that the device is no longer an actuator at all. M5b Task 8's
  * wrapper reindex is the one caller. */
 bool     actor_undeclare(int dev_idx);
+/* Lock-taking wrapper around actor_table_prune_absent(): reconcile a
+ * device's declared actions against the full set carried by a fresh
+ * announce/interview, dropping only the actions no longer present and
+ * preserving the guards of those that remain. Marks the guard image dirty
+ * only when something was actually removed, since this runs on every
+ * announce. Returns true iff at least one action was removed. */
+bool     actor_prune_absent(int dev_idx, const uint8_t *action_ids, uint8_t count);
 uint32_t actor_full_drops(void);
 /* Lock-taking wrapper around actor_table_action_flags() -- M5b Task 9's one
  * reader of a declared pair's flags (ACTOR_FLAG_DEVICE_LOCAL_TIMED_OFF, see

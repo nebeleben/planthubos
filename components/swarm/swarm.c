@@ -988,6 +988,15 @@ static void bridge_task(void *arg)
                                  idx, (unsigned)it.u.ann.action_ids[i], MAC2STR(it.mac));
                     }
                 }
+                /* An announce carries the device's FULL current action set,
+                 * so any action declared earlier but absent now has genuinely
+                 * gone -- drop it (and free the row if it empties). Without
+                 * this the actor table is add-only: a device runtime-
+                 * reclassified from a switch to an input (a Zigbee knob that
+                 * shed its phantom switch.on/off on re-announce) would keep
+                 * offering non-functional switch actions forever. Survivors
+                 * keep their guards; see actor_table_prune_absent(). */
+                actor_prune_absent(idx, it.u.ann.action_ids, it.u.ann.action_count);
                 actor_set_device_key(idx, (const uint8_t *)&id);
                 mark_bridge_dirty(now_s);
                 break;
