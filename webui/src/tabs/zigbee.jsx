@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
+import { permitRemaining, pendingActive, PAIR_PENDING_TIMEOUT_MS } from '../lib/pairing.js'
 
 // Consecutive poll(GET /api/v1/zigbee) failures before the on-screen
 // countdown stops being presented as authoritative -- see the `stale`
@@ -144,7 +145,8 @@ function keyOf(node) {
 // permit window is just a queued ESP-NOW command -- see radio-architecture
 // findings). `busyKey` is the tab-wide "which card's permit POST is in
 // flight" tracker; this card is busy iff busyKey === keyOf(c.node).
-function CoordinatorCard({ c, busyKey, onPermit, onRenamed, onRemoved, stale, pairingOutage }) {
+function CoordinatorCard({ c, busyKey, onPermit, onRenamed, onRemoved, stale, pairingOutage,
+                           permitLeft, pending, pendingStale }) {
   const [openMap, setOpenMap] = useState({})
   const isLocal = c.node === null
   const busy = busyKey === keyOf(c.node)
@@ -181,11 +183,11 @@ function CoordinatorCard({ c, busyKey, onPermit, onRenamed, onRemoved, stale, pa
         </span>
       </div>
       <p>
-        {c.permit_s > 0 ? (
+        {permitLeft > 0 ? (
           <span class="hint">
             {isLocal
-              ? `Pairing open — put the device into pairing mode now (${c.permit_s}s left).`
-              : `Pairing open on ${label} — ${c.permit_s}s left`}
+              ? `Pairing open — put the device into pairing mode now (${permitLeft}s left).`
+              : `Pairing open on ${label} — ${permitLeft}s left`}
             {isLocal && pairingOutage && !stale && (
               <span class="hint">
                 {' '}(hub briefly unreachable while pairing — this is normal)
@@ -197,10 +199,23 @@ function CoordinatorCard({ c, busyKey, onPermit, onRenamed, onRemoved, stale, pa
               </span>
             )}
           </span>
+        ) : pending ? (
+          // Click registered, window not open yet: a bridge takes a few
+          // seconds to receive the queued command and start its window.
+          <span class="hint">
+            {isLocal
+              ? 'Opening pairing window — the radio will open it shortly…'
+              : `Opening pairing window on ${label} — the bridge will open it shortly…`}
+          </span>
         ) : (
-          <button class="btn-primary" onClick={() => onPermit(c.node)} disabled={busy}>
-            {busy ? 'Opening…' : isLocal ? 'Pair a device' : `Pair a device on ${label}`}
-          </button>
+          <>
+            <button class="btn-primary" onClick={() => onPermit(c.node)} disabled={busy}>
+              {busy ? 'Opening…' : isLocal ? 'Pair a device' : `Pair a device on ${label}`}
+            </button>
+            {pendingStale && (
+              <span class="hint">{' '}last request didn’t open a window — try again</span>
+            )}
+          </>
         )}
       </p>
       {c.devices.length === 0 ? (
@@ -258,6 +273,32 @@ export function ZigbeeTab() {
   const windowEndRef = useRef(0)
   const [pairingOutage, setPairingOutage] = useState(false)
 
+  // Smooth countdown + "opening shortly…" pending state (see lib/pairing.js).
+  // permit_s only arrives on the poll cadence, so the displayed countdown is
+  // driven off a per-coordinator client-clock window-end (re-anchored each
+  // poll, keyed by keyOf(node)) and a 1s tick, not the 2s-stale snapshot.
+  // `pending` holds, per coordinator, the client-clock ms at which a permit
+  // was requested but the window has not yet been observed open -- a bridge
+  // POST only returns {ok,queued}, so without this the card would snap back
+  // to the button until the next poll saw permit_s > 0 (looks like nothing
+  // happened). windowEndsRef is a ref (read in render, doesn't itself drive
+  // renders); the 1s `nowMs` tick does. pendingRef mirrors `pending` so the
+  // tick can decide whether anything still needs counting without capturing
+  // stale state.
+  const windowEndsRef = useRef({})
+  const [pending, setPending] = useState({})
+  const pendingRef = useRef({})
+  const [nowMs, setNowMs] = useState(Date.now())
+
+  function setPendingFor(key, postedAtMs) {
+    setPending((prev) => {
+      const next = { ...prev }
+      if (postedAtMs) next[key] = postedAtMs; else delete next[key]
+      pendingRef.current = next
+      return next
+    })
+  }
+
   // Self-rescheduling poll (recursive setTimeout, not setInterval): the
   // cadence must flip the INSTANT any pairing window opens or closes, not
   // wait for whichever interval happens to be running. 2s while ANY
@@ -280,10 +321,24 @@ export function ZigbeeTab() {
         consecFailsRef.current = 0
         setStale(false)
         setPairingOutage(false)
+        // Re-anchor each coordinator's client-clock window-end from the fresh
+        // permit_s, and drop the pending flag for any window now observed open.
+        const t = Date.now()
+        const ends = {}
+        coordinators.forEach((c) => {
+          const key = keyOf(c.node)
+          ends[key] = c.permit_s > 0 ? t + c.permit_s * 1000 : 0
+          if (c.permit_s > 0 && pendingRef.current[key]) setPendingFor(key, 0)
+        })
+        windowEndsRef.current = ends
+        setNowMs(t)
         const local = coordinators.find((c) => c.node === null)
         lastPermitRef.current = local ? local.permit_s || 0 : 0
         const anyOpen = coordinators.some((c) => c.permit_s > 0)
-        pollTimerRef.current = setTimeout(poll, anyOpen ? 2000 : 10000)
+        // Also poll fast while a queued bridge open is still pending, so its
+        // window is noticed within ~2s of the node opening it, not ~10s.
+        const anyPending = Object.keys(pendingRef.current).length > 0
+        pollTimerRef.current = setTimeout(poll, (anyOpen || anyPending) ? 2000 : 10000)
       })
       .catch((err) => {
         if (err.name === 'AbortError') return
@@ -307,7 +362,8 @@ export function ZigbeeTab() {
           if (prev == null) setError(true)
           return prev
         })
-        pollTimerRef.current = setTimeout(poll, lastPermitRef.current > 0 ? 2000 : 10000)
+        const anyPending = Object.keys(pendingRef.current).length > 0
+        pollTimerRef.current = setTimeout(poll, (lastPermitRef.current > 0 || anyPending) ? 2000 : 10000)
       })
   }
 
@@ -318,6 +374,20 @@ export function ZigbeeTab() {
       controllerRef.current.abort()
       clearTimeout(pollTimerRef.current)
     }
+  }, [])
+
+  // 1s tick driving the smooth countdown and the pending timeout. Only
+  // re-renders when something is actually counting (a window still open on
+  // the client clock, or a queued open still pending), so an idle tab with
+  // no open window is not re-rendered every second.
+  useEffect(() => {
+    const t = setInterval(() => {
+      const now = Date.now()
+      const anyWindow = Object.values(windowEndsRef.current).some((end) => end > now)
+      const anyPending = Object.keys(pendingRef.current).length > 0
+      if (anyWindow || anyPending) setNowMs(now)
+    }, 1000)
+    return () => clearInterval(t)
   }, [])
 
   // node: null for the local coordinator, mac12 for a bridge -- Task 9's
@@ -337,18 +407,30 @@ export function ZigbeeTab() {
       })
       const body = await res.json().catch(() => ({}))
       if (res.ok && body.ok) {
+        const key = keyOf(node)
         if (node === null) {
+          const end = Date.now() + (body.permit_s || 0) * 1000
           setData((prev) => (prev
             ? prev.map((c) => (c.node === null ? { ...c, permit_s: body.permit_s } : c))
             : prev))
           lastPermitRef.current = body.permit_s || 0
-          windowEndRef.current = Date.now() + (body.permit_s || 0) * 1000
+          windowEndRef.current = end
+          // Anchor the smooth countdown from this response so it starts
+          // ticking now, not on the next poll.
+          windowEndsRef.current = { ...windowEndsRef.current, [key]: end }
           // This POST just succeeded, so the hub is reachable right now --
           // clear any stale-countdown state immediately rather than
           // waiting for poll()'s own next success to do it.
           consecFailsRef.current = 0
           setStale(false)
+        } else {
+          // Bridge: the POST only QUEUES an ESP-NOW command ({ok,queued});
+          // the window opens seconds later when the node next polls. Show
+          // the pending state immediately so the click visibly registers --
+          // cleared by the first poll that sees permit_s > 0, or timed out.
+          setPendingFor(key, Date.now())
         }
+        setNowMs(Date.now())
         clearTimeout(pollTimerRef.current)
         poll()
       } else {
@@ -389,11 +471,20 @@ export function ZigbeeTab() {
 
   return (
     <>
-      {data.map((c) => (
-        <CoordinatorCard key={keyOf(c.node)} c={c} busyKey={busyKey} onPermit={doPermit}
-                          onRenamed={onRenamed} onRemoved={onRemoved}
-                          stale={stale} pairingOutage={pairingOutage} />
-      ))}
+      {data.map((c) => {
+        const key = keyOf(c.node)
+        const permitLeft = permitRemaining(windowEndsRef.current[key], nowMs)
+        const postedAt = pending[key]
+        const isPending = permitLeft === 0 && pendingActive(postedAt, nowMs, PAIR_PENDING_TIMEOUT_MS)
+        const pendingStale = permitLeft === 0 && !!postedAt &&
+          !pendingActive(postedAt, nowMs, PAIR_PENDING_TIMEOUT_MS)
+        return (
+          <CoordinatorCard key={key} c={c} busyKey={busyKey} onPermit={doPermit}
+                            onRenamed={onRenamed} onRemoved={onRemoved}
+                            stale={stale} pairingOutage={pairingOutage}
+                            permitLeft={permitLeft} pending={isPending} pendingStale={pendingStale} />
+        )
+      })}
     </>
   )
 }
