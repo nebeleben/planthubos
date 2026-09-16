@@ -51,3 +51,7 @@ tests/host/test_swarm_rules
 tests/host/test_bridge_table
 tests/host/test_bridge_cmd
 tests/host/test_data_core_events
+tests/host/test_zb_cmd_rx
+tests/host/test_zb_interview
+tests/host/test_zb_map
+tests/host/test_zb_store
