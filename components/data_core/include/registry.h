@@ -46,6 +46,13 @@ typedef struct {
     uint8_t  via_node[6];
     int8_t   best_rssi;
     uint32_t attributed_s;
+    /* Transient (never serialized): true for a row restored from the boot
+     * snapshot (registry_persist.h) that has not yet been heard from live
+     * this boot. last_seen_s/updated_s are uptime seconds and reset across a
+     * reboot, so a restored row's age is taken from the snapshot epoch and
+     * marked stale by devices_json instead of reading as just-seen. Cleared
+     * the moment a live value arrives for the device. */
+    bool     snapshot_only;
 } device_entry_t;
 
 typedef struct { device_entry_t devices[REGISTRY_MAX_DEVICES]; } registry_t;

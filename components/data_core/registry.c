@@ -65,6 +65,7 @@ int registry_set_cap(registry_t *r, const device_id_t *id, uint8_t cap_id,
     if (idx < 0) return -1;
     device_entry_t *d = &r->devices[idx];
     d->last_seen_s = now_s;
+    d->snapshot_only = false;   /* a live value de-stales a restored row */
     d->caps[cap_id].raw = raw;
     d->caps[cap_id].updated_s = now_s;
     d->caps[cap_id].valid = (raw != CAP_VALUE_NONE);
@@ -92,6 +93,7 @@ bool registry_attribute(registry_t *r, const device_id_t *id, uint32_t frame_cnt
     if (idx < 0) return false;
     device_entry_t *d = &r->devices[idx];
     d->last_seen_s = now_s;
+    d->snapshot_only = false;   /* a live sighting de-stales a restored row */
 
     if (created) {
         /* Brand-new device: unconditionally attributed to whoever reported
