@@ -95,6 +95,16 @@ export function fmtCapParts(caps, id, value) {
     if (value == null || Number.isNaN(value)) return { text: 'waiting for a press', unit: '' }
     return { text: PRESS_LABEL[value] ?? `code ${value}`, unit: '' }
   }
+  // dim.rotate (id 10, zigbee-command-controller amendment) reports a
+  // signed integer from a knob remote -- positive is a clockwise turn,
+  // negative counter-clockwise -- not a numeric+unit reading, so it gets
+  // its own branch alongside button.action's, ahead of the generic
+  // null-check and toFixed() paths below.
+  if (c && c.name === 'dim.rotate') {
+    if (value == null || Number.isNaN(value)) return { text: 'waiting for a turn', unit: '' }
+    const n = Number(value)
+    return { text: n > 0 ? `↻ +${n} (CW)` : n < 0 ? `↺ ${n} (CCW)` : '0', unit: '' }
+  }
   if (value == null || Number.isNaN(value)) return { text: '–', unit: '' }
   if (!c) return { text: String(value), unit: '' }
   return { text: value.toFixed(c.precision ?? 0), unit: c.unit }
