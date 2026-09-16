@@ -50,6 +50,18 @@
 #include "data_core.h"
 #include "actor.h"
 #include "actor_persist.h"
+#include "action.h"
+
+/* Task 3 (2026-09-16 zigbee-command-controller spec): the raw ZCL command
+ * handler below decodes a proprietary knob remote's On/Off command
+ * overload -- see task-3-brief.md. zboss_api.h brings in ZB_BUF_GET_PARAM
+ * (zboss_api_buf.h) and, via zboss_api_zcl.h, zcl/zb_zcl_common.h's
+ * zb_zcl_parsed_hdr_t; the explicit zcl/zb_zcl_common.h include below is
+ * belt-and-suspenders documentation of what this file actually uses from
+ * it. zb_cmd_rx.h is Task 2's pure, host-tested decode/accumulate logic. */
+#include "zboss_api.h"
+#include "zcl/zb_zcl_common.h"
+#include "zb_cmd_rx.h"
 
 static const char *TAG = "zigbee";
 
@@ -1319,6 +1331,203 @@ static void zb_iv_handle_store(void)
     if (s_observer) s_observer(dev, false);
 }
 
+/* ---- Task 3 (2026-09-16 zigbee-command-controller): the knob remote ----
+ *
+ * A proprietary "knob" remote interviews as a plain On/Off switch
+ * (CAP_SWITCH_STATE / ACT_SWITCH_ON / ACT_SWITCH_OFF), but presses and
+ * rotations both arrive as On/Off cluster (0x0006) commands whose command
+ * id overloads the standard set -- 0x00/0x02 for a press, 0x03/0x04 for a
+ * rotation step, on top of whatever standard ids ({0x00,0x01,0x02,0x40,
+ * 0x41,0x42}) a normal On/Off device also uses. zb_cmd_rx_is_knob_sig()
+ * (Task 2, host-tested) is the gate: it is true only for a command id
+ * outside that standard set, so a genuinely standard On/Off device is
+ * never decoded this way. Once a device has sent ONE non-standard id it
+ * is remembered as a knob (s_knobs[].is_knob) and every subsequent On/Off
+ * command from it -- standard-looking ids included -- is decoded via
+ * zb_cmd_rx_knob_decode().
+ *
+ * Per-device state for this lives in s_knobs[], touched only by
+ * zb_rawcmd_handler() and knob_rotate_flush() below -- both run on the
+ * Zigbee stack task (the raw command callback and the scheduler-alarm
+ * callback it arms), so s_knobs[] needs no mutex of its own. */
+#define ZB_KNOB_SLOTS 4
+typedef struct { uint8_t eui64[8]; bool used; bool is_knob; zb_rot_acc_t acc; } zb_knob_t;
+static zb_knob_t s_knobs[ZB_KNOB_SLOTS];
+
+/* find-or-claim a slot for eui64 (reuse slot 0 when full -- a bench never
+ * has >ZB_KNOB_SLOTS knobs). Called only on the stack task. */
+static zb_knob_t *knob_slot(const uint8_t eui64[8])
+{
+    for (int i = 0; i < ZB_KNOB_SLOTS; i++)
+        if (s_knobs[i].used && memcmp(s_knobs[i].eui64, eui64, 8) == 0) return &s_knobs[i];
+    for (int i = 0; i < ZB_KNOB_SLOTS; i++)
+        if (!s_knobs[i].used) {
+            s_knobs[i] = (zb_knob_t){0};
+            memcpy(s_knobs[i].eui64, eui64, 8);
+            s_knobs[i].used = true;
+            return &s_knobs[i];
+        }
+    s_knobs[0] = (zb_knob_t){0};                 /* full: reuse slot 0 */
+    memcpy(s_knobs[0].eui64, eui64, 8);
+    s_knobs[0].used = true;
+    return &s_knobs[0];
+}
+
+/* Reclassifies a knob's STORED record: mirrors zb_interview_finalize()'s
+ * switch-removal (zb_interview.c) -- same shift loops, same two things
+ * removed -- but runs after the interview already finished and settled on
+ * "switch", because that is the only thing the interview itself can see;
+ * only live traffic proves it is actually a knob. Adds `cap`
+ * (CAP_BUTTON_ACTION or CAP_DIM_ROTATE) if not already present, guarding
+ * ZB_STORE_MAX_CAPS the same way the report-handler cap-list backfill
+ * above does, then strips CAP_SWITCH_STATE / ACT_SWITCH_ON / ACT_SWITCH_OFF
+ * if any remain. Idempotent: once `cap` is present and no switch residue
+ * remains, returns early -- no save, no re-announce -- so repeat knob
+ * traffic after the first press/rotation costs only the lookup. */
+static void knob_reclassify(const uint8_t eui64[8], uint8_t cap)
+{
+    zb_device_t dev_copy = {0};
+    bool changed = false;
+
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+    int bi = zb_store_find(&s_store, eui64);
+    if (bi < 0) { xSemaphoreGive(s_store_mutex); return; }
+    zb_device_t *d = &s_store.dev[bi];
+
+    bool has_cap = false;
+    for (int i = 0; i < d->cap_count; i++)
+        if (d->caps[i] == cap) { has_cap = true; break; }
+    bool has_switch_cap = false;
+    for (int i = 0; i < d->cap_count; i++)
+        if (d->caps[i] == CAP_SWITCH_STATE) { has_switch_cap = true; break; }
+    bool has_switch_action = false;
+    for (int i = 0; i < d->action_count; i++)
+        if (d->actions[i] == ACT_SWITCH_ON || d->actions[i] == ACT_SWITCH_OFF) { has_switch_action = true; break; }
+
+    if (has_cap && !has_switch_cap && !has_switch_action) {
+        xSemaphoreGive(s_store_mutex);
+        return;                          /* idempotent: already reclassified */
+    }
+
+    if (!has_cap) {
+        if (d->cap_count < ZB_STORE_MAX_CAPS) {
+            d->caps[d->cap_count] = cap;
+            d->cap_clusters[d->cap_count] = 0x0006;
+            d->cap_count++;
+            changed = true;
+        } else {
+            ESP_LOGW(TAG, "knob_reclassify: cap list full; cannot add cap %u", cap);
+        }
+    }
+
+    /* Remove CAP_SWITCH_STATE (and its parallel cap_clusters entry) --
+     * zb_interview_finalize()'s loop, verbatim. */
+    for (int i = 0; i < d->cap_count; ) {
+        if (d->caps[i] == CAP_SWITCH_STATE) {
+            for (int k = i; k < d->cap_count - 1; k++) {
+                d->caps[k] = d->caps[k + 1];
+                d->cap_clusters[k] = d->cap_clusters[k + 1];
+            }
+            d->cap_count--;
+            changed = true;
+        } else i++;
+    }
+    /* Remove the switch actions -- same loop shape. */
+    for (int i = 0; i < d->action_count; ) {
+        if (d->actions[i] == ACT_SWITCH_ON || d->actions[i] == ACT_SWITCH_OFF) {
+            for (int k = i; k < d->action_count - 1; k++)
+                d->actions[k] = d->actions[k + 1];
+            d->action_count--;
+            changed = true;
+        } else i++;
+    }
+
+    if (!changed) { xSemaphoreGive(s_store_mutex); return; }
+
+    zb_store_save();
+    dev_copy = *d;
+    xSemaphoreGive(s_store_mutex);
+
+    ESP_LOGI(TAG, "knob reclassify: cap %u settled, switch residue removed; re-announcing", cap);
+    if (s_observer) s_observer(&dev_copy, false);
+}
+
+/* The debounce flush callback (esp_zb_scheduler_alarm, 250 ms). Each
+ * rotation step cancels the pending alarm and re-arms it (see the arm site),
+ * so a multi-detent turn flushes once, 250 ms after its LAST step, rather
+ * than once per step. Runs on the Zigbee stack task. Takes the net delta
+ * for the knob slot the alarm was armed for and submits one dim.rotate
+ * event; a net of exactly zero (equal steps each way) submits nothing. */
+static void knob_rotate_flush(uint8_t slot)
+{
+    if (slot >= ZB_KNOB_SLOTS || !s_knobs[slot].used) return;
+    int16_t net = zb_rot_acc_take(&s_knobs[slot].acc);
+    if (net == 0) return;
+    device_id_t id = { .kind = DEV_KIND_ZIGBEE };
+    memcpy(id.addr, s_knobs[slot].eui64, 8);
+    data_core_submit_event(&id, CAP_DIM_ROTATE, net);
+    ESP_LOGI(TAG, "knob rotate: net=%d -> dim.rotate", net);
+}
+
+/* ESP_ZB_CORE_ACTION handlers only see standard ZCL commands the stack
+ * already parsed into a known action; this raw handler is the escape
+ * hatch that also sees a cluster-specific/manufacturer command like the
+ * knob's On/Off overload before the stack discards it as unrecognised.
+ * Registered in zb_task() below (esp_zb_raw_command_handler_register()),
+ * on the same stack task as every other callback in this file.
+ *
+ * Always returns false ("unprocessed"): the MAC ACK already satisfied the
+ * sender and the stack frees bufid regardless of the return value, so
+ * there is nothing to gain by claiming ownership of a buffer this handler
+ * never needs again. */
+static bool zb_rawcmd_handler(uint8_t bufid)
+{
+    zb_zcl_parsed_hdr_t *h = ZB_BUF_GET_PARAM(bufid, zb_zcl_parsed_hdr_t);
+    if (!h || h->cluster_id != 0x0006 || h->is_common_command) return false;
+    uint8_t cmd = h->cmd_id;
+    uint16_t short_addr = h->addr_data.common_data.source.u.short_addr;
+
+    /* zb_eui64_for_short() does not exist; the real lookup is
+     * zb_store_find_by_short() (already used by zb_handle_report_attr()
+     * above), which -- like s_store.dev[] itself -- requires
+     * s_store_mutex. Copy the eui64 out and release before doing
+     * anything else: data_core_submit_event()/knob_reclassify() must
+     * never run with s_store_mutex held. */
+    uint8_t eui64[8];
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+    int idx = zb_store_find_by_short(short_addr);
+    bool found = idx >= 0;
+    if (found) memcpy(eui64, s_store.dev[idx].eui64, 8);
+    xSemaphoreGive(s_store_mutex);
+    if (!found) return false;                                     /* unknown device */
+
+    zb_knob_t *k = knob_slot(eui64);
+    if (zb_cmd_rx_is_knob_sig(cmd)) k->is_knob = true;
+    if (!k->is_knob) return false;                                 /* not (yet) a knob: leave alone */
+
+    int16_t v;
+    zbcmd_kind_t kind = zb_cmd_rx_knob_decode(cmd, &v);
+    if (kind == ZBCMD_PRESS) {
+        device_id_t id = { .kind = DEV_KIND_ZIGBEE }; memcpy(id.addr, eui64, 8);
+        data_core_submit_event(&id, CAP_BUTTON_ACTION, v);
+        ESP_LOGI(TAG, "knob press: code=%d -> button.action", (int)v);
+        knob_reclassify(eui64, CAP_BUTTON_ACTION);
+    } else if (kind == ZBCMD_ROTATE) {
+        zb_rot_acc_add(&k->acc, v);
+        int slot = (int)(k - s_knobs);
+        /* Re-arm, don't stack: esp_zb_scheduler_alarm() ENQUEUES a fresh
+         * alarm on every call (ZBOSS lets the same callback be scheduled
+         * more than once), so without the cancel each rotation step would
+         * leave its own 250 ms alarm and a multi-detent turn would flush in
+         * several pieces instead of once. Cancel-then-arm is this file's own
+         * idiom for the permit timer (see zb_permit_expiry_cb above). */
+        esp_zb_scheduler_alarm_cancel(knob_rotate_flush, (uint8_t)slot);
+        esp_zb_scheduler_alarm(knob_rotate_flush, (uint8_t)slot, 250);
+        knob_reclassify(eui64, CAP_DIM_ROTATE);
+    }
+    return false;
+}
+
 /* The stack task. Owns esp_zb_stack_main_loop() for the life of the
  * device -- it never returns on success. Any failure before that loop
  * starts is logged and the task exits; it must NOT call ESP_ERROR_CHECK/
@@ -1363,6 +1572,15 @@ static void zb_task(void *arg)
      * zb_handle_report_attr() above. Registered before esp_zb_start()
      * below, so no report can arrive before a handler exists for it. */
     esp_zb_core_action_handler_register(zb_core_action_handler);
+
+    /* Task 3 (zigbee-command-controller): the knob remote's On/Off
+     * overload never reaches zb_core_action_handler() -- it is a
+     * cluster-specific command the stack does not recognise as a
+     * standard action, so it needs the raw-command escape hatch instead.
+     * Registered here, right after the core action handler and still
+     * before esp_zb_start() below, for the same reason: no command can
+     * arrive before a handler exists for it. */
+    esp_zb_raw_command_handler_register(zb_rawcmd_handler);
 
     /* autostart=false: the stack comes up as far as its scheduler and
      * buffer pool, then raises ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP and waits.

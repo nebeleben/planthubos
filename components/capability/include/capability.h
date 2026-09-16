@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define CAPABILITY_COUNT 10
+#define CAPABILITY_COUNT 11
 #define CAP_NONE         0xFF          /* "no capability" marker (column maps) */
 #define CAP_VALUE_NONE   INT16_MIN     /* stored sentinel: no value */
 
@@ -17,6 +17,7 @@ enum {
     CAP_SOIL_CONDUCTIVITY = 3, CAP_BATTERY_LEVEL = 4, CAP_AIR_HUMIDITY = 5,
     CAP_AIR_PRESSURE = 6, CAP_SIGNAL_RSSI = 7, CAP_SWITCH_STATE = 8,
     CAP_BUTTON_ACTION = 9,
+    CAP_DIM_ROTATE    = 10,
 };
 
 typedef struct {

@@ -26,6 +26,7 @@ export const CAPS = {
   // Unitless (capability.c's .unit is ""), so no alias suffix applies.
   'switch.state': { id: 8, unit: '', aliases: [] },
   'button.action': { id: 9, unit: '', aliases: [] },
+  'dim.rotate': { id: 10, unit: '', aliases: [] },
 }
 
 export const CAPS_BY_ID = Object.fromEntries(
