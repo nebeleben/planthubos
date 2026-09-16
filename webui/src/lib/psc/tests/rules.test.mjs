@@ -89,3 +89,17 @@ then plant("F").pump.run(121s)`)
   assert.equal(r.ok, false)
   assert.match(r.errors[0].message, /121 exceeds the 120/)
 })
+
+test('a button.action rule compiles (the "action" keyword is a valid cap-name segment)', () => {
+  // Regression: `action` is a reserved keyword (M5b wrapper action block),
+  // so the parser used to reject `button.action` with "expected identifier,
+  // got 'action'" -- making the momentary button.action capability (cap 9)
+  // unusable in a rule. Cap-name segments now accept a keyword token.
+  const r = compileRule(`rule "btn single"
+when device("zb:13F92704008D1500").button.action == 1
+then log("single press")
+mode edge
+cooldown 1s`)
+  assert.equal(r.ok, true)
+  assert.match(disassemble(r.bytecode), /button\.action/)
+})

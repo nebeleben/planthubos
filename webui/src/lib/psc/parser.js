@@ -120,6 +120,20 @@ class Parser {
     return this.advance()
   }
 
+  // A dotted cap/action-name segment. Normally an identifier, but a segment
+  // may collide with a reserved keyword -- notably `button.action`, where
+  // `action` is the M5b wrapper action-block keyword. Cap/action names are
+  // validated against a closed set (CAPS / ACTION_DEFS) immediately after
+  // they are assembled, so accepting a keyword here is unambiguous and
+  // cannot mask a genuine syntax error.
+  expectNameSeg() {
+    const t = this.peek()
+    if (t.type !== 'IDENT' && t.type !== 'KEYWORD') {
+      throw new PSError(`expected identifier, got '${describeToken(t)}'`, t.line, t.col)
+    }
+    return this.advance()
+  }
+
   expectString() {
     const t = this.peek()
     if (t.type !== 'STRING') {
@@ -383,9 +397,9 @@ class Parser {
   // nothing in the spec asks for reordering flexibility here.
   parseActionBlock() {
     const aTok = this.expectKeyword('action')
-    const seg1 = this.expectIdent()
+    const seg1 = this.expectNameSeg()
     this.expectPunct('.')
-    const seg2 = this.expectIdent()
+    const seg2 = this.expectNameSeg()
     const name = `${seg1.value}.${seg2.value}`
     const defn = ACTION_DEFS[name]
     if (!defn) {
@@ -706,9 +720,9 @@ class Parser {
     }
     if (this.isKeyword('emit')) {
       const t = this.advance()
-      const seg1 = this.expectIdent()
+      const seg1 = this.expectNameSeg()
       this.expectPunct('.')
-      const seg2 = this.expectIdent()
+      const seg2 = this.expectNameSeg()
       const capability = `${seg1.value}.${seg2.value}`
       if (!CAPS[capability]) {
         throw new PSError(`unknown capability '${capability}'`, seg1.line, seg1.col)
@@ -921,9 +935,9 @@ class Parser {
     const name = plainStringValue(nameTok)
     this.expectPunct(')')
     this.expectPunct('.')
-    const seg1 = this.expectIdent()
+    const seg1 = this.expectNameSeg()
     this.expectPunct('.')
-    const seg2 = this.expectIdent()
+    const seg2 = this.expectNameSeg()
     const actionName = `${seg1.value}.${seg2.value}`
     const actionDef = ACTION_DEFS[actionName]
     if (!actionDef) {
@@ -1105,9 +1119,9 @@ class Parser {
     const name = plainStringValue(nameTok)
     this.expectPunct(')')
     this.expectPunct('.')
-    const seg1 = this.expectIdent()
+    const seg1 = this.expectNameSeg()
     this.expectPunct('.')
-    const seg2 = this.expectIdent()
+    const seg2 = this.expectNameSeg()
     const capability = `${seg1.value}.${seg2.value}`
     if (!CAPS[capability]) {
       throw new PSError(`unknown capability '${capability}'`, seg1.line, seg1.col)
