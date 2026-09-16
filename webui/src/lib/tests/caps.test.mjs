@@ -26,7 +26,12 @@ test('fmtCap: dim.rotate null value (never reported) renders the waiting label',
 })
 
 test('fmtCap: dim.rotate zero value renders "0"', () => {
-  assert.equal(fmtCap(caps, 10, 0), '0')
+  // Give this map a distinguishing unit+precision so the assertion actually
+  // exercises the dim.rotate branch: without the branch, value 0 falls through
+  // to the generic path -> (0).toFixed(2) + unit -> "0.00 rot", not "0". So a
+  // bare "0" proves the branch (which ignores unit/precision) ran.
+  const dressed = new Map([[10, { id: 10, name: 'dim.rotate', unit: 'rot', precision: 2 }]])
+  assert.equal(fmtCap(dressed, 10, 0), '0')
 })
 
 test('fmtCapParts: dim.rotate carries no unit', () => {
