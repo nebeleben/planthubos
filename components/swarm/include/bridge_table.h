@@ -79,6 +79,13 @@ void bridge_table_forget_node(bridge_table_t *t, const uint8_t mac[6]);
  * matched on kind+addr, across every in-use node. NULL if no node has it. */
 const bridge_node_t *bridge_table_find_device(const bridge_table_t *t, const swarm_dev_addr_t *dev);
 
+/* The device announce RECORD for (kind, addr) across every in-use node --
+ * carrying its name/name_len, caps, endpoint, etc. NULL if no node has it.
+ * (bridge_table_find_device() returns the owning NODE; this returns the
+ * device row itself, for callers that need its stored fields.) */
+const swarm_device_announce_t *bridge_table_device(const bridge_table_t *t,
+                                                   const swarm_dev_addr_t *dev);
+
 /* Writes the whole table's image (magic+version, every in-use node's mac/
  * status/device count, then each device via swarm_encode_device_announce(),
  * length-prefixed) into buf. Returns the image length, or 0 if buf is too

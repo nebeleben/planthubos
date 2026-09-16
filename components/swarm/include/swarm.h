@@ -2,6 +2,7 @@
 #include "esp_err.h"
 #include "radio_role_str.h"
 #include "bridge_table.h"
+#include "capability.h"   /* device_id_t */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -193,6 +194,14 @@ esp_err_t swarm_bridge_rename(const uint8_t mac[6], const uint8_t eui64[8], cons
  * remove/rename() above, this never waits on bridge_task -- it just takes
  * the mutex bridge_task already yields whenever it isn't mid-tick). */
 bool swarm_bridge_snapshot(bridge_table_t *out);
+
+/* Copies the stored display name of a bridge-announced Zigbee device (by its
+ * DEV_KIND_ZIGBEE device_id_t / eui64) into `out`, NUL-terminated. Returns
+ * false (out untouched) when the device is unknown to the bridge table, its
+ * stored name is empty, or `out` is too small -- the caller then falls back
+ * to the device id, exactly as the BLE name path does. Takes s_bridges_mutex;
+ * safe from the httpd task (devices_json.c's /api/v1/devices name lookup). */
+bool swarm_bridge_device_name(const device_id_t *id, char *out, size_t cap);
 
 /* Battery-mode wake cycle (spec §4). Called from main.c's node-paired
  * branch INSTEAD OF returning to a plain always-on run, when
