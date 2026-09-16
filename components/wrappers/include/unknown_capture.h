@@ -71,6 +71,12 @@ typedef struct {
     uint32_t last_seen_s;
     unknown_sample_t s[UNKNOWN_SAMPLES];
     uint8_t  n;
+    /* BLE manufacturer-data company id (BLE SIG assigned number), for the
+     * Devices tab's best-effort vendor label; 0 when this device advertised
+     * no manufacturer data. Set on first sighting and refreshed whenever a
+     * later advert carries one, so a device whose first frame lacked it can
+     * still fill in later. */
+    uint16_t company_id;
 } unknown_dev_t;
 
 /* Resets the capture to empty. Called once at boot
@@ -102,7 +108,7 @@ void unknown_capture_init(void);
  *
  * This function is internally synchronised and safe to call from any task. */
 void unknown_capture_add(const uint8_t mac[6], const uint8_t *payload,
-                          uint8_t len, int8_t rssi, uint32_t ts);
+                          uint8_t len, int8_t rssi, uint32_t ts, uint16_t company_id);
 
 /* Removes a tracked device (spec section 5: "a device that later matches a
  * wrapper is removed from the capture"). Since BTHome and native MiFlora

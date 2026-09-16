@@ -1171,7 +1171,11 @@ no_match:
      * rssi/uptime_s are the queued item's own fields, unpacked here at the
      * call site rather than passed as an adv_item_t* (see unknown_capture.h's
      * top comment on why this module takes primitives instead). */
-    unknown_capture_add(item->mac, item->payload, item->len, item->rssi, item->uptime_s);
+    /* manu_id is 0xFFFFFFFF when the advert carried no manufacturer data;
+     * pass 0 then, else the 16-bit BLE SIG company id, for the Devices tab's
+     * vendor label. */
+    unknown_capture_add(item->mac, item->payload, item->len, item->rssi, item->uptime_s,
+                        manu_id == 0xFFFFFFFFu ? 0 : (uint16_t)manu_id);
 }
 
 /* See ble_collector.h's doc comment on ble_collector_wrapper_reindex_request()

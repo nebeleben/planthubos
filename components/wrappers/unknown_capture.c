@@ -145,7 +145,7 @@ static void push_sample(unknown_dev_t *d, const uint8_t *payload, uint8_t len,
 }
 
 void unknown_capture_add(const uint8_t mac[6], const uint8_t *payload,
-                          uint8_t len, int8_t rssi, uint32_t ts)
+                          uint8_t len, int8_t rssi, uint32_t ts, uint16_t company_id)
 {
     cap_lock();
 
@@ -160,6 +160,10 @@ void unknown_capture_add(const uint8_t mac[6], const uint8_t *payload,
         memcpy(s_tbl[idx].mac, mac, 6);
     }
     s_tbl[idx].last_seen_s = ts;
+    /* Keep a known company id: only overwrite when this advert actually
+     * carried one, so a frame without manufacturer data doesn't clear a
+     * value an earlier frame established. */
+    if (company_id) s_tbl[idx].company_id = company_id;
     push_sample(&s_tbl[idx], payload, len, rssi, ts);
 
     cap_unlock();

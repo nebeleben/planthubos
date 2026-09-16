@@ -26,7 +26,7 @@ int main(void)
 
     /* 1. first advert creates a device with one sample */
     uint8_t p1[4] = {0x01, 0x02, 0x03, 0x04};
-    unknown_capture_add(MAC_A, p1, sizeof(p1), -40, 100);
+    unknown_capture_add(MAC_A, p1, sizeof(p1), -40, 100, 0);
     size_t n = unknown_capture_list(out, UNKNOWN_DEVICES);
     assert(n == 1);
     assert(out[0].in_use);
@@ -40,7 +40,7 @@ int main(void)
 
     /* 2. second advert from the same device rotates into the second slot */
     uint8_t p2[3] = {0x11, 0x12, 0x13};
-    unknown_capture_add(MAC_A, p2, sizeof(p2), -41, 101);
+    unknown_capture_add(MAC_A, p2, sizeof(p2), -41, 101, 0);
     n = unknown_capture_list(out, UNKNOWN_DEVICES);
     assert(n == 1);   /* still one device */
     assert(out[0].n == 2);
@@ -56,7 +56,7 @@ int main(void)
 
     /* 3. a third advert replaces the oldest sample, not the device */
     uint8_t p3[5] = {0x21, 0x22, 0x23, 0x24, 0x25};
-    unknown_capture_add(MAC_A, p3, sizeof(p3), -42, 102);
+    unknown_capture_add(MAC_A, p3, sizeof(p3), -42, 102, 0);
     n = unknown_capture_list(out, UNKNOWN_DEVICES);
     assert(n == 1);                    /* still exactly one device */
     assert(out[0].n == UNKNOWN_SAMPLES); /* sample count stays capped */
@@ -70,7 +70,7 @@ int main(void)
 
     /* a second, distinct device is tracked independently */
     uint8_t pb[2] = {0x55, 0x66};
-    unknown_capture_add(MAC_B, pb, sizeof(pb), -50, 200);
+    unknown_capture_add(MAC_B, pb, sizeof(pb), -50, 200, 0);
     n = unknown_capture_list(out, UNKNOWN_DEVICES);
     assert(n == 2);
 
@@ -91,14 +91,14 @@ int main(void)
         uint8_t payload[1] = {(uint8_t)i};
         /* last_seen_s ascending with device index -- device 0 is the
          * least-recently-seen once all 8 slots are full. */
-        unknown_capture_add(mac, payload, sizeof(payload), -30, (uint32_t)(1000 + i));
+        unknown_capture_add(mac, payload, sizeof(payload), -30, (uint32_t)(1000 + i), 0);
     }
     n = unknown_capture_list(out, UNKNOWN_DEVICES);
     assert(n == UNKNOWN_DEVICES);
 
     mac_n(mac, 8);   /* the 9th distinct device */
     uint8_t payload9[1] = {0x09};
-    unknown_capture_add(mac, payload9, sizeof(payload9), -30, 2000);
+    unknown_capture_add(mac, payload9, sizeof(payload9), -30, 2000, 0);
     n = unknown_capture_list(out, UNKNOWN_DEVICES);
     assert(n == UNKNOWN_DEVICES);   /* still capped at UNKNOWN_DEVICES */
 
@@ -127,7 +127,7 @@ int main(void)
     for (int i = 0; i < UNKNOWN_DEVICES; i++) {
         mac_n(mac, (uint8_t)i);
         uint8_t payload[1] = {(uint8_t)i};
-        unknown_capture_add(mac, payload, sizeof(payload), -30, (uint32_t)(3000 + i));
+        unknown_capture_add(mac, payload, sizeof(payload), -30, (uint32_t)(3000 + i), 0);
     }
     assert(unknown_capture_list(out, UNKNOWN_DEVICES) == UNKNOWN_DEVICES);
     unknown_capture_forget(mac);   /* mac still holds device 7's MAC from the loop above */
@@ -141,9 +141,21 @@ int main(void)
     unknown_capture_init();
     uint8_t big[ADV_PAYLOAD_MAX + 10];
     memset(big, 0x7A, sizeof(big));
-    unknown_capture_add(MAC_A, big, sizeof(big), -20, 1);
+    unknown_capture_add(MAC_A, big, sizeof(big), -20, 1, 0);
     assert(unknown_capture_list(out, 1) == 1);
     assert(out[0].s[0].len == ADV_PAYLOAD_MAX);
+
+    /* company id round-trips, and is kept (not cleared) when a later advert
+     * carries none -- so a device whose first frame lacked manu data can
+     * still fill it in, and one that had it doesn't lose it. */
+    unknown_capture_init();
+    unknown_capture_add(MAC_A, p1, sizeof(p1), -40, 100, 0x0499);
+    assert(unknown_capture_list(out, 1) == 1 && out[0].company_id == 0x0499);
+    unknown_capture_add(MAC_A, p1, sizeof(p1), -41, 101, 0);       /* no manu data: keep 0x0499 */
+    assert(unknown_capture_list(out, 1) == 1 && out[0].company_id == 0x0499);
+    unknown_capture_init();
+    unknown_capture_add(MAC_B, p1, sizeof(p1), -50, 100, 0);       /* never carried one */
+    assert(unknown_capture_list(out, 1) == 1 && out[0].company_id == 0);
 
     printf("test_unknown_capture: OK\n");
     return 0;

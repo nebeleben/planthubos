@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 import { loadCaps, capLabel, fmtCap } from '../lib/caps.js'
 import { hasAiKey } from '../lib/ai/settings.js'
+import { resolveVendor } from '../lib/vendors.js'
 import {
   fmtRemainingCooldown, fmtBudget, verdictLabel, switchStateLabel, resolveActionSend, validateDuration,
 } from '../lib/actuators.js'
@@ -481,12 +482,14 @@ function fmtHexBytes(hex) {
 // untouched.
 function UnknownDeviceCard({ d, open, onToggle, onAddWrapper, onGenerateWrapper }) {
   const newest = d.samples[d.samples.length - 1]   // s[] is oldest-first, newest-last (api_v1.c's unknown_get)
+  const vendor = resolveVendor(d)                  // best-effort maker label (company id / OUI)
   return (
     <div class={`node-card${open ? ' open' : ''}`}>
       <button type="button" class="node-card-header" onClick={onToggle} aria-expanded={open}>
         <span class="node-card-chevron" aria-hidden="true">▸</span>
         <span class="node-card-title">
           <span class="node-card-name mono">{d.id}</span>
+          {vendor && <span class="node-card-mac hint">{vendor}</span>}
         </span>
         <span class="node-card-age hint">{fmtAge(d.last_seen_s)}</span>
       </button>
