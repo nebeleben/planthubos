@@ -10,7 +10,7 @@
 // PlantScript compiler's own frozen, hand-written ids-0-4 table (compiler
 // literal/unit checking, source-derived) -- a different concern with a
 // similar name purely by coincidence. This file is the live, server-served
-// capability table (all 10 ids, 0-9, through button.action) and must never
+// capability table (all 11 ids, 0-10, through dim.rotate) and must never
 // be merged with or read by the compiler.
 let capsPromise = null
 

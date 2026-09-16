@@ -72,6 +72,11 @@ static const capability_t CAP_TABLE[CAPABILITY_COUNT] = {
         .ha_device_class = NULL, .influx_field = "button",
         .scale = 1.0f, .offset = 0.0f, .precision = 0, .event = true,
     },
+    [CAP_DIM_ROTATE] = {
+        .id = CAP_DIM_ROTATE, .name = "dim.rotate", .unit = "",
+        .ha_device_class = NULL, .influx_field = "rotate",
+        .scale = 1.0f, .offset = 0.0f, .precision = 0, .event = true,
+    },
 };
 
 const capability_t *capability_get(uint8_t id) {

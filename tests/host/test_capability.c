@@ -45,17 +45,25 @@ int main(void) {
     assert(isnan(capability_decode(CAP_SOIL_MOISTURE, CAP_VALUE_NONE)));
 
     /* button.action event flag tests */
-    assert(CAPABILITY_COUNT == 10);
+    assert(CAPABILITY_COUNT == 11);
     const capability_t *b = capability_get(CAP_BUTTON_ACTION);
     assert(b && strcmp(b->name, "button.action") == 0);
     assert(b->event == true);
-    /* every non-button cap is not an event */
+    /* event caps: button.action and dim.rotate */
     for (int i = 0; i < CAPABILITY_COUNT; i++)
-        assert((i == CAP_BUTTON_ACTION) == capability_get(i)->event);
+        assert((i == CAP_BUTTON_ACTION || i == CAP_DIM_ROTATE) == capability_get(i)->event);
     /* identity codec for the press code */
     assert(capability_encode(CAP_BUTTON_ACTION, 2.0f) == 2);
     assert(capability_decode(CAP_BUTTON_ACTION, 255) == 255.0f);
     assert(capability_by_name("button.action") == b);
+
+    /* dim.rotate (id 10): momentary event, identity scale */
+    const capability_t *dr = capability_get(CAP_DIM_ROTATE);
+    assert(dr != NULL);
+    assert(strcmp(dr->name, "dim.rotate") == 0);
+    assert(dr->event == true);
+    assert(dr->scale == 1.0f && dr->offset == 0.0f);
+    assert(CAPABILITY_COUNT == 11);
 
     printf("test_capability: OK\n");
     return 0;
