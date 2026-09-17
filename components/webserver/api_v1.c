@@ -19,6 +19,7 @@
 #include "espnow_link.h"
 #include "rules.h"
 #include "wrapper_index.h"
+#include "wrapper_bind.h"
 #include "unknown_capture.h"
 #include "bthome.h"
 #include "psvm.h"
@@ -3740,6 +3741,106 @@ static esp_err_t devices_guards_put(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* POST /api/v1/devices/{id}/wrapper {"wrapper_id": N} -- per-device wrapper
+ * binding (2026-09-17 per-device-wrapper-binding spec, Task 3). Mirrors the
+ * "/key" handler just below: same wildcard-route-plus-suffix-check shape,
+ * called from devices_post_dispatch() with idbuf already extracted. BLE
+ * only (dev.kind gate) -- wrapper_bind.h keys every binding on a BLE MAC
+ * (dev.addr, display order).
+ *
+ * Existence is checked against wrapper_store_list()'s snapshot
+ * (s_http_list.wrappers, the same WRAPPERS_MAX-sized scratch the wrappers
+ * list/get handlers already share -- see that union's top comment), NOT
+ * wrapper_store_get_source(): this handler never needs the source text,
+ * only whether `id` is currently a real wrapper, and get_source would pull
+ * a 4 KB buffer onto this path for nothing.
+ *
+ * On success: wrapper_bind_set()+wrapper_bind_save() persist the binding,
+ * unknown_capture_forget() drops any stale unknown-capture entry for this
+ * MAC (that table stores RAW GAP-order MACs -- dev.addr is display order,
+ * so it is reversed first, exactly like ble_collector.c's own mac_disp
+ * conversion), and ble_collector_wrapper_reindex_request() makes the
+ * decoder task pick the new binding up. */
+static esp_err_t devices_wrapper_post(httpd_req_t *req, const char *idbuf)
+{
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev) || dev.kind != DEV_KIND_BLE) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id (BLE only)");
+        return ESP_OK;
+    }
+
+    char body[64];
+    if (req->content_len == 0 || req->content_len > sizeof(body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(body);
+    const cJSON *id_j = json ? cJSON_GetObjectItem(json, "wrapper_id") : NULL;
+    if (!json || !cJSON_IsNumber(id_j) || id_j->valuedouble < 1 || id_j->valuedouble > 65535) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "wrapper_id required (1..65535)");
+        return ESP_OK;
+    }
+    uint16_t id = (uint16_t)id_j->valuedouble;
+    cJSON_Delete(json);
+
+    size_t n = wrapper_store_list(s_http_list.wrappers, WRAPPERS_MAX);
+    bool found = false;
+    for (size_t i = 0; i < n; i++) {
+        if (s_http_list.wrappers[i].id == id) { found = true; break; }
+    }
+    if (!found) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such wrapper");
+        return ESP_OK;
+    }
+
+    if (!wrapper_bind_set(dev.addr, id)) return send_409(req, "binding table full");
+    wrapper_bind_save();
+
+    /* unknown_capture stores RAW GAP-order MACs; dev.addr is display order
+     * (device_id_t's own contract) -- reverse before forgetting it. */
+    uint8_t gap[6];
+    for (int i = 0; i < 6; i++) gap[i] = dev.addr[5 - i];
+    unknown_capture_forget(gap);
+    ble_collector_wrapper_reindex_request();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* DELETE /api/v1/devices/{id}/wrapper -- clears a per-device wrapper
+ * binding. Idempotent: OK even if none was set (wrapper_bind_clear()'s own
+ * contract), same "no-op is not an error" shape unknown_capture_forget()
+ * uses. Called from devices_delete_dispatch() below with idbuf already
+ * extracted. */
+static esp_err_t devices_wrapper_delete(httpd_req_t *req, const char *idbuf)
+{
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev) || dev.kind != DEV_KIND_BLE) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id (BLE only)");
+        return ESP_OK;
+    }
+    wrapper_bind_clear(dev.addr);
+    wrapper_bind_save();
+    ble_collector_wrapper_reindex_request();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 /* POST /api/v1/devices/{id}/key {"key":"<32 hex chars>"|null} -- bind-key
  * set/clear (spec §4, auth). Only the "/api/v1/devices" wildcard route (POST)
  * has -- unlike plants/nodes/rules there is nothing else to dispatch on
@@ -3755,7 +3856,10 @@ static esp_err_t devices_guards_put(httpd_req_t *req)
  * Also dispatches POST .../actions/{action} (manual invocation, Task 11)
  * to devices_action_post() above -- tried FIRST, since "/actions/{action}"
  * and "/key" are mutually exclusive suffix shapes on this one wildcard
- * route and a device id can never itself contain "/actions/". */
+ * route and a device id can never itself contain "/actions/". Also
+ * dispatches POST .../wrapper (Task 3, per-device wrapper binding) to
+ * devices_wrapper_post() above, tried before "/key" since "/wrapper" and
+ * "/key" are likewise mutually exclusive suffix shapes. */
 static esp_err_t devices_post_dispatch(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
@@ -3769,6 +3873,21 @@ static esp_err_t devices_post_dispatch(httpd_req_t *req)
     }
 
     size_t taillen = strcspn(tail, "?");
+
+    static const char wrapper_suffix[] = "/wrapper";
+    size_t wsuflen = sizeof(wrapper_suffix) - 1;
+    if (taillen > wsuflen && strncmp(tail + taillen - wsuflen, wrapper_suffix, wsuflen) == 0) {
+        size_t idlen = taillen - wsuflen;
+        char idbuf[40];
+        if (idlen == 0 || idlen >= sizeof(idbuf)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+            return ESP_OK;
+        }
+        memcpy(idbuf, tail, idlen);
+        idbuf[idlen] = '\0';
+        return devices_wrapper_post(req, idbuf);
+    }
+
     static const char key_suffix[] = "/key";
     size_t suflen = sizeof(key_suffix) - 1;
     if (taillen <= suflen || strncmp(tail + taillen - suflen, key_suffix, suflen) != 0) {
@@ -3849,6 +3968,42 @@ static esp_err_t devices_post_dispatch(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
+}
+
+/* DELETE "/api/v1/devices/" + wildcard dispatcher -- currently the only
+ * DELETE-able suffix on this wildcard is ".../wrapper" (unbind, Task 3).
+ * Registered as its own httpd_uri_t below (same "/api/v1/devices/" +
+ * wildcard URI template as devices_post_dispatch()/devices_guards_put()
+ * above, different HTTP method) since devices_post_dispatch() is
+ * POST-only and ESP-IDF's
+ * wildcard-route dedup key is (uri, method) -- same non-collision
+ * precedent plants_post_dispatch()/plants_delete_delete(),
+ * node_post_dispatch()/node_forget_delete() and
+ * zigbee_devices_post()/zigbee_devices_delete() already rely on for their
+ * own POST+DELETE pairs on one wildcard URI. Any other/no suffix is a 404,
+ * same as devices_post_dispatch()'s own fallthrough. */
+static esp_err_t devices_delete_dispatch(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/devices/");
+    size_t taillen = strcspn(tail, "?");
+
+    static const char wrapper_suffix[] = "/wrapper";
+    size_t suflen = sizeof(wrapper_suffix) - 1;
+    if (taillen <= suflen || strncmp(tail + taillen - suflen, wrapper_suffix, suflen) != 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+        return ESP_OK;
+    }
+    size_t idlen = taillen - suflen;
+    char idbuf[40];
+    if (idlen == 0 || idlen >= sizeof(idbuf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+    memcpy(idbuf, tail, idlen);
+    idbuf[idlen] = '\0';
+    return devices_wrapper_delete(req, idbuf);
 }
 
 /* ---------------------------------------------------------------------
@@ -4458,6 +4613,15 @@ void api_v1_register(httpd_handle_t server)
      * own comment on the wildcard-collision rule this relies on). */
     httpd_uri_t devices_guards = { .uri = "/api/v1/devices/*", .method = HTTP_PUT, .handler = devices_guards_put };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &devices_guards));
+
+    /* DELETE .../wrapper (Task 3, per-device wrapper binding unbind): a
+     * distinct HTTP method on the same "/api/v1/devices/" + wildcard URI
+     * template as devices_post/devices_guards above, so it does not
+     * collide with either -- same per-(uri, method) non-collision rule,
+     * mirroring plants_del/node_forget/zigbee_devices_del's own POST+DELETE
+     * pairs elsewhere in this function. */
+    httpd_uri_t devices_del = { .uri = "/api/v1/devices/*", .method = HTTP_DELETE, .handler = devices_delete_dispatch };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &devices_del));
 
     /* Zigbee (Task 9, spec §8's Zigbee tab): network state + joined-device
      * list, permit-join, and per-device rename/remove. "/api/v1/zigbee"

@@ -12,6 +12,7 @@
 #include "gatt_engine.h"
 #include "actor.h"
 #include "action.h"
+#include "wrapper_bind.h"
 #include <stdio.h>
 
 /* now_uptime_s - last_seen_s, both esp_timer uptime seconds off the same
@@ -162,6 +163,11 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
     } else {
         cJSON_AddNullToObject(o, "name");
     }
+
+    /* Per-device wrapper binding (0 = none). BLE only -- bindings key on a
+     * BLE MAC (e->id.addr is display order for a BLE device). */
+    uint16_t bound = (e->id.kind == DEV_KIND_BLE) ? wrapper_bind_lookup(e->id.addr) : 0;
+    cJSON_AddNumberToObject(o, "wrapper_id", bound);
 
     cJSON *caps = cJSON_AddArrayToObject(o, "caps");
     for (uint8_t c = 0; c < CAPABILITY_COUNT; c++) {
