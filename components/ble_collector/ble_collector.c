@@ -10,6 +10,7 @@
 #include "wrapper_index.h"
 #include "wrapper_arena.h"
 #include "wrapper_exec.h"
+#include "wrapper_bind.h"
 #include "unknown_capture.h"
 #include "gatt_engine.h"
 #include "gatt_sched.h"
@@ -932,6 +933,16 @@ static void decode_adv_item(const adv_item_t *item)
         }
     }
 
+    /* Per-device binding (wrapper_bind.h): a fallback wrapper-id source
+     * consulted only when nothing else matched, so it rescues an otherwise-
+     * unknown device the operator explicitly assigned a wrapper to, without
+     * overriding BTHome or a real match-key/connect-plan hit. mac_disp is
+     * display order, the key wrapper_bind stores. */
+    if (wrapper_id < 0) {
+        uint16_t bound = wrapper_bind_lookup(mac_disp);
+        if (bound) wrapper_id = bound;
+    }
+
     if (wrapper_id >= 0) {
         /* M3 Task 6 (spec §5): this advert now resolves to a wrapper --
          * either it always did, or a wrapper install/reindex just made it
@@ -1178,6 +1189,16 @@ no_match:
                         manu_id == 0xFFFFFFFFu ? 0 : (uint16_t)manu_id);
 }
 
+/* Per-device binding prune helper (wrapper_bind_prune()'s exists callback):
+ * scans the freshly-reloaded wrapper metadata table for `id`. */
+static bool wrapper_id_exists(uint16_t id)
+{
+    wrapper_info_t infos[WRAPPERS_MAX];
+    size_t n = wrapper_store_list(infos, WRAPPERS_MAX);
+    for (size_t i = 0; i < n; i++) if (infos[i].id == id) return true;
+    return false;
+}
+
 /* See ble_collector.h's doc comment on ble_collector_wrapper_reindex_request()
  * (M3 Task 5, review FINDING 4): rebuild the match index from flash, then
  * throw away every cached bytecode blob and every device's memoised
@@ -1189,6 +1210,10 @@ no_match:
 static void do_wrapper_reindex(void)
 {
     wrapper_store_load_all(&s_wrapper_index);
+    /* Drop any binding whose wrapper no longer exists (deleted since the bind).
+     * exists() scans the freshly loaded store list. */
+    wrapper_bind_prune(wrapper_id_exists);
+    wrapper_bind_save();
     /* Bulk memset(), not a per-element atomic store -- see
      * ble_collector_wrapper_for_device()'s doc comment (ble_collector.h)
      * for what that means for a concurrent httpd read. */
@@ -1557,6 +1582,7 @@ esp_err_t ble_collector_start(void)
      * adv_decoder_task (below) can run decode_adv_item() and start filling
      * it. Static 768 B (see unknown_capture.c's top comment). */
     unknown_capture_init();
+    wrapper_bind_load();
     log_heap("before adv_decoder_task");
     if (xTaskCreate(adv_decoder_task, "ble_adv_decoder", ADV_DECODER_TASK_STACK,
                      NULL, ADV_DECODER_TASK_PRIO, NULL) != pdPASS) {
