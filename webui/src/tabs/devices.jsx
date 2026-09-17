@@ -333,7 +333,7 @@ function ActionsSection({ d, nowS, fetchedAtS, onLockoutChanged }) {
 
 // Same collapsible-card shape as nodes.jsx's NodeCard / rules.jsx's
 // RuleCard: name/id + last-seen while collapsed, details in the body.
-function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, fetchedAtS, onLockoutChanged }) {
+function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, fetchedAtS, onLockoutChanged, wrappers, onUnassignWrapper }) {
   const isBle = d.kind === 'ble'
   const [name, setName] = useState(d.name || '')
   const [state, setState] = useState('idle') // idle | saving | saved | error | unauth
@@ -424,6 +424,13 @@ function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, f
             <BindKeyField deviceId={d.id} hasKey={d.has_key} />
           </div>
         )}
+        {d.wrapper_id > 0 && (
+          <div class="node-card-row">
+            <span class="hint">wrapper: {(wrappers.find((w) => w.id === d.wrapper_id) || {}).name || d.wrapper_id}</span>
+            {' '}
+            <button type="button" onClick={() => onUnassignWrapper(d)}>Unassign</button>
+          </div>
+        )}
         {d.caps.length === 0 ? (
           <p class="hint">No live capabilities yet.</p>
         ) : (
@@ -480,9 +487,10 @@ function fmtHexBytes(hex) {
 // a distinct callback so app.jsx can tell WrappersTab to actually start a
 // generation on arrival; onAddWrapper (and its hand-written path) is
 // untouched.
-function UnknownDeviceCard({ d, open, onToggle, onAddWrapper, onGenerateWrapper }) {
+function UnknownDeviceCard({ d, open, onToggle, onAddWrapper, onGenerateWrapper, wrappers, onAssignWrapper }) {
   const newest = d.samples[d.samples.length - 1]   // s[] is oldest-first, newest-last (api_v1.c's unknown_get)
   const vendor = resolveVendor(d)                  // best-effort maker label (company id / OUI)
+  const [sel, setSel] = useState('')
   return (
     <div class={`node-card${open ? ' open' : ''}`}>
       <button type="button" class="node-card-header" onClick={onToggle} aria-expanded={open}>
@@ -521,13 +529,24 @@ function UnknownDeviceCard({ d, open, onToggle, onAddWrapper, onGenerateWrapper 
                   title={hasAiKey() ? undefined : 'Set an API key in Config to use AI generation'}>
             Generate wrapper with AI
           </button>
+          {wrappers.length > 0 && (
+            <span>
+              {' '}
+              <select value={sel} onChange={(e) => setSel(e.target.value)}>
+                <option value="">— existing wrapper —</option>
+                {wrappers.map((w) => <option key={w.id} value={w.id}>{w.name || `wrapper ${w.id}`}</option>)}
+              </select>
+              {' '}
+              <button type="button" disabled={!sel} onClick={() => onAssignWrapper(d, Number(sel))}>Assign</button>
+            </span>
+          )}
         </div>
       </div>
     </div>
   )
 }
 
-function UnknownDevicesSection({ onAddWrapper, onGenerateWrapper }) {
+function UnknownDevicesSection({ onAddWrapper, onGenerateWrapper, wrappers, onAssignWrapper, reloadKey }) {
   const [devices, setDevices] = useState(null)
   const [error, setError] = useState(false)
   const [openMap, setOpenMap] = useState({})
@@ -550,6 +569,17 @@ function UnknownDevicesSection({ onAddWrapper, onGenerateWrapper }) {
     return () => { clearInterval(id); controller.abort() }
   }, [])
 
+  // Bumped by the tab after an assign POST -- a device leaves this list only
+  // once it decodes, which the background 10s poll above would eventually
+  // reflect anyway, but the operator just clicked Assign and expects the
+  // card to disappear right away rather than waiting out the interval.
+  useEffect(() => {
+    if (!reloadKey) return
+    const controller = new AbortController()
+    refresh(controller.signal).catch(() => {})
+    return () => controller.abort()
+  }, [reloadKey])
+
   function toggle(id) {
     setOpenMap((prev) => ({ ...prev, [id]: !prev[id] }))
   }
@@ -566,7 +596,8 @@ function UnknownDevicesSection({ onAddWrapper, onGenerateWrapper }) {
         <div class="node-cards">
           {devices.map((d) => (
             <UnknownDeviceCard key={d.id} d={d} open={!!openMap[d.id]} onToggle={() => toggle(d.id)}
-                                onAddWrapper={onAddWrapper} onGenerateWrapper={onGenerateWrapper} />
+                                onAddWrapper={onAddWrapper} onGenerateWrapper={onGenerateWrapper}
+                                wrappers={wrappers} onAssignWrapper={onAssignWrapper} />
           ))}
         </div>
       )}
@@ -578,8 +609,13 @@ export function DevicesTab({ onAddWrapper, onGenerateWrapper, radioRole }) {
   const [caps, setCaps] = useState(null)
   const [devices, setDevices] = useState(null)
   const [plants, setPlants] = useState(null)
+  const [wrappers, setWrappers] = useState([])
   const [error, setError] = useState(false)
   const [openMap, setOpenMap] = useState({})
+  // Bumped after an assign POST to nudge UnknownDevicesSection's own list
+  // to re-poll immediately, rather than waiting out its 10s interval, since
+  // that's a separate component with its own local `devices` state.
+  const [unknownReloadKey, setUnknownReloadKey] = useState(0)
   // The instant GET /api/v1/devices' `actions[].last_fired_s` (an AGE, not
   // an absolute time) was read -- lets ActionControl convert that age into
   // an absolute epoch second exactly once per poll, then tick a cooldown
@@ -605,7 +641,36 @@ export function DevicesTab({ onAddWrapper, onGenerateWrapper, radioRole }) {
         setFetchedAtS(fetchedAt)
       }),
       fetch('/api/v1/plants', { signal }).then((r) => r.json()).then((d) => setPlants(d.plants)),
+      // Same shape wrappers.jsx's own WrappersTab already consumes
+      // (GET /api/v1/wrappers -> {wrappers:[{id,name,...}]}) -- needed here
+      // only for id->name lookups on the assign/unassign controls below.
+      fetch('/api/v1/wrappers', { signal, headers: authHeaders() }).then((r) => r.json()).then((d) => setWrappers(d.wrappers || [])),
     ])
+  }
+
+  // POST/DELETE .../wrapper (Task 3's binding routes). Both re-poll rather
+  // than update optimistically: an assign moves the device off the unknown
+  // list only once it actually decodes (not guaranteed the instant the POST
+  // returns), and an unassign's only visible effect (the wrapper row
+  // disappearing) is exactly what the next `devices` poll already shows --
+  // neither is the "must feel responsive" case onLockoutChanged's comment
+  // calls out.
+  async function onAssignWrapper(d, id) {
+    await fetch(`/api/v1/devices/${d.id}/wrapper`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ wrapper_id: id }),
+    })
+    refresh().catch(() => {})
+    setUnknownReloadKey((k) => k + 1)
+  }
+
+  async function onUnassignWrapper(d) {
+    await fetch(`/api/v1/devices/${d.id}/wrapper`, {
+      method: 'DELETE',
+      headers: authHeaders(),
+    })
+    refresh().catch(() => {})
   }
 
   useEffect(() => {
@@ -673,14 +738,16 @@ export function DevicesTab({ onAddWrapper, onGenerateWrapper, radioRole }) {
                 {byKind.get(k).map((d) => (
                   <DeviceCard key={d.id} d={d} caps={caps} plantNameById={plantNameById}
                               open={!!openMap[d.id]} onToggle={() => toggleDevice(d.id)} onRenamed={onRenamed}
-                              nowS={nowS} fetchedAtS={fetchedAtS} onLockoutChanged={onLockoutChanged} />
+                              nowS={nowS} fetchedAtS={fetchedAtS} onLockoutChanged={onLockoutChanged}
+                              wrappers={wrappers} onUnassignWrapper={onUnassignWrapper} />
                 ))}
               </div>
             </div>
           ))
         )}
       </div>
-      <UnknownDevicesSection onAddWrapper={onAddWrapper} onGenerateWrapper={onGenerateWrapper} />
+      <UnknownDevicesSection onAddWrapper={onAddWrapper} onGenerateWrapper={onGenerateWrapper}
+                             wrappers={wrappers} onAssignWrapper={onAssignWrapper} reloadKey={unknownReloadKey} />
     </div>
   )
 }
