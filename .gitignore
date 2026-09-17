@@ -36,6 +36,7 @@ tests/host/test_adv_queue
 tests/host/test_wrapper_index
 tests/host/test_wrapper_arena
 tests/host/test_unknown_capture
+tests/host/test_wrapper_bind
 tests/host/test_bthome
 tests/host/test_bindkey_core
 .DS_Store
