@@ -96,6 +96,19 @@ function mac12FromBleId(id) {
   return i < 0 ? id : id.slice(i + 1)
 }
 
+// Best-effort error text for a non-ok wrapper-bind response. 409 ("binding
+// table full", api_v1.c's devices_wrapper_post()) sends a JSON {"error":..}
+// body via send_409; 400/404 use httpd_resp_send_err()'s default body,
+// which is not JSON, so this falls back to `fallback` rather than throwing
+// on a failed .json() parse.
+async function wrapperErrText(res, fallback) {
+  try {
+    const body = await res.json()
+    if (body && typeof body.error === 'string' && body.error) return body.error
+  } catch {}
+  return `${fallback} (${res.status})`
+}
+
 // Device-level stop button (M5b Task 12, spec §7 design points: "Lockout
 // sits next to the device it governs"). PUT .../actions/{action}/guards
 // only accepts a body keyed by ONE action's URL, but actor_set_lockout()
@@ -656,20 +669,38 @@ export function DevicesTab({ onAddWrapper, onGenerateWrapper, radioRole }) {
   // neither is the "must feel responsive" case onLockoutChanged's comment
   // calls out.
   async function onAssignWrapper(d, id) {
-    await fetch(`/api/v1/devices/${d.id}/wrapper`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({ wrapper_id: id }),
-    })
+    try {
+      const res = await fetch(`/api/v1/devices/${d.id}/wrapper`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ wrapper_id: id }),
+      })
+      if (!res.ok) {
+        alert(res.status === 401 ? 'unauthorized — set the hub key in Config' : await wrapperErrText(res, 'assign failed'))
+        return
+      }
+    } catch {
+      alert('hub not reachable')
+      return
+    }
     refresh().catch(() => {})
     setUnknownReloadKey((k) => k + 1)
   }
 
   async function onUnassignWrapper(d) {
-    await fetch(`/api/v1/devices/${d.id}/wrapper`, {
-      method: 'DELETE',
-      headers: authHeaders(),
-    })
+    try {
+      const res = await fetch(`/api/v1/devices/${d.id}/wrapper`, {
+        method: 'DELETE',
+        headers: authHeaders(),
+      })
+      if (!res.ok) {
+        alert(res.status === 401 ? 'unauthorized — set the hub key in Config' : await wrapperErrText(res, 'unassign failed'))
+        return
+      }
+    } catch {
+      alert('hub not reachable')
+      return
+    }
     refresh().catch(() => {})
   }
 
