@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 import { compileWrapper, disassemble } from '../lib/psc/index.js'
+import { WRAPPER_LIBRARY } from '../lib/wrapperLibrary.js'
 import { getAiSettings, hasAiKey } from '../lib/ai/settings.js'
 import { aiComplete, AiError } from '../lib/ai/provider.js'
 import { WRAPPER_TEMPLATE } from '../lib/ai/prompts/wrapper.js'
@@ -150,6 +151,11 @@ export function WrappersTab({ prefill, onPrefillConsumed }) {
   const [compileResult, setCompileResult] = useState(null)
   const [saveState, setSaveState] = useState('idle')  // idle | saving | saved | error | unauth
   const [saveMsg, setSaveMsg] = useState('')
+
+  // Built-in wrapper library (lib/wrapperLibrary.js): Install compiles a
+  // catalog entry client-side and POSTs it like a manual save.
+  const [installing, setInstalling] = useState('')     // name of the entry whose Install is in flight
+  const [libErr, setLibErr] = useState({})             // { [entry name]: error string }
 
   // M4 Task 7: the device this editor session was prefilled from (or null
   // for a from-scratch/Edit-an-existing-wrapper session). Drives both the
@@ -501,6 +507,42 @@ export function WrappersTab({ prefill, onPrefillConsumed }) {
     if (abortRef.current) abortRef.current.abort()
   }
 
+  async function onInstallLibrary(lib) {
+    setLibErr((prev) => ({ ...prev, [lib.name]: '' }))
+    const compiled = compileWrapper(lib.source)
+    if (!compiled.ok) {
+      // Should never happen (wrapperLibrary.test.mjs compiles every entry),
+      // but surface it rather than POST garbage.
+      setLibErr((prev) => ({ ...prev, [lib.name]: 'library entry failed to compile' }))
+      return
+    }
+    setInstalling(lib.name)
+    try {
+      const res = await fetch('/api/v1/wrappers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+          name: compiled.name,
+          source: lib.source,
+          bytecode_b64: btoa(String.fromCharCode(...compiled.bytecode)),
+          enabled: true,
+        }),
+      })
+      if (res.ok) {
+        refreshWrappers().catch(() => {})
+      } else if (res.status === 401) {
+        setLibErr((prev) => ({ ...prev, [lib.name]: 'unauthorized — set the hub key in Config' }))
+      } else {
+        const d = await res.json().catch(() => ({}))
+        setLibErr((prev) => ({ ...prev, [lib.name]: d.error || `install failed (${res.status})` }))
+      }
+    } catch {
+      setLibErr((prev) => ({ ...prev, [lib.name]: 'hub not reachable' }))
+    } finally {
+      setInstalling('')
+    }
+  }
+
   async function onSave() {
     if (!compileResult || !compileResult.ok) return
     setSaveState('saving')
@@ -556,6 +598,39 @@ export function WrappersTab({ prefill, onPrefillConsumed }) {
             ))}
           </div>
         )}
+      </div>
+
+      <div class="panel">
+        <h2>Library</h2>
+        <p class="hint">
+          Ready-made wrappers for common open sensor formats. Install compiles and adds one;
+          you can edit or delete it afterward like any wrapper.
+        </p>
+        <div class="node-cards">
+          {WRAPPER_LIBRARY.map((lib) => {
+            const c = compileWrapper(lib.source)
+            const installed = c.ok && Array.isArray(wrappers) &&
+              wrappers.some((w) => w.match && w.match.key === c.match.key)
+            return (
+              <div class="node-card" key={lib.name}>
+                <div class="node-card-header">
+                  <span class="node-card-title"><span class="node-card-name">{lib.name}</span></span>
+                  {installed
+                    ? <span class="hint">Installed</span>
+                    : <button type="button" class="btn-primary"
+                              disabled={!c.ok || installing === lib.name}
+                              onClick={() => onInstallLibrary(lib)}>
+                        {installing === lib.name ? 'Installing…' : 'Install'}
+                      </button>}
+                </div>
+                <div class="node-card-body">
+                  <p class="hint">{lib.description}</p>
+                  {libErr[lib.name] && <p class="error">{libErr[lib.name]}</p>}
+                </div>
+              </div>
+            )
+          })}
+        </div>
       </div>
 
       <div class="panel">
