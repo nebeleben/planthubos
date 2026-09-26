@@ -62,6 +62,7 @@
 #include "zboss_api.h"
 #include "zcl/zb_zcl_common.h"
 #include "zb_cmd_rx.h"
+#include "zb_tuya.h"
 
 static const char *TAG = "zigbee";
 
@@ -78,9 +79,11 @@ static const char *TAG = "zigbee";
  * `if (s_status_observer)`. */
 static zigbee_device_observer_t s_observer;
 static zigbee_status_observer_t s_status_observer;
+static zigbee_tuya_dp_observer_t s_tuya_dp_observer;
 
 void zigbee_set_device_observer(zigbee_device_observer_t fn) { s_observer = fn; }
 void zigbee_set_status_observer(zigbee_status_observer_t fn) { s_status_observer = fn; }
+void zigbee_set_tuya_dp_observer(zigbee_tuya_dp_observer_t fn) { s_tuya_dp_observer = fn; }
 
 /* Whole-branch review, FIX 6: main.c's log_heap("after ble_collector_start")
  * fires before zigbee_start() is even called, and this stack forms/restores
@@ -1499,7 +1502,40 @@ static void knob_rotate_flush(uint8_t slot)
 static bool zb_rawcmd_handler(uint8_t bufid)
 {
     zb_zcl_parsed_hdr_t *h = ZB_BUF_GET_PARAM(bufid, zb_zcl_parsed_hdr_t);
-    if (!h || h->cluster_id != 0x0006 || h->is_common_command) return false;
+    if (!h) return false;
+
+    /* Tuya EF00 datapoint task: a manufacturer-specific cluster the ZCL
+     * core actions never recognise, so -- like the knob's On/Off overload
+     * below -- this raw handler is the only place it is ever seen. 0x01 is
+     * a "datapoint report" (unsolicited push) and 0x02 a "datapoint
+     * response" (reply to a query); both carry the same payload shape.
+     * Checked before the cluster_id != 0x0006 early-return below since
+     * this is a different cluster entirely. Same eui64 lookup as the knob
+     * branch (copy out, release s_store_mutex, never held across the
+     * parse/observer call). Always returns false, same reasoning as the
+     * rest of this handler: the MAC ACK already satisfied the sender. */
+    if (h->cluster_id == 0xEF00 && (h->cmd_id == 0x01 || h->cmd_id == 0x02)) {
+        const uint8_t *p = (const uint8_t *)zb_buf_begin(bufid);
+        uint16_t n = (uint16_t)zb_buf_len(bufid);
+        uint16_t sa = h->addr_data.common_data.source.u.short_addr;
+        uint8_t eui64[8];
+        xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+        int si = zb_store_find_by_short(sa);
+        bool sf = si >= 0;
+        if (sf) memcpy(eui64, s_store.dev[si].eui64, 8);
+        xSemaphoreGive(s_store_mutex);
+        if (sf && p) {
+            zb_tuya_dp_t dps[ZB_TUYA_MAX_DPS];
+            int nd = zb_tuya_parse(p, n, dps, ZB_TUYA_MAX_DPS);
+            for (int i = 0; i < nd; i++) {
+                ESP_LOGI(TAG, "tuya DP 0x%02x type 0x%02x = %ld", dps[i].dp_id, dps[i].type, (long)dps[i].value);
+                if (s_tuya_dp_observer) s_tuya_dp_observer(eui64, dps[i].dp_id, dps[i].type, dps[i].value);
+            }
+        }
+        return false;
+    }
+
+    if (h->cluster_id != 0x0006 || h->is_common_command) return false;
     uint8_t cmd = h->cmd_id;
     uint16_t short_addr = h->addr_data.common_data.source.u.short_addr;
 
@@ -2001,6 +2037,11 @@ void zigbee_set_device_observer(zigbee_device_observer_t fn)
 }
 
 void zigbee_set_status_observer(zigbee_status_observer_t fn)
+{
+    (void)fn;
+}
+
+void zigbee_set_tuya_dp_observer(zigbee_tuya_dp_observer_t fn)
 {
     (void)fn;
 }

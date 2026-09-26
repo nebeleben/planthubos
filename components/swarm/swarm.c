@@ -2970,6 +2970,9 @@ static void forward_task(void *arg)
         case SWARM_OUT_STATUS:
             n = swarm_encode_coord_status(&r.u.status, buf, sizeof buf);
             break;
+        case SWARM_OUT_TUYA_DP:
+            n = swarm_encode_tuya_dp(&r.u.tuya_dp, buf, sizeof buf);
+            break;
         default:
             ESP_LOGW(TAG, "forward: unknown out tag %u, dropped", r.tag);
             continue;
@@ -3111,6 +3114,23 @@ static void zb_observer(const zb_device_t *dev, bool gone)
     }
     if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
         ESP_LOGW(TAG, "forward queue full, dropping %s", gone ? "device-gone" : "device-announce");
+}
+
+/* zigbee.c's Tuya EF00 datapoint observer -- see
+ * zigbee_set_tuya_dp_observer()'s header comment for the calling contract
+ * (stack task, non-blocking queue send only, one call per datapoint in a
+ * decoded EF00 frame). Mirrors zb_observer() above for the exact
+ * union-member access and enqueue pattern. */
+static void zb_tuya_dp_observer(const uint8_t eui64[8], uint8_t dp_id, uint8_t dp_type, int32_t value)
+{
+    swarm_out_t o = { .tag = SWARM_OUT_TUYA_DP };
+    o.u.tuya_dp.dev.kind = DEV_KIND_ZIGBEE;
+    memcpy(o.u.tuya_dp.dev.addr, eui64, 8);
+    o.u.tuya_dp.dp_id = dp_id;
+    o.u.tuya_dp.dp_type = dp_type;
+    o.u.tuya_dp.value = value;
+    if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
+        ESP_LOGW(TAG, "forward queue full, dropping tuya datapoint");
 }
 
 /* Builds a COORD_STATUS from zigbee.c's current state and queues it. Called
@@ -4161,6 +4181,7 @@ esp_err_t swarm_start_node(void)
     if (radio_role_get() == RADIO_ROLE_ZIGBEE) {
         zigbee_set_device_observer(zb_observer);
         zigbee_set_status_observer(zb_status_observer);
+        zigbee_set_tuya_dp_observer(zb_tuya_dp_observer);
         if (xTaskCreate(zb_boot_replay_task, "swarm_zb_replay", 3072, NULL, 3, NULL) != pdPASS) {
             ESP_LOGE(TAG, "failed to create zigbee boot replay task; the hub will not learn "
                           "this bridge's already-known devices until they next announce");
