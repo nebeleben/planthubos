@@ -21,6 +21,7 @@
 #include "data_core.h"
 #include "registry.h"
 #include "capability.h"
+#include "tuya_dp.h"
 #include "mibeacon.h"
 #include "app_config.h"
 #include "rules.h"
@@ -823,6 +824,7 @@ typedef struct {
         swarm_coord_status_t    status;
         swarm_command_ack_t     ack;
         bridge_submit_t         submit;
+        swarm_tuya_dp_t         tuya_dp;
     } u;
 } bridge_item_t;
 
@@ -1063,6 +1065,24 @@ static void bridge_task(void *arg)
                              ok ? "accepted" : "rejected");
                 }
                 if (ok) rules_notify_value_update();
+                break;
+            }
+            case SWARM_MSG_TUYA_DP: {
+                device_id_t id = { .kind = (device_kind_t)it.u.tuya_dp.dev.kind };
+                memcpy(id.addr, it.u.tuya_dp.dev.addr, SWARM_ADDR_LEN);
+                /* Discovery, not a registry write: record the raw DP
+                 * regardless of whether it's mapped yet, same as
+                 * zb_tuya_dp_observer() does for the local coordinator's
+                 * own devices -- not gated on data_core_find_index() the
+                 * way MEASUREMENT is above. */
+                tuya_dp_observe(&id, it.u.tuya_dp.dp_id, it.u.tuya_dp.dp_type, it.u.tuya_dp.value, now_s);
+                uint8_t cap; float scale;
+                if (tuya_dp_map_get(&id, it.u.tuya_dp.dp_id, &cap, &scale)) {
+                    bool ok = data_core_submit_cap_id(&id, cap, (float)it.u.tuya_dp.value * scale);
+                    ESP_LOGI(TAG, "bridge: tuya dp 0x%02x from " MACSTR " cap %u -> %s",
+                             it.u.tuya_dp.dp_id, MAC2STR(it.mac), cap, ok ? "accepted" : "rejected");
+                    if (ok) rules_notify_value_update();
+                }
                 break;
             }
             case SWARM_MSG_COORD_STATUS: {
@@ -1715,7 +1735,7 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
     }
     if (type == SWARM_MSG_DEVICE_ANNOUNCE || type == SWARM_MSG_DEVICE_GONE ||
         type == SWARM_MSG_MEASUREMENT || type == SWARM_MSG_COORD_STATUS ||
-        type == SWARM_MSG_COMMAND_ACK) {
+        type == SWARM_MSG_COMMAND_ACK || type == SWARM_MSG_TUYA_DP) {
         /* Bridge -> hub, unicast, encrypted (M7 Task 7) -- same pairing/
          * spoofing reasoning as READING/CHECKIN above: is_paired_node() is
          * the gate that keeps an unpaired device from injecting a fake
@@ -1742,6 +1762,7 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
         case SWARM_MSG_MEASUREMENT:     ok = swarm_decode_measurement(data, (size_t)len, &item.u.meas); break;
         case SWARM_MSG_COORD_STATUS:    ok = swarm_decode_coord_status(data, (size_t)len, &item.u.status); break;
         case SWARM_MSG_COMMAND_ACK:     ok = swarm_decode_command_ack(data, (size_t)len, &item.u.ack); break;
+        case SWARM_MSG_TUYA_DP:         ok = swarm_decode_tuya_dp(data, (size_t)len, &item.u.tuya_dp); break;
         default:                        ok = false; break;   /* unreachable: the outer if() already narrowed type */
         }
         if (!ok) return;
