@@ -40,6 +40,23 @@ int zb_map_cluster_to_actions(uint16_t cluster, uint8_t *out, int max) {
     return n;
 }
 
+int zb_map_onoff_backfill_actions(const uint8_t *caps, uint8_t cap_count, uint8_t *out, int max) {
+    if (!out || max <= 0)
+        return 0;
+    /* An input device -- a button or knob -- non-compliantly advertises the
+     * On/Off cluster but is NOT an actuator; zb_interview_finalize and
+     * knob_reclassify deliberately strip its switch caps and actions. So a
+     * device already carrying button.action or dim.rotate must never have the
+     * On/Off actions backfilled from a stray 0x0006 report, or we would
+     * re-add exactly what those paths removed. Any other device reporting
+     * On/Off (including one that interviewed with no clusters at all, e.g. a
+     * Tuya plug) is a genuine actuator and gets switch.on/switch.off. */
+    for (uint8_t i = 0; caps && i < cap_count; i++)
+        if (caps[i] == CAP_BUTTON_ACTION || caps[i] == CAP_DIM_ROTATE)
+            return 0;
+    return zb_map_cluster_to_actions(CL_ON_OFF, out, max);
+}
+
 uint16_t zb_map_report_attr(uint16_t cluster) {
     switch (cluster) {
         /* MeasuredValue on every measurement cluster, OnOff on 0x0006 --

@@ -25,6 +25,16 @@ uint8_t zb_map_cluster_to_cap(uint16_t cluster);
  * (never more than max). Sensor clusters return 0. */
 int zb_map_cluster_to_actions(uint16_t cluster, uint8_t *out, int max);
 
+/* The On/Off actions (switch.on/switch.off) to backfill onto a device that
+ * reported the On/Off cluster, given its current capability list -- returns
+ * 0 (backfill nothing) for an INPUT device that already carries
+ * CAP_BUTTON_ACTION or CAP_DIM_ROTATE, since a button/knob only
+ * non-compliantly advertises On/Off and its switch caps/actions are stripped
+ * on purpose (zb_interview_finalize / knob_reclassify). `caps` may be NULL
+ * with cap_count 0 (a device that interviewed with no clusters). Pure, so
+ * tests/host/test_zb_map.c exercises the guard directly. */
+int zb_map_onoff_backfill_actions(const uint8_t *caps, uint8_t cap_count, uint8_t *out, int max);
+
 /* The attribute id to configure reporting on, or ZB_MAP_NO_ATTR. */
 uint16_t zb_map_report_attr(uint16_t cluster);
 
