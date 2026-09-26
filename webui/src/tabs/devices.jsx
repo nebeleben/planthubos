@@ -344,6 +344,140 @@ function ActionsSection({ d, nowS, fetchedAtS, onLockoutChanged }) {
   )
 }
 
+// Zigbee EF00 (Tuya) datapoint ids are conventionally read/written as hex
+// (vendor docs and zigbee2mqtt alike label them "DP 0x02" etc.) -- this is
+// display-only, distinct from the URL's plain-decimal dp_id (api_v1.c's
+// datapoints route parses base-0, so a zero-padded/hex path segment would
+// misparse; the fetch calls below always send `dp.dp_id` as-is, a Number).
+function fmtDpId(dpId) {
+  return dpId.toString(16).padStart(2, '0')
+}
+
+// One observed Tuya datapoint + its map/unmap controls (task 7, backend
+// contract already merged: GET .../datapoints, POST/DELETE
+// .../datapoints/{dp_id}). Factored out the same way BindKeyField/
+// ActionControl are: its own local select/scale/request state, independent
+// of every other row's.
+//
+// Unlike ActionControl's fire-and-poll-for-confirmation dance, a map/unmap
+// POST/DELETE here is a plain synchronous write (`{"ok":true}`, no queueing)
+// -- so this simply re-fetches the parent's list on success rather than
+// tracking a pending/confirmed lifecycle.
+function DatapointRow({ deviceId, dp, caps, onChanged }) {
+  const isMapped = dp.cap_id != null
+  const [sel, setSel] = useState(isMapped ? String(dp.cap_id) : '')
+  const [scaleStr, setScaleStr] = useState(dp.scale != null ? String(dp.scale) : '1')
+  const [state, setState] = useState('idle') // idle | busy | error | unauth
+
+  async function send(method, body) {
+    setState('busy')
+    try {
+      const res = await fetch(`/api/v1/devices/${deviceId}/datapoints/${dp.dp_id}`, {
+        method,
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: body ? JSON.stringify(body) : undefined,
+      })
+      if (res.ok) { setState('idle'); onChanged() }
+      else setState(res.status === 401 ? 'unauth' : 'error')
+    } catch {
+      setState('error')
+    }
+  }
+
+  function onMap() {
+    if (!sel) return
+    send('POST', { cap_id: Number(sel), scale: Number(scaleStr) || 1 })
+  }
+
+  function onUnmap() {
+    send('DELETE')
+  }
+
+  return (
+    <tr>
+      <td class="mono">DP 0x{fmtDpId(dp.dp_id)}</td>
+      <td>{dp.value}</td>
+      <td class="hint">{fmtAge(dp.age_s)}</td>
+      <td>
+        {isMapped
+          ? <span>{capLabel(caps, dp.cap_id)} × {dp.scale}</span>
+          : <span class="hint">unmapped</span>}
+      </td>
+      <td>
+        <select value={sel} onChange={(e) => setSel(e.currentTarget.value)} disabled={state === 'busy'}>
+          <option value="">— capability —</option>
+          {[...caps.values()].map((c) => (
+            <option key={c.id} value={c.id}>{capLabel(caps, c.id)}</option>
+          ))}
+        </select>
+        {' '}
+        <input type="number" step="any" value={scaleStr} size="4"
+               onInput={(e) => setScaleStr(e.currentTarget.value)} disabled={state === 'busy'} />
+        {' '}
+        <button type="button" class="btn-primary" onClick={onMap} disabled={!sel || state === 'busy'}>
+          Map
+        </button>
+        {isMapped && (
+          <button type="button" class="btn-destructive" onClick={onUnmap} disabled={state === 'busy'}>
+            Unmap
+          </button>
+        )}
+        {state === 'error' && <span class="error">failed</span>}
+        {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
+      </td>
+    </tr>
+  )
+}
+
+// The Zigbee EF00 (Tuya) datapoint surface (task 7, spec's tuya-ef00-
+// datapoints amendment): only worth fetching once a device card is
+// expanded (the operator opened it to look at exactly this kind of detail)
+// and only worth rendering once the fetch actually returns datapoints --
+// an ordinary non-Tuya Zigbee device (or one that hasn't reported yet)
+// gets an empty {"datapoints":[]} and this renders nothing at all, same
+// discipline as the caps table's own "no live capabilities yet" branch
+// just below it not needing a heading when there's nothing to show.
+function DatapointsSection({ deviceId, caps, open }) {
+  const [dps, setDps] = useState([])
+  const [dpError, setDpError] = useState(false)
+
+  function refresh(signal) {
+    return fetch(`/api/v1/devices/${deviceId}/datapoints`, { signal })
+      .then((r) => r.json())
+      .then((body) => { setDps(body.datapoints || []); setDpError(false) })
+  }
+
+  // Fetched only while the card is expanded -- collapsed cards stay
+  // mounted (see DeviceCard's own body, always in the DOM regardless of
+  // `open`) but have no reason to poll a detail the operator isn't looking
+  // at, matching the brief's "do NOT fetch when collapsed" instruction.
+  useEffect(() => {
+    if (!open) return
+    const controller = new AbortController()
+    refresh(controller.signal).catch((err) => { if (err.name !== 'AbortError') setDpError(true) })
+    return () => controller.abort()
+  }, [open, deviceId])
+
+  if (dps.length === 0) return dpError ? <p class="hint">Datapoints unavailable.</p> : null
+
+  return (
+    <div class="node-card-row">
+      <span class="hint">Tuya datapoints</span>
+      <div class="table-scroll">
+        <table class="devices">
+          <thead><tr><th>DP</th><th>Raw</th><th>Age</th><th>Mapped to</th><th>Map / unmap</th></tr></thead>
+          <tbody>
+            {dps.map((dp) => (
+              <DatapointRow key={dp.dp_id} deviceId={deviceId} dp={dp} caps={caps}
+                            onChanged={() => refresh().catch(() => {})} />
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
 // Same collapsible-card shape as nodes.jsx's NodeCard / rules.jsx's
 // RuleCard: name/id + last-seen while collapsed, details in the body.
 function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, fetchedAtS, onLockoutChanged, wrappers, onUnassignWrapper }) {
@@ -462,6 +596,7 @@ function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, f
             </table>
           </div>
         )}
+        <DatapointsSection deviceId={d.id} caps={caps} open={open} />
         <div class="node-card-row">
           <span class="hint">
             {plantNames.length > 0 ? `Bound to ${plantNames.join(', ')}` : 'Not bound to any plant'}
