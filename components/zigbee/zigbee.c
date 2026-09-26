@@ -863,7 +863,7 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
      * (device, cap) since the presence check then finds it. The observer,
      * like every s_observer call in this file, only queues (Task 5). */
     if (accepted) {
-        bool cap_added = false;
+        bool changed = false;
         zb_device_t dev_copy = {0};
         xSemaphoreTake(s_store_mutex, portMAX_DELAY);
         int bi = zb_store_find(&s_store, eui64);
@@ -876,14 +876,30 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
                 d->caps[d->cap_count] = cap;
                 d->cap_clusters[d->cap_count] = msg->cluster;
                 d->cap_count++;
-                zb_store_save();
-                dev_copy = *d;
-                cap_added = true;
+                changed = true;
             }
+            /* On/Off ACTION backfill: the cap backfill above rescues
+             * switch.state, but a device that interviewed with no clusters
+             * (a Tuya plug) also needs its switch.on/switch.off ACTIONS to be
+             * controllable -- the interview never registered them. Add the
+             * missing ones (zb_map_onoff_backfill_actions returns none for a
+             * button/knob, so a stray On/Off report never re-arms the switch
+             * actions knob_reclassify strips). */
+            if (msg->cluster == 0x0006 /* On/Off */) {
+                uint8_t acts[ZB_STORE_MAX_ACTIONS];
+                int na = zb_map_onoff_backfill_actions(d->caps, d->cap_count, acts, ZB_STORE_MAX_ACTIONS);
+                for (int a = 0; a < na && d->action_count < ZB_STORE_MAX_ACTIONS; a++) {
+                    bool ap = false;
+                    for (int j = 0; j < d->action_count; j++)
+                        if (d->actions[j] == acts[a]) { ap = true; break; }
+                    if (!ap) { d->actions[d->action_count++] = acts[a]; changed = true; }
+                }
+            }
+            if (changed) { zb_store_save(); dev_copy = *d; }
         }
         xSemaphoreGive(s_store_mutex);
-        if (cap_added) {
-            ESP_LOGI(TAG, "backfilled cap %u (cluster 0x%04x) from a report; re-announcing", cap, msg->cluster);
+        if (changed) {
+            ESP_LOGI(TAG, "backfilled caps/actions (cluster 0x%04x) from a report; re-announcing", msg->cluster);
             if (s_observer) s_observer(&dev_copy, false);
         }
     }

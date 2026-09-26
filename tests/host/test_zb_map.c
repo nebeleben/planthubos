@@ -116,6 +116,30 @@ int main(void) {
     assert(zb_map_zcl_attr_to_value(0x0012, 0x0055, 0, &v) && close_to(v, 0.0f));
     assert(zb_map_zcl_attr_to_value(0x0012, 0x0055, 255, &v) && close_to(v, 255.0f));
 
+    /* --- On/Off action backfill guard (feature 1) --- */
+    /* A genuine actuator (no button.action/dim.rotate cap) reporting On/Off
+     * gets switch.on/off backfilled; an input device that non-compliantly
+     * advertises On/Off (a button/knob, already carrying button.action or
+     * dim.rotate) gets NONE, so the report-path backfill never re-adds the
+     * switch actions zb_interview_finalize/knob_reclassify deliberately
+     * stripped. */
+    uint8_t ba[4];
+    uint8_t caps_actuator[1] = { CAP_SWITCH_STATE };
+    assert(zb_map_onoff_backfill_actions(caps_actuator, 1, ba, 4) == 2);
+    assert(ba[0] == ACT_SWITCH_ON && ba[1] == ACT_SWITCH_OFF);
+    /* empty caps (a Tuya plug that interviewed with 0 clusters) -> actuator */
+    assert(zb_map_onoff_backfill_actions(NULL, 0, ba, 4) == 2);
+    uint8_t caps_batt[1] = { CAP_BATTERY_LEVEL };
+    assert(zb_map_onoff_backfill_actions(caps_batt, 1, ba, 4) == 2);
+    /* input devices: button or knob -> no switch actions */
+    uint8_t caps_button[2] = { CAP_BUTTON_ACTION, CAP_SWITCH_STATE };
+    assert(zb_map_onoff_backfill_actions(caps_button, 2, ba, 4) == 0);
+    uint8_t caps_knob[2] = { CAP_DIM_ROTATE, CAP_SWITCH_STATE };
+    assert(zb_map_onoff_backfill_actions(caps_knob, 2, ba, 4) == 0);
+    /* respects max, and a zero/NULL out is a safe 0 */
+    assert(zb_map_onoff_backfill_actions(caps_actuator, 1, ba, 1) == 1);
+    assert(zb_map_onoff_backfill_actions(caps_actuator, 1, NULL, 4) == 0);
+
     printf("test_zb_map: OK\n");
     return 0;
 }
