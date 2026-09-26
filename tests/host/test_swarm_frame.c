@@ -395,6 +395,17 @@ int main(void)
         assert(o.cap_id == 2 && o.value == 16.5f && o.age_s == 7);
         assert(!swarm_decode_measurement(buf, n + 1, &o));
     }
+    /* v4: TUYA_DP */
+    {
+        swarm_tuya_dp_t td = { .dev = { .kind = 2, .addr = {1,2,3,4,5,6,7,8} }, .dp_id = 0x65, .dp_type = 0x02, .value = -1234 };
+        uint8_t tb[64];
+        size_t tn = swarm_encode_tuya_dp(&td, tb, sizeof tb);
+        assert(tn > 0);
+        swarm_tuya_dp_t td2;
+        assert(swarm_decode_tuya_dp(tb, tn, &td2));
+        assert(td2.dev.kind == 2 && td2.dev.addr[7] == 8 && td2.dp_id == 0x65 && td2.dp_type == 0x02 && td2.value == -1234);
+        assert(!swarm_decode_tuya_dp(tb, tn - 1, &td2));   /* truncated rejected */
+    }
     /* v4: COORD_STATUS */
     {
         swarm_coord_status_t s = { .radio_role = 2, .formed = 1, .channel = 15, .pan_id = 0x489a, .permit_s = 179, .device_count = 3 };

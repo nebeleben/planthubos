@@ -48,6 +48,13 @@ typedef enum {
      * command through (see swarm.c's poll_task and hub_rx_cb's
      * BRIDGE_ITEM_FLUSH handling). No ack, no fields; len must be 0. */
     SWARM_MSG_POLL             = 21,
+    /* Bridge -> hub, raw Tuya EF00 datapoint (Tuya EF00 datapoints task 2).
+     * NOTE: the task brief for this said "= 20" and a later correction
+     * said "= 21, right after SWARM_MSG_NODE_CONFIG_ACK" -- both are
+     * already taken (20 is SWARM_MSG_NODE_CONFIG_ACK itself, 21 is
+     * SWARM_MSG_POLL, added by a later M7 commit than either the brief or
+     * its correction saw). Assigned the next free value instead. */
+    SWARM_MSG_TUYA_DP          = 22,
 } swarm_msg_t;
 
 /* Checkin commands (CHECKIN_ACK.command) */
@@ -370,6 +377,12 @@ typedef struct { swarm_dev_addr_t dev; } swarm_device_gone_t;
 /* Bridge -> hub. One capability reading from one zigbee end device. */
 typedef struct { swarm_dev_addr_t dev; uint8_t cap_id; float value; uint32_t age_s; } swarm_measurement_t;
 
+/* Bridge -> hub. One raw Tuya EF00 datapoint (dp_id/dp_type/value) from a
+ * Tuya zigbee end device -- the hub-side Tuya decoding (dp_type-specific
+ * interpretation of value) is out of scope here; this frame just carries
+ * the datapoint across the wire unchanged. */
+typedef struct { swarm_dev_addr_t dev; uint8_t dp_id; uint8_t dp_type; int32_t value; } swarm_tuya_dp_t;
+
 /* Bridge -> hub. The bridge node's zigbee coordinator status (network
  * formed, channel/PAN, permit-join countdown, device count). */
 typedef struct { uint8_t radio_role; uint8_t formed; uint8_t channel; uint16_t pan_id; uint8_t permit_s; uint8_t device_count; } swarm_coord_status_t;
@@ -411,6 +424,7 @@ typedef enum {
     SWARM_OUT_ANNOUNCE    = 3,
     SWARM_OUT_GONE        = 4,
     SWARM_OUT_STATUS      = 5,
+    SWARM_OUT_TUYA_DP     = 6,
 } swarm_out_tag_t;
 
 typedef struct {
@@ -421,6 +435,7 @@ typedef struct {
         swarm_device_announce_t  ann;
         swarm_device_gone_t      gone;
         swarm_coord_status_t     status;
+        swarm_tuya_dp_t          tuya_dp;
     } u;
 } swarm_out_t;
 
@@ -455,6 +470,7 @@ size_t swarm_encode_ota_abort(const swarm_ota_abort_t *in, uint8_t *out, size_t 
 bool swarm_decode_device_announce(const uint8_t *buf, size_t len, swarm_device_announce_t *out);
 bool swarm_decode_device_gone(const uint8_t *buf, size_t len, swarm_device_gone_t *out);
 bool swarm_decode_measurement(const uint8_t *buf, size_t len, swarm_measurement_t *out);
+bool swarm_decode_tuya_dp(const uint8_t *buf, size_t len, swarm_tuya_dp_t *out);
 bool swarm_decode_coord_status(const uint8_t *buf, size_t len, swarm_coord_status_t *out);
 bool swarm_decode_command(const uint8_t *buf, size_t len, swarm_command_t *out);
 bool swarm_decode_command_ack(const uint8_t *buf, size_t len, swarm_command_ack_t *out);
@@ -463,6 +479,7 @@ bool swarm_decode_node_config_ack(const uint8_t *buf, size_t len, swarm_node_con
 size_t swarm_encode_device_announce(const swarm_device_announce_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_device_gone(const swarm_device_gone_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_measurement(const swarm_measurement_t *in, uint8_t *out, size_t cap);
+size_t swarm_encode_tuya_dp(const swarm_tuya_dp_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_coord_status(const swarm_coord_status_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_command(const swarm_command_t *in, uint8_t *out, size_t cap);
 size_t swarm_encode_command_ack(const swarm_command_ack_t *in, uint8_t *out, size_t cap);
