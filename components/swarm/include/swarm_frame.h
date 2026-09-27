@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SWARM_PROTO_VERSION 4
+#define SWARM_PROTO_VERSION 5
 #define SWARM_HDR_LEN 4      /* version(1) + type(1) + len(2) */
 #define SWARM_LMK_LEN 16
 
@@ -346,8 +346,8 @@ typedef struct __attribute__((packed)) {
 
 #define SWARM_ADDR_LEN 8
 #define SWARM_DEV_NAME_MAX 24
-#define SWARM_DEV_MAX_CAPS 4
-#define SWARM_DEV_MAX_ACTIONS 2
+#define SWARM_DEV_MAX_CAPS 6
+#define SWARM_DEV_MAX_ACTIONS 8
 
 /* Command ops (swarm_command_t.op) */
 enum { SWARM_CMD_PERMIT_JOIN = 1, SWARM_CMD_DEVICE_REMOVE = 2, SWARM_CMD_DEVICE_RENAME = 3,
@@ -360,22 +360,25 @@ enum { SWARM_ACK_ACCEPTED = 1, SWARM_ACK_DONE = 2, SWARM_ACK_FAILED = 3 };
 typedef struct { uint8_t kind; uint8_t addr[SWARM_ADDR_LEN]; } swarm_dev_addr_t;
 
 /* Bridge -> hub. A newly interviewed (or re-announced) zigbee end device:
- * its address, endpoint, interview state, human name, and the capabilities
- * (cap_id + zigbee cluster id pairs) and actions it exposes. */
+ * its address, interview state, human name, and the capabilities (cap_id +
+ * zigbee cluster id + endpoint triples) and actions (action_id + endpoint
+ * pairs) it exposes -- v5: each cap/action carries its own endpoint,
+ * replacing the single device-wide `endpoint` v4 had. */
 typedef struct {                       /* in-memory form; wire form is field-serialised */
     swarm_dev_addr_t dev;
-    uint8_t  endpoint;
     uint8_t  interviewed;
     uint8_t  name_len;  char name[SWARM_DEV_NAME_MAX];
     uint8_t  cap_count; uint8_t cap_ids[SWARM_DEV_MAX_CAPS]; uint16_t cap_clusters[SWARM_DEV_MAX_CAPS];
+    uint8_t  cap_endpoints[SWARM_DEV_MAX_CAPS];
     uint8_t  action_count; uint8_t action_ids[SWARM_DEV_MAX_ACTIONS];
+    uint8_t  action_endpoints[SWARM_DEV_MAX_ACTIONS];
 } swarm_device_announce_t;
 
 /* Bridge -> hub. A previously announced device has left the network. */
 typedef struct { swarm_dev_addr_t dev; } swarm_device_gone_t;
 
 /* Bridge -> hub. One capability reading from one zigbee end device. */
-typedef struct { swarm_dev_addr_t dev; uint8_t cap_id; float value; uint32_t age_s; } swarm_measurement_t;
+typedef struct { swarm_dev_addr_t dev; uint8_t cap_id; uint8_t endpoint; float value; uint32_t age_s; } swarm_measurement_t;
 
 /* Bridge -> hub. One raw Tuya EF00 datapoint (dp_id/dp_type/value) from a
  * Tuya zigbee end device -- the hub-side Tuya decoding (dp_type-specific
@@ -389,7 +392,7 @@ typedef struct { uint8_t radio_role; uint8_t formed; uint8_t channel; uint16_t p
 
 /* Hub -> bridge. Directs the bridge's zigbee coordinator to act on a
  * device (permit-join, remove, rename, actuate) or resync its state. */
-typedef struct { uint16_t seq; uint16_t ttl_s; uint8_t op; swarm_dev_addr_t dev; uint16_t arg; uint8_t name_len; char name[SWARM_DEV_NAME_MAX]; } swarm_command_t;
+typedef struct { uint16_t seq; uint16_t ttl_s; uint8_t op; swarm_dev_addr_t dev; uint16_t arg; uint8_t endpoint; uint8_t name_len; char name[SWARM_DEV_NAME_MAX]; } swarm_command_t;
 
 /* Bridge -> hub. Reply to a COMMAND, correlated by seq. */
 typedef struct { uint16_t seq; uint8_t op; uint8_t status; uint8_t detail; } swarm_command_ack_t;

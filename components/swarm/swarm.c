@@ -3121,7 +3121,6 @@ static void zb_observer(const zb_device_t *dev, bool gone)
         swarm_device_announce_t *a = &o.u.ann;
         a->dev.kind = DEV_KIND_ZIGBEE;
         memcpy(a->dev.addr, dev->eui64, 8);
-        a->endpoint = dev->endpoint;
         a->interviewed = dev->interviewed;
         a->name_len = (uint8_t)strnlen(dev->name, SWARM_DEV_NAME_MAX);
         memcpy(a->name, dev->name, a->name_len);
@@ -3129,9 +3128,18 @@ static void zb_observer(const zb_device_t *dev, bool gone)
         for (uint8_t i = 0; i < a->cap_count; i++) {
             a->cap_ids[i] = dev->caps[i];
             a->cap_clusters[i] = dev->cap_clusters[i];
+            /* TODO(task 6): wire per-cap endpoint -- dev->cap_endpoints[i]
+             * already carries it (zb_store.h, Task 1); this compile stub
+             * just zero-fills so v5's swarm_device_announce_t keeps
+             * building until Task 6 wires the real announce producer. */
+            a->cap_endpoints[i] = 0;
         }
         a->action_count = dev->action_count > SWARM_DEV_MAX_ACTIONS ? SWARM_DEV_MAX_ACTIONS : dev->action_count;
-        for (uint8_t i = 0; i < a->action_count; i++) a->action_ids[i] = dev->actions[i];
+        for (uint8_t i = 0; i < a->action_count; i++) {
+            a->action_ids[i] = dev->actions[i];
+            /* TODO(task 6): wire per-action endpoint -- dev->action_endpoints[i]. */
+            a->action_endpoints[i] = 0;
+        }
     }
     if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
         ESP_LOGW(TAG, "forward queue full, dropping %s", gone ? "device-gone" : "device-announce");

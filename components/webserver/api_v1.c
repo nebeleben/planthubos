@@ -4337,7 +4337,12 @@ static cJSON *announce_device_json(const swarm_device_announce_t *a)
     cJSON_AddStringToObject(o, "name", namebuf);
     cJSON_AddBoolToObject(o, "interviewed", a->interviewed != 0);
     cJSON_AddNullToObject(o, "short_addr");
-    cJSON_AddNumberToObject(o, "endpoint", a->endpoint);
+    /* TODO(later task): v5's swarm_device_announce_t has no single
+     * scalar endpoint any more -- cap_endpoints[]/action_endpoints[] are
+     * per-cap/per-action now. This compile stub reports 0 rather than a
+     * misleading single endpoint until the webui/API surface (multi-
+     * endpoint-zigbee) is updated to render per-cap/action endpoints. */
+    cJSON_AddNumberToObject(o, "endpoint", 0);
 
     cJSON *caps = cJSON_AddArrayToObject(o, "caps");
     for (uint8_t i = 0; i < a->cap_count; i++) {

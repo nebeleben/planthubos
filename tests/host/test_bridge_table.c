@@ -7,8 +7,9 @@ int main(void)
 {
     bridge_table_t t; bridge_table_init(&t);
     uint8_t m1[6] = {1,1,1,1,1,1}, m2[6] = {2,2,2,2,2,2};
-    swarm_device_announce_t a = { .dev = { .kind = 2, .addr = {1,2,3,4,5,6,7,8} }, .endpoint = 1, .interviewed = 1,
-                                  .name_len = 1, .name = "A", .cap_count = 1, .cap_ids = {2}, .cap_clusters = {0x400} };
+    swarm_device_announce_t a = { .dev = { .kind = 2, .addr = {1,2,3,4,5,6,7,8} }, .interviewed = 1,
+                                  .name_len = 1, .name = "A", .cap_count = 1, .cap_ids = {2}, .cap_clusters = {0x400},
+                                  .cap_endpoints = {1} };
     assert(bridge_table_upsert(&t, m1, &a));
     assert(bridge_table_node(&t, m1, false)->count == 1);
     a.name_len = 2; a.name[1] = 'B';
