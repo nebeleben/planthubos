@@ -905,8 +905,16 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
                 int na = zb_map_onoff_backfill_actions(d->caps, d->cap_count, acts, ZB_STORE_MAX_ACTIONS);
                 for (int a = 0; a < na && d->action_count < ZB_STORE_MAX_ACTIONS; a++) {
                     bool ap = false;
+                    /* Endpoint-aware, matching the cap backfill above: the
+                     * same action on a DIFFERENT endpoint is a distinct
+                     * instance and must be backfilled too. Without the
+                     * endpoint compare, an empty-descriptor On/Off device
+                     * whose actions were recorded on one endpoint (e.g. a
+                     * pre-v5 single-endpoint record migrated with endpoint 0)
+                     * would never get its real-endpoint actions from a fresh
+                     * report -- leaving it uncontrollable until re-paired. */
                     for (int j = 0; j < d->action_count; j++)
-                        if (d->actions[j] == acts[a]) { ap = true; break; }
+                        if (d->actions[j] == acts[a] && d->action_endpoints[j] == msg->src_endpoint) { ap = true; break; }
                     if (!ap) {
                         d->action_endpoints[d->action_count] = msg->src_endpoint;
                         d->actions[d->action_count++] = acts[a];
