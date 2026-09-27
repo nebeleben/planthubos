@@ -692,7 +692,7 @@ static void zb_register_restored_devices(void)
         for (uint8_t a = 0; a < dev->action_count; a++) {
             /* param_max=0, no flags: every action zb_map.c hands out today
              * (On/Off) takes no parameter -- zb_map.h's own comment. */
-            if (!actor_declare(dev_idx, dev->actions[a], 0, 0)) {
+            if (!actor_declare_ep(dev_idx, dev->actions[a], dev->action_endpoints[a], 0, 0)) {
                 ESP_LOGW(TAG, "device %d: could not re-declare action %u after restore",
                          dev_idx, (unsigned)dev->actions[a]);
             }
@@ -1340,7 +1340,7 @@ static void zb_iv_handle_store(void)
     for (uint8_t a = 0; a < dev->action_count; a++) {
         /* param_max=0, no flags: every action zb_map.c hands out today
          * (On/Off) takes no parameter -- zb_map.h's own comment. */
-        if (!actor_declare(dev_idx, dev->actions[a], 0, 0)) {
+        if (!actor_declare_ep(dev_idx, dev->actions[a], dev->action_endpoints[a], 0, 0)) {
             ESP_LOGW(TAG, "device %d: could not declare action %u", dev_idx,
                      (unsigned)dev->actions[a]);
         }
