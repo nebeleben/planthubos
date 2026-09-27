@@ -792,6 +792,13 @@ typedef struct {
     uint8_t          op;             /* SWARM_CMD_* */
     swarm_dev_addr_t dev;
     uint16_t         arg;
+    uint8_t          endpoint;       /* M8 Task 8: ACTUATE's target endpoint
+                                       * (actor_cmd_t.endpoint, off the actor
+                                       * queue) -- travels through
+                                       * bridge_cmd_submit()/bridge_cmd_t and
+                                       * onto swarm_command_t.endpoint on the
+                                       * wire. Every other op has no endpoint
+                                       * of its own; those callers set 1. */
     char             name[SWARM_DEV_NAME_MAX];
     uint8_t          name_len;
     uint32_t         ttl_s;
@@ -870,6 +877,7 @@ static void request_resync(const uint8_t mac[6])
     item.type = BRIDGE_ITEM_SUBMIT;
     item.u.submit.op = SWARM_CMD_RESYNC;
     item.u.submit.ttl_s = 30;
+    item.u.submit.endpoint = 1;   /* M8 Task 8: RESYNC has no endpoint of its own */
     item.u.submit.actor_dev_idx = -1;
     if (!s_bridge_queue || xQueueSend(s_bridge_queue, &item, 0) != pdTRUE) {
         ESP_LOGW(TAG, "RESYNC -> " MACSTR ": no bridge task/queue full, dropping", MAC2STR(mac));
@@ -1155,9 +1163,10 @@ static void bridge_task(void *arg)
                 if (it.u.submit.want_result && !bridge_table_node(&s_bridges, it.mac, false)) {
                     res = ESP_ERR_NOT_FOUND;
                 } else if (bridge_cmd_submit(&s_router, it.mac, it.u.submit.op, &it.u.submit.dev,
-                                              it.u.submit.arg, it.u.submit.name, it.u.submit.name_len,
-                                              it.u.submit.ttl_s, now_s, it.u.submit.actor_dev_idx,
-                                              it.u.submit.actor_action, it.u.submit.actor_param)) {
+                                              it.u.submit.arg, it.u.submit.endpoint, it.u.submit.name,
+                                              it.u.submit.name_len, it.u.submit.ttl_s, now_s,
+                                              it.u.submit.actor_dev_idx, it.u.submit.actor_action,
+                                              it.u.submit.actor_param)) {
                     res = ESP_OK;
                 } else {
                     res = ESP_ERR_INVALID_STATE;   /* one already in flight for this node */
@@ -1233,7 +1242,8 @@ static void bridge_task(void *arg)
              * above and this use, so it is still valid here. */
             if (flush_cmd) {
                 swarm_command_t cmd = { .seq = flush_cmd->seq, .op = flush_cmd->op, .dev = flush_cmd->dev,
-                                         .arg = flush_cmd->arg, .name_len = flush_cmd->name_len };
+                                         .arg = flush_cmd->arg, .endpoint = flush_cmd->endpoint,
+                                         .name_len = flush_cmd->name_len };
                 memcpy(cmd.name, flush_cmd->name, flush_cmd->name_len);
                 cmd.ttl_s = (uint16_t)(flush_cmd->deadline_s > now_s ? (flush_cmd->deadline_s - now_s) : 1);
                 uint8_t buf[64];
@@ -1327,7 +1337,7 @@ static void bridge_task(void *arg)
         const bridge_cmd_t *c;
         while ((c = bridge_cmd_next_send(&s_router, now_s)) != NULL) {
             swarm_command_t cmd = { .seq = c->seq, .op = c->op, .dev = c->dev, .arg = c->arg,
-                                     .name_len = c->name_len };
+                                     .endpoint = c->endpoint, .name_len = c->name_len };
             memcpy(cmd.name, c->name, c->name_len);
             /* c->deadline_s was fixed at submit time (now + the caller's
              * ttl_s); re-derive the REMAINING seconds for the wire so a
@@ -1436,6 +1446,7 @@ static esp_err_t submit_and_wait(const uint8_t mac[6], uint8_t op, const swarm_d
         item.u.submit.name_len = n;
     }
     item.u.submit.ttl_s = BRIDGE_API_TTL_S;
+    item.u.submit.endpoint = 1;   /* M8 Task 8: no actor behind this call, no endpoint of its own */
     item.u.submit.actor_dev_idx = -1;
     item.u.submit.want_result = true;
 
@@ -1891,6 +1902,7 @@ static void swarm_zb_dispatch(const actor_cmd_t *cmd)
     it.u.submit.op = SWARM_CMD_ACTUATE;
     it.u.submit.dev = dev;
     it.u.submit.arg = (uint16_t)((uint16_t)cmd->action_id | ((uint16_t)cmd->param << 8));
+    it.u.submit.endpoint = cmd->endpoint;
     it.u.submit.ttl_s = deadline_to_ttl(cmd->deadline_s);
     it.u.submit.actor_dev_idx = cmd->dev_idx;
     it.u.submit.actor_action = cmd->action_id;
@@ -3501,8 +3513,9 @@ static void command_task(void *arg)
             s_actuate_pending = (typeof(s_actuate_pending)){ .dev_idx = idx, .seq = c.seq, .active = true,
                                                               .deadline_us = esp_timer_get_time() + 10 * 1000000LL };
             taskEXIT_CRITICAL(&s_actuate_mux);
-            bool queued_ok = actor_request(idx, (uint8_t)(c.arg & 0xff), (uint16_t)(c.arg >> 8),
-                                            ACTOR_SRC_REMOTE, actor_now_s() + c.ttl_s);
+            bool queued_ok = actor_request_ep(idx, (uint8_t)(c.arg & 0xff), c.endpoint,
+                                              (uint16_t)(c.arg >> 8), ACTOR_SRC_REMOTE,
+                                              actor_now_s() + c.ttl_s);
             if (!queued_ok) {
                 taskENTER_CRITICAL(&s_actuate_mux);
                 s_actuate_pending.active = false;

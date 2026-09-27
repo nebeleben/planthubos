@@ -8,8 +8,8 @@ int main(void)
     bridge_router_t r; bridge_cmd_init(&r);
     uint8_t m[6] = {1,2,3,4,5,6};
     swarm_dev_addr_t d = { .kind = 2, .addr = {1} };
-    assert(bridge_cmd_submit(&r, m, SWARM_CMD_ACTUATE, &d, 0x0100, NULL, 0, 30, 1000, 3, 0, 1));
-    assert(!bridge_cmd_submit(&r, m, SWARM_CMD_PERMIT_JOIN, NULL, 0, NULL, 0, 30, 1000, -1, 0, 0));  /* one in flight */
+    assert(bridge_cmd_submit(&r, m, SWARM_CMD_ACTUATE, &d, 0x0100, 1, NULL, 0, 30, 1000, 3, 0, 1));
+    assert(!bridge_cmd_submit(&r, m, SWARM_CMD_PERMIT_JOIN, NULL, 0, 1, NULL, 0, 30, 1000, -1, 0, 0));  /* one in flight */
     const bridge_cmd_t *s = bridge_cmd_next_send(&r, 1000);
     assert(s && s->seq == 1 && s->op == SWARM_CMD_ACTUATE && s->sends == 1);
     assert(bridge_cmd_next_send(&r, 1001) == NULL);              /* not yet due for retry */
@@ -21,7 +21,7 @@ int main(void)
     swarm_command_ack_t dup = acc; assert(!bridge_cmd_on_ack(&r, m, &dup, 1005, &done));
     swarm_command_ack_t fin = { .seq = 1, .op = SWARM_CMD_ACTUATE, .status = SWARM_ACK_DONE, .detail = 0 };
     assert(bridge_cmd_on_ack(&r, m, &fin, 1006, &done) && done.actor_dev_idx == 3 && done.active == false);
-    assert(bridge_cmd_submit(&r, m, SWARM_CMD_PERMIT_JOIN, NULL, 0, NULL, 0, 30, 2000, -1, 0, 0));   /* slot free again */
+    assert(bridge_cmd_submit(&r, m, SWARM_CMD_PERMIT_JOIN, NULL, 0, 1, NULL, 0, 30, 2000, -1, 0, 0));   /* slot free again */
     s = bridge_cmd_next_send(&r, 2000); assert(s && s->seq == 2);
     swarm_command_ack_t wrong = { .seq = 9, .op = SWARM_CMD_PERMIT_JOIN, .status = SWARM_ACK_DONE };
     assert(!bridge_cmd_on_ack(&r, m, &wrong, 2001, &done));      /* unknown seq ignored */
@@ -29,7 +29,7 @@ int main(void)
     assert(bridge_cmd_expire(&r, 2031, &ex) && ex.op == SWARM_CMD_PERMIT_JOIN);   /* ttl 30 passed */
     assert(bridge_cmd_next_send(&r, 2032) == NULL);
     uint8_t other[6] = {9,9,9,9,9,9};
-    assert(bridge_cmd_submit(&r, other, SWARM_CMD_RESYNC, NULL, 0, NULL, 0, 10, 3000, -1, 0, 0));   /* per-node slots */
+    assert(bridge_cmd_submit(&r, other, SWARM_CMD_RESYNC, NULL, 0, 1, NULL, 0, 10, 3000, -1, 0, 0));   /* per-node slots */
 
     /* M7: bridge_cmd_peek_pending()/bridge_cmd_mark_sent() (POLL-triggered
      * opportunistic send). `other` has a fresh, never-sent RESYNC (sends==0,
@@ -51,12 +51,23 @@ int main(void)
 
     /* Accepted slot: peek must return NULL (already progressing, no resend). */
     uint8_t acc_mac[6] = {7,7,7,7,7,7};
-    assert(bridge_cmd_submit(&r, acc_mac, SWARM_CMD_ACTUATE, &d, 0, NULL, 0, 30, 4000, -1, 0, 0));
+    assert(bridge_cmd_submit(&r, acc_mac, SWARM_CMD_ACTUATE, &d, 0, 1, NULL, 0, 30, 4000, -1, 0, 0));
     assert(bridge_cmd_peek_pending(&r, acc_mac) != NULL);     /* not yet accepted: pending */
     swarm_command_ack_t acc2 = { .seq = 1, .op = SWARM_CMD_ACTUATE, .status = SWARM_ACK_ACCEPTED };
     bridge_cmd_t done2;
     assert(!bridge_cmd_on_ack(&r, acc_mac, &acc2, 4001, &done2));   /* still in flight, now accepted */
     assert(bridge_cmd_peek_pending(&r, acc_mac) == NULL);     /* accepted: nothing to flush-send */
+
+    /* M8 Task 8: endpoint travels with the stored row, unrelated to arg.
+     * Fresh router: acc_mac's own slot above is still "due" for a first
+     * send (sends == 0) even though it was already accepted out of band
+     * (peek/on_ack, never next_send), so reusing r here could hand back
+     * that slot instead of this submit's. */
+    bridge_router_t r2; bridge_cmd_init(&r2);
+    uint8_t ep_mac[6] = {6,6,6,6,6,6};
+    assert(bridge_cmd_submit(&r2, ep_mac, SWARM_CMD_ACTUATE, &d, 0, 2, NULL, 0, 30, 5000, -1, 0, 0));
+    const bridge_cmd_t *ep_s = bridge_cmd_next_send(&r2, 5000);
+    assert(ep_s && ep_s->endpoint == 2);
 
     printf("test_bridge_cmd: OK\n");
     return 0;
