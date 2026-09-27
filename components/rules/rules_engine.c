@@ -245,17 +245,23 @@ static bool capture_sink(void *ctx, uint8_t builtin, const char *msg)
  * for the diagnostic log line, and evaluate_real()/rules_test() below pass
  * the SAME ctx instance to both sink and action_sink on one psvm_run()
  * call. */
+/* endpoint (Task 10, trailing psvm_action_sink_t arg): the device-relative
+ * endpoint CALL_ACTION decoded off `@N`, or 0 ("unspecified -> lowest
+ * slot" -- both a bare action with no `@N`, and every action in a legacy
+ * v1 program). actor_request() itself always targets endpoint 1 (actor.h),
+ * so 0 is substituted with 1 here to keep an unmodified rule's action
+ * firing exactly where it always did. */
 static bool real_action_sink(void *ctx, uint8_t kind, const char *name,
-                             uint8_t action_id, uint16_t param)
+                             uint8_t action_id, uint16_t param, uint8_t endpoint)
 {
     const real_sink_ctx_t *c = ctx;
     int dev_idx = rules_resolve_action_dev(kind, name, action_id);
-    bool queued = actor_request(dev_idx, action_id, param, ACTOR_SRC_RULE,
-                                actor_now_s() + ACTOR_RULE_TTL_S);
+    bool queued = actor_request_ep(dev_idx, action_id, endpoint ? endpoint : 1, param, ACTOR_SRC_RULE,
+                                   actor_now_s() + ACTOR_RULE_TTL_S);
     const action_t *a = action_get(action_id);
-    ESP_LOGI(TAG, "rule %u: %s(\"%s\").%s(%u) -> %s", (unsigned)c->rule_id,
+    ESP_LOGI(TAG, "rule %u: %s(\"%s\").%s(%u)@%u -> %s", (unsigned)c->rule_id,
              kind == 0 ? "plant" : "device", name, a ? a->name : "?",
-             (unsigned)param, queued ? "queued" : "refused (see alert)");
+             (unsigned)param, (unsigned)(endpoint ? endpoint : 1), queued ? "queued" : "refused (see alert)");
     return true;
 }
 
@@ -268,15 +274,24 @@ static bool real_action_sink(void *ctx, uint8_t kind, const char *name,
  * in true program order (whichever opcode -- CALL_BUILTIN or CALL_ACTION
  * -- psvm_run() reaches first appends first), not grouped by kind. */
 static bool capture_action_sink(void *ctx, uint8_t kind, const char *name,
-                                uint8_t action_id, uint16_t param)
+                                uint8_t action_id, uint16_t param, uint8_t endpoint)
 {
     capture_sink_ctx_t *c = ctx;
     if (c->acts && c->nacts && *c->nacts < c->cap) {
         rules_test_action_t *a = &c->acts[*c->nacts];
         const action_t *ad = action_get(action_id);
         a->builtin = 0xFF;   /* not a log/notify level -- msg is everything the /test API renders */
-        snprintf(a->msg, sizeof(a->msg), "%s(\"%s\").%s(%u)",
-                kind == 0 ? "plant" : "device", name, ad ? ad->name : "?", (unsigned)param);
+        /* endpoint 0 (no `@N`, or a legacy v1 program) renders exactly as
+         * before -- no "@0" ever appears, since 0 is "unspecified", not a
+         * real endpoint. */
+        if (endpoint) {
+            snprintf(a->msg, sizeof(a->msg), "%s(\"%s\").%s(%u)@%u",
+                    kind == 0 ? "plant" : "device", name, ad ? ad->name : "?",
+                    (unsigned)param, (unsigned)endpoint);
+        } else {
+            snprintf(a->msg, sizeof(a->msg), "%s(\"%s\").%s(%u)",
+                    kind == 0 ? "plant" : "device", name, ad ? ad->name : "?", (unsigned)param);
+        }
         (*c->nacts)++;
     }
     return true;

@@ -36,7 +36,7 @@ const TWO_CHAR_PUNCT = new Set(['<=', '>=', '==', '!=', '>>'])
 // '=' (connect block: `write <uuid16> = <hex>`, M5a spec section 2) is
 // checked one-char-at-a-time, but '==' above is matched first via the
 // two-char lookahead in readToken(), so this never swallows '=='.
-const ONE_CHAR_PUNCT = new Set(['(', ')', '.', ',', ';', '<', '>', '+', '-', '*', '/', '='])
+const ONE_CHAR_PUNCT = new Set(['(', ')', '.', ',', ';', '<', '>', '+', '-', '*', '/', '=', '@'])
 
 function unescape(s) {
   let out = ''

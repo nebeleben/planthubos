@@ -154,6 +154,21 @@ class Parser {
     return this.advance()
   }
 
+  // Optional `@<endpoint>` suffix (Task 10) on a capability/action ref:
+  // `switch.state@2`, `switch.on()@2`. Returns `undefined` (default/lowest
+  // slot, matching pre-feature single-endpoint semantics) when absent, else
+  // an integer in 1..240 (registry_get_cap_ep/actor_request_ep's device-
+  // relative endpoint range; 0 is reserved for "unspecified").
+  parseEndpointSuffix() {
+    if (!this.isPunct('@')) return undefined
+    this.advance()
+    const nTok = this.expectIntLiteral()
+    if (nTok.value < 1 || nTok.value > 240) {
+      throw new PSError(`endpoint must be 1..240, got ${nTok.value}`, nTok.line, nTok.col)
+    }
+    return nTok.value
+  }
+
   // A payload accessor's FIRST argument (wrapper dialect): 'payload' in a
   // wrapper with no connect block (M3, unchanged); a declared buffer name
   // in one that has a connect block, where 'payload' itself is not
@@ -980,9 +995,11 @@ class Parser {
       }
     }
 
+    const endpoint = this.parseEndpointSuffix()
+
     return {
       type: 'action_call', kind, name,
-      actionId: actionDef.id, actionName, paramSeconds,
+      actionId: actionDef.id, actionName, paramSeconds, endpoint,
       line: kindTok.line, col: kindTok.col,
     }
   }
@@ -1126,13 +1143,14 @@ class Parser {
     if (!CAPS[capability]) {
       throw new PSError(`unknown capability '${capability}'`, seg1.line, seg1.col)
     }
+    const endpoint = this.parseEndpointSuffix()
     let field = 'value'
     if (this.isPunct('.') && this.peek(1).type === 'IDENT' && this.peek(1).value === 'age') {
       this.advance()
       this.advance()
       field = 'age'
     }
-    return { type: 'ref', kind, name, capability, field, line: kindTok.line, col: kindTok.col }
+    return { type: 'ref', kind, name, capability, field, endpoint, line: kindTok.line, col: kindTok.col }
   }
 }
 

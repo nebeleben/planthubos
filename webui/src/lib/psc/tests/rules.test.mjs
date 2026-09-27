@@ -5,6 +5,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { compile as compileRule, disassemble } from '../index.js'
+import { tokenize } from '../lexer.js'
+import { parse } from '../parser.js'
 
 test('a rule can fire a plant action', () => {
   const r = compileRule(`rule "water the ficus"
@@ -102,4 +104,72 @@ mode edge
 cooldown 1s`)
   assert.equal(r.ok, true)
   assert.match(disassemble(r.bytecode), /button\.action/)
+})
+
+// ---- Task 10: `@N` endpoint qualifier ----
+
+test('@N parses on a capability ref (condition)', () => {
+  const ast = parse(tokenize('rule "r" when device("zb:AA").switch.state@2 == 1 then log("x")'))
+  assert.equal(ast.when.left.type, 'ref')
+  assert.equal(ast.when.left.endpoint, 2)
+})
+
+test('bare ref has no explicit endpoint (defaults to lowest)', () => {
+  const ast = parse(tokenize('rule "r" when device("zb:AA").switch.state == 1 then log("x")'))
+  assert.equal(ast.when.left.type, 'ref')
+  assert.equal(ast.when.left.endpoint, undefined)
+})
+
+test('@0 and @999 are rejected', () => {
+  assert.throws(
+    () => parse(tokenize('rule "r" when device("zb:AA").switch.state@0 == 1 then log("x")')),
+    /endpoint/
+  )
+  assert.throws(
+    () => parse(tokenize('rule "r" when device("zb:AA").switch.state@999 == 1 then log("x")')),
+    /endpoint/
+  )
+})
+
+test('an @N ref compiles: the ref table carries the endpoint and LOAD_REF renders it', () => {
+  const r = compileRule('rule "r" when device("zb:AA").switch.state@2 == 1 then log("x")')
+  assert.equal(r.ok, true)
+  assert.deepEqual(r.refs, [{ kind: 1, name: 'zb:AA', capability: 8, field: 0, endpoint: 2 }])
+  assert.match(disassemble(r.bytecode), /LOAD_REF 0 ; device "zb:AA" switch\.state@2/)
+})
+
+test('a bare ref (no @N) compiles with endpoint 0 (unspecified -> lowest) and renders with no @ suffix', () => {
+  const r = compileRule('rule "r" when device("zb:AA").switch.state == 1 then log("x")')
+  assert.equal(r.ok, true)
+  assert.equal(r.refs[0].endpoint, 0)
+  assert.doesNotMatch(disassemble(r.bytecode), /switch\.state@/)
+})
+
+test('an @N action ref parses: the action node carries endpoint (then clause)', () => {
+  const ast = parse(tokenize('rule "r" when device("zb:AA").switch.state == 1 then device("zb:AA").switch.on()@2'))
+  assert.equal(ast.actions[0].type, 'action_call')
+  assert.equal(ast.actions[0].endpoint, 2)
+})
+
+test('a bare action ref (no @N) has no explicit endpoint', () => {
+  const ast = parse(tokenize('rule "r" when device("zb:AA").switch.state == 1 then device("zb:AA").switch.on()'))
+  assert.equal(ast.actions[0].endpoint, undefined)
+})
+
+test('an @N action compiles: CALL_ACTION carries the endpoint byte', () => {
+  const r = compileRule(`rule "pump"
+when plant("Ficus").soil.moisture < 20
+then device("zb:AA").switch.on()@2`)
+  assert.equal(r.ok, true)
+  assert.match(disassemble(r.bytecode), /CALL_ACTION device "zb:AA" switch\.on@2/)
+})
+
+test('@0 and @999 are rejected on an action ref too', () => {
+  const bad0 = compileRule('rule "r" when plant("F").soil.moisture < 20 then device("zb:AA").switch.on()@0')
+  assert.equal(bad0.ok, false)
+  assert.match(bad0.errors[0].message, /endpoint/)
+
+  const bad999 = compileRule('rule "r" when plant("F").soil.moisture < 20 then device("zb:AA").switch.on()@999')
+  assert.equal(bad999.ok, false)
+  assert.match(bad999.errors[0].message, /endpoint/)
 })

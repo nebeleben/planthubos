@@ -3,7 +3,16 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define PSVM_FMT_VER      1
+/* Task 10 (@N endpoint qualifier): bumped 1 -> 2. v2 widens the ref-table
+ * entry and CALL_ACTION operands by one trailing endpoint byte each (see
+ * psvm_ref_t.endpoint and psvm_action_sink_t below). psvm_validate() is
+ * version-gated, not version-exclusive: it still accepts a v1 blob
+ * (5-byte ref entry, 5-byte CALL_ACTION, endpoint always 0 = unspecified
+ * -> lowest slot) because the hub has no compiler and cannot recompile a
+ * stored .psbc from its .psrc on load -- an old single-endpoint rule must
+ * keep validating and running exactly as before, forever. The browser
+ * compiler (codegen.js) always emits v2 going forward. */
+#define PSVM_FMT_VER      2
 #define PSVM_DIALECT_RULES 1
 #define PSVM_DIALECT_WRAPPERS 2
 #define PSVM_MAX_REFS     32
@@ -131,8 +140,13 @@ typedef enum { PSVM_OK = 0, PSVM_ERR_HEADER, PSVM_ERR_LIMITS, PSVM_ERR_TRUNCATED
 
 typedef struct { float value; uint32_t age_s; bool ready; } psvm_ref_val_t;
 
-/* kind: 0 plant, 1 device; field: 0 value, 1 age (spec section 2) */
-typedef struct { uint8_t kind; uint16_t name_const; uint8_t capability; uint8_t field; } psvm_ref_t;
+/* kind: 0 plant, 1 device; field: 0 value, 1 age (spec section 2).
+ * endpoint (Task 10, v2 only): 1..240 as authored via `@N`, or 0 meaning
+ * "unspecified -> lowest slot" -- both a bare ref with no `@N` (v2) and
+ * EVERY ref in a legacy v1 blob (which has no endpoint byte at all)
+ * decode to 0 here, so callers have exactly one "default" value to
+ * special-case, never two. */
+typedef struct { uint8_t kind; uint16_t name_const; uint8_t capability; uint8_t field; uint8_t endpoint; } psvm_ref_t;
 
 /* Builtin sink: builtin 0=log 1=notify, msg NUL-terminated (may be truncated
  * to PSVM_STRBUF-1). Return false to abort the run (treated as PSVM_ERR_TYPE).
@@ -150,9 +164,18 @@ typedef bool (*psvm_sink_t)(void *ctx, uint8_t builtin, const char *msg);
  * same convention as psvm_sink_t; the real engine sink (rules_engine.c)
  * never does this -- actor_request() already reports its own refusal via
  * alert_post(), so a guard refusal must not also unwind the VM and skip
- * whatever `then` actions follow it. */
+ * whatever `then` actions follow it.
+ *
+ * endpoint (Task 10, trailing arg): the device-relative endpoint CALL_ACTION
+ * decoded, 1..240, or 0 meaning "unspecified -> lowest slot" -- exactly the
+ * same convention as psvm_ref_t.endpoint, and always 0 for a v1 program
+ * (which has no endpoint operand at all). The real engine sink
+ * (rules_engine.c's real_action_sink) forwards this to actor_request_ep(),
+ * substituting 1 for 0 (base actor_request()'s own default endpoint) so a
+ * rule with no `@N` keeps actuating exactly what it always did. */
 typedef bool (*psvm_action_sink_t)(void *ctx, uint8_t kind, const char *name,
-                                   uint8_t action_id, uint16_t param);
+                                   uint8_t action_id, uint16_t param,
+                                   uint8_t endpoint);
 
 /* Wrapper dialect (dialect=2) EMIT sink: capability id (EMIT's own u8
  * operand) and the popped numeric value. Called once per buffered emit,
@@ -217,6 +240,7 @@ typedef struct {
 
 typedef struct {
     const uint8_t *blob; size_t len;          /* validated PSBC */
+    uint8_t  fmt_ver;                          /* header byte 4: 1 or PSVM_FMT_VER (2) */
     uint16_t const_count, ref_count, code_len;
     uint32_t builtins;                         /* header bitmap */
     const uint8_t *consts, *refs, *code;       /* section pointers */

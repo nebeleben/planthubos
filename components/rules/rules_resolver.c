@@ -62,24 +62,20 @@ static registry_t s_reg_snap;
 static plants_table_t s_plants_snap;
 
 /* plant("<name>") kind: name -> plants table entry -> that capability's
- * binding -> registry value, via plants_cap_value() (plants.h), which does
- * the binding lookup + registry_find() + slot read in one call over a
- * registry snapshot this function already took. Failure reasons (spec Sec.7
- * / task-6 brief step 3): "no plant X" (unknown name), "plant X has no
- * <cap> bound" (name known, but this ref's capability was never bound on
- * it -- was "plant X has no probe" pre-M2), "device never heard" (bound,
- * but plants_cap_value() still can't produce a value -- the bound device
- * isn't in this snapshot, or its slot has never been written; was "probe
- * never heard" pre-M2). */
-static bool resolve_plant(const char *name, uint8_t capability, uint8_t field,
+ * binding -> registry value. Task 10: reads the bound device_id_t straight
+ * off the plants snapshot and the (cap,endpoint) slot via
+ * registry_get_cap_ep() (Task 4) directly, rather than through
+ * plants_cap_value() (plants.h), which has no endpoint parameter --
+ * otherwise the same binding-lookup + registry_find() + slot-read shape
+ * that call used to do in one step. Failure reasons (spec Sec.7 / task-6
+ * brief step 3): "no plant X" (unknown name), "plant X has no <cap> bound"
+ * (name known, but this ref's capability was never bound on it -- was
+ * "plant X has no probe" pre-M2), "device never heard" (bound, but the
+ * bound device isn't in this snapshot, or the requested endpoint's slot
+ * has never been written; was "probe never heard" pre-M2). */
+static bool resolve_plant(const char *name, uint8_t capability, uint8_t field, uint8_t endpoint,
                           uint32_t now_uptime_s, psvm_ref_val_t *out, char *why, size_t whylen)
 {
-    /* plants_cap_value() takes its own wall-clock read for age_s (see its
-     * doc comment in plants.h) -- this function has no use for the shared
-     * now_uptime_s resolve_device() below needs for its own registry-slot
-     * math, but keeps the parameter so both resolver kinds share one call
-     * shape off rules_resolve(). */
-    (void)now_uptime_s;
     /* s_plants_snap (file scope, see its own comment above): only ever
      * touched from the caller's task (engine task, or a future
      * rules_test() caller serialized by rules_engine.c's evaluation mutex
@@ -105,20 +101,35 @@ static bool resolve_plant(const char *name, uint8_t capability, uint8_t field,
         }
         return false;
     }
-    uint8_t plant_id = snap->p[idx].id;
+    /* Task 10: this plant capability's bound device -- read directly off
+     * the same snapshot already used for cap_bound[] above, rather than
+     * going through plants_cap_value() (plants.h), which has no endpoint
+     * parameter of its own. Mirrors resolve_device()'s own device-slot
+     * read below, using registry_get_cap_ep() (Task 4) instead of
+     * plants_cap_value()'s internal caps[capability] indexing so a
+     * plant ref's `@N` reaches the same (cap,endpoint) slot a device ref
+     * would. */
+    device_id_t dev = snap->p[idx].cap_dev[capability];
 
     data_core_snapshot(&s_reg_snap);
 
-    float value; uint32_t age_s;
-    if (!plants_cap_value(plant_id, capability, &s_reg_snap, &value, &age_s)) {
+    int ridx = registry_find(&s_reg_snap, &dev);
+    if (ridx < 0) {
+        ref_not_ready(out);
+        if (why && whylen) snprintf(why, whylen, "device never heard");
+        return false;
+    }
+
+    const cap_slot_t *slot = registry_get_cap_ep(&s_reg_snap, &dev, capability, endpoint);
+    if (!slot || !slot->valid) {
         ref_not_ready(out);
         if (why && whylen) snprintf(why, whylen, "device never heard");
         return false;
     }
 
     out->ready = true;
-    out->age_s = age_s;
-    out->value = (field == 1) ? (float)age_s : value;
+    out->age_s = (now_uptime_s >= slot->updated_s) ? (now_uptime_s - slot->updated_s) : 0;
+    out->value = (field == 1) ? (float)out->age_s : capability_decode(capability, slot->raw);
     return true;
 }
 
@@ -176,7 +187,7 @@ static bool resolve_event_cap(const device_id_t *dev, uint8_t capability, uint8_
     return true;
 }
 
-static bool resolve_device(const char *id, uint8_t capability, uint8_t field,
+static bool resolve_device(const char *id, uint8_t capability, uint8_t field, uint8_t endpoint,
                            uint32_t now_uptime_s, psvm_ref_val_t *out, char *why, size_t whylen)
 {
     data_core_snapshot(&s_reg_snap);
@@ -203,8 +214,13 @@ static bool resolve_device(const char *id, uint8_t capability, uint8_t field,
         return false;
     }
 
-    const cap_slot_t *slot = &s_reg_snap.devices[ridx].caps[capability];
-    if (!slot->valid) {
+    /* Task 10: registry_get_cap_ep() (Task 4) reads the (capability,
+     * endpoint) slot instead of always the device's default caps[]
+     * entry -- endpoint 0 (a bare ref with no `@N`, or every ref in a
+     * legacy v1 program) returns that same default/lowest slot, so an
+     * unmodified rule resolves exactly as it always did. */
+    const cap_slot_t *slot = registry_get_cap_ep(&s_reg_snap, &dev, capability, endpoint);
+    if (!slot || !slot->valid) {
         ref_not_ready(out);
         if (why && whylen) {
             snprintf(why, whylen, "device \"%s\" %s never reported", id, rules_cap_name(capability));
@@ -244,9 +260,9 @@ bool rules_resolve(const psvm_prog_t *prog, uint16_t ref_idx, psvm_ref_val_t *ou
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
     if (r.kind == 0) {
-        return resolve_plant(name, r.capability, r.field, now_uptime_s, out, why, whylen);
+        return resolve_plant(name, r.capability, r.field, r.endpoint, now_uptime_s, out, why, whylen);
     } else {
-        return resolve_device(name, r.capability, r.field, now_uptime_s, out, why, whylen);
+        return resolve_device(name, r.capability, r.field, r.endpoint, now_uptime_s, out, why, whylen);
     }
 }
 
