@@ -850,9 +850,16 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
         accepted = data_core_submit_event(&id, cap, (int16_t)value);
         ESP_LOGI(TAG, "report: event cap %u code %d -> %s", cap, (int)value, accepted ? "queued" : "dropped");
     } else {
-        accepted = data_core_submit_cap_id(&id, cap, value);
-        ESP_LOGI(TAG, "report: cap %u value %.3f -> data_core %s", cap, (double)value,
-                 accepted ? "accepted" : "rejected (device not in registry?)");
+        /* Task 6 (multi-endpoint-zigbee): route by src_endpoint instead of
+         * always targeting the device's default/main slot -- a dual On/Off
+         * device (two switch.state instances, endpoints {1,2}) must land
+         * each report in its own instance, not clobber the other's value.
+         * A single-endpoint device (the overwhelming majority) reports on
+         * its one and only endpoint, so this is unchanged behavior for it:
+         * that endpoint becomes (and stays) the tracked default. */
+        accepted = data_core_submit_cap_id_ep(&id, cap, msg->src_endpoint, value, 0);
+        ESP_LOGI(TAG, "report: cap %u ep %u value %.3f -> data_core %s", cap, msg->src_endpoint,
+                 (double)value, accepted ? "accepted" : "rejected (device not in registry?)");
     }
 
     /* Cap-list backfill (2026-09-10): a device can stream a real value on a
@@ -872,12 +879,17 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
         int bi = zb_store_find(&s_store, eui64);
         if (bi >= 0) {
             zb_device_t *d = &s_store.dev[bi];
+            /* Task 6: presence is now keyed on (cap, endpoint), not cap
+             * alone -- a dual On/Off device's second gang reports the same
+             * cap on a DIFFERENT endpoint, and that must backfill a SECOND
+             * instance, not be swallowed as "already have switch.state". */
             bool present = false;
             for (int k = 0; k < d->cap_count; k++)
-                if (d->caps[k] == cap) { present = true; break; }
+                if (d->caps[k] == cap && d->cap_endpoints[k] == msg->src_endpoint) { present = true; break; }
             if (!present && d->cap_count < ZB_STORE_MAX_CAPS) {
                 d->caps[d->cap_count] = cap;
                 d->cap_clusters[d->cap_count] = msg->cluster;
+                d->cap_endpoints[d->cap_count] = msg->src_endpoint;
                 d->cap_count++;
                 changed = true;
             }
@@ -895,7 +907,11 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
                     bool ap = false;
                     for (int j = 0; j < d->action_count; j++)
                         if (d->actions[j] == acts[a]) { ap = true; break; }
-                    if (!ap) { d->actions[d->action_count++] = acts[a]; changed = true; }
+                    if (!ap) {
+                        d->action_endpoints[d->action_count] = msg->src_endpoint;
+                        d->actions[d->action_count++] = acts[a];
+                        changed = true;
+                    }
                 }
             }
             if (changed) { zb_store_save(); dev_copy = *d; }

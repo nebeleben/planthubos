@@ -2772,16 +2772,30 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
         if (!data_core_get_device(dev_id, &d)) return;
         /* One MEASUREMENT per valid capability whose value changed since we
          * last forwarded it: data_core posts one event per submit, so send
-         * the freshest slot only -- the one with the newest timestamp. */
-        int best = -1;
+         * the freshest slot only -- the one with the newest timestamp.
+         * Task 6: a multi-endpoint device's OTHER (cap,endpoint) instances
+         * live in extra_ep_caps (Task 4), not in caps[] at all -- scanning
+         * only the CAPABILITY_COUNT loop below would silently starve every
+         * non-default endpoint's readings of forwarding. Both loops track
+         * the same "freshest wins" candidate together. */
+        int best = -1; uint8_t best_ep = 0; uint32_t best_ts = 0; int16_t best_raw = 0; uint8_t best_cap = 0;
         for (int c = 0; c < CAPABILITY_COUNT; c++)
-            if (d.caps[c].valid && (best < 0 || d.caps[c].updated_s >= d.caps[best].updated_s)) best = c;
+            if (d.caps[c].valid && (best < 0 || d.caps[c].updated_s >= best_ts)) {
+                best = c; best_ts = d.caps[c].updated_s; best_ep = d.cap_endpoint[c] ? d.cap_endpoint[c] : 1;
+                best_cap = (uint8_t)c; best_raw = d.caps[c].raw;
+            }
+        for (uint8_t i = 0; i < d.extra_ep_cap_count; i++)
+            if (d.extra_ep_caps[i].slot.valid && (best < 0 || d.extra_ep_caps[i].slot.updated_s >= best_ts)) {
+                best = 1; best_ts = d.extra_ep_caps[i].slot.updated_s; best_ep = d.extra_ep_caps[i].endpoint;
+                best_cap = d.extra_ep_caps[i].cap_id; best_raw = d.extra_ep_caps[i].slot.raw;
+            }
         if (best < 0) return;
         swarm_out_t o = { .tag = SWARM_OUT_MEASUREMENT };
         o.u.meas.dev.kind = DEV_KIND_ZIGBEE;
         memcpy(o.u.meas.dev.addr, dev_id->addr, SWARM_ADDR_LEN);
-        o.u.meas.cap_id = (uint8_t)best;
-        o.u.meas.value = capability_decode((uint8_t)best, d.caps[best].raw);
+        o.u.meas.cap_id = best_cap;
+        o.u.meas.endpoint = best_ep;
+        o.u.meas.value = capability_decode(best_cap, best_raw);
         o.u.meas.age_s = 0;
         if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
             ESP_LOGW(TAG, "forward queue full, dropping measurement");
@@ -3128,17 +3142,17 @@ static void zb_observer(const zb_device_t *dev, bool gone)
         for (uint8_t i = 0; i < a->cap_count; i++) {
             a->cap_ids[i] = dev->caps[i];
             a->cap_clusters[i] = dev->cap_clusters[i];
-            /* TODO(task 6): wire per-cap endpoint -- dev->cap_endpoints[i]
-             * already carries it (zb_store.h, Task 1); this compile stub
-             * just zero-fills so v5's swarm_device_announce_t keeps
-             * building until Task 6 wires the real announce producer. */
-            a->cap_endpoints[i] = 0;
+            /* Task 6: per-cap endpoint, straight from the interview/backfill
+             * result (zb_store.h, Task 1) -- each cap instance carries the
+             * endpoint it actually lives on, instead of the removed
+             * device-wide `endpoint` v4 had. */
+            a->cap_endpoints[i] = dev->cap_endpoints[i];
         }
         a->action_count = dev->action_count > SWARM_DEV_MAX_ACTIONS ? SWARM_DEV_MAX_ACTIONS : dev->action_count;
         for (uint8_t i = 0; i < a->action_count; i++) {
             a->action_ids[i] = dev->actions[i];
-            /* TODO(task 6): wire per-action endpoint -- dev->action_endpoints[i]. */
-            a->action_endpoints[i] = 0;
+            /* Task 6: per-action endpoint, same source (dev->action_endpoints[i]). */
+            a->action_endpoints[i] = dev->action_endpoints[i];
         }
     }
     if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)

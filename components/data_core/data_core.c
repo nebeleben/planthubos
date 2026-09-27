@@ -478,13 +478,21 @@ void data_core_events_consume_through(uint32_t seq)
     xSemaphoreGive(s_mutex);
 }
 
-/* I4 fix: shared body of data_core_submit_cap_id() and
- * data_core_submit_cap_id_aged() below, parameterised on the timestamp to
- * stamp the registry with -- "now" for the un-aged caller,
- * "now - age_s" (already range-checked by the caller) for the aged one, so
- * a bridged measurement's real capture time survives into last_seen_s/
- * caps[].updated_s instead of always reading as "just now". */
-static bool submit_cap_id_at(const device_id_t *id, uint8_t cap_id, float value, uint32_t ts_s)
+/* I4 fix, extended by Task 6 (multi-endpoint-zigbee): shared body of
+ * data_core_submit_cap_id(), data_core_submit_cap_id_aged() and
+ * data_core_submit_cap_id_ep() below, parameterised on both the timestamp
+ * to stamp the registry with -- "now" for the un-aged callers,
+ * "now - age_s" (already range-checked by the caller) for the aged ones,
+ * so a bridged measurement's real capture time survives into last_seen_s/
+ * caps[].updated_s instead of always reading as "just now" -- and, as of
+ * Task 6, the specific (cap_id, endpoint) instance to write: the two
+ * single-endpoint wrappers below always pass endpoint 1 (registry_set_cap_ep()'s
+ * "first write becomes the default" rule then makes 1 the tracked default,
+ * matching the pre-Task-6 registry_set_cap() behavior exactly for every
+ * existing caller), while data_core_submit_cap_id_ep() passes through
+ * whatever endpoint its caller (currently zigbee.c's report path) knows the
+ * reading actually came from. */
+static bool submit_cap_id_at(const device_id_t *id, uint8_t cap_id, uint8_t endpoint, float value, uint32_t ts_s)
 {
     /* Task 4: an event capability (button.action) has no sticky value --
      * data_core_submit_event() above is its only legitimate entry point.
@@ -568,7 +576,7 @@ static bool submit_cap_id_at(const device_id_t *id, uint8_t cap_id, float value,
                  (unsigned long)++s_dropped_stale);
         return false;
     }
-    idx = registry_set_cap(&s_registry, id, cap_id, raw, ts_s);
+    idx = registry_set_cap_ep(&s_registry, id, cap_id, endpoint, raw, ts_s);
     xSemaphoreGive(s_mutex);
 
     if (idx < 0) {
@@ -585,7 +593,7 @@ static bool submit_cap_id_at(const device_id_t *id, uint8_t cap_id, float value,
 bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value)
 {
     uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
-    return submit_cap_id_at(id, cap_id, value, now_s);
+    return submit_cap_id_at(id, cap_id, 1, value, now_s);
 }
 
 /* I4 fix: mirrors data_core_submit_from()'s age policy (data_core.h's
@@ -604,7 +612,31 @@ bool data_core_submit_cap_id_aged(const device_id_t *id, uint8_t cap_id, float v
     uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
     /* Same clamp-rather-than-underflow reasoning as data_core_submit_from(). */
     uint32_t effective_s = (age_s <= now_s) ? now_s - age_s : 0;
-    return submit_cap_id_at(id, cap_id, value, effective_s);
+    return submit_cap_id_at(id, cap_id, 1, value, effective_s);
+}
+
+/* Task 6 (multi-endpoint-zigbee): the endpoint-aware sibling of
+ * data_core_submit_cap_id_aged() above -- see its declaration in
+ * data_core.h for the full contract. Identical age policy and shared body
+ * as data_core_submit_cap_id_aged(); the only difference is that `endpoint`
+ * (not always 1) is threaded through to registry_set_cap_ep(), so a report
+ * from a specific (cap, endpoint) instance on a multi-endpoint device lands
+ * in (or creates) that instance's own slot instead of always targeting the
+ * device's default/main one. First consumer: zigbee.c's
+ * zb_handle_report_attr(), which now resolves msg->src_endpoint to the
+ * correct instance before submitting. */
+bool data_core_submit_cap_id_ep(const device_id_t *id, uint8_t cap_id, uint8_t endpoint, float value, uint16_t age_s)
+{
+    if (age_s > DATA_CORE_MAX_AGE_S) {
+        ESP_LOGD(TAG, "dropping cap %u ep %u for " MACSTR_FMT ": age %us exceeds max %us (dropped_stale=%lu)",
+                 cap_id, endpoint, MAC_ARG(id->addr), (unsigned)age_s, (unsigned)DATA_CORE_MAX_AGE_S,
+                 (unsigned long)++s_dropped_stale);
+        return false;
+    }
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    /* Same clamp-rather-than-underflow reasoning as data_core_submit_from(). */
+    uint32_t effective_s = (age_s <= now_s) ? now_s - age_s : 0;
+    return submit_cap_id_at(id, cap_id, endpoint, value, effective_s);
 }
 
 bool data_core_submit_cap(const uint8_t mac[6], uint8_t cap_id, float value)

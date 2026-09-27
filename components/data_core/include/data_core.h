@@ -184,6 +184,25 @@ bool data_core_submit_cap_id(const device_id_t *id, uint8_t cap_id, float value)
  * contract as that function. */
 bool data_core_submit_cap_id_aged(const device_id_t *id, uint8_t cap_id, float value, uint16_t age_s);
 
+/* Task 6 (multi-endpoint-zigbee): the endpoint-aware sibling of
+ * data_core_submit_cap_id_aged() above, for a producer that knows WHICH of a
+ * multi-endpoint device's (cap_id, endpoint) instances a reading belongs to
+ * -- a dual-gang Zigbee switch reporting switch.state on endpoint 2 must not
+ * land on (or clobber) the endpoint-1 instance's slot. Same age policy as
+ * data_core_submit_cap_id_aged() (age_s > DATA_CORE_MAX_AGE_S drops the
+ * reading, otherwise last_seen_s/the cap's updated_s is backdated by
+ * age_s), same event-cap rejection and out-of-range/registry-full handling,
+ * same "false means nothing was stored" contract -- the only difference is
+ * that the write lands via registry_set_cap_ep() at the given endpoint
+ * instead of always targeting the device's default/main slot.
+ * data_core_submit_cap_id()/data_core_submit_cap_id_aged() are themselves
+ * now thin wrappers over the same shared body, always passing endpoint 1
+ * (registry_set_cap_ep()'s "first write becomes the default" rule then
+ * makes 1 the tracked default for a single-endpoint device, matching the
+ * pre-Task-6 registry_set_cap() behavior exactly) -- every existing
+ * single-endpoint caller is unaffected. */
+bool data_core_submit_cap_id_ep(const device_id_t *id, uint8_t cap_id, uint8_t endpoint, float value, uint16_t age_s);
+
 /* Task 4 (zigbee-button-support): as of this task, data_core_submit_cap_id()
  * and data_core_submit_cap_id_aged() above both return false (logged WARN,
  * nothing stored) when cap_id is an `event` capability (capability_get()->
