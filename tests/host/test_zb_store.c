@@ -252,10 +252,13 @@ int main(void) {
         assert(i >= 0 && back.dev[i].meter_state == ZB_METER_PRESENT);
     }
     /* record size grew by exactly the meter_state byte (v3 91 -> v4 92) --
-     * a historical fact about v4, pinned as the literal 92 below rather
-     * than against ZB_STORE_RECORD_SIZE, which now names the *current*
-     * (v5, 156-byte) record; see the v5 test below for the live
-     * assertion against that macro. */
+     * a historical fact about v4, no longer checkable against
+     * ZB_STORE_RECORD_SIZE (that macro now names the *current*, v5,
+     * 156-byte record; see the v5 test below for the live assertion
+     * against it). The 92 fact itself is pinned concretely by the
+     * `assert(sizeof v4 == 8 + 92)` in the v4 legacy-read test below,
+     * and by the `8 + 92 - 1` in the v3 legacy-read test right after
+     * this comment. */
 
     /* --- legacy (v3, 91-byte) record defaults meter_state to
      * ZB_METER_UNKNOWN -- a pre-power-metering file loads as if the
@@ -330,6 +333,7 @@ int main(void) {
         /* forge a v4 image: version=4, record length 92 (drop the trailing 64
          * identity bytes of the single record) */
         uint8_t v4[8 + 92];
+        assert(sizeof v4 == 8 + 92);   /* pins the v4 (pre-identity) record at 92 bytes */
         memcpy(v4, buf, 8);
         v4[4] = 4;
         memcpy(v4 + 8, buf + 8, 92);
