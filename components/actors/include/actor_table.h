@@ -185,6 +185,30 @@ void actor_table_init(actor_table_t *t);
 bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id, uint8_t endpoint,
                       uint16_t param_max, uint8_t flags);
 
+/* Whole-branch review, F1 fix: resolves an ACTUATE-path endpoint of 0 --
+ * meaning "no explicit endpoint was named" -- to the LOWEST endpoint among
+ * dev_idx's declared slots for action_id, exactly mirroring the read
+ * path's treatment of endpoint 0 as the device's default/lowest/main slot
+ * (registry_get_cap_ep). A non-zero `endpoint` is returned completely
+ * unchanged -- this function only ever substitutes for the sentinel, never
+ * remaps a real endpoint. Returns 0 (unresolved) when dev_idx is negative,
+ * not declared, or declares no slot for action_id at ANY endpoint: callers
+ * must NOT then substitute some other literal default -- passing the
+ * unresolved 0 through to find_slot() already, correctly, fails to match,
+ * so actor_table_check()/actor_table_record() refuse ACTOR_REFUSED_UNKNOWN
+ * (or no-op) for a genuinely undeclared action exactly as before this fix.
+ *
+ * actor_table_check() and actor_table_record() both call this on entry, so
+ * every guard/cooldown/rate check downstream of either already sees the
+ * concrete resolved endpoint -- per-endpoint guard state is never
+ * collapsed. actor_request_decide() (actor.c) also resolves once, up
+ * front, before its own call into actor_table_check(), so the concrete
+ * endpoint is what gets stamped onto the queued actor_cmd_t and, from
+ * there, onto the wire (e.g. zb_cmd.c's dst_endpoint) -- a dispatched
+ * command never carries the endpoint-0 sentinel. */
+uint8_t actor_table_resolve_endpoint(const actor_table_t *t, int dev_idx, uint8_t action_id,
+                                       uint8_t endpoint);
+
 /* The single source of truth for "is this command allowed right now".
  * Evaluates in this fixed order and returns the FIRST refusal:
  *

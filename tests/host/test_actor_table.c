@@ -537,6 +537,79 @@ static void test_four_gang_device_fits_and_a_ninth_instance_is_refused(void) {
     assert(actor_table_full_drops(&E) == 1);
 }
 
+/* ---- Whole-branch review, F1 fix: endpoint 0 ("unspecified") resolves to
+ * the lowest declared endpoint on the actuate path, mirroring the read
+ * path's own treatment of endpoint 0 (registry_get_cap_ep). ---- */
+
+/* (a) A single-gang actuator declared ONLY at endpoint 2 (no endpoint-1
+ * slot at all) -- exactly the regression this fix closes: a bare rule ref
+ * or an endpoint-less manual POST used to force endpoint 1 and be refused
+ * ACTOR_REFUSED_UNKNOWN even though the device is perfectly well declared,
+ * just not at 1. An endpoint-0 request must resolve to endpoint 2, be
+ * accepted, and actually land its record on the ep2 slot. */
+static void test_endpoint_zero_resolves_to_sole_non_one_endpoint(void) {
+    actor_table_t E; actor_table_init(&E);
+    assert(actor_table_add(&E, 5, ACT_SWITCH_ON, 2, 0, 0));   /* ep2 only */
+    assert(actor_table_resolve_endpoint(&E, 5, ACT_SWITCH_ON, 0) == 2);
+    assert(actor_table_check(&E, 5, ACT_SWITCH_ON, 0, 0, ACTOR_SRC_RULE, 100) == ACTOR_OK);
+    actor_table_set_guards(&E, 5, ACT_SWITCH_ON, 2, /*cooldown*/ 60, /*max*/ 0);
+    actor_table_record(&E, 5, ACT_SWITCH_ON, 0, 100);
+    /* The record above must have landed on the ep2 slot -- verified by
+     * reading its cooldown back, both via endpoint 0 (re-resolves to the
+     * same slot) and via the explicit endpoint. */
+    assert(actor_table_check(&E, 5, ACT_SWITCH_ON, 0, 0, ACTOR_SRC_RULE, 120) == ACTOR_REFUSED_COOLDOWN);
+    assert(actor_table_check(&E, 5, ACT_SWITCH_ON, 2, 0, ACTOR_SRC_RULE, 120) == ACTOR_REFUSED_COOLDOWN);
+}
+
+/* (b) Both endpoints 1 and 2 declared: endpoint 0 resolves to the LOWEST
+ * (1), an explicit 2 still hits the ep2 slot, and the two stay
+ * independently guarded -- resolving 0 must never collapse per-endpoint
+ * guard state. */
+static void test_endpoint_zero_resolves_to_lowest_when_multiple_declared(void) {
+    actor_table_t E; actor_table_init(&E);
+    assert(actor_table_add(&E, 5, ACT_SWITCH_ON, 1, 0, 0));
+    assert(actor_table_add(&E, 5, ACT_SWITCH_ON, 2, 0, 0));
+    assert(actor_table_resolve_endpoint(&E, 5, ACT_SWITCH_ON, 0) == 1);
+
+    actor_table_set_guards(&E, 5, ACT_SWITCH_ON, 1, /*cooldown*/ 60, /*max*/ 0);
+    /* A 0-endpoint request/record must land on ep1 (the lowest), putting
+     * ep1 into cooldown while leaving ep2 untouched. */
+    assert(actor_table_check(&E, 5, ACT_SWITCH_ON, 0, 0, ACTOR_SRC_RULE, 100) == ACTOR_OK);
+    actor_table_record(&E, 5, ACT_SWITCH_ON, 0, 100);
+    assert(actor_table_check(&E, 5, ACT_SWITCH_ON, 0, 0, ACTOR_SRC_RULE, 120) == ACTOR_REFUSED_COOLDOWN);
+    assert(actor_table_check(&E, 5, ACT_SWITCH_ON, 1, 0, ACTOR_SRC_RULE, 120) == ACTOR_REFUSED_COOLDOWN);
+    /* ep2, named explicitly, is a completely independent slot: no cooldown
+     * configured there, so it stays OK throughout -- guard independence
+     * survives endpoint-0 resolution. */
+    assert(actor_table_check(&E, 5, ACT_SWITCH_ON, 2, 0, ACTOR_SRC_RULE, 120) == ACTOR_OK);
+}
+
+/* (c) An action declared at no endpoint at all (device 5 declares only
+ * ACT_SWITCH_OFF, never ACT_SWITCH_ON) -- an endpoint-0 request for the
+ * undeclared action must still refuse ACTOR_REFUSED_UNKNOWN, exactly as
+ * before this fix: there is no "lowest endpoint" to fall back to when the
+ * action itself was never declared anywhere, on this device or at all. */
+static void test_endpoint_zero_stays_unknown_when_action_never_declared(void) {
+    actor_table_t E; actor_table_init(&E);
+    assert(actor_table_add(&E, 5, ACT_SWITCH_OFF, 1, 0, 0));
+    assert(actor_table_resolve_endpoint(&E, 5, ACT_SWITCH_ON, 0) == 0);
+    assert(actor_table_check(&E, 5, ACT_SWITCH_ON, 0, 0, ACTOR_SRC_RULE, 100) == ACTOR_REFUSED_UNKNOWN);
+    /* Also true for a dev_idx with no declared row at all. */
+    assert(actor_table_resolve_endpoint(&E, 9, ACT_SWITCH_ON, 0) == 0);
+    assert(actor_table_check(&E, 9, ACT_SWITCH_ON, 0, 0, ACTOR_SRC_RULE, 100) == ACTOR_REFUSED_UNKNOWN);
+}
+
+/* A real (non-zero) endpoint must pass through actor_table_resolve_endpoint()
+ * completely unchanged, whether or not that exact endpoint is declared --
+ * this function only ever substitutes for the 0 sentinel, never remaps a
+ * caller's explicit choice. */
+static void test_resolve_endpoint_passes_through_nonzero_unchanged(void) {
+    actor_table_t E; actor_table_init(&E);
+    assert(actor_table_add(&E, 5, ACT_SWITCH_ON, 2, 0, 0));
+    assert(actor_table_resolve_endpoint(&E, 5, ACT_SWITCH_ON, 2) == 2);
+    assert(actor_table_resolve_endpoint(&E, 5, ACT_SWITCH_ON, 7) == 7);   /* not even declared */
+}
+
 int main(void) {
     test_bound_enforced(); test_wrapper_bound_tightens(); test_cooldown();
     test_rate_limit_fixed_window(); test_one_budget_across_sources(); test_lockout();
@@ -566,6 +639,10 @@ int main(void) {
     test_prune_absent_negative_or_unknown();
     test_multi_endpoint_actions_are_independent();
     test_four_gang_device_fits_and_a_ninth_instance_is_refused();
+    test_endpoint_zero_resolves_to_sole_non_one_endpoint();
+    test_endpoint_zero_resolves_to_lowest_when_multiple_declared();
+    test_endpoint_zero_stays_unknown_when_action_never_declared();
+    test_resolve_endpoint_passes_through_nonzero_unchanged();
     printf("test_actor_table: OK\n");
     return 0;
 }

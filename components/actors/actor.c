@@ -119,6 +119,18 @@ actor_request_result_t actor_request_decide(actor_table_t *t, actor_queue_t *q,
     actor_request_result_t r;
     memset(&r, 0, sizeof(r));
 
+    /* F1 fix: resolve an endpoint of 0 ("unspecified") to the lowest
+     * declared endpoint for this (dev_idx, action_id), ONCE, here, before
+     * the guard even runs -- actor_table_resolve_endpoint()'s doc comment
+     * (actor_table.h). This matters beyond the guard itself: the resolved,
+     * concrete endpoint is what gets stamped onto `cmd` below and queued,
+     * so a dispatcher reading cmd->endpoint later (e.g. zb_cmd.c's
+     * dst_endpoint) never sees the endpoint-0 sentinel. actor_table_check()
+     * would resolve it again internally if asked to, but resolving here
+     * first means this call already sees the concrete value, same as
+     * every other caller of actor_table_check() with a real endpoint. */
+    endpoint = actor_table_resolve_endpoint(t, dev_idx, action_id, endpoint);
+
     /* The guards run BEFORE the retry bit is looked at, and the bit is not
      * consulted here at all: a retry is checked exactly like a first
      * attempt (see actor_request_retry()). */
@@ -467,6 +479,14 @@ bool actor_lockout(int dev_idx, bool *out)
     return ok;
 }
 
+uint8_t actor_resolve_endpoint(int dev_idx, uint8_t action_id, uint8_t endpoint)
+{
+    actor_lock();
+    uint8_t resolved = actor_table_resolve_endpoint(&s_table, dev_idx, action_id, endpoint);
+    actor_unlock();
+    return resolved;
+}
+
 static bool request_common(int dev_idx, uint8_t action_id, uint8_t endpoint, uint16_t param,
                             actor_source_t source, uint32_t deadline_s, bool retried)
 {
@@ -516,7 +536,13 @@ static bool request_common(int dev_idx, uint8_t action_id, uint8_t endpoint, uin
 bool actor_request(int dev_idx, uint8_t action_id, uint16_t param,
                     actor_source_t source, uint32_t deadline_s)
 {
-    return request_common(dev_idx, action_id, 1, param, source, deadline_s, false);
+    /* F1 fix: 0, not 1 -- "unspecified", resolved by actor_request_decide()
+     * to dev_idx's lowest declared endpoint for action_id. Identical to the
+     * old literal 1 for every single-endpoint device and the dual valve's
+     * first gang (both cases still have lowest endpoint == 1); only a
+     * device whose lowest endpoint is something else now resolves correctly
+     * instead of being refused ACTOR_REFUSED_UNKNOWN. */
+    return request_common(dev_idx, action_id, 0, param, source, deadline_s, false);
 }
 
 bool actor_request_ep(int dev_idx, uint8_t action_id, uint8_t endpoint, uint16_t param,

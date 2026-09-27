@@ -168,7 +168,14 @@ typedef struct {
  * `endpoint` (M8 Task 5) is checked against the table with `action_id` (see
  * actor_table_check()'s own (device, action, endpoint) key) and stamped
  * onto the queued command as actor_cmd_t.endpoint, so actor_service_step()
- * re-checks and records the same endpoint at dispatch time. */
+ * re-checks and records the same endpoint at dispatch time.
+ *
+ * Whole-branch review, F1 fix: an `endpoint` of 0 ("unspecified") is
+ * resolved to the lowest endpoint dev_idx declares action_id on
+ * (actor_table_resolve_endpoint(), actor_table.h) ONCE, here, before the
+ * guard runs -- so the CONCRETE endpoint, never the 0 sentinel, is what
+ * gets checked, queued, and eventually reaches the radio via
+ * actor_cmd_t.endpoint. */
 actor_request_result_t actor_request_decide(actor_table_t *t, actor_queue_t *q,
     int dev_idx, uint8_t action_id, uint8_t endpoint, uint16_t param, actor_source_t source,
     uint32_t deadline_s, uint32_t now_s, bool retried);
@@ -281,6 +288,19 @@ bool     actor_pair_state_ep(int dev_idx, uint8_t action_id, uint8_t endpoint,
                               actor_pair_state_t *out);
 bool     actor_lockout(int dev_idx, bool *out);
 
+/* Whole-branch review, F1 fix: lock-taking wrapper around
+ * actor_table_resolve_endpoint() (actor_table.h) -- resolves an endpoint of
+ * 0 ("unspecified") to dev_idx's lowest declared endpoint for action_id, or
+ * returns a non-zero `endpoint` unchanged. api_v1.c's manual_refusal_reason()
+ * is the one caller: since devices_action_post() now defaults an omitted
+ * endpoint to 0 (this same fix), the 409 body's reason lookup must resolve
+ * to the SAME concrete endpoint actor_request_ep() itself used to decide
+ * the refusal, or it reads back the wrong pair's guard state via
+ * actor_pair_state_ep() and misreports "unknown" for a refusal that was
+ * really cooldown or rate. Purely a lookup -- changes no state, and
+ * actor_table_pair_state()/actor_table_check() themselves are untouched. */
+uint8_t  actor_resolve_endpoint(int dev_idx, uint8_t action_id, uint8_t endpoint);
+
 /* ---------------------------------------------------------------------
  * Whole-branch review, ruling FINAL-persist: the lock-taking half of guard
  * persistence. actor_persist.c owns the file and calls these; the table
@@ -327,7 +347,13 @@ bool     actor_guards_apply(int dev_idx, const actor_guard_row_t *row);
 bool actor_request(int dev_idx, uint8_t action_id, uint16_t param,
                     actor_source_t source, uint32_t deadline_s);
 /* M8 Task 5: the endpoint-carrying sibling (Task 8's caller). Base
- * actor_request() above is actor_request_ep(d, a, endpoint 1, p, s, dl). */
+ * actor_request() above is actor_request_ep(d, a, endpoint 0, p, s, dl) --
+ * whole-branch review, F1 fix: endpoint 0 is "unspecified", resolved by
+ * actor_request_decide() to dev_idx's lowest declared endpoint for
+ * action_id (actor_table_resolve_endpoint()), which is endpoint 1 for
+ * every single-endpoint device and for the dual valve's own first gang --
+ * so this changes nothing for either; it only stops forcing a literal 1
+ * on a device whose lowest endpoint is genuinely something else. */
 bool actor_request_ep(int dev_idx, uint8_t action_id, uint8_t endpoint, uint16_t param,
                        actor_source_t source, uint32_t deadline_s);
 

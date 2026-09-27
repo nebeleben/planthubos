@@ -19,6 +19,40 @@ static actor_device_t *find_free_row(actor_table_t *t)
     return NULL;
 }
 
+/* Forward declaration: defined further down (shared with
+ * actor_table_pair_state()/actor_table_lockout()), needed here by
+ * actor_table_resolve_endpoint() below, which must take a const table (it
+ * is called from actor_table_check() but the header also exposes it to
+ * read-only-minded callers). */
+static const actor_device_t *find_row_const(const actor_table_t *t, int dev_idx);
+
+/* F1 fix: the lowest endpoint among `row`'s declared slots for action_id,
+ * or 0 if none. See actor_table_resolve_endpoint()'s doc comment
+ * (actor_table.h) for the contract this implements. */
+static uint8_t lowest_declared_endpoint(const actor_device_t *row, uint8_t action_id)
+{
+    uint8_t lowest = 0;
+    bool found = false;
+    for (int i = 0; i < ACTOR_MAX_ACTIONS; i++) {
+        if (row->actions[i].action_id != action_id) continue;
+        if (!found || row->actions[i].endpoint < lowest) {
+            lowest = row->actions[i].endpoint;
+            found = true;
+        }
+    }
+    return found ? lowest : 0;
+}
+
+uint8_t actor_table_resolve_endpoint(const actor_table_t *t, int dev_idx, uint8_t action_id,
+                                       uint8_t endpoint)
+{
+    if (endpoint != 0) return endpoint;
+    if (dev_idx < 0) return 0;
+    const actor_device_t *row = find_row_const(t, dev_idx);
+    if (!row) return 0;
+    return lowest_declared_endpoint(row, action_id);
+}
+
 /* M8 Task 5: keyed on (action_id, endpoint), not action_id alone -- the
  * same action can be declared independently on more than one endpoint of
  * one dev_idx (a dual valve, a multi-gang switch), each getting its own
@@ -140,6 +174,12 @@ actor_verdict_t actor_table_check(actor_table_t *t, int dev_idx, uint8_t action_
     actor_device_t *row = find_row(t, dev_idx);
     if (!row) return ACTOR_REFUSED_UNKNOWN;
 
+    /* F1 fix: endpoint 0 ("unspecified") resolves to the lowest declared
+     * endpoint for this action_id, ONCE, here, before find_slot() and
+     * before every guard below -- see actor_table_resolve_endpoint()'s
+     * doc comment. A real endpoint passes through unchanged. */
+    endpoint = actor_table_resolve_endpoint(t, dev_idx, action_id, endpoint);
+
     actor_slot_t *slot = find_slot(row, action_id, endpoint);
     if (!slot) return ACTOR_REFUSED_UNKNOWN;
 
@@ -204,6 +244,13 @@ void actor_table_record(actor_table_t *t, int dev_idx, uint8_t action_id,
 
     actor_device_t *row = find_row(t, dev_idx);
     if (!row) return;
+
+    /* F1 fix: same resolution as actor_table_check() -- see its comment
+     * above and actor_table_resolve_endpoint()'s doc comment. Keeps
+     * check-time and record-time agreeing on which concrete slot a
+     * 0-endpoint request/record refers to. */
+    endpoint = actor_table_resolve_endpoint(t, dev_idx, action_id, endpoint);
+
     actor_slot_t *slot = find_slot(row, action_id, endpoint);
     if (!slot) return;
 

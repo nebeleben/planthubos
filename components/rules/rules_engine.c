@@ -248,20 +248,31 @@ static bool capture_sink(void *ctx, uint8_t builtin, const char *msg)
 /* endpoint (Task 10, trailing psvm_action_sink_t arg): the device-relative
  * endpoint CALL_ACTION decoded off `@N`, or 0 ("unspecified -> lowest
  * slot" -- both a bare action with no `@N`, and every action in a legacy
- * v1 program). actor_request() itself always targets endpoint 1 (actor.h),
- * so 0 is substituted with 1 here to keep an unmodified rule's action
- * firing exactly where it always did. */
+ * v1 program).
+ *
+ * Whole-branch review, F1 fix: this 0 used to be substituted with a
+ * literal 1 here, which is wrong for a device whose lowest declared
+ * endpoint is NOT 1 (a single-gang Zigbee actuator declared at, say,
+ * endpoint 2 or 11 -- Tasks 7+, action_endpoints) -- actor_table.c's
+ * find_slot() matches (action_id, endpoint) strictly, so that literal 1
+ * was refused ACTOR_REFUSED_UNKNOWN. Passed through UNCHANGED instead:
+ * actor_request_ep() (actor.c's actor_request_decide(), which now calls
+ * actor_table_resolve_endpoint()) resolves 0 to dev_idx's actual lowest
+ * declared endpoint for action_id, mirroring the read path's own
+ * treatment of endpoint 0. For every device whose lowest endpoint IS 1
+ * (every pre-M8 single-endpoint device, and the dual valve's first gang)
+ * this resolves to the same 1 as before -- nothing changes for them. */
 static bool real_action_sink(void *ctx, uint8_t kind, const char *name,
                              uint8_t action_id, uint16_t param, uint8_t endpoint)
 {
     const real_sink_ctx_t *c = ctx;
     int dev_idx = rules_resolve_action_dev(kind, name, action_id);
-    bool queued = actor_request_ep(dev_idx, action_id, endpoint ? endpoint : 1, param, ACTOR_SRC_RULE,
+    bool queued = actor_request_ep(dev_idx, action_id, endpoint, param, ACTOR_SRC_RULE,
                                    actor_now_s() + ACTOR_RULE_TTL_S);
     const action_t *a = action_get(action_id);
     ESP_LOGI(TAG, "rule %u: %s(\"%s\").%s(%u)@%u -> %s", (unsigned)c->rule_id,
              kind == 0 ? "plant" : "device", name, a ? a->name : "?",
-             (unsigned)param, (unsigned)(endpoint ? endpoint : 1), queued ? "queued" : "refused (see alert)");
+             (unsigned)param, (unsigned)endpoint, queued ? "queued" : "refused (see alert)");
     return true;
 }
 

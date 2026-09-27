@@ -3490,6 +3490,14 @@ static const char *verdict_reason_str(actor_verdict_t v)
  * UNKNOWN, BOUND, COOLDOWN or RATE. */
 static const char *manual_refusal_reason(int dev_idx, uint8_t action_id, uint8_t endpoint, uint16_t param)
 {
+    /* Whole-branch review, F1 fix: devices_action_post() now passes an
+     * omitted endpoint through as 0 ("unspecified"), the same sentinel
+     * actor_request_ep() just resolved to dev_idx's lowest declared
+     * endpoint for action_id to decide the refusal this function is
+     * explaining. Resolve identically here, or actor_pair_state_ep() below
+     * looks up endpoint 0 -- a slot that (almost) never exists -- and
+     * misreports "unknown" for what was really cooldown/rate/bound. */
+    endpoint = actor_resolve_endpoint(dev_idx, action_id, endpoint);
     actor_pair_state_t ps;
     if (dev_idx < 0 || !actor_pair_state_ep(dev_idx, action_id, endpoint, &ps)) return "unknown";
     if (!action_param_ok(action_id, param) || param > ps.param_max) return "bound";
@@ -3788,13 +3796,17 @@ static esp_err_t devices_dp_map_delete(httpd_req_t *req, const char *idbuf, uint
  * needs a positive duration is simply refused as "bound" by
  * actor_request_ep(), not by this handler second-guessing it. A body that
  * is present but does NOT parse is a 400, never that default (whole-branch
- * review, finding 7). `endpoint` (M8 Task 9) defaults to 1 -- the action's
- * lowest declared endpoint and the base actor_request()/actor_declare()
- * endpoint every pre-M8 caller already lives on -- so an existing client
- * that never sends the field keeps its exact single-endpoint behaviour;
- * a multi-endpoint device's non-default gang is reached only by naming its
- * endpoint explicitly. Auth checked by devices_post_dispatch() before this
- * is ever reached. */
+ * review, finding 7). `endpoint` (M8 Task 9) defaults to 0 -- "unspecified"
+ * -- so an existing client that never sends the field resolves, inside
+ * actor_request_ep(), to the action's LOWEST declared endpoint (whole-
+ * branch review, F1 fix: actor_table_resolve_endpoint(), mirroring the read
+ * side's own treatment of endpoint 0), whatever that endpoint actually is --
+ * 1 for every pre-M8 single-endpoint device and for the dual valve's first
+ * gang, so neither changes behaviour, but also correctly a single-gang
+ * device declared at a non-1 endpoint, which a literal default of 1 used
+ * to refuse ACTOR_REFUSED_UNKNOWN. A multi-endpoint device's non-default
+ * gang is still reached only by naming its endpoint explicitly. Auth
+ * checked by devices_post_dispatch() before this is ever reached. */
 static esp_err_t devices_action_post(httpd_req_t *req, const char *idbuf, const char *action_name)
 {
     device_id_t dev;
@@ -3811,7 +3823,9 @@ static esp_err_t devices_action_post(httpd_req_t *req, const char *idbuf, const 
     }
 
     uint16_t param = 0;
-    uint8_t endpoint = 1;   /* the action's lowest declared endpoint, absent any override */
+    uint8_t endpoint = 0;   /* unspecified -- actor_request_ep() resolves this to
+                             * the action's lowest declared endpoint, absent
+                             * any override (whole-branch review, F1 fix) */
     if (req->content_len > 0) {
         char body[64];
         if (req->content_len > sizeof(body) - 1) {
