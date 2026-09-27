@@ -200,6 +200,77 @@ static void test_fmt1_backward_compat(void) {
     assert(d->cap_endpoint[CAP_SWITCH_STATE] == 0);
 }
 
+/* --- power-metering (Task 3): cap-count growth (11->14) is
+ * snapshot-compatible -- CAPABILITY_COUNT grew from 11 to 14 (adds
+ * CAP_ELECTRIC_POWER/VOLTAGE/CURRENT, ids 11-13) but the serialized layout
+ * carries no fixed caps[CAPABILITY_COUNT] array -- each cap is tagged with
+ * its own cap_id byte -- so this is a format no-op. See task-3-brief.md's
+ * ruling: no registry_persist.c change, just pinning the invariant. */
+
+/* A device carrying a brand-new cap (electric.power, id 11, from Task 1)
+ * round-trips through serialize/deserialize like any other cap. */
+static void test_new_cap_round_trip(void) {
+    registry_t r; registry_init(&r);
+    device_id_t id = mkid(2 /* DEV_KIND_ZIGBEE */, 0x60);
+    assert(registry_set_cap(&r, &id, CAP_ELECTRIC_POWER, 600, 111) >= 0);  /* 60.0 W */
+
+    uint8_t buf[REGISTRY_PERSIST_MAX_BYTES];
+    size_t n = registry_persist_serialize(&r, 1000, buf, sizeof buf);
+    assert(n > 0 && n <= sizeof buf);
+
+    registry_t out; uint32_t epoch = 0;
+    assert(registry_persist_deserialize(buf, n, &out, &epoch));
+    assert(epoch == 1000);
+
+    const device_entry_t *d = find(&out, 2, 0x60);
+    assert(d != NULL);
+    assert(d->caps[CAP_ELECTRIC_POWER].valid);
+    assert(d->caps[CAP_ELECTRIC_POWER].raw == 600);
+}
+
+/* A hand-built snapshot carrying only legacy cap ids (0-10, the range that
+ * existed before Task 1 grew CAPABILITY_COUNT to 14) -- e.g. the kind of
+ * file already sitting on a device's flash from before this feature --
+ * must still deserialize successfully under the new CAPABILITY_COUNT, not
+ * be rejected. Mirrors test_fmt1_backward_compat()'s hand-assembly, but
+ * pins cap-count compatibility rather than format-version compatibility:
+ * current FMT 2, one device, one battery.level (id 4) cap row. */
+static void test_legacy_cap_only_snapshot_still_loads(void) {
+    uint8_t buf[64];
+    memset(buf, 0, sizeof buf);
+    size_t off = REGISTRY_PERSIST_HEADER_LEN;
+    buf[off++] = 1;                        /* kind = BLE */
+    memset(&buf[off], 0, 8); buf[off] = 0x70; off += 8;   /* addr, addr[0]=0x70 */
+    buf[off++] = 0;                        /* via_valid */
+    off += 6;                              /* via[6] left zero */
+    buf[off++] = (uint8_t)(-50);           /* best_rssi */
+    buf[off++] = 1;                        /* cap_count */
+    buf[off++] = CAP_BATTERY_LEVEL;        /* cap_id = 4 (legacy, < old CAPABILITY_COUNT of 11) */
+    buf[off++] = 77; buf[off++] = 0;       /* raw = 77, little-endian */
+    buf[off++] = 0;                        /* cap_endpoint (FMT 2 trailing byte) */
+    buf[off++] = 0;                        /* extra_ep_cap_count = 0 */
+
+    buf[0] = REGISTRY_PERSIST_FMT;          /* fmt = 2 (current) */
+    uint32_t epoch = 55;
+    buf[3] = (uint8_t)(epoch & 0xFF);
+    buf[4] = (uint8_t)((epoch >> 8) & 0xFF);
+    buf[5] = (uint8_t)((epoch >> 16) & 0xFF);
+    buf[6] = (uint8_t)((epoch >> 24) & 0xFF);
+    buf[7] = 1;                             /* device count */
+
+    uint16_t crc = fixture_crc16(0xFFFFu, &buf[0], 1);
+    crc = fixture_crc16(crc, &buf[3], off - 3);
+    buf[1] = (uint8_t)(crc & 0xFF);
+    buf[2] = (uint8_t)(crc >> 8);
+
+    registry_t out; uint32_t epoch_out = 0;
+    assert(registry_persist_deserialize(buf, off, &out, &epoch_out));  /* not rejected */
+    assert(epoch_out == 55);
+    const device_entry_t *d = find(&out, 1, 0x70);
+    assert(d != NULL);
+    assert(d->caps[CAP_BATTERY_LEVEL].valid && d->caps[CAP_BATTERY_LEVEL].raw == 77);
+}
+
 int main(void) {
     test_round_trip();
     test_empty();
@@ -209,6 +280,8 @@ int main(void) {
     test_buffer_too_small();
     test_extra_ep_round_trip();
     test_fmt1_backward_compat();
+    test_new_cap_round_trip();
+    test_legacy_cap_only_snapshot_still_loads();
     printf("test_registry_persist: OK\n");
     return 0;
 }

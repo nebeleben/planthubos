@@ -140,6 +140,31 @@ int main(void) {
     assert(zb_map_onoff_backfill_actions(caps_actuator, 1, ba, 1) == 1);
     assert(zb_map_onoff_backfill_actions(caps_actuator, 1, NULL, 4) == 0);
 
+    /* --- Electrical Measurement 0x0B04 (power-metering) --- */
+    /* per-attr cap selection */
+    assert(zb_map_attr_to_cap(0x0B04, 0x050B) == CAP_ELECTRIC_POWER);
+    assert(zb_map_attr_to_cap(0x0B04, 0x0505) == CAP_ELECTRIC_VOLTAGE);
+    assert(zb_map_attr_to_cap(0x0B04, 0x0508) == CAP_ELECTRIC_CURRENT);
+    assert(zb_map_attr_to_cap(0x0B04, 0x0000) == ZB_MAP_NONE);   /* unmapped attr */
+    /* attr_to_cap delegates to cluster_to_cap for existing clusters */
+    assert(zb_map_attr_to_cap(0x0402, 0x0000) == CAP_AIR_TEMPERATURE);
+    assert(zb_map_attr_to_cap(0x0001, 0x0021) == CAP_BATTERY_LEVEL);
+    /* cluster_to_cap itself stays NONE for 0x0B04 (probe-driven, not interview) */
+    assert(zb_map_cluster_to_cap(0x0B04) == ZB_MAP_NONE);
+    /* accepts only the three metering attrs */
+    assert(zb_map_accepts_attr(0x0B04, 0x050B));
+    assert(zb_map_accepts_attr(0x0B04, 0x0505));
+    assert(zb_map_accepts_attr(0x0B04, 0x0508));
+    assert(!zb_map_accepts_attr(0x0B04, 0x0000));
+    /* TS011F scaling: power/10 -> W, voltage/10 -> V, current/1000 -> A */
+    assert(zb_map_zcl_attr_to_value(0x0B04, 0x050B, 600, &v) && close_to(v, 60.0f));
+    assert(zb_map_zcl_attr_to_value(0x0B04, 0x0505, 2300, &v) && close_to(v, 230.0f));
+    assert(zb_map_zcl_attr_to_value(0x0B04, 0x0508, 500, &v) && close_to(v, 0.5f));
+    /* sentinels: 0x8000 (signed power) / 0xFFFF (unsigned V/I) -> no reading */
+    assert(!zb_map_zcl_attr_to_value(0x0B04, 0x050B, 0x8000, &v));
+    assert(!zb_map_zcl_attr_to_value(0x0B04, 0x0505, 0xFFFF, &v));
+    assert(!zb_map_zcl_attr_to_value(0x0B04, 0x0508, 0xFFFF, &v));
+
     printf("test_zb_map: OK\n");
     return 0;
 }

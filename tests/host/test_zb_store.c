@@ -235,6 +235,65 @@ int main(void) {
     assert(zb_store_upsert(&t, &overflow) == -1);
     assert(t.count == ZB_STORE_MAX_DEVICES);
 
+    /* --- power-metering: meter_state persists (record v4) --- */
+    {
+        zb_table_t t; memset(&t, 0, sizeof t);
+        zb_device_t d; memset(&d, 0, sizeof d);
+        uint8_t eui[8] = {1,2,3,4,5,6,7,8};
+        memcpy(d.eui64, eui, 8); d.endpoint = 1; d.cap_count = 0;
+        d.meter_state = ZB_METER_PRESENT;
+        assert(zb_store_upsert(&t, &d) >= 0);
+        uint8_t buf[ZB_STORE_IMAGE_MAX];
+        size_t n = zb_store_serialize(&t, buf, sizeof buf);
+        assert(n > 0);
+        zb_table_t back; memset(&back, 0, sizeof back);
+        assert(zb_store_deserialize(&back, buf, n));
+        int i = zb_store_find(&back, eui);
+        assert(i >= 0 && back.dev[i].meter_state == ZB_METER_PRESENT);
+    }
+    /* record size grew by exactly the meter_state byte */
+    assert(ZB_STORE_RECORD_SIZE == 92);
+
+    /* --- legacy (v3, 91-byte) record defaults meter_state to
+     * ZB_METER_UNKNOWN -- a pre-power-metering file loads as if the
+     * field had never been probed. Hand-assembled v3 image: full
+     * multi-endpoint width (caps[6]/cap_clusters[6]/cap_endpoints[6]/
+     * actions[8]/action_endpoints[8]), no trailing meter_state byte,
+     * record 91. --- */
+    {
+        uint8_t v3[8 + 91];             /* header + one v3 (91-byte) record */
+        memset(v3, 0, sizeof v3);
+        v3[0] = 'P'; v3[1] = 'H'; v3[2] = 'Z'; v3[3] = 'B';
+        v3[4] = 3;              /* version */
+        v3[5] = 1;              /* count */
+        uint8_t *p = v3 + 8;
+        const uint8_t eui[8] = { 0x00, 0x12, 0x4B, 0x00, 0x0A, 0x0B, 0x0C, 0xA0 };
+        memcpy(p, eui, 8); p += 8;
+        p[0] = 0x78; p[1] = 0x56; p += 2;          /* short_addr = 0x5678 */
+        *p++ = 3;                                   /* endpoint = 3 */
+        *p++ = 1;                                    /* interviewed */
+        *p++ = 0;                                    /* cap_count */
+        p += 6;                                       /* caps[6] */
+        p += 12;                                      /* cap_clusters[6] */
+        p += 6;                                       /* cap_endpoints[6] */
+        *p++ = 0;                                    /* action_count */
+        p += 8;                                       /* actions[8] */
+        p += 8;                                       /* action_endpoints[8] */
+        *p++ = 0;                                    /* unmapped_count */
+        p += 12;                                      /* unmapped_clusters[6] */
+        memcpy(p, "v3dev", 5);
+        p += ZB_STORE_NAME_MAX;
+        assert((size_t)(p - v3) == sizeof v3);
+        assert(sizeof v3 == 8 + ZB_STORE_RECORD_SIZE - 1);  /* v3 = v4 minus meter_state */
+
+        zb_table_t vt3;
+        assert(zb_store_deserialize(&vt3, v3, sizeof v3));
+        assert(vt3.count == 1);
+        assert(vt3.dev[0].endpoint == 3);
+        assert(strcmp(vt3.dev[0].name, "v3dev") == 0);
+        assert(vt3.dev[0].meter_state == ZB_METER_UNKNOWN);
+    }
+
     printf("test_zb_store: OK\n");
     return 0;
 }

@@ -11,10 +11,14 @@
 #define CL_PRESSURE         0x0403
 #define CL_HUMIDITY         0x0405
 #define CL_SOIL_MOISTURE    0x0408
+#define CL_ELECTRICAL_MEAS  0x0B04
 
 #define AT_BATTERY_VOLTAGE   0x0020  /* Power Config: uint8, 100 mV units */
 #define AT_BATTERY_PERCENT   0x0021  /* Power Config: uint8, 0.5 % units  */
 #define AT_MULTISTATE_PRESENT 0x0055  /* PresentValue, uint16 */
+#define AT_EM_ACTIVE_POWER   0x050B  /* ActivePower, int16, per ACPowerDivisor (TS011F: 0.1 W) */
+#define AT_EM_RMS_VOLTAGE    0x0505  /* RMSVoltage, uint16, per ACVoltageDivisor (TS011F: 0.1 V) */
+#define AT_EM_RMS_CURRENT    0x0508  /* RMSCurrent, uint16, per ACCurrentDivisor (TS011F: 1 mA) */
 
 uint8_t zb_map_cluster_to_cap(uint16_t cluster) {
     switch (cluster) {
@@ -28,6 +32,23 @@ uint8_t zb_map_cluster_to_cap(uint16_t cluster) {
         case CL_MULTISTATE_INPUT: return CAP_BUTTON_ACTION;
         default:                  return ZB_MAP_NONE;
     }
+}
+
+uint8_t zb_map_attr_to_cap(uint16_t cluster, uint16_t attr) {
+    /* Electrical Measurement is the only cluster whose attributes map to
+     * DIFFERENT caps, so cap selection here is attr-aware; every other
+     * cluster has a single cap and ignores attr. cluster_to_cap(0x0B04) is
+     * ZB_MAP_NONE on purpose -- metering is discovered by the bridge's
+     * blind-probe (not the single-cap interview), and routed here. */
+    if (cluster == CL_ELECTRICAL_MEAS) {
+        switch (attr) {
+            case AT_EM_ACTIVE_POWER: return CAP_ELECTRIC_POWER;
+            case AT_EM_RMS_VOLTAGE:  return CAP_ELECTRIC_VOLTAGE;
+            case AT_EM_RMS_CURRENT:  return CAP_ELECTRIC_CURRENT;
+            default:                 return ZB_MAP_NONE;
+        }
+    }
+    return zb_map_cluster_to_cap(cluster);
 }
 
 int zb_map_cluster_to_actions(uint16_t cluster, uint8_t *out, int max) {
@@ -140,6 +161,9 @@ bool zb_map_zcl_to_value(uint16_t cluster, int32_t raw, float *out) {
 }
 
 bool zb_map_accepts_attr(uint16_t cluster, uint16_t attr) {
+    if (cluster == CL_ELECTRICAL_MEAS)
+        return attr == AT_EM_ACTIVE_POWER || attr == AT_EM_RMS_VOLTAGE
+            || attr == AT_EM_RMS_CURRENT;
     if (cluster == CL_POWER_CONFIG)
         return attr == AT_BATTERY_PERCENT || attr == AT_BATTERY_VOLTAGE;
     uint16_t mapped = zb_map_report_attr(cluster);
@@ -169,6 +193,29 @@ bool zb_map_zcl_attr_to_value(uint16_t cluster, uint16_t attr, int32_t raw, floa
             return true;
         }
         return false;
+    }
+    if (cluster == CL_ELECTRICAL_MEAS) {
+        switch (attr) {
+            case AT_EM_ACTIVE_POWER:
+                /* ActivePower is int16 (signed; export is negative). ZCL
+                 * invalid = 0x8000; reject both spellings. TS011F reports
+                 * 0.1 W units -> /10 gives W (CAP_ELECTRIC_POWER's unit). */
+                if (raw == 0x8000 || raw == -32768) return false;
+                *out = (float)raw / 10.0f;
+                return true;
+            case AT_EM_RMS_VOLTAGE:
+                /* uint16, ZCL invalid = 0xFFFF. TS011F 0.1 V units -> /10 V. */
+                if (raw == 0xFFFF) return false;
+                *out = (float)raw / 10.0f;
+                return true;
+            case AT_EM_RMS_CURRENT:
+                /* uint16, ZCL invalid = 0xFFFF. TS011F 1 mA units -> /1000 A. */
+                if (raw == 0xFFFF) return false;
+                *out = (float)raw / 1000.0f;
+                return true;
+            default:
+                return false;
+        }
     }
     if (cluster == CL_MULTISTATE_INPUT) {
         if (attr != AT_MULTISTATE_PRESENT) return false;

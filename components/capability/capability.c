@@ -77,6 +77,21 @@ static const capability_t CAP_TABLE[CAPABILITY_COUNT] = {
         .ha_device_class = NULL, .influx_field = "rotate",
         .scale = 1.0f, .offset = 0.0f, .precision = 0, .event = true,
     },
+    [CAP_ELECTRIC_POWER] = {
+        .id = CAP_ELECTRIC_POWER, .name = "electric.power", .unit = "W",
+        .ha_device_class = "power", .influx_field = "watt",
+        .scale = 1.0f, .offset = 0.0f, .precision = 0,
+    },
+    [CAP_ELECTRIC_VOLTAGE] = {
+        .id = CAP_ELECTRIC_VOLTAGE, .name = "electric.voltage", .unit = "V",
+        .ha_device_class = "voltage", .influx_field = "volt",
+        .scale = 10.0f, .offset = 0.0f, .precision = 1,
+    },
+    [CAP_ELECTRIC_CURRENT] = {
+        .id = CAP_ELECTRIC_CURRENT, .name = "electric.current", .unit = "A",
+        .ha_device_class = "current", .influx_field = "ampere",
+        .scale = 100.0f, .offset = 0.0f, .precision = 2,
+    },
 };
 
 const capability_t *capability_get(uint8_t id) {

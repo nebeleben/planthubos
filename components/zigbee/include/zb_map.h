@@ -21,6 +21,13 @@
  * starting evidence (spec section 5). */
 uint8_t zb_map_cluster_to_cap(uint16_t cluster);
 
+/* Capability id for a (cluster, attr) pair, or ZB_MAP_NONE. Attr-aware
+ * because Electrical Measurement (0x0B04) maps ActivePower/RMSVoltage/
+ * RMSCurrent to three DIFFERENT caps; every other cluster ignores attr and
+ * returns zb_map_cluster_to_cap(cluster). The report/read-response path uses
+ * this instead of cluster_to_cap so a 0x0B04 attribute lands in the right cap. */
+uint8_t zb_map_attr_to_cap(uint16_t cluster, uint16_t attr);
+
 /* Fills out[] with the action ids a cluster provides, returns how many
  * (never more than max). Sensor clusters return 0. */
 int zb_map_cluster_to_actions(uint16_t cluster, uint8_t *out, int max);
