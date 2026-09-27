@@ -63,6 +63,12 @@ typedef struct {
      * Free in memory: it fills padding actor_cmd_t already had. */
     uint8_t  retried;
     uint16_t param;
+    uint8_t  endpoint;     /* M8 Task 5: the gang/endpoint this command
+                             * targets -- see actor_table.h's top comment.
+                             * Fills what was the OTHER hole in this struct,
+                             * between `param` and the 4-byte-aligned
+                             * `deadline_s` below; 1 B of true padding
+                             * remains after it, so the assert stays 12. */
     uint32_t deadline_s;   /* absolute actor_now_s()-scale seconds -- see
                              * actor_queue_pop(). NOT a duration and
                              * deadline_s == 0 is NOT a "no deadline"
@@ -157,9 +163,14 @@ typedef struct {
  * true. It changes NOTHING about the decision -- a retry faces exactly the
  * same guards, in the same order, as any other command -- it only travels
  * with the command so the dispatcher can tell a first attempt from a
- * second one. */
+ * second one.
+ *
+ * `endpoint` (M8 Task 5) is checked against the table with `action_id` (see
+ * actor_table_check()'s own (device, action, endpoint) key) and stamped
+ * onto the queued command as actor_cmd_t.endpoint, so actor_service_step()
+ * re-checks and records the same endpoint at dispatch time. */
 actor_request_result_t actor_request_decide(actor_table_t *t, actor_queue_t *q,
-    int dev_idx, uint8_t action_id, uint16_t param, actor_source_t source,
+    int dev_idx, uint8_t action_id, uint8_t endpoint, uint16_t param, actor_source_t source,
     uint32_t deadline_s, uint32_t now_s, bool retried);
 
 typedef struct {
@@ -218,8 +229,18 @@ uint32_t actor_now_s(void);
  * a concurrent actor_table_check()/actor_table_record() and observe a
  * half-written 16 B slot. See actor_table.h for what each call means. */
 bool     actor_declare(int dev_idx, uint8_t action_id, uint16_t param_max, uint8_t flags);
+/* M8 Task 5: the endpoint-carrying sibling, for a multi-gang device
+ * declaring the same action independently per gang (Task 7 is the first
+ * caller). The base actor_declare() above is exactly
+ * actor_declare_ep(d, a, endpoint 1, pm, f) -- every current caller
+ * (zigbee.c, ble_collector.c, devices_json.c, swarm.c) keeps compiling and
+ * behaving unchanged, on endpoint 1. */
+bool     actor_declare_ep(int dev_idx, uint8_t action_id, uint8_t endpoint,
+                           uint16_t param_max, uint8_t flags);
 bool     actor_configure_guards(int dev_idx, uint8_t action_id,
                                  uint16_t cooldown_s, uint8_t max_per_hour);
+bool     actor_configure_guards_ep(int dev_idx, uint8_t action_id, uint8_t endpoint,
+                                    uint16_t cooldown_s, uint8_t max_per_hour);
 void     actor_set_lockout(int dev_idx, bool on);
 /* Undeclares dev_idx entirely -- see actor_table_remove() for the full
  * contract and for why this is deliberately blunt (the device's guards,
@@ -240,6 +261,8 @@ uint32_t actor_full_drops(void);
  * actor_table.h), used to decide whether a dispatched timed-open action
  * needs a hub-scheduled close at all. */
 bool     actor_action_flags(int dev_idx, uint8_t action_id, uint8_t *flags_out);
+bool     actor_action_flags_ep(int dev_idx, uint8_t action_id, uint8_t endpoint,
+                                uint8_t *flags_out);
 
 /* Lock-taking wrappers around actor_table_pair_state()/actor_table_lockout()
  * (actor_table.h -- M5b Task 11) -- the READ side this list was missing
@@ -252,6 +275,10 @@ bool     actor_action_flags(int dev_idx, uint8_t action_id, uint8_t *flags_out);
  * actor_table_pair_state()'s doc comment for exactly what each field of
  * actor_pair_state_t means. */
 bool     actor_pair_state(int dev_idx, uint8_t action_id, actor_pair_state_t *out);
+/* M8 Task 5: the endpoint-carrying sibling (Task 9's caller). Base
+ * actor_pair_state() above is actor_pair_state_ep(d, a, endpoint 1, o). */
+bool     actor_pair_state_ep(int dev_idx, uint8_t action_id, uint8_t endpoint,
+                              actor_pair_state_t *out);
 bool     actor_lockout(int dev_idx, bool *out);
 
 /* ---------------------------------------------------------------------
@@ -299,6 +326,10 @@ bool     actor_guards_apply(int dev_idx, const actor_guard_row_t *row);
  * its own alert. Never a silent failure. */
 bool actor_request(int dev_idx, uint8_t action_id, uint16_t param,
                     actor_source_t source, uint32_t deadline_s);
+/* M8 Task 5: the endpoint-carrying sibling (Task 8's caller). Base
+ * actor_request() above is actor_request_ep(d, a, endpoint 1, p, s, dl). */
+bool actor_request_ep(int dev_idx, uint8_t action_id, uint8_t endpoint, uint16_t param,
+                       actor_source_t source, uint32_t deadline_s);
 
 /* The same door, for a command that was already dispatched once and never
  * reached the actuator because the radio belonged to something else at

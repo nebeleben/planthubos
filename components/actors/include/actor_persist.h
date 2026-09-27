@@ -51,9 +51,21 @@
  * cares sets max_per_hour, which caps it hard at 4 writes an hour per pair,
  * which is the guard's own purpose. */
 
-#define ACTOR_PERSIST_FMT        1u
+/* M8 Task 5: bumped 1 -> 2 for the endpoint byte added to every record
+ * (23 -> 24 B; see ACTOR_PERSIST_RECORD_LEN below). actor_persist_deserialize()'s
+ * existing wrong-format-byte policy handles the mismatch: an FMT-1 file
+ * read by this FMT-2 firmware fails the `buf[0] != ACTOR_PERSIST_FMT` check
+ * and is refused outright -- same as any other corrupt/foreign image,
+ * yielding zero rows rather than misreading a byte that used to be
+ * something else as the new endpoint field. actor_persist_init() then logs
+ * the "unreadable" warning and every device's guards start unconfigured
+ * this run (this firmware's existing, and only, upgrade story for this
+ * file -- there is no migrator, by design: the FINAL-persist ruling on
+ * corruption is "nothing partial, ever", and a guessed-at endpoint on an
+ * old row is exactly a partial, unverifiable table). */
+#define ACTOR_PERSIST_FMT        2u
 #define ACTOR_PERSIST_HEADER_LEN 4u
-#define ACTOR_PERSIST_RECORD_LEN 23u
+#define ACTOR_PERSIST_RECORD_LEN 24u
 #define ACTOR_PERSIST_BUF_MAX \
     (ACTOR_PERSIST_HEADER_LEN + ACTOR_GUARD_ROWS_MAX * ACTOR_PERSIST_RECORD_LEN)
 
@@ -66,9 +78,11 @@
  *                                     record byte -- not `fmt`, not itself.
  *                                     Same algorithm event_ring.c and
  *                                     pending_close.c both use.
- *   count x 23 B {
+ *   count x 24 B {
  *     u8  key[9]                     device_id_t bytes (kind + addr[8])
  *     u8  action_id
+ *     u8  endpoint                   M8 Task 5: the gang/endpoint this row
+ *                                     guards, alongside action_id
  *     u8  lockout                    0/1, device-level
  *     u16 cooldown_s
  *     u8  max_per_hour

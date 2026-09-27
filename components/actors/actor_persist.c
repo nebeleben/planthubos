@@ -69,6 +69,7 @@ size_t actor_persist_serialize(const actor_guard_row_t *rows, size_t n,
         memcpy(buf + off, rows[i].key, ACTOR_DEVICE_KEY_LEN);
         off += ACTOR_DEVICE_KEY_LEN;
         buf[off++] = rows[i].action_id;
+        buf[off++] = rows[i].endpoint;
         buf[off++] = rows[i].lockout ? 1u : 0u;
         buf[off++] = (uint8_t)(rows[i].cooldown_s & 0xFFu);
         buf[off++] = (uint8_t)((rows[i].cooldown_s >> 8) & 0xFFu);
@@ -131,6 +132,7 @@ size_t actor_persist_deserialize(const uint8_t *buf, size_t len,
         memcpy(r.key, buf + off, ACTOR_DEVICE_KEY_LEN);
         off += ACTOR_DEVICE_KEY_LEN;
         r.action_id = buf[off++];
+        r.endpoint = buf[off++];
         r.lockout = buf[off++] != 0;
         r.cooldown_s = (uint16_t)(buf[off] | ((uint16_t)buf[off + 1] << 8));
         off += 2;

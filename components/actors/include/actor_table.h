@@ -10,14 +10,22 @@
  * (actor_request(), Task 7) trusts this module's verdict, so it is the one
  * part of the safety core a host test can prove exhaustively.
  *
- * Guards attach to the (device, action) PAIR, not to a plant or a rule: two
- * plants bound to the same valve, plus a manual press, all draw on ONE
- * budget, so "max 4 opens per hour" means the valve opens at most four
- * times total, from any source. That is the whole reason this table exists
- * instead of a per-rule counter. */
+ * Guards attach to the (device, action, endpoint) INSTANCE, not to a plant
+ * or a rule: two plants bound to the same valve, plus a manual press, all
+ * draw on ONE budget, so "max 4 opens per hour" means the valve opens at
+ * most four times total, from any source. That is the whole reason this
+ * table exists instead of a per-rule counter.
+ *
+ * M8 Task 5 (multi-endpoint): a single dev_idx can be a multi-gang device
+ * (a dual valve, a 4-gang switch) whose gangs are independently
+ * declarable, requestable and guarded -- endpoint is the third part of the
+ * key, alongside action_id, on every primitive below. A single-endpoint
+ * device (everything before this task) is endpoint 1, the default the
+ * actor.c wrappers apply, so nothing about a one-gang device's behaviour
+ * changes. */
 
 #define ACTOR_MAX_DEVICES 4
-#define ACTOR_MAX_ACTIONS 4
+#define ACTOR_MAX_ACTIONS 8
 
 /* A device's STABLE identity, as opposed to its registry index. Exactly
  * sizeof(device_id_t) (capability.h: `{ uint8_t kind; uint8_t addr[8]; }`),
@@ -62,9 +70,11 @@ typedef enum {
     ACTOR_REFUSED_RATE,
 } actor_verdict_t;
 
-/* Per (device, action) pair state -- 16 B, pinned below. This hub's static
- * budget already failed once on hardware (spec section 8) and had to be
- * recovered, so this size is load-bearing, not a suggestion.
+/* Per (device, action, endpoint) instance state -- 16 B/pair budget bumped
+ * to 20 for the endpoint key (M8 Task 5, multi-endpoint), pinned below.
+ * This hub's static budget already failed once on hardware (spec section
+ * 8) and had to be recovered, so this size is load-bearing, not a
+ * suggestion.
  *
  * The hourly rate limit is a FIXED window, not a sliding one: a sliding
  * window needs a ring of timestamps per pair, and at ACTOR_MAX_DEVICES *
@@ -94,10 +104,26 @@ typedef struct {
                                  * doubles as "has this pair ever fired",
                                  * since actor_table_record() always leaves
                                  * it >= 1 -- see actor_table.c */
+    uint8_t  endpoint;         /* M8 Task 5: the gang/endpoint this slot's
+                                 * action_id is declared on -- part of the
+                                 * key alongside action_id, so the same
+                                 * action (e.g. switch.on) can be declared
+                                 * independently per endpoint on one dev_idx
+                                 * (a dual valve, a multi-gang switch).
+                                 * Endpoint 1 for every pre-M8 single-
+                                 * endpoint device (see actor.c's base
+                                 * wrappers, which default to it). */
     uint32_t last_fire_s;
     uint32_t window_start_s;
 } actor_slot_t;
-_Static_assert(sizeof(actor_slot_t) == 16, "spec section 8 budgets 16 B per (device, action)");
+/* Was fully packed at 16 B (spec section 8's original budget); adding one
+ * more uint8_t after window_count leaves 5 packed bytes ahead of the two
+ * uint32_t fields below, which need 4-byte alignment -- so the struct pads
+ * to 20, not 17. Deliberately bumped and re-pinned here rather than left to
+ * float: a future field added in the wrong place would again silently cost
+ * 4 B x ACTOR_MAX_DEVICES x ACTOR_MAX_ACTIONS. */
+_Static_assert(sizeof(actor_slot_t) == 20,
+               "16 B/pair budget bumped to 20 for the endpoint key (multi-endpoint)");
 
 /* One row per known device, holding up to ACTOR_MAX_ACTIONS declared
  * actions for it plus the device's own lockout state (the operator's stop
@@ -149,8 +175,14 @@ void actor_table_init(actor_table_t *t);
  * reset an operator's guards or erase an hourly budget already spent.
  * (The device row's `lockout` already survives a re-add the same way; a
  * new row starts with lockout off, same as a genuinely new pair starts
- * with clean guards.) */
-bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id,
+ * with clean guards.)
+ *
+ * M8 Task 5: `endpoint` is part of the key alongside action_id -- declaring
+ * the same action_id on two different endpoints of the same dev_idx claims
+ * two distinct slots (a dual valve's two gangs, each with switch.on), not
+ * one shared one. Endpoint 1 is the single-endpoint default every base
+ * (non-`_ep`) caller in actor.c uses. */
+bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id, uint8_t endpoint,
                       uint16_t param_max, uint8_t flags);
 
 /* The single source of truth for "is this command allowed right now".
@@ -181,20 +213,23 @@ bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id,
  * Read-only: does not record a fire. Callers that decide to proceed must
  * call actor_table_record() themselves once the command is actually sent. */
 actor_verdict_t actor_table_check(actor_table_t *t, int dev_idx, uint8_t action_id,
-                                   uint16_t param, actor_source_t source, uint32_t now_s);
+                                   uint8_t endpoint, uint16_t param,
+                                   actor_source_t source, uint32_t now_s);
 
-/* Records that (dev_idx, action_id) fired at now_s: updates the cooldown
- * clock and the fixed-window rate counter. A no-op if dev_idx is negative
- * or the pair is not declared. Takes no `source` -- guards are one budget
- * shared by every source, by design (see this file's top comment). */
-void actor_table_record(actor_table_t *t, int dev_idx, uint8_t action_id, uint32_t now_s);
+/* Records that (dev_idx, action_id, endpoint) fired at now_s: updates the
+ * cooldown clock and the fixed-window rate counter. A no-op if dev_idx is
+ * negative or the instance is not declared. Takes no `source` -- guards are
+ * one budget shared by every source, by design (see this file's top
+ * comment). */
+void actor_table_record(actor_table_t *t, int dev_idx, uint8_t action_id,
+                         uint8_t endpoint, uint32_t now_s);
 
-/* Configures the cooldown and hourly cap for an already-declared pair.
- * Returns false if dev_idx is negative or the pair is not declared.
- * cooldown_s == 0 disables the cooldown; max_per_hour == 0 disables the
- * rate cap ("unlimited"). */
+/* Configures the cooldown and hourly cap for an already-declared
+ * (device, action, endpoint) instance. Returns false if dev_idx is negative
+ * or the instance is not declared. cooldown_s == 0 disables the cooldown;
+ * max_per_hour == 0 disables the rate cap ("unlimited"). */
 bool actor_table_set_guards(actor_table_t *t, int dev_idx, uint8_t action_id,
-                             uint16_t cooldown_s, uint8_t max_per_hour);
+                             uint8_t endpoint, uint16_t cooldown_s, uint8_t max_per_hour);
 
 /* Sets or clears the device-level lockout (a no-op if dev_idx is negative
  * or not declared). See actor_table_check()'s comment for what lockout
@@ -238,7 +273,13 @@ bool actor_table_remove(actor_table_t *t, int dev_idx);
  * it has genuinely gone -- the case that made this necessary is a Zigbee
  * knob that interviews as a switch, registers switch.on/off, then is
  * runtime-reclassified and re-announces with those actions stripped. count
- * may be 0 (action_ids is then unread), which prunes every action. */
+ * may be 0 (action_ids is then unread), which prunes every action.
+ *
+ * M8 Task 5: deliberately stays action_id-only, not per-endpoint -- an
+ * action still declared on ANY endpoint of dev_idx survives this pass. A
+ * multi-gang device's announce carries its action vocabulary, not which
+ * gang currently has which action, so pruning at the endpoint grain would
+ * need evidence this call site does not have. Accepted simplification. */
 bool actor_table_prune_absent(actor_table_t *t, int dev_idx,
                               const uint8_t *action_ids, uint8_t count);
 
@@ -250,7 +291,7 @@ uint32_t actor_table_full_drops(const actor_table_t *t);
  * false (and leaves *flags_out untouched) when dev_idx is negative or the
  * pair is not declared, exactly like actor_table_set_guards()'s contract. */
 bool actor_table_action_flags(const actor_table_t *t, int dev_idx, uint8_t action_id,
-                               uint8_t *flags_out);
+                               uint8_t endpoint, uint8_t *flags_out);
 
 /* ---------------------------------------------------------------------
  * M5b Task 11: read-only accessors for the HTTP API. Task 7 fix round 1
@@ -318,7 +359,7 @@ typedef struct {
  * find_row()/find_slot() helpers are shared with the mutating calls in
  * this file). */
 bool actor_table_pair_state(const actor_table_t *t, int dev_idx, uint8_t action_id,
-                             uint32_t now_s, actor_pair_state_t *out);
+                             uint8_t endpoint, uint32_t now_s, actor_pair_state_t *out);
 
 /* Read-only device-level lockout (the operator's stop button,
  * actor_table_check()'s own comment) for the HTTP API. Returns false
@@ -386,6 +427,11 @@ typedef struct {
     uint16_t cooldown_s;
     uint8_t  key[ACTOR_DEVICE_KEY_LEN];
     uint8_t  action_id;
+    uint8_t  endpoint;      /* M8 Task 5: fills what was the struct's one
+                              * trailing alignment-pad byte (23 used bytes
+                              * -> 24 with the endpoint, same total size) --
+                              * see actor_table.h's top comment for why this
+                              * is part of the key alongside action_id. */
     uint8_t  max_per_hour;
     uint8_t  window_count;
     bool     lockout;
@@ -401,15 +447,20 @@ _Static_assert(sizeof(actor_guard_row_t) == 24,
  * Three rules, in this order:
  *
  *   1. A row whose key belongs to a device that IS declared right now, for
- *      an action that device no longer declares, is dropped. (The wrapper's
- *      action block changed, or actor_table_remove() ran.)
- *   2. Every declared pair with a key is written over the row with the
- *      same (key, action_id), or into a free slot, or -- only when `cap` is
- *      exhausted -- over the first row whose key belongs to NO currently
- *      declared device. A live pair therefore always gets a slot: `cap` is
- *      ACTOR_GUARD_ROWS_MAX, which is exactly the number of pairs that can
- *      be live at once, so an eviction candidate provably exists whenever
- *      one is needed.
+ *      an action that device no longer declares (on ANY endpoint -- see
+ *      actor_table_prune_absent()'s own comment for why this rule stays
+ *      action_id-only rather than per-endpoint, an accepted simplification),
+ *      is dropped. (The wrapper's action block changed, or
+ *      actor_table_remove() ran.)
+ *   2. Every declared (device, action, endpoint) instance with a key is
+ *      written over the row with the same (key, action_id, endpoint) --
+ *      M8 Task 5 added endpoint to this match, and the row's `endpoint`
+ *      field is copied from the live slot on every write -- or into a free
+ *      slot, or -- only when `cap` is exhausted -- over the first row whose
+ *      key belongs to NO currently declared device. A live instance
+ *      therefore always gets a slot: `cap` is ACTOR_GUARD_ROWS_MAX, which is
+ *      exactly the number of instances that can be live at once, so an
+ *      eviction candidate provably exists whenever one is needed.
  *   3. Every OTHER row is left exactly as it was. This is the load-bearing
  *      one: a valve that has not advertised since the last boot is not
  *      declared, and its operator's lockout must not be erased from flash
@@ -429,9 +480,10 @@ _Static_assert(sizeof(actor_guard_row_t) == 24,
 size_t actor_table_guard_merge(const actor_table_t *t, actor_guard_row_t *rows,
                                 size_t n, size_t cap);
 
-/* Applies one restored row to an already-declared pair. Returns false
- * (changing nothing) when dev_idx is negative, the device is not declared,
- * or it does not declare row->action_id.
+/* Applies one restored row to an already-declared (action, endpoint)
+ * instance -- resolved via row->action_id AND row->endpoint (M8 Task 5).
+ * Returns false (changing nothing) when dev_idx is negative, the device is
+ * not declared, or it does not declare that (action_id, endpoint) instance.
  *
  * THE TIMESTAMP DECISION, stated here because it is a safety choice and
  * not an implementation detail: `window_start_s` and `last_fire_s` are

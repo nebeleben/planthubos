@@ -19,16 +19,27 @@ static actor_device_t *find_free_row(actor_table_t *t)
     return NULL;
 }
 
-static actor_slot_t *find_slot(actor_device_t *row, uint8_t action_id)
+/* M8 Task 5: keyed on (action_id, endpoint), not action_id alone -- the
+ * same action can be declared independently on more than one endpoint of
+ * one dev_idx (a dual valve, a multi-gang switch), each getting its own
+ * slot. */
+static actor_slot_t *find_slot(actor_device_t *row, uint8_t action_id, uint8_t endpoint)
 {
     for (int i = 0; i < ACTOR_MAX_ACTIONS; i++)
-        if (row->actions[i].action_id == action_id) return &row->actions[i];
+        if (row->actions[i].action_id == action_id && row->actions[i].endpoint == endpoint)
+            return &row->actions[i];
     return NULL;
 }
 
+/* Endpoint-agnostic on purpose: a free slot is free regardless of what
+ * endpoint value it last held (actor_table_add()/actor_table_remove() reset
+ * it to 0 alongside action_id == ACTION_NONE), so this cannot use
+ * find_slot() the way it did before endpoint became part of the key. */
 static actor_slot_t *find_free_slot(actor_device_t *row)
 {
-    return find_slot(row, ACTION_NONE);
+    for (int i = 0; i < ACTOR_MAX_ACTIONS; i++)
+        if (row->actions[i].action_id == ACTION_NONE) return &row->actions[i];
+    return NULL;
 }
 
 /* True iff `slot`'s current hourly window (opened at window_start_s) is
@@ -56,6 +67,7 @@ void actor_table_init(actor_table_t *t)
         for (int j = 0; j < ACTOR_MAX_ACTIONS; j++) {
             actor_slot_t *s = &t->devices[i].actions[j];
             s->action_id = ACTION_NONE;
+            s->endpoint = 0;
             s->flags = 0;
             s->param_max = 0;
             s->cooldown_s = 0;
@@ -67,7 +79,7 @@ void actor_table_init(actor_table_t *t)
     }
 }
 
-bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id,
+bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id, uint8_t endpoint,
                       uint16_t param_max, uint8_t flags)
 {
     /* -1 is find_free_row()'s own sentinel for an unused row, and also the
@@ -90,12 +102,13 @@ bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id,
         for (int j = 0; j < ACTOR_MAX_ACTIONS; j++) row->actions[j].action_id = ACTION_NONE;
     }
 
-    actor_slot_t *slot = find_slot(row, action_id);
+    actor_slot_t *slot = find_slot(row, action_id, endpoint);
     bool is_new_slot = (slot == NULL);
     if (!slot) slot = find_free_slot(row);
     if (!slot) { t->full_drops++; return false; }
 
     slot->action_id = action_id;
+    slot->endpoint = endpoint;
     slot->flags = flags;
     /* Effective bound: tightening the firmware's own hard bound (a lower
      * wrapper-declared param_max) is always allowed; a wrapper cannot
@@ -119,14 +132,15 @@ bool actor_table_add(actor_table_t *t, int dev_idx, uint8_t action_id,
 }
 
 actor_verdict_t actor_table_check(actor_table_t *t, int dev_idx, uint8_t action_id,
-                                   uint16_t param, actor_source_t source, uint32_t now_s)
+                                   uint8_t endpoint, uint16_t param,
+                                   actor_source_t source, uint32_t now_s)
 {
     if (dev_idx < 0) return ACTOR_REFUSED_UNKNOWN;
 
     actor_device_t *row = find_row(t, dev_idx);
     if (!row) return ACTOR_REFUSED_UNKNOWN;
 
-    actor_slot_t *slot = find_slot(row, action_id);
+    actor_slot_t *slot = find_slot(row, action_id, endpoint);
     if (!slot) return ACTOR_REFUSED_UNKNOWN;
 
     /* action_param_ok() is the ONLY place the firmware's hard bound is
@@ -183,13 +197,14 @@ actor_verdict_t actor_table_check(actor_table_t *t, int dev_idx, uint8_t action_
     return ACTOR_OK;
 }
 
-void actor_table_record(actor_table_t *t, int dev_idx, uint8_t action_id, uint32_t now_s)
+void actor_table_record(actor_table_t *t, int dev_idx, uint8_t action_id,
+                         uint8_t endpoint, uint32_t now_s)
 {
     if (dev_idx < 0) return;
 
     actor_device_t *row = find_row(t, dev_idx);
     if (!row) return;
-    actor_slot_t *slot = find_slot(row, action_id);
+    actor_slot_t *slot = find_slot(row, action_id, endpoint);
     if (!slot) return;
 
     slot->last_fire_s = now_s;
@@ -211,13 +226,13 @@ void actor_table_record(actor_table_t *t, int dev_idx, uint8_t action_id, uint32
 }
 
 bool actor_table_set_guards(actor_table_t *t, int dev_idx, uint8_t action_id,
-                             uint16_t cooldown_s, uint8_t max_per_hour)
+                             uint8_t endpoint, uint16_t cooldown_s, uint8_t max_per_hour)
 {
     if (dev_idx < 0) return false;
 
     actor_device_t *row = find_row(t, dev_idx);
     if (!row) return false;
-    actor_slot_t *slot = find_slot(row, action_id);
+    actor_slot_t *slot = find_slot(row, action_id, endpoint);
     if (!slot) return false;
 
     slot->cooldown_s = cooldown_s;
@@ -252,6 +267,7 @@ bool actor_table_remove(actor_table_t *t, int dev_idx)
     for (int j = 0; j < ACTOR_MAX_ACTIONS; j++) {
         actor_slot_t *s = &row->actions[j];
         s->action_id = ACTION_NONE;
+        s->endpoint = 0;
         s->flags = 0;
         s->param_max = 0;
         s->cooldown_s = 0;
@@ -289,6 +305,7 @@ bool actor_table_prune_absent(actor_table_t *t, int dev_idx,
             if (action_ids[i] == s->action_id) { listed = true; break; }
         if (listed) continue;
         s->action_id = ACTION_NONE;
+        s->endpoint = 0;
         s->flags = 0;
         s->param_max = 0;
         s->cooldown_s = 0;
@@ -319,7 +336,7 @@ uint32_t actor_table_full_drops(const actor_table_t *t)
 }
 
 bool actor_table_action_flags(const actor_table_t *t, int dev_idx, uint8_t action_id,
-                               uint8_t *flags_out)
+                               uint8_t endpoint, uint8_t *flags_out)
 {
     if (dev_idx < 0) return false;
 
@@ -333,7 +350,7 @@ bool actor_table_action_flags(const actor_table_t *t, int dev_idx, uint8_t actio
     if (!row) return false;
 
     for (int i = 0; i < ACTOR_MAX_ACTIONS; i++) {
-        if (row->actions[i].action_id == action_id) {
+        if (row->actions[i].action_id == action_id && row->actions[i].endpoint == endpoint) {
             if (flags_out) *flags_out = row->actions[i].flags;
             return true;
         }
@@ -351,7 +368,7 @@ static const actor_device_t *find_row_const(const actor_table_t *t, int dev_idx)
 }
 
 bool actor_table_pair_state(const actor_table_t *t, int dev_idx, uint8_t action_id,
-                             uint32_t now_s, actor_pair_state_t *out)
+                             uint8_t endpoint, uint32_t now_s, actor_pair_state_t *out)
 {
     if (dev_idx < 0) return false;
 
@@ -360,7 +377,9 @@ bool actor_table_pair_state(const actor_table_t *t, int dev_idx, uint8_t action_
 
     const actor_slot_t *slot = NULL;
     for (int i = 0; i < ACTOR_MAX_ACTIONS; i++) {
-        if (row->actions[i].action_id == action_id) { slot = &row->actions[i]; break; }
+        if (row->actions[i].action_id == action_id && row->actions[i].endpoint == endpoint) {
+            slot = &row->actions[i]; break;
+        }
     }
     if (!slot) return false;
 
@@ -496,7 +515,8 @@ size_t actor_table_guard_merge(const actor_table_t *t, actor_guard_row_t *rows,
 
             size_t at = n;   /* n == "append" until proven otherwise */
             for (size_t r = 0; r < n; r++) {
-                if (rows[r].action_id == slot->action_id && key_equal(rows[r].key, dev->key)) {
+                if (rows[r].action_id == slot->action_id && rows[r].endpoint == slot->endpoint &&
+                    key_equal(rows[r].key, dev->key)) {
                     at = r;
                     break;
                 }
@@ -515,6 +535,7 @@ size_t actor_table_guard_merge(const actor_table_t *t, actor_guard_row_t *rows,
 
             memcpy(rows[at].key, dev->key, ACTOR_DEVICE_KEY_LEN);
             rows[at].action_id = slot->action_id;
+            rows[at].endpoint = slot->endpoint;
             rows[at].lockout = dev->lockout;
             rows[at].cooldown_s = slot->cooldown_s;
             rows[at].max_per_hour = slot->max_per_hour;
@@ -537,7 +558,7 @@ bool actor_table_guard_apply(actor_table_t *t, int dev_idx,
 
     actor_device_t *dev = find_row(t, dev_idx);
     if (!dev) return false;
-    actor_slot_t *slot = find_slot(dev, row->action_id);
+    actor_slot_t *slot = find_slot(dev, row->action_id, row->endpoint);
     if (!slot) return false;
 
     slot->cooldown_s = row->cooldown_s;

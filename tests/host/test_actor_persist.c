@@ -25,8 +25,8 @@ static const uint8_t KEY_B[ACTOR_DEVICE_KEY_LEN] =
 static void setup_one_device(void)
 {
     actor_table_init(&T);
-    assert(actor_table_add(&T, 3, ACT_IRRIGATION_OPEN, 300, 0x00));
-    assert(actor_table_add(&T, 3, ACT_SWITCH_OFF, 0, 0x00));
+    assert(actor_table_add(&T, 3, ACT_IRRIGATION_OPEN, 1, 300, 0x00));
+    assert(actor_table_add(&T, 3, ACT_SWITCH_OFF, 1, 0, 0x00));
     actor_table_set_key(&T, 3, KEY_A);
 }
 
@@ -40,6 +40,10 @@ static void test_round_trip(void)
     memset(in, 0, sizeof in);
     memcpy(in[0].key, KEY_A, ACTOR_DEVICE_KEY_LEN);
     in[0].action_id = ACT_IRRIGATION_OPEN;
+    in[0].endpoint = 2;        /* M8 Task 5: a non-1 endpoint, so a bug that
+                                 * drops or mis-orders the byte on the wire
+                                 * cannot hide behind the single-endpoint
+                                 * default. */
     in[0].lockout = true;
     in[0].cooldown_s = 21600;
     in[0].max_per_hour = 4;
@@ -48,6 +52,7 @@ static void test_round_trip(void)
     in[0].last_fire_s = 123999;
     memcpy(in[1].key, KEY_B, ACTOR_DEVICE_KEY_LEN);
     in[1].action_id = ACT_SWITCH_OFF;
+    in[1].endpoint = 1;
     in[1].lockout = false;
     in[1].cooldown_s = 0;
     in[1].max_per_hour = 0;
@@ -63,6 +68,10 @@ static void test_round_trip(void)
     assert(actor_persist_deserialize(buf, len, out, ACTOR_GUARD_ROWS_MAX) == 2);
     assert(memcmp(&out[0], &in[0], sizeof in[0]) == 0);
     assert(memcmp(&out[1], &in[1], sizeof in[1]) == 0);
+    /* The endpoint specifically, named rather than left to the memcmp above
+     * (which would also catch it, but not say WHAT differed). */
+    assert(out[0].endpoint == 2);
+    assert(out[1].endpoint == 1);
 }
 
 static void test_empty_table_round_trips(void)
@@ -187,10 +196,10 @@ static void test_find_walks_every_row_of_one_device(void)
 static void test_merge_captures_config_and_state(void)
 {
     setup_one_device();
-    assert(actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, 600, 4));
+    assert(actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, 1, 600, 4));
     actor_table_set_lockout(&T, 3, true);
-    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 1000);
-    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 1200);
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 1, 1000);
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 1, 1200);
 
     actor_guard_row_t rows[ACTOR_GUARD_ROWS_MAX];
     memset(rows, 0, sizeof rows);
@@ -215,7 +224,7 @@ static void test_merge_captures_config_and_state(void)
 static void test_merge_skips_a_device_with_no_key(void)
 {
     actor_table_init(&T);
-    assert(actor_table_add(&T, 3, ACT_SWITCH_ON, 0, 0x00));
+    assert(actor_table_add(&T, 3, ACT_SWITCH_ON, 1, 0, 0x00));
     actor_guard_row_t rows[ACTOR_GUARD_ROWS_MAX];
     memset(rows, 0, sizeof rows);
     assert(actor_table_guard_merge(&T, rows, 0, ACTOR_GUARD_ROWS_MAX) == 0);
@@ -255,6 +264,9 @@ static void test_merge_drops_a_stale_action_of_a_declared_device(void)
     rows[0].action_id = ACT_PUMP_RUN;         /* not declared below */
     memcpy(rows[1].key, KEY_A, ACTOR_DEVICE_KEY_LEN);
     rows[1].action_id = ACT_IRRIGATION_OPEN;  /* declared below */
+    rows[1].endpoint = 1;   /* matches setup_one_device()'s default endpoint,
+                              * so rule 2 updates this row IN PLACE rather
+                              * than appending a duplicate for it */
     rows[1].max_per_hour = 4;
 
     setup_one_device();
@@ -271,7 +283,7 @@ static void test_merge_updates_in_place_rather_than_appending(void)
     size_t n = actor_table_guard_merge(&T, rows, 0, ACTOR_GUARD_ROWS_MAX);
     assert(n == 2);
 
-    assert(actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, 900, 2));
+    assert(actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, 1, 900, 2));
     n = actor_table_guard_merge(&T, rows, n, ACTOR_GUARD_ROWS_MAX);
     assert(n == 2);   /* still two rows, not four */
     for (size_t i = 0; i < n; i++) {
@@ -317,6 +329,9 @@ static void test_apply_restores_config_and_does_not_refund_the_budget(void)
     memset(&row, 0, sizeof row);
     memcpy(row.key, KEY_A, ACTOR_DEVICE_KEY_LEN);
     row.action_id = ACT_IRRIGATION_OPEN;
+    row.endpoint = 1;   /* matches setup_one_device()'s default endpoint --
+                          * actor_table_guard_apply() resolves the target
+                          * slot via (action_id, endpoint) since M8 Task 5 */
     row.lockout = true;
     row.cooldown_s = 60;
     row.max_per_hour = 4;
@@ -326,29 +341,29 @@ static void test_apply_restores_config_and_does_not_refund_the_budget(void)
 
     /* Before the restore, the reboot has refunded everything -- which is
      * exactly the bug. */
-    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 50) == ACTOR_OK);
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 1, 10, ACTOR_SRC_RULE, 50) == ACTOR_OK);
 
     assert(actor_table_guard_apply(&T, 3, &row, /*now_s*/ 50));
 
     /* The stop button is back on, so a rule is refused... */
-    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 50)
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 1, 10, ACTOR_SRC_RULE, 50)
            == ACTOR_REFUSED_LOCKOUT);
     /* ...and a manual press, which lockout permits, hits the restored
      * cooldown rather than sailing through. */
-    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_MANUAL, 50)
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 1, 10, ACTOR_SRC_MANUAL, 50)
            == ACTOR_REFUSED_COOLDOWN);
     /* Past the cooldown, the spent hourly budget is still spent. */
-    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_MANUAL, 200)
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 1, 10, ACTOR_SRC_MANUAL, 200)
            == ACTOR_REFUSED_RATE);
     /* And it stays spent for a full window measured from the RESTORE, not
      * from the pre-reboot uptime the file happened to record. */
-    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_MANUAL, 50 + 3599)
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 1, 10, ACTOR_SRC_MANUAL, 50 + 3599)
            == ACTOR_REFUSED_RATE);
-    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_MANUAL, 50 + 3600)
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 1, 10, ACTOR_SRC_MANUAL, 50 + 3600)
            == ACTOR_OK);
 
     /* The safety close is exempt from every one of those, as always. */
-    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 0, ACTOR_SRC_SAFETY, 50) == ACTOR_OK);
+    assert(actor_table_check(&T, 3, ACT_SWITCH_OFF, 1, 0, ACTOR_SRC_SAFETY, 50) == ACTOR_OK);
 }
 
 /* window_count == 0 is "never fired". A restored row saying so must leave
@@ -361,6 +376,7 @@ static void test_apply_of_a_never_fired_row_leaves_clocks_at_zero(void)
     memset(&row, 0, sizeof row);
     memcpy(row.key, KEY_A, ACTOR_DEVICE_KEY_LEN);
     row.action_id = ACT_IRRIGATION_OPEN;
+    row.endpoint = 1;   /* matches setup_one_device()'s default endpoint */
     row.cooldown_s = 600;
     row.max_per_hour = 4;
     row.window_count = 0;
@@ -370,10 +386,10 @@ static void test_apply_of_a_never_fired_row_leaves_clocks_at_zero(void)
     assert(actor_table_guard_apply(&T, 3, &row, /*now_s*/ 50));
     /* Cooldown configured but never fired -> permitted (the same rule
      * test_cooldown_before_first_fire_permits() pins for a fresh pair). */
-    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 50) == ACTOR_OK);
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 1, 10, ACTOR_SRC_RULE, 50) == ACTOR_OK);
 
     actor_pair_state_t ps;
-    assert(actor_table_pair_state(&T, 3, ACT_IRRIGATION_OPEN, 50, &ps));
+    assert(actor_table_pair_state(&T, 3, ACT_IRRIGATION_OPEN, 1, 50, &ps));
     assert(!ps.has_fired);
     assert(ps.last_fire_s == 0);
     assert(ps.activations_this_hour == 0);
@@ -421,8 +437,8 @@ static void test_merge_before_restore_keeps_a_lockout_the_image_predates(void)
     /* The operator presses the stop button and a command fires. Both land
      * in the LIVE table; neither has reached the image yet. */
     actor_table_set_lockout(&T, 3, true);
-    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 1000);
-    assert(actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, 0, 4));
+    actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 1, 1000);
+    assert(actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, 1, 0, 4));
 
     /* WITHOUT the merge, restoring from the stale image is exactly the
      * bug: the stop button comes back up, and the activation is refunded.
@@ -435,7 +451,7 @@ static void test_merge_before_restore_keeps_a_lockout_the_image_predates(void)
         bool lock = true;
         assert(actor_table_lockout(&stale, 3, &lock) && !lock);   /* un-pressed */
         actor_pair_state_t ps;
-        assert(actor_table_pair_state(&stale, 3, ACT_IRRIGATION_OPEN, 2000, &ps));
+        assert(actor_table_pair_state(&stale, 3, ACT_IRRIGATION_OPEN, 1, 2000, &ps));
         assert(ps.activations_this_hour == 0);                    /* refunded */
     }
 
@@ -449,10 +465,10 @@ static void test_merge_before_restore_keeps_a_lockout_the_image_predates(void)
     }
     bool lock = false;
     assert(actor_table_lockout(&T, 3, &lock) && lock);            /* still pressed */
-    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 2000)
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 1, 10, ACTOR_SRC_RULE, 2000)
            == ACTOR_REFUSED_LOCKOUT);
     actor_pair_state_t ps;
-    assert(actor_table_pair_state(&T, 3, ACT_IRRIGATION_OPEN, 2000, &ps));
+    assert(actor_table_pair_state(&T, 3, ACT_IRRIGATION_OPEN, 1, 2000, &ps));
     assert(ps.activations_this_hour == 1);                        /* still spent */
 }
 
@@ -467,6 +483,9 @@ static void test_merge_before_key_is_set_cannot_erase_saved_rows(void)
     memset(img, 0, sizeof img);
     memcpy(img[0].key, KEY_A, ACTOR_DEVICE_KEY_LEN);
     img[0].action_id = ACT_IRRIGATION_OPEN;
+    img[0].endpoint = 1;   /* matches the declare below's default endpoint,
+                              * so the later guard_apply() resolves the
+                              * right slot via (action_id, endpoint) */
     img[0].lockout = true;
     img[0].cooldown_s = 600;
     img[0].max_per_hour = 4;
@@ -475,8 +494,8 @@ static void test_merge_before_key_is_set_cannot_erase_saved_rows(void)
     /* The device is declared this boot but its key is not set yet -- the
      * exact instant actor_persist_sync() runs. */
     actor_table_init(&T);
-    assert(actor_table_add(&T, 3, ACT_IRRIGATION_OPEN, 300, 0x00));
-    assert(actor_table_add(&T, 3, ACT_SWITCH_OFF, 0, 0x00));
+    assert(actor_table_add(&T, 3, ACT_IRRIGATION_OPEN, 1, 300, 0x00));
+    assert(actor_table_add(&T, 3, ACT_SWITCH_OFF, 1, 0, 0x00));
 
     size_t n = actor_table_guard_merge(&T, img, 1, ACTOR_GUARD_ROWS_MAX);
     assert(n == 1);                       /* the keyless device contributed nothing */
@@ -488,7 +507,7 @@ static void test_merge_before_key_is_set_cannot_erase_saved_rows(void)
     assert(actor_table_guard_apply(&T, 3, &img[0], /*now_s*/ 10));
     bool lock = false;
     assert(actor_table_lockout(&T, 3, &lock) && lock);
-    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_MANUAL, 10)
+    assert(actor_table_check(&T, 3, ACT_IRRIGATION_OPEN, 1, 10, ACTOR_SRC_MANUAL, 10)
            == ACTOR_REFUSED_COOLDOWN);
 }
 
@@ -498,9 +517,9 @@ static void test_merge_before_key_is_set_cannot_erase_saved_rows(void)
 static void test_reboot_round_trip(void)
 {
     setup_one_device();
-    assert(actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, 0, 4));
+    assert(actor_table_set_guards(&T, 3, ACT_IRRIGATION_OPEN, 1, 0, 4));
     actor_table_set_lockout(&T, 3, true);
-    for (int i = 0; i < 4; i++) actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 1000 + i * 10);
+    for (int i = 0; i < 4; i++) actor_table_record(&T, 3, ACT_IRRIGATION_OPEN, 1, 1000 + i * 10);
 
     actor_guard_row_t rows[ACTOR_GUARD_ROWS_MAX];
     memset(rows, 0, sizeof rows);
@@ -517,8 +536,8 @@ static void test_reboot_round_trip(void)
     /* The device now comes up at a DIFFERENT registry index -- which is
      * the whole reason rows are keyed on the device and not on dev_idx. */
     actor_table_init(&T);
-    assert(actor_table_add(&T, 0, ACT_IRRIGATION_OPEN, 300, 0x00));
-    assert(actor_table_add(&T, 0, ACT_SWITCH_OFF, 0, 0x00));
+    assert(actor_table_add(&T, 0, ACT_IRRIGATION_OPEN, 1, 300, 0x00));
+    assert(actor_table_add(&T, 0, ACT_SWITCH_OFF, 1, 0, 0x00));
     actor_table_set_key(&T, 0, KEY_A);
 
     unsigned applied = 0;
@@ -531,11 +550,11 @@ static void test_reboot_round_trip(void)
 
     bool lock = false;
     assert(actor_table_lockout(&T, 0, &lock) && lock);
-    assert(actor_table_check(&T, 0, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_RULE, 5)
+    assert(actor_table_check(&T, 0, ACT_IRRIGATION_OPEN, 1, 10, ACTOR_SRC_RULE, 5)
            == ACTOR_REFUSED_LOCKOUT);
-    assert(actor_table_check(&T, 0, ACT_IRRIGATION_OPEN, 10, ACTOR_SRC_MANUAL, 5)
+    assert(actor_table_check(&T, 0, ACT_IRRIGATION_OPEN, 1, 10, ACTOR_SRC_MANUAL, 5)
            == ACTOR_REFUSED_RATE);
-    assert(actor_table_check(&T, 0, ACT_SWITCH_OFF, 0, ACTOR_SRC_SAFETY, 5) == ACTOR_OK);
+    assert(actor_table_check(&T, 0, ACT_SWITCH_OFF, 1, 0, ACTOR_SRC_SAFETY, 5) == ACTOR_OK);
 }
 
 int main(void)
