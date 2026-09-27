@@ -26,6 +26,12 @@
 #define ZB_STORE_NAME_MAX    24
 #define ZB_STORE_MAX_UNMAPPED 6
 
+typedef enum {
+    ZB_METER_UNKNOWN = 0,   /* not yet probed */
+    ZB_METER_PRESENT = 1,   /* 0x0B04 answered -> poll/report electric.* */
+    ZB_METER_ABSENT  = 2,   /* probe rejected -> never probe/poll again */
+} zb_meter_state_t;
+
 typedef struct {
     uint8_t  eui64[8];
     uint16_t short_addr;
@@ -52,6 +58,7 @@ typedef struct {
                                           * dropped silently, a diagnostic aid
                                           * rather than a guarantee. */
     char     name[ZB_STORE_NAME_MAX];
+    uint8_t  meter_state;   /* zb_meter_state_t; blind-probe result, persisted */
 } zb_device_t;
 
 typedef struct {
@@ -65,7 +72,7 @@ typedef struct {
  *   eui64 8 + short_addr 2 + endpoint 1 + interviewed 1 + cap_count 1
  *   + caps 6 + cap_clusters 12 + cap_endpoints 6 + action_count 1
  *   + actions 8 + action_endpoints 8 + unmapped_count 1
- *   + unmapped_clusters 12 + name 24 = 91.
+ *   + unmapped_clusters 12 + name 24 + meter_state 1 = 92.
  * Not sizeof(zb_device_t): struct padding is not a file format, and a
  * compiler or field-order change would silently invalidate every stored
  * file. zb_store_deserialize() requires len to equal the header plus
@@ -80,8 +87,15 @@ typedef struct {
  * (v2, 65-byte) file is read via a version-gated legacy path in
  * zb_store_deserialize() that fans its single `endpoint` into every new
  * array slot, rather than being misread against the new, longer layout
- * or silently rejected. */
-#define ZB_STORE_RECORD_SIZE 91
+ * or silently rejected.
+ *
+ * Power metering (record v4) grew this again, 91 -> 92 bytes: a single
+ * trailing `meter_state` byte (zb_meter_state_t) recording whether a
+ * device answered the 0x0B04 blind-probe. ZB_STORE_VERSION bumped
+ * alongside it: an old (v3, 91-byte) file is read via a version-gated
+ * legacy path in zb_store_deserialize() that defaults meter_state to
+ * ZB_METER_UNKNOWN, same treatment as the v2 path above it. */
+#define ZB_STORE_RECORD_SIZE 92
 #define ZB_STORE_IMAGE_MAX   (8 + ZB_STORE_MAX_DEVICES * ZB_STORE_RECORD_SIZE)
 
 void zb_store_init(zb_table_t *t);

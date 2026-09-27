@@ -21,8 +21,13 @@
  * NOT rejected outright: zb_store_deserialize() reads it with the old
  * 65-byte layout via get_record_v2() and fans its single `endpoint` into
  * every new array slot, so an existing hub's persisted devices survive
- * the upgrade instead of coming back empty. */
-#define ZB_STORE_VERSION 3
+ * the upgrade instead of coming back empty.
+ *
+ * Power metering grew the record again, 91 -> 92 bytes (a trailing
+ * meter_state byte -- see zb_store.h), and bumped this to 4. A v3 file is
+ * likewise not rejected: it is read via get_record_v3(), which defaults
+ * meter_state to ZB_METER_UNKNOWN. */
+#define ZB_STORE_VERSION 4
 /* The exact v2 (pre-multi-endpoint) record layout, kept only so
  * get_record_v2() can read an old file: eui64 8 + short_addr 2
  * + endpoint 1 + interviewed 1 + cap_count 1 + caps 4 + cap_clusters 8
@@ -31,6 +36,10 @@
 #define ZB_STORE_V2_MAX_CAPS    4
 #define ZB_STORE_V2_MAX_ACTIONS 2
 #define ZB_STORE_V2_RECORD_SIZE 65
+/* The exact v3 (pre-power-metering) record layout, kept only so
+ * get_record_v3() can read an old file: identical to the current record
+ * minus the trailing meter_state byte -- see zb_store.h. */
+#define ZB_STORE_V3_RECORD_SIZE 91
 #define ZB_STORE_HEADER_SIZE 8
 
 void zb_store_init(zb_table_t *t) {
@@ -129,6 +138,7 @@ static uint8_t *put_record(uint8_t *p, const zb_device_t *d) {
     size_t nlen = strnlen(d->name, ZB_STORE_NAME_MAX - 1);
     memcpy(p, d->name, nlen);
     p += ZB_STORE_NAME_MAX;
+    p = put_u8(p, d->meter_state);
     return p;
 }
 
@@ -162,6 +172,47 @@ static const uint8_t *get_record(const uint8_t *p, zb_device_t *d) {
     memcpy(d->name, p, ZB_STORE_NAME_MAX);
     d->name[ZB_STORE_NAME_MAX - 1] = '\0';
     p += ZB_STORE_NAME_MAX;
+    p = get_u8(p, &d->meter_state);
+    return p;
+}
+
+/* Reads one v3 (91-byte, pre-power-metering) record. `d` must already be
+ * zeroed by the caller. Identical to get_record() through the name
+ * field; v3 had no meter_state byte, so it is defaulted to
+ * ZB_METER_UNKNOWN rather than left whatever the caller's zero-fill
+ * happened to produce (they coincide today, but the default should not
+ * depend on that). */
+static const uint8_t *get_record_v3(const uint8_t *p, zb_device_t *d) {
+    memcpy(d->eui64, p, 8);
+    p += 8;
+    p = get_u16le(p, &d->short_addr);
+    p = get_u8(p, &d->endpoint);
+    p = get_u8(p, &d->interviewed);
+    p = get_u8(p, &d->cap_count);
+    for (int i = 0; i < ZB_STORE_MAX_CAPS; i++) {
+        p = get_u8(p, &d->caps[i]);
+    }
+    for (int i = 0; i < ZB_STORE_MAX_CAPS; i++) {
+        p = get_u16le(p, &d->cap_clusters[i]);
+    }
+    for (int i = 0; i < ZB_STORE_MAX_CAPS; i++) {
+        p = get_u8(p, &d->cap_endpoints[i]);
+    }
+    p = get_u8(p, &d->action_count);
+    for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
+        p = get_u8(p, &d->actions[i]);
+    }
+    for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
+        p = get_u8(p, &d->action_endpoints[i]);
+    }
+    p = get_u8(p, &d->unmapped_count);
+    for (int i = 0; i < ZB_STORE_MAX_UNMAPPED; i++) {
+        p = get_u16le(p, &d->unmapped_clusters[i]);
+    }
+    memcpy(d->name, p, ZB_STORE_NAME_MAX);
+    d->name[ZB_STORE_NAME_MAX - 1] = '\0';
+    p += ZB_STORE_NAME_MAX;
+    d->meter_state = ZB_METER_UNKNOWN;
     return p;
 }
 
@@ -235,21 +286,24 @@ bool zb_store_deserialize(zb_table_t *t, const uint8_t *buf, size_t len) {
         buf[2] != ZB_STORE_MAGIC2 || buf[3] != ZB_STORE_MAGIC3) {
         return false;
     }
-    /* v2 (pre-multi-endpoint, 65-byte record) is not rejected outright:
-     * it is read via the old layout below and its single `endpoint`
-     * fanned into the new per-cap/per-action arrays, so an existing
-     * hub's persisted devices survive the upgrade to v3 rather than the
-     * table coming back empty. Any OTHER unknown version is still
-     * rejected -- there is no layout to read it with. */
+    /* v2 (pre-multi-endpoint, 65-byte record) and v3 (pre-power-metering,
+     * 91-byte record) are not rejected outright: each is read via its own
+     * legacy layout below -- v2 fanning its single `endpoint` into the
+     * new per-cap/per-action arrays, v3 defaulting the new meter_state --
+     * so an existing hub's persisted devices survive the upgrade rather
+     * than the table coming back empty. Any OTHER unknown version is
+     * still rejected -- there is no layout to read it with. */
     uint8_t ver = buf[4];
-    if (ver != ZB_STORE_VERSION && ver != 2) {
+    if (ver != ZB_STORE_VERSION && ver != 3 && ver != 2) {
         return false;
     }
     uint8_t count = buf[5];
     if (count > ZB_STORE_MAX_DEVICES) {
         return false;
     }
-    size_t rec = (ver == 2) ? ZB_STORE_V2_RECORD_SIZE : ZB_STORE_RECORD_SIZE;
+    size_t rec = (ver == 2) ? ZB_STORE_V2_RECORD_SIZE
+               : (ver == 3) ? ZB_STORE_V3_RECORD_SIZE
+               : ZB_STORE_RECORD_SIZE;
     size_t need = ZB_STORE_HEADER_SIZE + (size_t)count * rec;
     if (len != need) {
         return false;
@@ -263,7 +317,9 @@ bool zb_store_deserialize(zb_table_t *t, const uint8_t *buf, size_t len) {
     out.count = count;
     const uint8_t *p = buf + ZB_STORE_HEADER_SIZE;
     for (int i = 0; i < count; i++) {
-        p = (ver == 2) ? get_record_v2(p, &out.dev[i]) : get_record(p, &out.dev[i]);
+        p = (ver == 2) ? get_record_v2(p, &out.dev[i])
+          : (ver == 3) ? get_record_v3(p, &out.dev[i])
+          : get_record(p, &out.dev[i]);
         /* A cap_count/action_count beyond the fixed-size arrays they index
          * is as impossible as a bad table count -- the field exists so a
          * consumer can loop `for (i = 0; i < d->cap_count; i++)` over
