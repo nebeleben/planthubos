@@ -16,8 +16,8 @@
 #define AT_BATTERY_VOLTAGE   0x0020  /* Power Config: uint8, 100 mV units */
 #define AT_BATTERY_PERCENT   0x0021  /* Power Config: uint8, 0.5 % units  */
 #define AT_MULTISTATE_PRESENT 0x0055  /* PresentValue, uint16 */
-#define AT_EM_ACTIVE_POWER   0x050B  /* ActivePower, int16, per ACPowerDivisor (TS011F: 0.1 W) */
-#define AT_EM_RMS_VOLTAGE    0x0505  /* RMSVoltage, uint16, per ACVoltageDivisor (TS011F: 0.1 V) */
+#define AT_EM_ACTIVE_POWER   0x050B  /* ActivePower, int16 (WK35: whole W, divisor 1 -- bench-calibrated) */
+#define AT_EM_RMS_VOLTAGE    0x0505  /* RMSVoltage, uint16 (WK35: whole V, divisor 1 -- bench-calibrated) */
 #define AT_EM_RMS_CURRENT    0x0508  /* RMSCurrent, uint16, per ACCurrentDivisor (TS011F: 1 mA) */
 
 uint8_t zb_map_cluster_to_cap(uint16_t cluster) {
@@ -198,15 +198,17 @@ bool zb_map_zcl_attr_to_value(uint16_t cluster, uint16_t attr, int32_t raw, floa
         switch (attr) {
             case AT_EM_ACTIVE_POWER:
                 /* ActivePower is int16 (signed; export is negative). ZCL
-                 * invalid = 0x8000; reject both spellings. TS011F reports
-                 * 0.1 W units -> /10 gives W (CAP_ELECTRIC_POWER's unit). */
+                 * invalid = 0x8000; reject both spellings. The WK35 reports
+                 * whole watts (divisor 1), NOT the 0.1 W the TS011F default
+                 * assumed -- bench-calibrated 2026-09-27 against a 10 W bulb
+                 * (raw 10 = 10 W, matching V*I = 229 * 0.05). */
                 if (raw == 0x8000 || raw == -32768) return false;
-                *out = (float)raw / 10.0f;
+                *out = (float)raw / 1.0f;
                 return true;
             case AT_EM_RMS_VOLTAGE:
-                /* uint16, ZCL invalid = 0xFFFF. TS011F 0.1 V units -> /10 V. */
+                /* uint16, ZCL invalid = 0xFFFF. WK35 reports whole volts -> /1 V (bench-calibrated 2026-09-27). */
                 if (raw == 0xFFFF) return false;
-                *out = (float)raw / 10.0f;
+                *out = (float)raw / 1.0f;
                 return true;
             case AT_EM_RMS_CURRENT:
                 /* uint16, ZCL invalid = 0xFFFF. TS011F 1 mA units -> /1000 A. */

@@ -156,9 +156,9 @@ int main(void) {
     assert(zb_map_accepts_attr(0x0B04, 0x0505));
     assert(zb_map_accepts_attr(0x0B04, 0x0508));
     assert(!zb_map_accepts_attr(0x0B04, 0x0000));
-    /* TS011F scaling: power/10 -> W, voltage/10 -> V, current/1000 -> A */
-    assert(zb_map_zcl_attr_to_value(0x0B04, 0x050B, 600, &v) && close_to(v, 60.0f));
-    assert(zb_map_zcl_attr_to_value(0x0B04, 0x0505, 2300, &v) && close_to(v, 230.0f));
+    /* WK35 scaling (bench-calibrated 2026-09-27): power/1 -> W, voltage/1 -> V, current/1000 -> A */
+    assert(zb_map_zcl_attr_to_value(0x0B04, 0x050B, 600, &v) && close_to(v, 600.0f));  /* WK35: whole W, /1 */
+    assert(zb_map_zcl_attr_to_value(0x0B04, 0x0505, 230, &v) && close_to(v, 230.0f));   /* WK35: whole V, /1 */
     assert(zb_map_zcl_attr_to_value(0x0B04, 0x0508, 500, &v) && close_to(v, 0.5f));
     /* sentinels: 0x8000 (signed power) / 0xFFFF (unsigned V/I) -> no reading */
     assert(!zb_map_zcl_attr_to_value(0x0B04, 0x050B, 0x8000, &v));
