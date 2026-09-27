@@ -80,8 +80,8 @@ int main(void) {
     /* current: scale 100.0, 0.01 A resolution */
     assert(capability_encode(CAP_ELECTRIC_CURRENT, 16.0f) == 1600);
     assert(fabsf(capability_decode(CAP_ELECTRIC_CURRENT, 1600) - 16.0f) < 0.001f);
-    /* over-range clamps to INT16_MAX, never wraps or fabricates */
-    assert(capability_encode(CAP_ELECTRIC_VOLTAGE, 5000.0f) == 32767);
+    /* over-range -> CAP_VALUE_NONE, not a wrapped value */
+    assert(capability_encode(CAP_ELECTRIC_VOLTAGE, 5000.0f) == CAP_VALUE_NONE);
     assert(CAPABILITY_COUNT == 14);
 
     printf("test_capability: OK\n");

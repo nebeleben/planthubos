@@ -35,7 +35,6 @@ typedef struct {
     float       offset;
     uint8_t     precision;       /* display decimals */
     bool        event;           /* momentary: a press/event, not a stored state (button.action) */
-    bool        clamp;           /* clamp overflow to INT16_MAX vs. return CAP_VALUE_NONE */
 } capability_t;
 
 const capability_t *capability_get(uint8_t id);          /* NULL if unknown */
