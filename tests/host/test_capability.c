@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <limits.h>
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -38,14 +39,14 @@ int main(void) {
     assert(fabsf(capability_decode(CAP_AIR_PRESSURE,
            capability_encode(CAP_AIR_PRESSURE, 1013.2f)) - 1013.2f) < 0.05f);
 
-    /* out-of-range -> CAP_VALUE_NONE, not a wrapped value */
+    /* out-of-range -> CAP_VALUE_NONE, not a wrapped value (except electrical caps) */
     assert(capability_encode(CAP_LIGHT_ILLUMINANCE, 9000000.0f) == CAP_VALUE_NONE);
     assert(capability_encode(CAP_AIR_PRESSURE, 100.0f) == CAP_VALUE_NONE);
     /* sentinel decodes to NAN */
     assert(isnan(capability_decode(CAP_SOIL_MOISTURE, CAP_VALUE_NONE)));
 
     /* button.action event flag tests */
-    assert(CAPABILITY_COUNT == 11);
+    assert(CAPABILITY_COUNT == 14);
     const capability_t *b = capability_get(CAP_BUTTON_ACTION);
     assert(b && strcmp(b->name, "button.action") == 0);
     assert(b->event == true);
@@ -63,7 +64,25 @@ int main(void) {
     assert(strcmp(dr->name, "dim.rotate") == 0);
     assert(dr->event == true);
     assert(dr->scale == 1.0f && dr->offset == 0.0f);
-    assert(CAPABILITY_COUNT == 11);
+    assert(CAPABILITY_COUNT == 14);
+
+    /* --- electrical caps (power-metering) --- */
+    assert(capability_get(CAP_ELECTRIC_POWER)  != NULL);
+    assert(capability_get(CAP_ELECTRIC_VOLTAGE) != NULL);
+    assert(capability_get(CAP_ELECTRIC_CURRENT) != NULL);
+    /* power: scale 1.0, whole watts */
+    assert(capability_encode(CAP_ELECTRIC_POWER, 60.0f) == 60);
+    assert(capability_encode(CAP_ELECTRIC_POWER, 3680.0f) == 3680);
+    assert(fabsf(capability_decode(CAP_ELECTRIC_POWER, 60) - 60.0f) < 0.001f);
+    /* voltage: scale 10.0, 0.1 V resolution */
+    assert(capability_encode(CAP_ELECTRIC_VOLTAGE, 230.0f) == 2300);
+    assert(fabsf(capability_decode(CAP_ELECTRIC_VOLTAGE, 2300) - 230.0f) < 0.001f);
+    /* current: scale 100.0, 0.01 A resolution */
+    assert(capability_encode(CAP_ELECTRIC_CURRENT, 16.0f) == 1600);
+    assert(fabsf(capability_decode(CAP_ELECTRIC_CURRENT, 1600) - 16.0f) < 0.001f);
+    /* over-range clamps to INT16_MAX, never wraps or fabricates */
+    assert(capability_encode(CAP_ELECTRIC_VOLTAGE, 5000.0f) == 32767);
+    assert(CAPABILITY_COUNT == 14);
 
     printf("test_capability: OK\n");
     return 0;

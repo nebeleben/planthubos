@@ -25,57 +25,72 @@ static const capability_t CAP_TABLE[CAPABILITY_COUNT] = {
     [CAP_SOIL_MOISTURE] = {
         .id = CAP_SOIL_MOISTURE, .name = "soil.moisture", .unit = "%",
         .ha_device_class = "moisture", .influx_field = "moisture",
-        .scale = 1.0f, .offset = 0.0f, .precision = 0,
+        .scale = 1.0f, .offset = 0.0f, .precision = 0, .clamp = false,
     },
     [CAP_AIR_TEMPERATURE] = {
         .id = CAP_AIR_TEMPERATURE, .name = "air.temperature", .unit = "°C",
         .ha_device_class = "temperature", .influx_field = "temp",
-        .scale = 10.0f, .offset = 0.0f, .precision = 1,
+        .scale = 10.0f, .offset = 0.0f, .precision = 1, .clamp = false,
     },
     [CAP_LIGHT_ILLUMINANCE] = {
         .id = CAP_LIGHT_ILLUMINANCE, .name = "light.illuminance", .unit = "lux",
         .ha_device_class = "illuminance", .influx_field = "lux",
-        .scale = 1.0f / 16.0f, .offset = 0.0f, .precision = 0,
+        .scale = 1.0f / 16.0f, .offset = 0.0f, .precision = 0, .clamp = false,
     },
     [CAP_SOIL_CONDUCTIVITY] = {
         .id = CAP_SOIL_CONDUCTIVITY, .name = "soil.conductivity", .unit = "µS/cm",
         .ha_device_class = NULL, .influx_field = "conductivity",
-        .scale = 1.0f, .offset = 0.0f, .precision = 0,
+        .scale = 1.0f, .offset = 0.0f, .precision = 0, .clamp = false,
     },
     [CAP_BATTERY_LEVEL] = {
         .id = CAP_BATTERY_LEVEL, .name = "battery.level", .unit = "%",
         .ha_device_class = "battery", .influx_field = "battery",
-        .scale = 1.0f, .offset = 0.0f, .precision = 0,
+        .scale = 1.0f, .offset = 0.0f, .precision = 0, .clamp = false,
     },
     [CAP_AIR_HUMIDITY] = {
         .id = CAP_AIR_HUMIDITY, .name = "air.humidity", .unit = "%",
         .ha_device_class = "humidity", .influx_field = "humidity",
-        .scale = 10.0f, .offset = 0.0f, .precision = 1,
+        .scale = 10.0f, .offset = 0.0f, .precision = 1, .clamp = false,
     },
     [CAP_AIR_PRESSURE] = {
         .id = CAP_AIR_PRESSURE, .name = "air.pressure", .unit = "hPa",
         .ha_device_class = "atmospheric_pressure", .influx_field = "pressure",
-        .scale = 10.0f, .offset = 900.0f, .precision = 1,
+        .scale = 10.0f, .offset = 900.0f, .precision = 1, .clamp = false,
     },
     [CAP_SIGNAL_RSSI] = {
         .id = CAP_SIGNAL_RSSI, .name = "signal.rssi", .unit = "dBm",
         .ha_device_class = "signal_strength", .influx_field = "rssi",
-        .scale = 1.0f, .offset = 0.0f, .precision = 0,
+        .scale = 1.0f, .offset = 0.0f, .precision = 0, .clamp = false,
     },
     [CAP_SWITCH_STATE] = {
         .id = CAP_SWITCH_STATE, .name = "switch.state", .unit = "",
         .ha_device_class = NULL, .influx_field = "switch",
-        .scale = 1.0f, .offset = 0.0f, .precision = 0,
+        .scale = 1.0f, .offset = 0.0f, .precision = 0, .clamp = false,
     },
     [CAP_BUTTON_ACTION] = {
         .id = CAP_BUTTON_ACTION, .name = "button.action", .unit = "",
         .ha_device_class = NULL, .influx_field = "button",
-        .scale = 1.0f, .offset = 0.0f, .precision = 0, .event = true,
+        .scale = 1.0f, .offset = 0.0f, .precision = 0, .event = true, .clamp = false,
     },
     [CAP_DIM_ROTATE] = {
         .id = CAP_DIM_ROTATE, .name = "dim.rotate", .unit = "",
         .ha_device_class = NULL, .influx_field = "rotate",
-        .scale = 1.0f, .offset = 0.0f, .precision = 0, .event = true,
+        .scale = 1.0f, .offset = 0.0f, .precision = 0, .event = true, .clamp = false,
+    },
+    [CAP_ELECTRIC_POWER] = {
+        .id = CAP_ELECTRIC_POWER, .name = "electric.power", .unit = "W",
+        .ha_device_class = "power", .influx_field = "watt",
+        .scale = 1.0f, .offset = 0.0f, .precision = 0, .clamp = true,
+    },
+    [CAP_ELECTRIC_VOLTAGE] = {
+        .id = CAP_ELECTRIC_VOLTAGE, .name = "electric.voltage", .unit = "V",
+        .ha_device_class = "voltage", .influx_field = "volt",
+        .scale = 10.0f, .offset = 0.0f, .precision = 1, .clamp = true,
+    },
+    [CAP_ELECTRIC_CURRENT] = {
+        .id = CAP_ELECTRIC_CURRENT, .name = "electric.current", .unit = "A",
+        .ha_device_class = "current", .influx_field = "ampere",
+        .scale = 100.0f, .offset = 0.0f, .precision = 2, .clamp = true,
     },
 };
 
@@ -114,8 +129,17 @@ int16_t capability_encode(uint8_t id, float value) {
      */
     double lo = (c->offset != 0.0f) ? 0.0 : (double)(INT16_MIN + 1);
     double hi = (double)INT16_MAX;
-    if (rounded < lo || rounded > hi)
-        return CAP_VALUE_NONE;
+
+    /* Clamp-mode capabilities clamp to range; others reject out-of-range values */
+    if (c->clamp) {
+        if (rounded > hi)
+            rounded = hi;
+        else if (rounded < lo)
+            rounded = lo;
+    } else {
+        if (rounded < lo || rounded > hi)
+            return CAP_VALUE_NONE;
+    }
 
     return (int16_t)rounded;
 }

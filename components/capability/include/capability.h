@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define CAPABILITY_COUNT 11
+#define CAPABILITY_COUNT 14
 #define CAP_NONE         0xFF          /* "no capability" marker (column maps) */
 #define CAP_VALUE_NONE   INT16_MIN     /* stored sentinel: no value */
 
@@ -18,6 +18,9 @@ enum {
     CAP_AIR_PRESSURE = 6, CAP_SIGNAL_RSSI = 7, CAP_SWITCH_STATE = 8,
     CAP_BUTTON_ACTION = 9,
     CAP_DIM_ROTATE    = 10,
+    CAP_ELECTRIC_POWER   = 11,
+    CAP_ELECTRIC_VOLTAGE = 12,
+    CAP_ELECTRIC_CURRENT = 13,
 };
 
 typedef struct {
@@ -32,6 +35,7 @@ typedef struct {
     float       offset;
     uint8_t     precision;       /* display decimals */
     bool        event;           /* momentary: a press/event, not a stored state (button.action) */
+    bool        clamp;           /* clamp overflow to INT16_MAX vs. return CAP_VALUE_NONE */
 } capability_t;
 
 const capability_t *capability_get(uint8_t id);          /* NULL if unknown */
