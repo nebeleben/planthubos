@@ -1,4 +1,7 @@
 #include "mapping_engine.h"
+#include <math.h>
+
+#define MAP_FLOAT_EPS 1e-6f
 
 map_action_t mapping_measurement(uint16_t source_cluster,
                                  const uint16_t *suppress_set, int suppress_count) {
@@ -22,8 +25,19 @@ map_action_t mapping_dp(uint8_t dp_id, int32_t value,
     return MAP_RECORD_UNMAPPED;
 }
 
-static bool dp_is_applied(uint8_t dp_id, const tuya_dp_map_t *applied, int applied_count) {
-    for (int i = 0; i < applied_count; i++) if (applied[i].dp_id == dp_id) return true;
+/* True when this profile DP entry is already reflected verbatim in the
+ * applied map: same dp_id AND same cap_id/scale/offset (spec section 4 --
+ * a same-dp_id entry that differs is a correction and must still be
+ * proposed, not withheld). */
+static bool dp_entry_already_applied(const dev_profile_entry_t *e,
+                                     const tuya_dp_map_t *applied, int applied_count) {
+    for (int i = 0; i < applied_count; i++) {
+        if (applied[i].dp_id != e->dp_id) continue;
+        if (applied[i].cap_id != e->cap_id) return false;
+        if (fabsf(applied[i].scale - e->scale) > MAP_FLOAT_EPS) return false;
+        if (fabsf(applied[i].offset - e->offset) > MAP_FLOAT_EPS) return false;
+        return true;
+    }
     return false;
 }
 
@@ -42,7 +56,7 @@ int mapping_proposals(const dev_profile_t *p,
     for (int i = 0; i < p->entry_count && n < max; i++) {
         const dev_profile_entry_t *e = &p->entries[i];
         if (e->kind == DEV_PROFILE_KIND_DP) {
-            if (!dp_is_applied(e->dp_id, applied, applied_count)) out[n++] = *e;
+            if (!dp_entry_already_applied(e, applied, applied_count)) out[n++] = *e;
         } else if (e->kind == DEV_PROFILE_KIND_SUPPRESS) {
             if (!cluster_is_suppressed(e->source_cluster, suppress_set, suppress_count)) out[n++] = *e;
         }
