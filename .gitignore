@@ -56,4 +56,6 @@ tests/host/test_zb_cmd_rx
 tests/host/test_zb_interview
 tests/host/test_zb_map
 tests/host/test_zb_store
+tests/host/test_zb_tuya
 tests/host/test_registry_persist
+tests/host/test_tuya_dp

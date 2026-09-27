@@ -285,6 +285,10 @@ $CC -Wall -Wextra -Werror -I../../components/zigbee/include \
 ./test_zb_map
 
 $CC -Wall -Wextra -Werror -I../../components/zigbee/include \
+    test_zb_tuya.c ../../components/zigbee/zb_tuya.c -o test_zb_tuya
+./test_zb_tuya
+
+$CC -Wall -Wextra -Werror -I../../components/zigbee/include \
     test_zb_store.c ../../components/zigbee/zb_store.c -o test_zb_store
 ./test_zb_store
 
@@ -327,3 +331,12 @@ $CC -Wall -Wextra -Werror -I../../components/swarm/include \
 $CC -Wall -Wextra -Werror -I../../components/swarm/include \
     test_bridge_cmd.c ../../components/swarm/bridge_cmd.c -o test_bridge_cmd
 ./test_bridge_cmd
+
+# Hub-side Tuya EF00 observed-datapoint + mapping store (Task 4): RAM store
+# find-or-insert/LRU (registry.c-shaped) plus a CRC-16 persisted mapping
+# table (wrapper_bind.c-shaped). Links capability.c+device_id.c for
+# device_id_t/device_id_equal() and CAPABILITY_COUNT.
+$CC -Wall -Wextra -Werror -I../../components/capability/include -I../../components/tuya_dp/include \
+    test_tuya_dp.c ../../components/tuya_dp/tuya_dp.c ../../components/capability/capability.c \
+    ../../components/capability/device_id.c -o test_tuya_dp -lm
+./test_tuya_dp

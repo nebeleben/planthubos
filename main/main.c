@@ -14,6 +14,7 @@
 #include "data_core.h"
 #include "ble_collector.h"
 #include "zigbee.h"
+#include "tuya_dp.h"
 #include "radio_role.h"
 #include "timekeeper.h"
 #include "sampler.h"
@@ -227,6 +228,7 @@ void app_main(void)
      * Runs before webserver_start() below so the API serves the values at
      * once. */
     if (storage_ok) data_core_restore_snapshot();
+    if (storage_ok) tuya_dp_map_load();
     log_heap("after data_core_init");
 
     /* swarm_store_init() loads role + paired-peer state from NVS into RAM;

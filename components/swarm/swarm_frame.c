@@ -47,9 +47,16 @@ int swarm_frame_type(const uint8_t *buf, size_t len)
         if (len < SWARM_OTA_CHUNK_HDR || len > SWARM_OTA_CHUNK_MAXLEN) return -1;
         return type;
     }
-    if (type >= SWARM_MSG_DEVICE_ANNOUNCE && type <= SWARM_MSG_NODE_CONFIG_ACK) {
+    if ((type >= SWARM_MSG_DEVICE_ANNOUNCE && type <= SWARM_MSG_NODE_CONFIG_ACK) ||
+        type == SWARM_MSG_TUYA_DP) {
         /* Variable-length v4 frames: the decoder validates its counted
-         * arrays against len (Task 2); here only the header is checked. */
+         * arrays against len (Task 2); here only the header is checked.
+         * SWARM_MSG_TUYA_DP is OR'd in rather than folded into the numeric
+         * range above because SWARM_MSG_POLL (21) sits between
+         * SWARM_MSG_NODE_CONFIG_ACK (20) and SWARM_MSG_TUYA_DP (22) and
+         * must keep going through expected_len()'s exact-length check
+         * below -- widening the range to include 22 would silently pull
+         * POLL in too and skip that check. */
         return type;
     }
     size_t want = expected_len(type);
@@ -292,6 +299,29 @@ bool swarm_decode_measurement(const uint8_t *buf, size_t len, swarm_measurement_
     uint32_t vbits = r32(&r);
     memcpy(&out->value, &vbits, sizeof(out->value));
     out->age_s = r32(&r);
+    return rend(&r);
+}
+
+size_t swarm_encode_tuya_dp(const swarm_tuya_dp_t *in, uint8_t *out, size_t cap)
+{
+    if (!in) return 0;
+    wr_t w = { out, cap, 0, out != NULL };
+    whdr(&w, SWARM_MSG_TUYA_DP);
+    waddr(&w, &in->dev);
+    w8(&w, in->dp_id); w8(&w, in->dp_type);
+    uint32_t vbits; memcpy(&vbits, &in->value, sizeof(vbits));
+    w32(&w, vbits);
+    return wfinish(&w);
+}
+
+bool swarm_decode_tuya_dp(const uint8_t *buf, size_t len, swarm_tuya_dp_t *out)
+{
+    rd_t r; if (!out || !rbegin(&r, buf, len, SWARM_MSG_TUYA_DP)) return false;
+    memset(out, 0, sizeof(*out));
+    raddr(&r, &out->dev);
+    out->dp_id = r8(&r); out->dp_type = r8(&r);
+    uint32_t vbits = r32(&r);
+    memcpy(&out->value, &vbits, sizeof(out->value));
     return rend(&r);
 }
 

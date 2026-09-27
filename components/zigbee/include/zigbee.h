@@ -57,6 +57,18 @@ esp_err_t zigbee_start(void);
 typedef void (*zigbee_device_observer_t)(const zb_device_t *dev, bool gone);
 void zigbee_set_device_observer(zigbee_device_observer_t fn);
 
+/* Tuya EF00 datapoint task: same observer pattern as
+ * zigbee_device_observer_t above -- zb_rawcmd_handler() decodes an EF00
+ * "datapoint report"/"datapoint response" frame (zb_tuya_parse(), zb_tuya.h)
+ * and reports each parsed datapoint through this plain function pointer
+ * instead of reaching into swarm.c directly (this component must not link
+ * swarm, see this header's top comment). Fires on the stack task (the raw
+ * command handler runs there), one call per datapoint in the frame. Same
+ * non-blocking-only contract as zigbee_device_observer_t: an observer must
+ * do nothing but queue the value, never block. */
+typedef void (*zigbee_tuya_dp_observer_t)(const uint8_t eui64[8], uint8_t dp_id, uint8_t dp_type, int32_t value);
+void zigbee_set_tuya_dp_observer(zigbee_tuya_dp_observer_t fn);
+
 /* M7 Task 5: same shape as zigbee_set_device_observer() above, but for
  * coordinator-status changes rather than device-table changes -- fired
  * (no arguments; the observer re-reads current state via

@@ -28,6 +28,7 @@
 #include "zigbee.h"
 #include "radio_role.h"
 #include "swarm_rules.h"
+#include "tuya_dp.h"
 #include "cJSON.h"
 #include "mbedtls/base64.h"
 #include "esp_littlefs.h"
@@ -41,6 +42,7 @@
 #include "freertos/timers.h"
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 static const char *TAG = "api_v1";
 #define FW_VERSION "2.0.0-dev"
@@ -3554,6 +3556,224 @@ static bool parse_device_action_path(const char *tail, bool want_guards_suffix,
     return true;
 }
 
+/* Parses "{id}/datapoints/{dp_id}" out of `tail` (already advanced past
+ * "/api/v1/devices/") -- the DP->capability mapping routes (POST set,
+ * DELETE clear; Task 6, 2026-09-27 tuya-ef00-datapoints spec). Same
+ * marker-split shape as parse_device_action_path() above: a query string
+ * is stripped first, the marker splits id from the trailing token, and
+ * VALIDITY of the id (device_id_parse()) is left to the caller -- this
+ * function only matches shape and range-checks dp_id. dp_id accepts
+ * decimal or 0x-hex (strtol base 0, tuya_dp.h's dp_id is a plain uint8_t
+ * wire byte, and operators copying it from a device's raw hex dump
+ * shouldn't have to convert it by hand) and must be a whole token
+ * (nothing after it but the query string already stripped, nothing before
+ * it but decimal/hex digits) fitting a uint8_t. Returns false (nothing
+ * touched) when `tail` doesn't match this shape at all. */
+static bool parse_device_dp_path(const char *tail, char *idbuf, size_t idbuf_cap,
+                                  uint8_t *dp_id_out)
+{
+    size_t taillen = strcspn(tail, "?");
+    char scratch[80];
+    if (taillen == 0 || taillen >= sizeof(scratch)) return false;
+    memcpy(scratch, tail, taillen);
+    scratch[taillen] = '\0';
+
+    static const char marker[] = "/datapoints/";
+    char *mpos = strstr(scratch, marker);
+    if (!mpos) return false;
+    size_t idlen = (size_t)(mpos - scratch);
+    if (idlen == 0 || idlen >= idbuf_cap) return false;
+
+    char *dp_start = mpos + (sizeof(marker) - 1);
+    if (*dp_start == '\0') return false;
+
+    char *endp;
+    long v = strtol(dp_start, &endp, 0);
+    if (*endp != '\0' || endp == dp_start || v < 0 || v > 255) return false;
+
+    memcpy(idbuf, scratch, idlen);
+    idbuf[idlen] = '\0';
+    *dp_id_out = (uint8_t)v;
+    return true;
+}
+
+/* GET /api/v1/devices/{id}/datapoints -- observed Tuya EF00 DPs for a
+ * device plus each one's DP->capability mapping (Task 6, 2026-09-27
+ * tuya-ef00-datapoints spec). tuya_dp_list() is RAM-only and boot-scoped
+ * (tuya_dp.h) -- a device with none observed yet returns "datapoints":[]
+ * (200), same "empty is not missing" convention devices_root() uses for an
+ * all-unbound device list, rather than 404. cap_id/scale are null when
+ * tuya_dp_map_get() reports no mapping for that dp_id. age_s uses the same
+ * esp_timer_get_time()/1e6 uptime clock devices_root() stamps its own
+ * "now" with -- tuya_dp_obs_t.updated_s is written from that same clock
+ * (tuya_dp.c). Called from devices_get_dispatch() below with idbuf already
+ * extracted; unauthenticated, like every other GET in this file
+ * (devices_get included). */
+static esp_err_t devices_datapoints_get(httpd_req_t *req, const char *idbuf)
+{
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+
+    tuya_dp_obs_t obs[TUYA_DP_MAX_PER_DEVICE];
+    int n = tuya_dp_list(&dev, obs, TUYA_DP_MAX_PER_DEVICE);
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "datapoints");
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "dp_id", obs[i].dp_id);
+        cJSON_AddNumberToObject(o, "type", obs[i].type);
+        cJSON_AddNumberToObject(o, "value", obs[i].value);
+        uint32_t age_s = now_s >= obs[i].updated_s ? now_s - obs[i].updated_s : 0;
+        cJSON_AddNumberToObject(o, "age_s", age_s);
+
+        uint8_t cap_id;
+        float scale;
+        if (tuya_dp_map_get(&dev, obs[i].dp_id, &cap_id, &scale)) {
+            cJSON_AddNumberToObject(o, "cap_id", cap_id);
+            cJSON_AddNumberToObject(o, "scale", scale);
+        } else {
+            cJSON_AddNullToObject(o, "cap_id");
+            cJSON_AddNullToObject(o, "scale");
+        }
+        cJSON_AddItemToArray(arr, o);
+    }
+    return send_json(req, root);
+}
+
+/* GET "/api/v1/devices/" + wildcard dispatcher -- currently the only
+ * GET-able suffix on this wildcard is ".../datapoints" (Task 6). Any
+ * other/no suffix is a 404 rather than falling through to devices_get()'s
+ * list: each GET sub-route earns its own explicit branch here, so a future
+ * GET sub-resource under this prefix doesn't silently collide with this
+ * one (or vice versa) -- same discipline devices_post_dispatch()'s and
+ * devices_delete_dispatch()'s own suffix checks already apply to their
+ * methods. "/api/v1/devices" (GET, exact, devices_get above) already owns
+ * the bare prefix -- this wildcard is a distinct URI template to
+ * ESP-IDF's matcher, same non-collision every other exact+wildcard pair in
+ * this file relies on. Unauthenticated: no GET in this file calls
+ * api_auth_ok (devices_get, node_ota_get). */
+static esp_err_t devices_get_dispatch(httpd_req_t *req)
+{
+    const char *tail = req->uri + strlen("/api/v1/devices/");
+    size_t taillen = strcspn(tail, "?");
+
+    static const char dp_suffix[] = "/datapoints";
+    size_t suflen = sizeof(dp_suffix) - 1;
+    if (taillen <= suflen || strncmp(tail + taillen - suflen, dp_suffix, suflen) != 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+        return ESP_OK;
+    }
+    size_t idlen = taillen - suflen;
+    char idbuf[40];
+    if (idlen == 0 || idlen >= sizeof(idbuf)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+    memcpy(idbuf, tail, idlen);
+    idbuf[idlen] = '\0';
+    return devices_datapoints_get(req, idbuf);
+}
+
+/* POST /api/v1/devices/{id}/datapoints/{dp_id} {"cap_id":N,"scale":F} --
+ * sets a DP->capability mapping (Task 6). cap_id is checked against
+ * capability_get() (400 if unknown) and scale must be a finite JSON number
+ * (400) BEFORE calling tuya_dp_map_set(): that function re-validates both
+ * itself and simply no-ops on rejection (tuya_dp.h) -- pre-validating here
+ * is what turns that silent no-op into an honest 400 instead of a 200 that
+ * lied. Every return path frees the parsed cJSON. Called from
+ * devices_post_dispatch() below with idbuf/dp_id already extracted by
+ * parse_device_dp_path(); auth already checked there. */
+static esp_err_t devices_dp_map_post(httpd_req_t *req, const char *idbuf, uint8_t dp_id)
+{
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+
+    char body[128];
+    if (req->content_len == 0 || req->content_len > sizeof(body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(body);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return ESP_OK;
+    }
+    const cJSON *cap_j = cJSON_GetObjectItem(json, "cap_id");
+    const cJSON *scale_j = cJSON_GetObjectItem(json, "scale");
+    if (!cap_j || !cJSON_IsNumber(cap_j) || cap_j->valuedouble < 0 || cap_j->valuedouble > 255) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad cap_id");
+        return ESP_OK;
+    }
+    if (!scale_j || !cJSON_IsNumber(scale_j) || !isfinite(scale_j->valuedouble)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad scale");
+        return ESP_OK;
+    }
+    uint8_t cap_id = (uint8_t)cap_j->valuedouble;
+    float scale = (float)scale_j->valuedouble;
+    cJSON_Delete(json);
+
+    if (!capability_get(cap_id)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown capability");
+        return ESP_OK;
+    }
+
+    if (!tuya_dp_map_set(&dev, dp_id, cap_id, scale)) {
+        /* cap_id and scale were already validated above (400), so the only
+         * way map_set fails here is a full mapping table (TUYA_MAP_MAX). Say
+         * so plainly; esp_http_server has no 4xx/507 for a capacity refusal,
+         * hence 500 with an accurate message rather than "server error". */
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "datapoint mapping table full");
+        return ESP_OK;
+    }
+    tuya_dp_map_save();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* DELETE /api/v1/devices/{id}/datapoints/{dp_id} -- clears a DP->capability
+ * mapping (Task 6). Idempotent: OK even if none was set
+ * (tuya_dp_map_clear()'s own contract), same "no-op is not an error" shape
+ * devices_wrapper_delete() above uses. Called from devices_delete_dispatch()
+ * below with idbuf/dp_id already extracted by parse_device_dp_path(); auth
+ * already checked there. */
+static esp_err_t devices_dp_map_delete(httpd_req_t *req, const char *idbuf, uint8_t dp_id)
+{
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+    tuya_dp_map_clear(&dev, dp_id);
+    tuya_dp_map_save();
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 /* POST /api/v1/devices/{id}/actions/{action} {"param":N} -- manual
  * invocation (M5b Task 11, design spec §7). Goes through actor_request()
  * and NOTHING else (actor.h: the ONE door onto an actuator) -- a manual
@@ -3859,7 +4079,11 @@ static esp_err_t devices_wrapper_delete(httpd_req_t *req, const char *idbuf)
  * route and a device id can never itself contain "/actions/". Also
  * dispatches POST .../wrapper (Task 3, per-device wrapper binding) to
  * devices_wrapper_post() above, tried before "/key" since "/wrapper" and
- * "/key" are likewise mutually exclusive suffix shapes. */
+ * "/key" are likewise mutually exclusive suffix shapes. Also dispatches
+ * POST .../datapoints/{dp_id} (Task 6, Tuya EF00 DP->capability mapping)
+ * to devices_dp_map_post() above, tried after "/wrapper" and before "/key"
+ * for the same reason -- "/datapoints/{dp_id}" cannot also end in
+ * "/wrapper" or "/key". */
 static esp_err_t devices_post_dispatch(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
@@ -3886,6 +4110,12 @@ static esp_err_t devices_post_dispatch(httpd_req_t *req)
         memcpy(idbuf, tail, idlen);
         idbuf[idlen] = '\0';
         return devices_wrapper_post(req, idbuf);
+    }
+
+    char dp_idbuf[40];
+    uint8_t dp_id;
+    if (parse_device_dp_path(tail, dp_idbuf, sizeof(dp_idbuf), &dp_id)) {
+        return devices_dp_map_post(req, dp_idbuf, dp_id);
     }
 
     static const char key_suffix[] = "/key";
@@ -3970,8 +4200,12 @@ static esp_err_t devices_post_dispatch(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* DELETE "/api/v1/devices/" + wildcard dispatcher -- currently the only
- * DELETE-able suffix on this wildcard is ".../wrapper" (unbind, Task 3).
+/* DELETE "/api/v1/devices/" + wildcard dispatcher -- DELETE-able suffixes
+ * on this wildcard are ".../wrapper" (unbind, Task 3) and
+ * ".../datapoints/{dp_id}" (clear a DP->capability mapping, Task 6, tried
+ * first since "/datapoints/" and "/wrapper" are mutually exclusive suffix
+ * shapes on this one wildcard, same ordering devices_post_dispatch() uses
+ * between its own action/wrapper/datapoints/key branches).
  * Registered as its own httpd_uri_t below (same "/api/v1/devices/" +
  * wildcard URI template as devices_post_dispatch()/devices_guards_put()
  * above, different HTTP method) since devices_post_dispatch() is
@@ -3988,6 +4222,12 @@ static esp_err_t devices_delete_dispatch(httpd_req_t *req)
 
     const char *tail = req->uri + strlen("/api/v1/devices/");
     size_t taillen = strcspn(tail, "?");
+
+    char dp_idbuf[40];
+    uint8_t dp_id;
+    if (parse_device_dp_path(tail, dp_idbuf, sizeof(dp_idbuf), &dp_id)) {
+        return devices_dp_map_delete(req, dp_idbuf, dp_id);
+    }
 
     static const char wrapper_suffix[] = "/wrapper";
     size_t suflen = sizeof(wrapper_suffix) - 1;
@@ -4622,6 +4862,17 @@ void api_v1_register(httpd_handle_t server)
      * pairs elsewhere in this function. */
     httpd_uri_t devices_del = { .uri = "/api/v1/devices/*", .method = HTTP_DELETE, .handler = devices_delete_dispatch };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &devices_del));
+
+    /* GET .../datapoints (Task 6, Tuya EF00 datapoints): a distinct HTTP
+     * method on the same "/api/v1/devices/" + wildcard URI template as
+     * devices_post/devices_guards/devices_del above, so it does not
+     * collide with any of them -- same per-(uri, method) non-collision
+     * rule. "/api/v1/devices" (GET, exact) above keeps owning the bare
+     * prefix (devices_get); devices_get_dispatch() 404s on any suffix
+     * other than "/datapoints" so it cannot shadow a future GET
+     * sub-resource under this prefix. */
+    httpd_uri_t devices_get_w = { .uri = "/api/v1/devices/*", .method = HTTP_GET, .handler = devices_get_dispatch };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &devices_get_w));
 
     /* Zigbee (Task 9, spec §8's Zigbee tab): network state + joined-device
      * list, permit-join, and per-device rename/remove. "/api/v1/zigbee"

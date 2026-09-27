@@ -21,6 +21,7 @@
 #include "data_core.h"
 #include "registry.h"
 #include "capability.h"
+#include "tuya_dp.h"
 #include "mibeacon.h"
 #include "app_config.h"
 #include "rules.h"
@@ -823,6 +824,7 @@ typedef struct {
         swarm_coord_status_t    status;
         swarm_command_ack_t     ack;
         bridge_submit_t         submit;
+        swarm_tuya_dp_t         tuya_dp;
     } u;
 } bridge_item_t;
 
@@ -1063,6 +1065,24 @@ static void bridge_task(void *arg)
                              ok ? "accepted" : "rejected");
                 }
                 if (ok) rules_notify_value_update();
+                break;
+            }
+            case SWARM_MSG_TUYA_DP: {
+                device_id_t id = { .kind = (device_kind_t)it.u.tuya_dp.dev.kind };
+                memcpy(id.addr, it.u.tuya_dp.dev.addr, SWARM_ADDR_LEN);
+                /* Discovery, not a registry write: record the raw DP
+                 * regardless of whether it's mapped yet, same as
+                 * zb_tuya_dp_observer() does for the local coordinator's
+                 * own devices -- not gated on data_core_find_index() the
+                 * way MEASUREMENT is above. */
+                tuya_dp_observe(&id, it.u.tuya_dp.dp_id, it.u.tuya_dp.dp_type, it.u.tuya_dp.value, now_s);
+                uint8_t cap; float scale;
+                if (tuya_dp_map_get(&id, it.u.tuya_dp.dp_id, &cap, &scale)) {
+                    bool ok = data_core_submit_cap_id(&id, cap, (float)it.u.tuya_dp.value * scale);
+                    ESP_LOGI(TAG, "bridge: tuya dp 0x%02x from " MACSTR " cap %u -> %s",
+                             it.u.tuya_dp.dp_id, MAC2STR(it.mac), cap, ok ? "accepted" : "rejected");
+                    if (ok) rules_notify_value_update();
+                }
                 break;
             }
             case SWARM_MSG_COORD_STATUS: {
@@ -1715,7 +1735,7 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
     }
     if (type == SWARM_MSG_DEVICE_ANNOUNCE || type == SWARM_MSG_DEVICE_GONE ||
         type == SWARM_MSG_MEASUREMENT || type == SWARM_MSG_COORD_STATUS ||
-        type == SWARM_MSG_COMMAND_ACK) {
+        type == SWARM_MSG_COMMAND_ACK || type == SWARM_MSG_TUYA_DP) {
         /* Bridge -> hub, unicast, encrypted (M7 Task 7) -- same pairing/
          * spoofing reasoning as READING/CHECKIN above: is_paired_node() is
          * the gate that keeps an unpaired device from injecting a fake
@@ -1742,6 +1762,7 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
         case SWARM_MSG_MEASUREMENT:     ok = swarm_decode_measurement(data, (size_t)len, &item.u.meas); break;
         case SWARM_MSG_COORD_STATUS:    ok = swarm_decode_coord_status(data, (size_t)len, &item.u.status); break;
         case SWARM_MSG_COMMAND_ACK:     ok = swarm_decode_command_ack(data, (size_t)len, &item.u.ack); break;
+        case SWARM_MSG_TUYA_DP:         ok = swarm_decode_tuya_dp(data, (size_t)len, &item.u.tuya_dp); break;
         default:                        ok = false; break;   /* unreachable: the outer if() already narrowed type */
         }
         if (!ok) return;
@@ -2970,6 +2991,9 @@ static void forward_task(void *arg)
         case SWARM_OUT_STATUS:
             n = swarm_encode_coord_status(&r.u.status, buf, sizeof buf);
             break;
+        case SWARM_OUT_TUYA_DP:
+            n = swarm_encode_tuya_dp(&r.u.tuya_dp, buf, sizeof buf);
+            break;
         default:
             ESP_LOGW(TAG, "forward: unknown out tag %u, dropped", r.tag);
             continue;
@@ -3111,6 +3135,23 @@ static void zb_observer(const zb_device_t *dev, bool gone)
     }
     if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
         ESP_LOGW(TAG, "forward queue full, dropping %s", gone ? "device-gone" : "device-announce");
+}
+
+/* zigbee.c's Tuya EF00 datapoint observer -- see
+ * zigbee_set_tuya_dp_observer()'s header comment for the calling contract
+ * (stack task, non-blocking queue send only, one call per datapoint in a
+ * decoded EF00 frame). Mirrors zb_observer() above for the exact
+ * union-member access and enqueue pattern. */
+static void zb_tuya_dp_observer(const uint8_t eui64[8], uint8_t dp_id, uint8_t dp_type, int32_t value)
+{
+    swarm_out_t o = { .tag = SWARM_OUT_TUYA_DP };
+    o.u.tuya_dp.dev.kind = DEV_KIND_ZIGBEE;
+    memcpy(o.u.tuya_dp.dev.addr, eui64, 8);
+    o.u.tuya_dp.dp_id = dp_id;
+    o.u.tuya_dp.dp_type = dp_type;
+    o.u.tuya_dp.value = value;
+    if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
+        ESP_LOGW(TAG, "forward queue full, dropping tuya datapoint");
 }
 
 /* Builds a COORD_STATUS from zigbee.c's current state and queues it. Called
@@ -4161,6 +4202,7 @@ esp_err_t swarm_start_node(void)
     if (radio_role_get() == RADIO_ROLE_ZIGBEE) {
         zigbee_set_device_observer(zb_observer);
         zigbee_set_status_observer(zb_status_observer);
+        zigbee_set_tuya_dp_observer(zb_tuya_dp_observer);
         if (xTaskCreate(zb_boot_replay_task, "swarm_zb_replay", 3072, NULL, 3, NULL) != pdPASS) {
             ESP_LOGE(TAG, "failed to create zigbee boot replay task; the hub will not learn "
                           "this bridge's already-known devices until they next announce");
