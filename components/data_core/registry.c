@@ -72,6 +72,72 @@ int registry_set_cap(registry_t *r, const device_id_t *id, uint8_t cap_id,
     return idx;
 }
 
+int registry_set_cap_ep(registry_t *r, const device_id_t *id, uint8_t cap_id,
+                        uint8_t endpoint, int16_t raw, uint32_t now_s)
+{
+    if (cap_id >= CAPABILITY_COUNT) return -1;
+    int idx = find_or_create(r, id, NULL);
+    if (idx < 0) return -1;
+    device_entry_t *d = &r->devices[idx];
+    d->last_seen_s = now_s;
+    d->snapshot_only = false;
+    uint8_t def = d->cap_endpoint[cap_id];
+    if (def == 0 || endpoint == def) {                 /* first write, or the default */
+        d->cap_endpoint[cap_id] = endpoint;
+        d->caps[cap_id].raw = raw;
+        d->caps[cap_id].updated_s = now_s;
+        d->caps[cap_id].valid = (raw != CAP_VALUE_NONE);
+        return idx;
+    }
+    if (endpoint < def) {                              /* a lower endpoint takes the default */
+        /* demote the current default value into the side list */
+        if (d->extra_ep_cap_count < REGISTRY_EXTRA_EP_CAPS) {
+            d->extra_ep_caps[d->extra_ep_cap_count].cap_id = cap_id;
+            d->extra_ep_caps[d->extra_ep_cap_count].endpoint = def;
+            d->extra_ep_caps[d->extra_ep_cap_count].slot = d->caps[cap_id];
+            d->extra_ep_cap_count++;
+        }
+        d->cap_endpoint[cap_id] = endpoint;
+        d->caps[cap_id].raw = raw;
+        d->caps[cap_id].updated_s = now_s;
+        d->caps[cap_id].valid = (raw != CAP_VALUE_NONE);
+        return idx;
+    }
+    /* endpoint > default: update or append a side-list instance */
+    for (uint8_t i = 0; i < d->extra_ep_cap_count; i++) {
+        if (d->extra_ep_caps[i].cap_id == cap_id && d->extra_ep_caps[i].endpoint == endpoint) {
+            d->extra_ep_caps[i].slot.raw = raw;
+            d->extra_ep_caps[i].slot.updated_s = now_s;
+            d->extra_ep_caps[i].slot.valid = (raw != CAP_VALUE_NONE);
+            return idx;
+        }
+    }
+    if (d->extra_ep_cap_count < REGISTRY_EXTRA_EP_CAPS) {
+        uint8_t k = d->extra_ep_cap_count++;
+        d->extra_ep_caps[k].cap_id = cap_id;
+        d->extra_ep_caps[k].endpoint = endpoint;
+        d->extra_ep_caps[k].slot.raw = raw;
+        d->extra_ep_caps[k].slot.updated_s = now_s;
+        d->extra_ep_caps[k].slot.valid = (raw != CAP_VALUE_NONE);
+    }
+    return idx;   /* full: drop silently (diagnostic budget, spec §2's REGISTRY_EXTRA_EP_CAPS) */
+}
+
+const cap_slot_t *registry_get_cap_ep(const registry_t *r, const device_id_t *id,
+                                      uint8_t cap_id, uint8_t endpoint)
+{
+    if (cap_id >= CAPABILITY_COUNT) return NULL;
+    int idx = registry_find(r, id);
+    if (idx < 0) return NULL;
+    const device_entry_t *d = &r->devices[idx];
+    if (endpoint == 0 || d->cap_endpoint[cap_id] == 0 || endpoint == d->cap_endpoint[cap_id])
+        return &d->caps[cap_id];
+    for (uint8_t i = 0; i < d->extra_ep_cap_count; i++)
+        if (d->extra_ep_caps[i].cap_id == cap_id && d->extra_ep_caps[i].endpoint == endpoint)
+            return &d->extra_ep_caps[i].slot;
+    return NULL;
+}
+
 static void set_attribution(device_entry_t *d, const uint8_t via_node[6], int8_t rssi, uint32_t now_s)
 {
     if (via_node) {

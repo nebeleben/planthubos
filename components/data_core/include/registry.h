@@ -16,6 +16,7 @@
  * storage_compat.h compatibility shims Tasks 2-4 introduced are deleted). */
 
 #define REGISTRY_MAX_DEVICES 16
+#define REGISTRY_EXTRA_EP_CAPS 4
 
 typedef struct { int16_t raw; uint32_t updated_s; bool valid; } cap_slot_t;
 
@@ -41,6 +42,12 @@ typedef struct {
     uint8_t  last_frame_cnt;
     uint32_t    last_seen_s;
     cap_slot_t  caps[CAPABILITY_COUNT];
+    /* Multi-endpoint (lazy side-list): cap_endpoint[c] is the DEFAULT (lowest)
+     * endpoint whose value lives in caps[c]; 0 == untracked/legacy. Additional
+     * (cap,endpoint) instances live in extra_ep_caps. */
+    uint8_t     cap_endpoint[CAPABILITY_COUNT];
+    struct { uint8_t cap_id; uint8_t endpoint; cap_slot_t slot; } extra_ep_caps[REGISTRY_EXTRA_EP_CAPS];
+    uint8_t     extra_ep_cap_count;
     /* attribution (M5b rules, carried over verbatim) */
     bool     via_node_valid;
     uint8_t  via_node[6];
@@ -78,6 +85,42 @@ int  registry_count(const registry_t *r);
  * device index on success. */
 int  registry_set_cap(registry_t *r, const device_id_t *id, uint8_t cap_id,
                       int16_t raw, uint32_t now_s);
+
+/* Multi-endpoint variant: writes the (cap_id, endpoint) pair explicitly,
+ * instead of always targeting the default/main slot the way
+ * registry_set_cap() does. registry_set_cap() is a thin wrapper over this
+ * that always passes the device's current default endpoint (or claims
+ * `endpoint` as the default on a device's first write for that cap_id), so
+ * every existing single-endpoint caller is unaffected.
+ *
+ * The FIRST endpoint ever seen for a (device, cap_id) becomes that cap's
+ * tracked default and lives in caps[cap_id] (see device_entry_t's
+ * cap_endpoint[] doc comment). A write at that same default endpoint keeps
+ * updating caps[cap_id]. A write at a DIFFERENT, higher endpoint lands in
+ * (or updates its existing row in) extra_ep_caps -- dropped silently once
+ * REGISTRY_EXTRA_EP_CAPS rows are already in use (a diagnostic-only budget:
+ * every value should still be requestable via zigbee re-poll on demand,
+ * per the design's endpoint-mapping-is-lossy note). A write at a LOWER
+ * endpoint than the current default promotes it: the new endpoint becomes
+ * the default (caps[cap_id]), and the previous default's value is demoted
+ * into extra_ep_caps -- interview order is lowest-endpoint-first, so this
+ * only matters for the rare device that reports its lowest endpoint late.
+ * Returns the device index (find-or-create semantics identical to
+ * registry_set_cap()), or -1 when cap_id is out of range or the table is
+ * full and the device is unknown. */
+int  registry_set_cap_ep(registry_t *r, const device_id_t *id, uint8_t cap_id,
+                         uint8_t endpoint, int16_t raw, uint32_t now_s);
+
+/* Reads the (cap_id, endpoint) slot registry_set_cap_ep() wrote. endpoint ==
+ * 0, or equal to the cap's tracked default endpoint, returns the main
+ * caps[cap_id] slot (so a caller that doesn't care about endpoints at all
+ * can keep passing 0). Any other endpoint is looked up in extra_ep_caps.
+ * Returns NULL when the device is unknown, cap_id is out of range, or the
+ * device never reported that specific endpoint for that cap. Read-only:
+ * unlike the two set_cap* entry points, never creates a device or mutates
+ * anything. */
+const cap_slot_t *registry_get_cap_ep(const registry_t *r, const device_id_t *id,
+                                      uint8_t cap_id, uint8_t endpoint);
 
 /* Finds id's registry slot, or claims a free one when id is unknown -- same
  * find-or-create primitive registry_set_cap()/registry_attribute() already
