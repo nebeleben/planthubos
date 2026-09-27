@@ -245,17 +245,34 @@ static bool capture_sink(void *ctx, uint8_t builtin, const char *msg)
  * for the diagnostic log line, and evaluate_real()/rules_test() below pass
  * the SAME ctx instance to both sink and action_sink on one psvm_run()
  * call. */
+/* endpoint (Task 10, trailing psvm_action_sink_t arg): the device-relative
+ * endpoint CALL_ACTION decoded off `@N`, or 0 ("unspecified -> lowest
+ * slot" -- both a bare action with no `@N`, and every action in a legacy
+ * v1 program).
+ *
+ * Whole-branch review, F1 fix: this 0 used to be substituted with a
+ * literal 1 here, which is wrong for a device whose lowest declared
+ * endpoint is NOT 1 (a single-gang Zigbee actuator declared at, say,
+ * endpoint 2 or 11 -- Tasks 7+, action_endpoints) -- actor_table.c's
+ * find_slot() matches (action_id, endpoint) strictly, so that literal 1
+ * was refused ACTOR_REFUSED_UNKNOWN. Passed through UNCHANGED instead:
+ * actor_request_ep() (actor.c's actor_request_decide(), which now calls
+ * actor_table_resolve_endpoint()) resolves 0 to dev_idx's actual lowest
+ * declared endpoint for action_id, mirroring the read path's own
+ * treatment of endpoint 0. For every device whose lowest endpoint IS 1
+ * (every pre-M8 single-endpoint device, and the dual valve's first gang)
+ * this resolves to the same 1 as before -- nothing changes for them. */
 static bool real_action_sink(void *ctx, uint8_t kind, const char *name,
-                             uint8_t action_id, uint16_t param)
+                             uint8_t action_id, uint16_t param, uint8_t endpoint)
 {
     const real_sink_ctx_t *c = ctx;
     int dev_idx = rules_resolve_action_dev(kind, name, action_id);
-    bool queued = actor_request(dev_idx, action_id, param, ACTOR_SRC_RULE,
-                                actor_now_s() + ACTOR_RULE_TTL_S);
+    bool queued = actor_request_ep(dev_idx, action_id, endpoint, param, ACTOR_SRC_RULE,
+                                   actor_now_s() + ACTOR_RULE_TTL_S);
     const action_t *a = action_get(action_id);
-    ESP_LOGI(TAG, "rule %u: %s(\"%s\").%s(%u) -> %s", (unsigned)c->rule_id,
+    ESP_LOGI(TAG, "rule %u: %s(\"%s\").%s(%u)@%u -> %s", (unsigned)c->rule_id,
              kind == 0 ? "plant" : "device", name, a ? a->name : "?",
-             (unsigned)param, queued ? "queued" : "refused (see alert)");
+             (unsigned)param, (unsigned)endpoint, queued ? "queued" : "refused (see alert)");
     return true;
 }
 
@@ -268,15 +285,24 @@ static bool real_action_sink(void *ctx, uint8_t kind, const char *name,
  * in true program order (whichever opcode -- CALL_BUILTIN or CALL_ACTION
  * -- psvm_run() reaches first appends first), not grouped by kind. */
 static bool capture_action_sink(void *ctx, uint8_t kind, const char *name,
-                                uint8_t action_id, uint16_t param)
+                                uint8_t action_id, uint16_t param, uint8_t endpoint)
 {
     capture_sink_ctx_t *c = ctx;
     if (c->acts && c->nacts && *c->nacts < c->cap) {
         rules_test_action_t *a = &c->acts[*c->nacts];
         const action_t *ad = action_get(action_id);
         a->builtin = 0xFF;   /* not a log/notify level -- msg is everything the /test API renders */
-        snprintf(a->msg, sizeof(a->msg), "%s(\"%s\").%s(%u)",
-                kind == 0 ? "plant" : "device", name, ad ? ad->name : "?", (unsigned)param);
+        /* endpoint 0 (no `@N`, or a legacy v1 program) renders exactly as
+         * before -- no "@0" ever appears, since 0 is "unspecified", not a
+         * real endpoint. */
+        if (endpoint) {
+            snprintf(a->msg, sizeof(a->msg), "%s(\"%s\").%s(%u)@%u",
+                    kind == 0 ? "plant" : "device", name, ad ? ad->name : "?",
+                    (unsigned)param, (unsigned)endpoint);
+        } else {
+            snprintf(a->msg, sizeof(a->msg), "%s(\"%s\").%s(%u)",
+                    kind == 0 ? "plant" : "device", name, ad ? ad->name : "?", (unsigned)param);
+        }
         (*c->nacts)++;
     }
     return true;

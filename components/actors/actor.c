@@ -113,16 +113,28 @@ uint32_t actor_queue_expired(const actor_queue_t *q)
  * --------------------------------------------------------------------- */
 
 actor_request_result_t actor_request_decide(actor_table_t *t, actor_queue_t *q,
-    int dev_idx, uint8_t action_id, uint16_t param, actor_source_t source,
+    int dev_idx, uint8_t action_id, uint8_t endpoint, uint16_t param, actor_source_t source,
     uint32_t deadline_s, uint32_t now_s, bool retried)
 {
     actor_request_result_t r;
     memset(&r, 0, sizeof(r));
 
+    /* F1 fix: resolve an endpoint of 0 ("unspecified") to the lowest
+     * declared endpoint for this (dev_idx, action_id), ONCE, here, before
+     * the guard even runs -- actor_table_resolve_endpoint()'s doc comment
+     * (actor_table.h). This matters beyond the guard itself: the resolved,
+     * concrete endpoint is what gets stamped onto `cmd` below and queued,
+     * so a dispatcher reading cmd->endpoint later (e.g. zb_cmd.c's
+     * dst_endpoint) never sees the endpoint-0 sentinel. actor_table_check()
+     * would resolve it again internally if asked to, but resolving here
+     * first means this call already sees the concrete value, same as
+     * every other caller of actor_table_check() with a real endpoint. */
+    endpoint = actor_table_resolve_endpoint(t, dev_idx, action_id, endpoint);
+
     /* The guards run BEFORE the retry bit is looked at, and the bit is not
      * consulted here at all: a retry is checked exactly like a first
      * attempt (see actor_request_retry()). */
-    r.verdict = actor_table_check(t, dev_idx, action_id, param, source, now_s);
+    r.verdict = actor_table_check(t, dev_idx, action_id, endpoint, param, source, now_s);
     if (r.verdict != ACTOR_OK) return r;
 
     actor_cmd_t cmd;
@@ -130,6 +142,7 @@ actor_request_result_t actor_request_decide(actor_table_t *t, actor_queue_t *q,
     cmd.action_id = action_id;
     cmd.source = (uint8_t)source;
     cmd.retried = retried ? 1u : 0u;
+    cmd.endpoint = endpoint;
     cmd.param = param;
     cmd.deadline_s = deadline_s;
 
@@ -160,8 +173,8 @@ actor_service_result_t actor_service_step(actor_table_t *t, actor_queue_t *q, ui
      * another command from another task may have consumed the rate cap,
      * or an operator may have set lockout -- so the enqueue-time OK is
      * not trusted to still hold. */
-    actor_verdict_t v = actor_table_check(t, r.cmd.dev_idx, r.cmd.action_id, r.cmd.param,
-                                           (actor_source_t)r.cmd.source, now_s);
+    actor_verdict_t v = actor_table_check(t, r.cmd.dev_idx, r.cmd.action_id, r.cmd.endpoint,
+                                           r.cmd.param, (actor_source_t)r.cmd.source, now_s);
     if (v != ACTOR_OK) {
         r.redecline = true;
         r.redecline_verdict = v;
@@ -171,7 +184,7 @@ actor_service_result_t actor_service_step(actor_table_t *t, actor_queue_t *q, ui
         return r; /* dispatched stays false: dropped, never sent */
     }
 
-    actor_table_record(t, r.cmd.dev_idx, r.cmd.action_id, now_s);
+    actor_table_record(t, r.cmd.dev_idx, r.cmd.action_id, r.cmd.endpoint, now_s);
     r.dispatched = true;
     return r;
 }
@@ -291,8 +304,14 @@ void actor_set_dispatch_hook(device_kind_t kind, actor_dispatch_fn_t fn)
 
 bool actor_declare(int dev_idx, uint8_t action_id, uint16_t param_max, uint8_t flags)
 {
+    return actor_declare_ep(dev_idx, action_id, 1, param_max, flags);
+}
+
+bool actor_declare_ep(int dev_idx, uint8_t action_id, uint8_t endpoint,
+                       uint16_t param_max, uint8_t flags)
+{
     actor_lock();
-    bool ok = actor_table_add(&s_table, dev_idx, action_id, param_max, flags);
+    bool ok = actor_table_add(&s_table, dev_idx, action_id, endpoint, param_max, flags);
     actor_unlock();
     return ok;
 }
@@ -300,8 +319,15 @@ bool actor_declare(int dev_idx, uint8_t action_id, uint16_t param_max, uint8_t f
 bool actor_configure_guards(int dev_idx, uint8_t action_id,
                              uint16_t cooldown_s, uint8_t max_per_hour)
 {
+    return actor_configure_guards_ep(dev_idx, action_id, 1, cooldown_s, max_per_hour);
+}
+
+bool actor_configure_guards_ep(int dev_idx, uint8_t action_id, uint8_t endpoint,
+                                uint16_t cooldown_s, uint8_t max_per_hour)
+{
     actor_lock();
-    bool ok = actor_table_set_guards(&s_table, dev_idx, action_id, cooldown_s, max_per_hour);
+    bool ok = actor_table_set_guards(&s_table, dev_idx, action_id, endpoint,
+                                      cooldown_s, max_per_hour);
     if (ok) s_guards_dirty = true;
     actor_unlock();
     return ok;
@@ -419,16 +445,28 @@ uint32_t actor_full_drops(void)
 
 bool actor_action_flags(int dev_idx, uint8_t action_id, uint8_t *flags_out)
 {
+    return actor_action_flags_ep(dev_idx, action_id, 1, flags_out);
+}
+
+bool actor_action_flags_ep(int dev_idx, uint8_t action_id, uint8_t endpoint,
+                            uint8_t *flags_out)
+{
     actor_lock();
-    bool ok = actor_table_action_flags(&s_table, dev_idx, action_id, flags_out);
+    bool ok = actor_table_action_flags(&s_table, dev_idx, action_id, endpoint, flags_out);
     actor_unlock();
     return ok;
 }
 
 bool actor_pair_state(int dev_idx, uint8_t action_id, actor_pair_state_t *out)
 {
+    return actor_pair_state_ep(dev_idx, action_id, 1, out);
+}
+
+bool actor_pair_state_ep(int dev_idx, uint8_t action_id, uint8_t endpoint,
+                          actor_pair_state_t *out)
+{
     actor_lock();
-    bool ok = actor_table_pair_state(&s_table, dev_idx, action_id, actor_now_s(), out);
+    bool ok = actor_table_pair_state(&s_table, dev_idx, action_id, endpoint, actor_now_s(), out);
     actor_unlock();
     return ok;
 }
@@ -441,14 +479,23 @@ bool actor_lockout(int dev_idx, bool *out)
     return ok;
 }
 
-static bool request_common(int dev_idx, uint8_t action_id, uint16_t param,
+uint8_t actor_resolve_endpoint(int dev_idx, uint8_t action_id, uint8_t endpoint)
+{
+    actor_lock();
+    uint8_t resolved = actor_table_resolve_endpoint(&s_table, dev_idx, action_id, endpoint);
+    actor_unlock();
+    return resolved;
+}
+
+static bool request_common(int dev_idx, uint8_t action_id, uint8_t endpoint, uint16_t param,
                             actor_source_t source, uint32_t deadline_s, bool retried)
 {
     uint32_t now_s = actor_now_s();
 
     actor_lock();
     actor_request_result_t r = actor_request_decide(&s_table, &s_queue, dev_idx, action_id,
-                                                      param, source, deadline_s, now_s, retried);
+                                                      endpoint, param, source, deadline_s,
+                                                      now_s, retried);
     actor_unlock();
 
     if (r.verdict != ACTOR_OK) {
@@ -489,7 +536,19 @@ static bool request_common(int dev_idx, uint8_t action_id, uint16_t param,
 bool actor_request(int dev_idx, uint8_t action_id, uint16_t param,
                     actor_source_t source, uint32_t deadline_s)
 {
-    return request_common(dev_idx, action_id, param, source, deadline_s, false);
+    /* F1 fix: 0, not 1 -- "unspecified", resolved by actor_request_decide()
+     * to dev_idx's lowest declared endpoint for action_id. Identical to the
+     * old literal 1 for every single-endpoint device and the dual valve's
+     * first gang (both cases still have lowest endpoint == 1); only a
+     * device whose lowest endpoint is something else now resolves correctly
+     * instead of being refused ACTOR_REFUSED_UNKNOWN. */
+    return request_common(dev_idx, action_id, 0, param, source, deadline_s, false);
+}
+
+bool actor_request_ep(int dev_idx, uint8_t action_id, uint8_t endpoint, uint16_t param,
+                       actor_source_t source, uint32_t deadline_s)
+{
+    return request_common(dev_idx, action_id, endpoint, param, source, deadline_s, false);
 }
 
 bool actor_request_retry(int dev_idx, uint8_t action_id, uint16_t param,
@@ -498,8 +557,11 @@ bool actor_request_retry(int dev_idx, uint8_t action_id, uint16_t param,
     /* Deliberately the same body as actor_request() with one argument
      * different -- the guards, the alerts and the queue are identical, so
      * this is one door with a flag, not a second door (see actor.h's top
-     * comment on why there is only ever one). */
-    return request_common(dev_idx, action_id, param, source, deadline_s, true);
+     * comment on why there is only ever one). Endpoint 1 here too: no
+     * caller of the retry door is endpoint-aware yet (M8 Task 5 leaves
+     * actor_request_retry() on its base form; a Task 8 caller that needs a
+     * retry on another endpoint is not yet a real case). */
+    return request_common(dev_idx, action_id, 1, param, source, deadline_s, true);
 }
 
 void actor_service(void)

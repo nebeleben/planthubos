@@ -117,11 +117,8 @@ int main(void) {
     assert(zb_interview_step(&iv, 1000 + ZB_IV_TIMEOUT_S) == ZB_IV_ACT_STORE);
     assert(iv.state == ZB_IV_FAILED);
 
-    /* --- fix round 2: two endpoints reporting the SAME cluster must not
-     * double up. The registry keeps one slot per (device, capability id)
-     * -- a second CAP_SWITCH_STATE entry for this EUI-64 is not just a
-     * wasted array slot, it is unrepresentable downstream and would have
-     * silently starved gang 2's actions of a slot gang 1 already took. --- */
+    /* --- multi-endpoint: On/Off on ep1 AND ep2 yields TWO switch.state
+     * instances tagged {1,2}, four actions tagged {1,1,2,2}. --- */
     zb_interview_begin(&iv, EUI, 0x1234, 500);
     zb_interview_step(&iv, 500);
     uint8_t eps2[2] = { 1, 2 };
@@ -129,15 +126,25 @@ int main(void) {
     zb_interview_step(&iv, 501);
     uint16_t gang1[1] = { 0x0006 };
     zb_interview_on_clusters(&iv, 1, gang1, 1);
+    /* same cap+endpoint again must STILL dedup (a duplicate simple-desc). */
+    zb_interview_on_clusters(&iv, 1, gang1, 1);
     zb_interview_step(&iv, 502);
     uint16_t gang2[1] = { 0x0006 };
     zb_interview_on_clusters(&iv, 2, gang2, 1);
-    zb_interview_step(&iv, 503);                    /* SEND_CONFIG_REPORT */
-    assert(zb_interview_step(&iv, 504) == ZB_IV_ACT_STORE);
-    assert(iv.dev.cap_count == 1);
-    assert(iv.dev.action_count == 2);
-    assert(iv.dev.actions[0] == ACT_SWITCH_ON);
-    assert(iv.dev.actions[1] == ACT_SWITCH_OFF);
+    zb_interview_step(&iv, 503);
+    while (zb_interview_step(&iv, 504) == ZB_IV_ACT_SEND_CONFIG_REPORT) {}
+    assert(iv.state == ZB_IV_DONE);
+    assert(iv.dev.cap_count == 2);
+    assert(iv.dev.caps[0] == CAP_SWITCH_STATE && iv.dev.cap_endpoints[0] == 1);
+    assert(iv.dev.caps[1] == CAP_SWITCH_STATE && iv.dev.cap_endpoints[1] == 2);
+    assert(iv.dev.action_count == 4);
+    assert(iv.dev.actions[0] == ACT_SWITCH_ON  && iv.dev.action_endpoints[0] == 1);
+    assert(iv.dev.actions[1] == ACT_SWITCH_OFF && iv.dev.action_endpoints[1] == 1);
+    assert(iv.dev.actions[2] == ACT_SWITCH_ON  && iv.dev.action_endpoints[2] == 2);
+    assert(iv.dev.actions[3] == ACT_SWITCH_OFF && iv.dev.action_endpoints[3] == 2);
+    assert(iv.dev.endpoint == 1);                 /* primary/default stays lowest */
+    assert(iv.report_count == 2);                 /* configure reporting on BOTH endpoints */
+    assert(iv.report_endpoints[0] == 1 && iv.report_endpoints[1] == 2);
 
     /* --- the dedup must not be over-broad: two endpoints reporting
      * DIFFERENT clusters keep both capabilities. --- */

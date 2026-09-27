@@ -44,8 +44,17 @@ function readConsts(view, bytes, offset, count) {
   return { consts, offset: o }
 }
 
-function readRefs(bytes, offset, count) {
+// Task 10: version-gated decode, mirroring psvm.c's psvm_validate()/
+// psvm_get_ref() exactly -- a v1 blob (fmt_ver 1, no endpoint byte at all)
+// has a 5-byte ref entry and endpoint always 0; v2 (PSVM_FMT_VER, the
+// codegen.js default from now on) has a 6th trailing endpoint byte. This
+// disassembler is a debug/test view over whatever PSBC the compiler just
+// produced (or a stored .psbc, either version), so it must decode both
+// exactly as the VM does -- a fixed 5-byte stride here would silently
+// misalign every ref/CALL_ACTION read once the compiler emits v2.
+function readRefs(bytes, offset, count, fmtVer) {
   const refs = []
+  const stride = fmtVer >= 2 ? 6 : 5
   let o = offset
   for (let i = 0; i < count; i++) {
     refs.push({
@@ -53,8 +62,9 @@ function readRefs(bytes, offset, count) {
       nameConstIdx: bytes[o + 1] | (bytes[o + 2] << 8),
       capability: bytes[o + 3],
       field: bytes[o + 4],
+      endpoint: fmtVer >= 2 ? bytes[o + 5] : 0,
     })
-    o += 5
+    o += stride
   }
   return { refs, offset: o }
 }
@@ -69,13 +79,18 @@ function fmtRef(r, consts) {
   const capName = CAPS_BY_ID[r.capability] ? CAPS_BY_ID[r.capability].name : `cap${r.capability}`
   const name = consts[r.nameConstIdx] ? consts[r.nameConstIdx].value : '?'
   const kindName = r.kind === 0 ? 'plant' : 'device'
-  return `${kindName} "${name}" ${capName}${r.field === 1 ? '.age' : ''}`
+  // endpoint 0 is "unspecified" (a bare ref, or every ref in a v1 blob),
+  // never a real endpoint -- rendered only when nonzero, same convention
+  // as rules_engine.c's capture_action_sink().
+  const epSuffix = r.endpoint ? `@${r.endpoint}` : ''
+  return `${kindName} "${name}" ${capName}${epSuffix}${r.field === 1 ? '.age' : ''}`
 }
 
 export function disassemble(bytecode) {
   const bytes = bytecode instanceof Uint8Array ? bytecode : new Uint8Array(bytecode)
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
 
+  const fmtVer = bytes[4]
   const constCount = view.getUint16(12, true)
   const refCount = view.getUint16(14, true)
   const codeLen = view.getUint16(16, true)
@@ -83,7 +98,7 @@ export function disassemble(bytecode) {
   let offset = HEADER_LEN
   const consts = readConsts(view, bytes, offset, constCount)
   offset = consts.offset
-  const refs = readRefs(bytes, offset, refCount)
+  const refs = readRefs(bytes, offset, refCount, fmtVer)
   offset = refs.offset
   const codeStart = offset
 
@@ -126,14 +141,18 @@ export function disassemble(bytecode) {
         break
       }
       case OPCODES.CALL_ACTION: {
+        // Task 10: v2 (fmtVer>=2) carries a trailing endpoint byte, widening
+        // this operand 5 -> 6, exactly like the ref-table stride above.
         const kind = bytes[codeStart + pc + 1]
         const nameConstIdx = view.getUint16(codeStart + pc + 2, true)
         const actionId = bytes[codeStart + pc + 4]
+        const endpoint = fmtVer >= 2 ? bytes[codeStart + pc + 5] : 0
         const kindName = kind === 0 ? 'plant' : 'device'
         const nm = consts.consts[nameConstIdx] ? consts.consts[nameConstIdx].value : '?'
         const actionName = ACTION_NAME_BY_ID[actionId] !== undefined ? ACTION_NAME_BY_ID[actionId] : `action${actionId}`
-        lines.push(`${addr}: CALL_ACTION ${kindName} "${nm}" ${actionName}`)
-        pc += 5
+        const epSuffix = endpoint ? `@${endpoint}` : ''
+        lines.push(`${addr}: CALL_ACTION ${kindName} "${nm}" ${actionName}${epSuffix}`)
+        pc += fmtVer >= 2 ? 6 : 5
         break
       }
       // ---- wrapper dialect (M3 spec section 3) ----

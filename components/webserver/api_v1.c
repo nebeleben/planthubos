@@ -3488,10 +3488,18 @@ static const char *verdict_reason_str(actor_verdict_t v)
  * unreachable here by construction: it refuses RULE only, never MANUAL
  * (actor_table.h's module contract), so a manual refusal can only ever be
  * UNKNOWN, BOUND, COOLDOWN or RATE. */
-static const char *manual_refusal_reason(int dev_idx, uint8_t action_id, uint16_t param)
+static const char *manual_refusal_reason(int dev_idx, uint8_t action_id, uint8_t endpoint, uint16_t param)
 {
+    /* Whole-branch review, F1 fix: devices_action_post() now passes an
+     * omitted endpoint through as 0 ("unspecified"), the same sentinel
+     * actor_request_ep() just resolved to dev_idx's lowest declared
+     * endpoint for action_id to decide the refusal this function is
+     * explaining. Resolve identically here, or actor_pair_state_ep() below
+     * looks up endpoint 0 -- a slot that (almost) never exists -- and
+     * misreports "unknown" for what was really cooldown/rate/bound. */
+    endpoint = actor_resolve_endpoint(dev_idx, action_id, endpoint);
     actor_pair_state_t ps;
-    if (dev_idx < 0 || !actor_pair_state(dev_idx, action_id, &ps)) return "unknown";
+    if (dev_idx < 0 || !actor_pair_state_ep(dev_idx, action_id, endpoint, &ps)) return "unknown";
     if (!action_param_ok(action_id, param) || param > ps.param_max) return "bound";
     return verdict_reason_str(ps.live_verdict); /* ok, cooldown or rate */
 }
@@ -3774,21 +3782,31 @@ static esp_err_t devices_dp_map_delete(httpd_req_t *req, const char *idbuf, uint
     return ESP_OK;
 }
 
-/* POST /api/v1/devices/{id}/actions/{action} {"param":N} -- manual
- * invocation (M5b Task 11, design spec §7). Goes through actor_request()
- * and NOTHING else (actor.h: the ONE door onto an actuator) -- a manual
- * press faces the identical guards a rule or a safety close does, and a
- * refusal already posts its own named alert there; this handler never
- * re-checks a guard itself. 202 Accepted on success (the command is
- * QUEUED, not necessarily dispatched yet -- the radio may still be busy
- * with a scheduled GATT read); 409 Conflict on refusal, naming the guard
- * (manual_refusal_reason(), above). `param` defaults to 0 when the body is
- * EMPTY or omits the field -- the correct value for a parameterless action;
- * a parameterised one that actually needs a positive duration is simply
- * refused as "bound" by actor_request(), not by this handler
- * second-guessing it. A body that is present but does NOT parse is a 400,
- * never that default (whole-branch review, finding 7). Auth checked by
- * devices_post_dispatch() before this is ever reached. */
+/* POST /api/v1/devices/{id}/actions/{action} {"param":N,"endpoint":N} --
+ * manual invocation (M5b Task 11, design spec §7). Goes through
+ * actor_request_ep() and NOTHING else (actor.h: the ONE door onto an
+ * actuator) -- a manual press faces the identical guards a rule or a
+ * safety close does, and a refusal already posts its own named alert
+ * there; this handler never re-checks a guard itself. 202 Accepted on
+ * success (the command is QUEUED, not necessarily dispatched yet -- the
+ * radio may still be busy with a scheduled GATT read); 409 Conflict on
+ * refusal, naming the guard (manual_refusal_reason(), above). `param`
+ * defaults to 0 when the body is EMPTY or omits the field -- the correct
+ * value for a parameterless action; a parameterised one that actually
+ * needs a positive duration is simply refused as "bound" by
+ * actor_request_ep(), not by this handler second-guessing it. A body that
+ * is present but does NOT parse is a 400, never that default (whole-branch
+ * review, finding 7). `endpoint` (M8 Task 9) defaults to 0 -- "unspecified"
+ * -- so an existing client that never sends the field resolves, inside
+ * actor_request_ep(), to the action's LOWEST declared endpoint (whole-
+ * branch review, F1 fix: actor_table_resolve_endpoint(), mirroring the read
+ * side's own treatment of endpoint 0), whatever that endpoint actually is --
+ * 1 for every pre-M8 single-endpoint device and for the dual valve's first
+ * gang, so neither changes behaviour, but also correctly a single-gang
+ * device declared at a non-1 endpoint, which a literal default of 1 used
+ * to refuse ACTOR_REFUSED_UNKNOWN. A multi-endpoint device's non-default
+ * gang is still reached only by naming its endpoint explicitly. Auth
+ * checked by devices_post_dispatch() before this is ever reached. */
 static esp_err_t devices_action_post(httpd_req_t *req, const char *idbuf, const char *action_name)
 {
     device_id_t dev;
@@ -3805,6 +3823,9 @@ static esp_err_t devices_action_post(httpd_req_t *req, const char *idbuf, const 
     }
 
     uint16_t param = 0;
+    uint8_t endpoint = 0;   /* unspecified -- actor_request_ep() resolves this to
+                             * the action's lowest declared endpoint, absent
+                             * any override (whole-branch review, F1 fix) */
     if (req->content_len > 0) {
         char body[64];
         if (req->content_len > sizeof(body) - 1) {
@@ -3842,13 +3863,25 @@ static esp_err_t devices_action_post(httpd_req_t *req, const char *idbuf, const 
             return ESP_OK;
         }
         if (param_j) param = (uint16_t)param_j->valuedouble;
+
+        /* M8 Task 9: optional endpoint override, same "present but bad is
+         * a 400, absent is the documented default" discipline `param`
+         * above already uses. */
+        const cJSON *endpoint_j = cJSON_GetObjectItem(json, "endpoint");
+        if (endpoint_j && (!cJSON_IsNumber(endpoint_j) || endpoint_j->valuedouble < 0 ||
+                           endpoint_j->valuedouble > 255)) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad endpoint");
+            return ESP_OK;
+        }
+        if (endpoint_j) endpoint = (uint8_t)endpoint_j->valuedouble;
         cJSON_Delete(json);
     }
 
-    bool queued = actor_request(dev_idx, a->id, param, ACTOR_SRC_MANUAL,
-                                 actor_now_s() + ACTOR_MANUAL_TTL_S);
+    bool queued = actor_request_ep(dev_idx, a->id, endpoint, param, ACTOR_SRC_MANUAL,
+                                    actor_now_s() + ACTOR_MANUAL_TTL_S);
     if (!queued) {
-        const char *why = manual_refusal_reason(dev_idx, a->id, param);
+        const char *why = manual_refusal_reason(dev_idx, a->id, endpoint, param);
         httpd_resp_set_status(req, "409 Conflict");
         httpd_resp_set_type(req, "application/json");
         char resp[64];
@@ -4308,17 +4341,21 @@ static cJSON *zb_device_json(const zb_device_t *d)
 }
 
 /* Renders one bridge-announced end device (swarm_device_announce_t,
- * swarm_frame.h) the same shape zb_device_json() above renders a locally-
- * joined one -- same id (via device_id_format(), reused directly: a
- * DEV_KIND_ZIGBEE id over the 8-byte eui64 is identical whether the device
- * joined the hub's own coordinator or a bridge node's), same caps/actions
- * name lookup. Differs only in what a bridge node's COORD_STATUS/ANNOUNCE
- * frames don't carry: short_addr (null -- the bridge never forwards it)
- * and clusters (always empty -- the auto-map's per-cluster bookkeeping,
- * zb_device_json()'s "clusters" comment above, lives on the bridge node,
- * not in what it announces upstream). name is copied through name_len
- * rather than trusted to be NUL-terminated within its fixed-size array --
- * see swarm_device_announce_t's own field comment. */
+ * swarm_frame.h) close to the shape zb_device_json() above renders a
+ * locally-joined one -- same id (via device_id_format(), reused directly:
+ * a DEV_KIND_ZIGBEE id over the 8-byte eui64 is identical whether the
+ * device joined the hub's own coordinator or a bridge node's), same
+ * caps/actions name lookup. Differs in what a bridge node's COORD_STATUS/
+ * ANNOUNCE frames don't carry: short_addr (null -- the bridge never
+ * forwards it) and clusters (always empty -- the auto-map's per-cluster
+ * bookkeeping, zb_device_json()'s "clusters" comment above, lives on the
+ * bridge node, not in what it announces upstream); and in caps/actions
+ * themselves (M8 Task 9): each entry is an object carrying its own
+ * "endpoint" (v5's swarm_device_announce_t has no device-wide scalar left
+ * to report, see this function's body), not the bare name string
+ * zb_device_json() puts in its own caps/actions arrays. name is copied
+ * through name_len rather than trusted to be NUL-terminated within its
+ * fixed-size array -- see swarm_device_announce_t's own field comment. */
 static cJSON *announce_device_json(const swarm_device_announce_t *a)
 {
     device_id_t id;
@@ -4337,18 +4374,30 @@ static cJSON *announce_device_json(const swarm_device_announce_t *a)
     cJSON_AddStringToObject(o, "name", namebuf);
     cJSON_AddBoolToObject(o, "interviewed", a->interviewed != 0);
     cJSON_AddNullToObject(o, "short_addr");
-    cJSON_AddNumberToObject(o, "endpoint", a->endpoint);
 
+    /* M8 Task 9: v5's swarm_device_announce_t dropped the single scalar
+     * `endpoint` in favour of a per-cap/per-action endpoint (Task 3) --
+     * there is no device-wide scalar left to report at top level, so each
+     * cap/action entry below carries its own "endpoint" field instead,
+     * the same field name devices_json.c's device_json() (Task 9's other
+     * caller) puts on every cap/action object. A single-endpoint device
+     * simply has every entry read endpoint 1. */
     cJSON *caps = cJSON_AddArrayToObject(o, "caps");
     for (uint8_t i = 0; i < a->cap_count; i++) {
         const capability_t *cap = capability_get(a->cap_ids[i]);
-        cJSON_AddItemToArray(caps, cJSON_CreateString(cap ? cap->name : "?"));
+        cJSON *co = cJSON_CreateObject();
+        cJSON_AddStringToObject(co, "name", cap ? cap->name : "?");
+        cJSON_AddNumberToObject(co, "endpoint", a->cap_endpoints[i]);
+        cJSON_AddItemToArray(caps, co);
     }
 
     cJSON *actions = cJSON_AddArrayToObject(o, "actions");
     for (uint8_t i = 0; i < a->action_count; i++) {
         const action_t *act = action_get(a->action_ids[i]);
-        cJSON_AddItemToArray(actions, cJSON_CreateString(act ? act->name : "?"));
+        cJSON *ao = cJSON_CreateObject();
+        cJSON_AddStringToObject(ao, "name", act ? act->name : "?");
+        cJSON_AddNumberToObject(ao, "endpoint", a->action_endpoints[i]);
+        cJSON_AddItemToArray(actions, ao);
     }
 
     cJSON_AddArrayToObject(o, "clusters");

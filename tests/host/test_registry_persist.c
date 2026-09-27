@@ -125,6 +125,81 @@ static void test_buffer_too_small(void) {
     assert(registry_persist_serialize(NULL, 7, tiny, sizeof tiny) == 0);
 }
 
+/* --- FMT 2: extra-endpoint side-list round-trips through serialize/deserialize --- */
+static void test_extra_ep_round_trip(void) {
+    registry_t r; registry_init(&r);
+    device_id_t z = mkid(2, 0x40);
+    assert(registry_set_cap_ep(&r, &z, CAP_SWITCH_STATE, 1, 7, 100) >= 0);
+    assert(registry_set_cap_ep(&r, &z, CAP_SWITCH_STATE, 2, 9, 101) >= 0);
+
+    uint8_t buf[REGISTRY_PERSIST_MAX_BYTES];
+    size_t n = registry_persist_serialize(&r, 555, buf, sizeof buf);
+    assert(n > 0 && n <= sizeof buf);
+
+    registry_t out; uint32_t epoch = 0;
+    assert(registry_persist_deserialize(buf, n, &out, &epoch));
+
+    const device_entry_t *d = find(&out, 2, 0x40);
+    assert(d != NULL);
+    assert(d->cap_endpoint[CAP_SWITCH_STATE] == 1);
+    assert(d->caps[CAP_SWITCH_STATE].valid && d->caps[CAP_SWITCH_STATE].raw == 7);
+    const cap_slot_t *ep2 = registry_get_cap_ep(&out, &z, CAP_SWITCH_STATE, 2);
+    assert(ep2 && ep2->valid && ep2->raw == 9);
+}
+
+/* CRC-16/CCITT-FALSE, copied inline from registry_persist.c so this fixture
+ * doesn't need a symbol the module doesn't export. */
+static uint16_t fixture_crc16(uint16_t crc, const uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        crc ^= (uint16_t)((uint16_t)p[i] << 8);
+        for (int b = 0; b < 8; b++)
+            crc = (uint16_t)((crc & 0x8000u) ? ((uint16_t)(crc << 1) ^ 0x1021u)
+                                             : (uint16_t)(crc << 1));
+    }
+    return crc;
+}
+
+/* A hand-assembled FMT-1 image (old layout: 3-byte cap rows, no per-cap
+ * endpoint byte, no extra-ep section) must still load -- an old snapshot on
+ * disk from before this task must not be rejected, just treated as having
+ * no endpoint info. */
+static void test_fmt1_backward_compat(void) {
+    uint8_t buf[64];
+    memset(buf, 0, sizeof buf);
+    size_t off = REGISTRY_PERSIST_HEADER_LEN;
+    buf[off++] = 1;                       /* kind */
+    memset(&buf[off], 0, 8); buf[off] = 0x50; off += 8;   /* addr, addr[0]=0x50 */
+    buf[off++] = 0;                       /* via_valid */
+    off += 6;                             /* via[6] left zero */
+    buf[off++] = (uint8_t)(-60);          /* best_rssi */
+    buf[off++] = 1;                       /* cap_count */
+    buf[off++] = CAP_SWITCH_STATE;        /* cap_id */
+    buf[off++] = 3; buf[off++] = 0;       /* raw = 3, little-endian */
+
+    buf[0] = 1;                           /* fmt = FMT 1 (old format) */
+    uint32_t epoch = 42;
+    buf[3] = (uint8_t)(epoch & 0xFF);
+    buf[4] = (uint8_t)((epoch >> 8) & 0xFF);
+    buf[5] = (uint8_t)((epoch >> 16) & 0xFF);
+    buf[6] = (uint8_t)((epoch >> 24) & 0xFF);
+    buf[7] = 1;                           /* device count */
+
+    uint16_t crc = fixture_crc16(0xFFFFu, &buf[0], 1);
+    crc = fixture_crc16(crc, &buf[3], off - 3);
+    buf[1] = (uint8_t)(crc & 0xFF);
+    buf[2] = (uint8_t)(crc >> 8);
+
+    registry_t out; uint32_t epoch_out = 0;
+    assert(registry_persist_deserialize(buf, off, &out, &epoch_out));
+    assert(epoch_out == 42);
+    const device_entry_t *d = find(&out, 1, 0x50);
+    assert(d != NULL);
+    assert(d->caps[CAP_SWITCH_STATE].valid && d->caps[CAP_SWITCH_STATE].raw == 3);
+    /* old snapshot carries no endpoint info -- untracked, not multi-endpoint */
+    assert(d->extra_ep_cap_count == 0);
+    assert(d->cap_endpoint[CAP_SWITCH_STATE] == 0);
+}
+
 int main(void) {
     test_round_trip();
     test_empty();
@@ -132,6 +207,8 @@ int main(void) {
     test_version_rejected();
     test_truncation_rejected();
     test_buffer_too_small();
+    test_extra_ep_round_trip();
+    test_fmt1_backward_compat();
     printf("test_registry_persist: OK\n");
     return 0;
 }

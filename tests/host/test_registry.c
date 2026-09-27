@@ -212,6 +212,26 @@ int main(void)
     assert(capability_encode(CAP_SWITCH_STATE, 2.0f) == 2);
     assert(capability_encode(CAP_SWITCH_STATE, -1.0f) == -1);
 
+    /* --- multi-endpoint: default (lowest) endpoint owns caps[]; a second
+     * endpoint's same cap id lands in the side list. --- */
+    {
+        registry_t rr; registry_init(&rr);
+        device_id_t z = { .kind = 2 }; z.addr[0] = 0xAA;
+        assert(registry_set_cap_ep(&rr, &z, CAP_SWITCH_STATE, 1, 1, 100) >= 0);
+        assert(registry_set_cap_ep(&rr, &z, CAP_SWITCH_STATE, 2, 0, 101) >= 0);
+        const cap_slot_t *s1 = registry_get_cap_ep(&rr, &z, CAP_SWITCH_STATE, 1);
+        const cap_slot_t *s2 = registry_get_cap_ep(&rr, &z, CAP_SWITCH_STATE, 2);
+        assert(s1 && s1->valid && s1->raw == 1);
+        assert(s2 && s2->valid && s2->raw == 0);
+        /* a bare read via registry_set_cap()/caps[] still reads the default (ep1) */
+        int idx = registry_find(&rr, &z);
+        assert(rr.devices[idx].caps[CAP_SWITCH_STATE].raw == 1);
+        /* a lower endpoint arriving later demotes the old default into the side list */
+        assert(registry_set_cap_ep(&rr, &z, CAP_SWITCH_STATE, 1, 1, 102) >= 0); /* still ep1 default */
+        const cap_slot_t *unknown = registry_get_cap_ep(&rr, &z, CAP_SWITCH_STATE, 9);
+        assert(unknown == NULL);   /* endpoint the device never reported */
+    }
+
     printf("test_registry: OK\n");
     return 0;
 }

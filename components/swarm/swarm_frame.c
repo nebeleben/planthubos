@@ -233,12 +233,12 @@ size_t swarm_encode_device_announce(const swarm_device_announce_t *in, uint8_t *
     wr_t w = { out, cap, 0, out != NULL };
     whdr(&w, SWARM_MSG_DEVICE_ANNOUNCE);
     waddr(&w, &in->dev);
-    w8(&w, in->endpoint); w8(&w, in->interviewed);
+    w8(&w, in->interviewed);
     w8(&w, in->name_len); wbytes(&w, in->name, in->name_len);
     w8(&w, in->cap_count);
-    for (uint8_t i = 0; i < in->cap_count; i++) { w8(&w, in->cap_ids[i]); w16(&w, in->cap_clusters[i]); }
+    for (uint8_t i = 0; i < in->cap_count; i++) { w8(&w, in->cap_ids[i]); w16(&w, in->cap_clusters[i]); w8(&w, in->cap_endpoints[i]); }
     w8(&w, in->action_count);
-    for (uint8_t i = 0; i < in->action_count; i++) w8(&w, in->action_ids[i]);
+    for (uint8_t i = 0; i < in->action_count; i++) { w8(&w, in->action_ids[i]); w8(&w, in->action_endpoints[i]); }
     return wfinish(&w);
 }
 
@@ -247,16 +247,16 @@ bool swarm_decode_device_announce(const uint8_t *buf, size_t len, swarm_device_a
     rd_t r; if (!out || !rbegin(&r, buf, len, SWARM_MSG_DEVICE_ANNOUNCE)) return false;
     memset(out, 0, sizeof(*out));
     raddr(&r, &out->dev);
-    out->endpoint = r8(&r); out->interviewed = r8(&r);
+    out->interviewed = r8(&r);
     out->name_len = r8(&r);
     if (out->name_len > SWARM_DEV_NAME_MAX) return false;
     rbytes(&r, out->name, out->name_len);
     out->cap_count = r8(&r);
     if (out->cap_count > SWARM_DEV_MAX_CAPS) return false;
-    for (uint8_t i = 0; i < out->cap_count; i++) { out->cap_ids[i] = r8(&r); out->cap_clusters[i] = r16(&r); }
+    for (uint8_t i = 0; i < out->cap_count; i++) { out->cap_ids[i] = r8(&r); out->cap_clusters[i] = r16(&r); out->cap_endpoints[i] = r8(&r); }
     out->action_count = r8(&r);
     if (out->action_count > SWARM_DEV_MAX_ACTIONS) return false;
-    for (uint8_t i = 0; i < out->action_count; i++) out->action_ids[i] = r8(&r);
+    for (uint8_t i = 0; i < out->action_count; i++) { out->action_ids[i] = r8(&r); out->action_endpoints[i] = r8(&r); }
     return rend(&r);
 }
 
@@ -284,6 +284,7 @@ size_t swarm_encode_measurement(const swarm_measurement_t *in, uint8_t *out, siz
     whdr(&w, SWARM_MSG_MEASUREMENT);
     waddr(&w, &in->dev);
     w8(&w, in->cap_id);
+    w8(&w, in->endpoint);
     uint32_t vbits; memcpy(&vbits, &in->value, sizeof(vbits));
     w32(&w, vbits);
     w32(&w, in->age_s);
@@ -296,6 +297,7 @@ bool swarm_decode_measurement(const uint8_t *buf, size_t len, swarm_measurement_
     memset(out, 0, sizeof(*out));
     raddr(&r, &out->dev);
     out->cap_id = r8(&r);
+    out->endpoint = r8(&r);
     uint32_t vbits = r32(&r);
     memcpy(&out->value, &vbits, sizeof(out->value));
     out->age_s = r32(&r);
@@ -352,6 +354,7 @@ size_t swarm_encode_command(const swarm_command_t *in, uint8_t *out, size_t cap)
     w16(&w, in->seq); w16(&w, in->ttl_s); w8(&w, in->op);
     waddr(&w, &in->dev);
     w16(&w, in->arg);
+    w8(&w, in->endpoint);
     w8(&w, in->name_len); wbytes(&w, in->name, in->name_len);
     return wfinish(&w);
 }
@@ -363,6 +366,7 @@ bool swarm_decode_command(const uint8_t *buf, size_t len, swarm_command_t *out)
     out->seq = r16(&r); out->ttl_s = r16(&r); out->op = r8(&r);
     raddr(&r, &out->dev);
     out->arg = r16(&r);
+    out->endpoint = r8(&r);
     out->name_len = r8(&r);
     if (out->name_len > SWARM_DEV_NAME_MAX) return false;
     rbytes(&r, out->name, out->name_len);

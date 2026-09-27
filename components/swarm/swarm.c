@@ -792,6 +792,13 @@ typedef struct {
     uint8_t          op;             /* SWARM_CMD_* */
     swarm_dev_addr_t dev;
     uint16_t         arg;
+    uint8_t          endpoint;       /* M8 Task 8: ACTUATE's target endpoint
+                                       * (actor_cmd_t.endpoint, off the actor
+                                       * queue) -- travels through
+                                       * bridge_cmd_submit()/bridge_cmd_t and
+                                       * onto swarm_command_t.endpoint on the
+                                       * wire. Every other op has no endpoint
+                                       * of its own; those callers set 1. */
     char             name[SWARM_DEV_NAME_MAX];
     uint8_t          name_len;
     uint32_t         ttl_s;
@@ -870,6 +877,7 @@ static void request_resync(const uint8_t mac[6])
     item.type = BRIDGE_ITEM_SUBMIT;
     item.u.submit.op = SWARM_CMD_RESYNC;
     item.u.submit.ttl_s = 30;
+    item.u.submit.endpoint = 1;   /* M8 Task 8: RESYNC has no endpoint of its own */
     item.u.submit.actor_dev_idx = -1;
     if (!s_bridge_queue || xQueueSend(s_bridge_queue, &item, 0) != pdTRUE) {
         ESP_LOGW(TAG, "RESYNC -> " MACSTR ": no bridge task/queue full, dropping", MAC2STR(mac));
@@ -985,9 +993,10 @@ static void bridge_task(void *arg)
                  * takes no parameter -- same as zigbee.c's own actor_declare()
                  * call site (zb_register_restored_devices()). */
                 for (uint8_t i = 0; i < it.u.ann.action_count; i++) {
-                    if (!actor_declare(idx, it.u.ann.action_ids[i], 0, 0)) {
-                        ESP_LOGW(TAG, "device %d: could not declare action %u from " MACSTR "'s announce",
-                                 idx, (unsigned)it.u.ann.action_ids[i], MAC2STR(it.mac));
+                    if (!actor_declare_ep(idx, it.u.ann.action_ids[i], it.u.ann.action_endpoints[i], 0, 0)) {
+                        ESP_LOGW(TAG, "device %d: could not declare action %u@ep%u from " MACSTR "'s announce",
+                                 idx, (unsigned)it.u.ann.action_ids[i], (unsigned)it.u.ann.action_endpoints[i],
+                                 MAC2STR(it.mac));
                     }
                 }
                 /* An announce carries the device's FULL current action set,
@@ -1059,10 +1068,11 @@ static void bridge_task(void *arg)
                     ESP_LOGI(TAG, "bridge: event from " MACSTR " cap %u code %d -> %s",
                              MAC2STR(it.mac), it.u.meas.cap_id, (int)it.u.meas.value, ok ? "queued" : "dropped");
                 } else {
-                    ok = data_core_submit_cap_id_aged(&id, it.u.meas.cap_id, it.u.meas.value, age_for_data_core);
-                    ESP_LOGI(TAG, "bridge: measurement from " MACSTR " cap %u value %.3f age %us -> %s",
-                             MAC2STR(it.mac), it.u.meas.cap_id, (double)it.u.meas.value, (unsigned)age_for_data_core,
-                             ok ? "accepted" : "rejected");
+                    ok = data_core_submit_cap_id_ep(&id, it.u.meas.cap_id, it.u.meas.endpoint, it.u.meas.value,
+                                                     age_for_data_core);
+                    ESP_LOGI(TAG, "bridge: measurement from " MACSTR " cap %u ep %u value %.3f age %us -> %s",
+                             MAC2STR(it.mac), it.u.meas.cap_id, (unsigned)it.u.meas.endpoint,
+                             (double)it.u.meas.value, (unsigned)age_for_data_core, ok ? "accepted" : "rejected");
                 }
                 if (ok) rules_notify_value_update();
                 break;
@@ -1153,9 +1163,10 @@ static void bridge_task(void *arg)
                 if (it.u.submit.want_result && !bridge_table_node(&s_bridges, it.mac, false)) {
                     res = ESP_ERR_NOT_FOUND;
                 } else if (bridge_cmd_submit(&s_router, it.mac, it.u.submit.op, &it.u.submit.dev,
-                                              it.u.submit.arg, it.u.submit.name, it.u.submit.name_len,
-                                              it.u.submit.ttl_s, now_s, it.u.submit.actor_dev_idx,
-                                              it.u.submit.actor_action, it.u.submit.actor_param)) {
+                                              it.u.submit.arg, it.u.submit.endpoint, it.u.submit.name,
+                                              it.u.submit.name_len, it.u.submit.ttl_s, now_s,
+                                              it.u.submit.actor_dev_idx, it.u.submit.actor_action,
+                                              it.u.submit.actor_param)) {
                     res = ESP_OK;
                 } else {
                     res = ESP_ERR_INVALID_STATE;   /* one already in flight for this node */
@@ -1231,7 +1242,8 @@ static void bridge_task(void *arg)
              * above and this use, so it is still valid here. */
             if (flush_cmd) {
                 swarm_command_t cmd = { .seq = flush_cmd->seq, .op = flush_cmd->op, .dev = flush_cmd->dev,
-                                         .arg = flush_cmd->arg, .name_len = flush_cmd->name_len };
+                                         .arg = flush_cmd->arg, .endpoint = flush_cmd->endpoint,
+                                         .name_len = flush_cmd->name_len };
                 memcpy(cmd.name, flush_cmd->name, flush_cmd->name_len);
                 cmd.ttl_s = (uint16_t)(flush_cmd->deadline_s > now_s ? (flush_cmd->deadline_s - now_s) : 1);
                 uint8_t buf[64];
@@ -1325,7 +1337,7 @@ static void bridge_task(void *arg)
         const bridge_cmd_t *c;
         while ((c = bridge_cmd_next_send(&s_router, now_s)) != NULL) {
             swarm_command_t cmd = { .seq = c->seq, .op = c->op, .dev = c->dev, .arg = c->arg,
-                                     .name_len = c->name_len };
+                                     .endpoint = c->endpoint, .name_len = c->name_len };
             memcpy(cmd.name, c->name, c->name_len);
             /* c->deadline_s was fixed at submit time (now + the caller's
              * ttl_s); re-derive the REMAINING seconds for the wire so a
@@ -1434,6 +1446,7 @@ static esp_err_t submit_and_wait(const uint8_t mac[6], uint8_t op, const swarm_d
         item.u.submit.name_len = n;
     }
     item.u.submit.ttl_s = BRIDGE_API_TTL_S;
+    item.u.submit.endpoint = 1;   /* M8 Task 8: no actor behind this call, no endpoint of its own */
     item.u.submit.actor_dev_idx = -1;
     item.u.submit.want_result = true;
 
@@ -1889,6 +1902,7 @@ static void swarm_zb_dispatch(const actor_cmd_t *cmd)
     it.u.submit.op = SWARM_CMD_ACTUATE;
     it.u.submit.dev = dev;
     it.u.submit.arg = (uint16_t)((uint16_t)cmd->action_id | ((uint16_t)cmd->param << 8));
+    it.u.submit.endpoint = cmd->endpoint;
     it.u.submit.ttl_s = deadline_to_ttl(cmd->deadline_s);
     it.u.submit.actor_dev_idx = cmd->dev_idx;
     it.u.submit.actor_action = cmd->action_id;
@@ -2772,16 +2786,30 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
         if (!data_core_get_device(dev_id, &d)) return;
         /* One MEASUREMENT per valid capability whose value changed since we
          * last forwarded it: data_core posts one event per submit, so send
-         * the freshest slot only -- the one with the newest timestamp. */
-        int best = -1;
+         * the freshest slot only -- the one with the newest timestamp.
+         * Task 6: a multi-endpoint device's OTHER (cap,endpoint) instances
+         * live in extra_ep_caps (Task 4), not in caps[] at all -- scanning
+         * only the CAPABILITY_COUNT loop below would silently starve every
+         * non-default endpoint's readings of forwarding. Both loops track
+         * the same "freshest wins" candidate together. */
+        int best = -1; uint8_t best_ep = 0; uint32_t best_ts = 0; int16_t best_raw = 0; uint8_t best_cap = 0;
         for (int c = 0; c < CAPABILITY_COUNT; c++)
-            if (d.caps[c].valid && (best < 0 || d.caps[c].updated_s >= d.caps[best].updated_s)) best = c;
+            if (d.caps[c].valid && (best < 0 || d.caps[c].updated_s >= best_ts)) {
+                best = c; best_ts = d.caps[c].updated_s; best_ep = d.cap_endpoint[c] ? d.cap_endpoint[c] : 1;
+                best_cap = (uint8_t)c; best_raw = d.caps[c].raw;
+            }
+        for (uint8_t i = 0; i < d.extra_ep_cap_count; i++)
+            if (d.extra_ep_caps[i].slot.valid && (best < 0 || d.extra_ep_caps[i].slot.updated_s >= best_ts)) {
+                best = 1; best_ts = d.extra_ep_caps[i].slot.updated_s; best_ep = d.extra_ep_caps[i].endpoint;
+                best_cap = d.extra_ep_caps[i].cap_id; best_raw = d.extra_ep_caps[i].slot.raw;
+            }
         if (best < 0) return;
         swarm_out_t o = { .tag = SWARM_OUT_MEASUREMENT };
         o.u.meas.dev.kind = DEV_KIND_ZIGBEE;
         memcpy(o.u.meas.dev.addr, dev_id->addr, SWARM_ADDR_LEN);
-        o.u.meas.cap_id = (uint8_t)best;
-        o.u.meas.value = capability_decode((uint8_t)best, d.caps[best].raw);
+        o.u.meas.cap_id = best_cap;
+        o.u.meas.endpoint = best_ep;
+        o.u.meas.value = capability_decode(best_cap, best_raw);
         o.u.meas.age_s = 0;
         if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
             ESP_LOGW(TAG, "forward queue full, dropping measurement");
@@ -3121,7 +3149,6 @@ static void zb_observer(const zb_device_t *dev, bool gone)
         swarm_device_announce_t *a = &o.u.ann;
         a->dev.kind = DEV_KIND_ZIGBEE;
         memcpy(a->dev.addr, dev->eui64, 8);
-        a->endpoint = dev->endpoint;
         a->interviewed = dev->interviewed;
         a->name_len = (uint8_t)strnlen(dev->name, SWARM_DEV_NAME_MAX);
         memcpy(a->name, dev->name, a->name_len);
@@ -3129,9 +3156,18 @@ static void zb_observer(const zb_device_t *dev, bool gone)
         for (uint8_t i = 0; i < a->cap_count; i++) {
             a->cap_ids[i] = dev->caps[i];
             a->cap_clusters[i] = dev->cap_clusters[i];
+            /* Task 6: per-cap endpoint, straight from the interview/backfill
+             * result (zb_store.h, Task 1) -- each cap instance carries the
+             * endpoint it actually lives on, instead of the removed
+             * device-wide `endpoint` v4 had. */
+            a->cap_endpoints[i] = dev->cap_endpoints[i];
         }
         a->action_count = dev->action_count > SWARM_DEV_MAX_ACTIONS ? SWARM_DEV_MAX_ACTIONS : dev->action_count;
-        for (uint8_t i = 0; i < a->action_count; i++) a->action_ids[i] = dev->actions[i];
+        for (uint8_t i = 0; i < a->action_count; i++) {
+            a->action_ids[i] = dev->actions[i];
+            /* Task 6: per-action endpoint, same source (dev->action_endpoints[i]). */
+            a->action_endpoints[i] = dev->action_endpoints[i];
+        }
     }
     if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
         ESP_LOGW(TAG, "forward queue full, dropping %s", gone ? "device-gone" : "device-announce");
@@ -3477,8 +3513,9 @@ static void command_task(void *arg)
             s_actuate_pending = (typeof(s_actuate_pending)){ .dev_idx = idx, .seq = c.seq, .active = true,
                                                               .deadline_us = esp_timer_get_time() + 10 * 1000000LL };
             taskEXIT_CRITICAL(&s_actuate_mux);
-            bool queued_ok = actor_request(idx, (uint8_t)(c.arg & 0xff), (uint16_t)(c.arg >> 8),
-                                            ACTOR_SRC_REMOTE, actor_now_s() + c.ttl_s);
+            bool queued_ok = actor_request_ep(idx, (uint8_t)(c.arg & 0xff), c.endpoint,
+                                              (uint16_t)(c.arg >> 8), ACTOR_SRC_REMOTE,
+                                              actor_now_s() + c.ttl_s);
             if (!queued_ok) {
                 taskENTER_CRITICAL(&s_actuate_mux);
                 s_actuate_pending.active = false;
@@ -4203,7 +4240,14 @@ esp_err_t swarm_start_node(void)
         zigbee_set_device_observer(zb_observer);
         zigbee_set_status_observer(zb_status_observer);
         zigbee_set_tuya_dp_observer(zb_tuya_dp_observer);
-        if (xTaskCreate(zb_boot_replay_task, "swarm_zb_replay", 3072, NULL, 3, NULL) != pdPASS) {
+        /* 4096, up from 3072 (multi-endpoint fix): replay_announces() puts a
+         * zb_device_t[ZB_STORE_MAX_DEVICES] on the stack, and the per-endpoint
+         * arrays (cap_endpoints[6]/action_endpoints[8]) plus the 4->6 / 2->8
+         * cap/action bumps grew that array by ~416 B (to ~1.47 KB). At 3072
+         * the boot replay overflowed (Stack protection fault in swarm_zb_replay
+         * -> reboot loop). command_task, the other replay_announces() caller,
+         * was already at 4096 (its I5 fix); this matches it. */
+        if (xTaskCreate(zb_boot_replay_task, "swarm_zb_replay", 4096, NULL, 3, NULL) != pdPASS) {
             ESP_LOGE(TAG, "failed to create zigbee boot replay task; the hub will not learn "
                           "this bridge's already-known devices until they next announce");
         }

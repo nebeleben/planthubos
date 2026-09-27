@@ -319,10 +319,12 @@ void zb_cmd_local_dispatch(const actor_cmd_t *cmd)
     const uint8_t *eui64 = key + 1;
 
     /* Requirement 2: a device absent from the store, or with no usable
-     * short_addr, cannot be commanded. */
+     * short_addr, cannot be commanded. M8 Task 8: the endpoint out-param is
+     * no longer wanted here -- cmd->endpoint (actor_cmd_t, always set by
+     * actor_request()/actor_request_ep()'s request_common(), never a
+     * "no value" sentinel) is now this dispatch's dst_endpoint, below. */
     uint16_t short_addr;
-    uint8_t  endpoint;
-    if (!zigbee_store_lookup(eui64, &short_addr, &endpoint)) {
+    if (!zigbee_store_lookup(eui64, &short_addr, NULL)) {
         zb_cmd_report(cmd->dev_idx, cmd->action_id, cmd->param, false,
                       "device not present in the Zigbee store", 0xff);
         return;
@@ -382,7 +384,7 @@ void zb_cmd_local_dispatch(const actor_cmd_t *cmd)
     esp_zb_zcl_on_off_cmd_t req = {
         .zcl_basic_cmd = {
             .dst_addr_u.addr_short = short_addr,
-            .dst_endpoint = endpoint,
+            .dst_endpoint = cmd->endpoint,
             .src_endpoint = zigbee_coordinator_endpoint(),
         },
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,

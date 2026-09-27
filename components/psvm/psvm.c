@@ -109,7 +109,7 @@ static void const_entry(const psvm_prog_t *p, uint16_t idx, uint8_t *tag_out,
  * or in psvm_run() itself actually gates opcode interpretation by dialect,
  * so checking unconditionally costs nothing and closes the loophole
  * regardless of how it might be reached. */
-static psvm_err_t validate_emit_caps(const uint8_t *code, uint16_t code_len, uint8_t caps_max) {
+static psvm_err_t validate_emit_caps(const uint8_t *code, uint16_t code_len, uint8_t caps_max, uint8_t fmt) {
     uint16_t pc = 0;
     while (pc < code_len) {
         uint8_t op = code[pc];
@@ -122,8 +122,11 @@ static psvm_err_t validate_emit_caps(const uint8_t *code, uint16_t code_len, uin
             width = 5; break;
         case 0x50: case 0x51:
             width = 2; break;
-        case 0x52:   /* CALL_ACTION u8 kind, u16 name_const, u8 action_id (M5b Task 10) */
-            width = 5; break;
+        case 0x52:   /* CALL_ACTION u8 kind, u16 name_const, u8 action_id[, u8 endpoint]
+                      * (M5b Task 10). v2 (fmt>=2) appends a trailing endpoint
+                      * byte, widening this to 6; a v1 blob (fmt==1) has no
+                      * endpoint operand at all and stays 5. */
+            width = (fmt >= 2) ? 6 : 5; break;
         case 0x69:
             if ((size_t)pc + 2 > code_len) return PSVM_OK;   /* truncated -- psvm_run() catches it */
             if (code[pc + 1] > caps_max) return PSVM_ERR_REF;
@@ -146,7 +149,14 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
                          uint8_t caps_max, uint32_t builtins_impl, psvm_prog_t *out) {
     if (len < PSVM_HEADER_LEN) return PSVM_ERR_TRUNCATED;
     if (memcmp(blob, "PSBC", 4) != 0) return PSVM_ERR_HEADER;
-    if (blob[4] != PSVM_FMT_VER || blob[5] != dialect) return PSVM_ERR_HEADER;
+    /* Task 10 version-gated decode: the hub has no compiler, so it cannot
+     * recompile an old .psbc from its .psrc on load (migration decision,
+     * task brief) -- a legacy v1 blob (5-byte ref entry, 5-byte
+     * CALL_ACTION, endpoint always 0) must keep validating forever
+     * alongside the current v2 (PSVM_FMT_VER) that the browser now emits.
+     * Any other header byte is still rejected outright. */
+    uint8_t fmt = blob[4];
+    if ((fmt != 1 && fmt != PSVM_FMT_VER) || blob[5] != dialect) return PSVM_ERR_HEADER;
     uint16_t flags = rd_u16(blob + 6);
     if (flags & ~(uint16_t)(PSVM_FLAG_CONNECT_PLAN | PSVM_FLAG_ACTION_TABLE)) return PSVM_ERR_HEADER;
     /* A rules program has no radio: letting dialect=1 declare a GATT connect
@@ -173,10 +183,13 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
     psvm_err_t e = validate_consts(blob, len, &offset, const_count);
     if (e != PSVM_OK) return e;
 
+    /* Task 10: v2 (fmt>=2) widens each ref entry by a trailing endpoint
+     * byte (5 -> 6); v1 has none, and every v1 ref is endpoint 0. */
+    size_t ref_stride = (fmt >= 2) ? 6u : 5u;
     size_t refs_off = offset;
-    if (refs_off + (size_t)ref_count * 5u > len) return PSVM_ERR_TRUNCATED;
+    if (refs_off + (size_t)ref_count * ref_stride > len) return PSVM_ERR_TRUNCATED;
     for (uint16_t i = 0; i < ref_count; i++) {
-        const uint8_t *r = blob + refs_off + (size_t)i * 5u;
+        const uint8_t *r = blob + refs_off + (size_t)i * ref_stride;
         uint8_t kind = r[0];
         uint16_t name_const = rd_u16(r + 1);
         uint8_t capability = r[3];
@@ -186,13 +199,26 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
         if (const_tag_at(blob, consts_off, name_const) != 1) return PSVM_ERR_REF;
         if (capability > caps_max) return PSVM_ERR_REF;
         if (field > 1) return PSVM_ERR_REF;
+        /* Task 10 validator split (brief step 8): psvm.c has no device
+         * metadata at all, so this is exactly the FORMAT/RANGE check
+         * (0 = unspecified, 1..240 = a real device-relative endpoint,
+         * matching registry_get_cap_ep()/actor_request_ep()'s own bound)
+         * and nothing device-specific. Whether a NAMED device actually
+         * exposes endpoint N is validated once, at author time, in the
+         * browser (Task 9's endpoint-carrying /api/v1/devices) -- never
+         * here. A rule that survives compile-time authoring but later
+         * outlives/outgrows the device it named (endpoint removed, device
+         * swapped) is not a validate()-time failure either way: it is a
+         * clean runtime refusal, a not-ready ref for a condition or
+         * ACTOR_REFUSED_UNKNOWN for an action, never a crash. */
+        if (fmt >= 2 && r[5] > 240) return PSVM_ERR_REF;
     }
-    offset = refs_off + (size_t)ref_count * 5u;
+    offset = refs_off + (size_t)ref_count * ref_stride;
 
     size_t code_off = offset;
     if (code_off + (size_t)code_len > len) return PSVM_ERR_TRUNCATED;
 
-    psvm_err_t emit_err = validate_emit_caps(blob + code_off, code_len, caps_max);
+    psvm_err_t emit_err = validate_emit_caps(blob + code_off, code_len, caps_max, fmt);
     if (emit_err != PSVM_OK) return emit_err;
 
     /* M5a connect plan (PSVM_FLAG_CONNECT_PLAN): a trailing section right
@@ -400,6 +426,7 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
     if (out) {
         out->blob = blob;
         out->len = len;
+        out->fmt_ver = fmt;
         out->const_count = const_count;
         out->ref_count = ref_count;
         out->code_len = code_len;
@@ -416,13 +443,15 @@ psvm_err_t psvm_validate(const uint8_t *blob, size_t len, uint8_t dialect,
 }
 
 psvm_ref_t psvm_get_ref(const psvm_prog_t *p, uint16_t idx) {
-    psvm_ref_t r = {0, 0, 0, 0};
+    psvm_ref_t r = {0, 0, 0, 0, 0};
     if (!p || idx >= p->ref_count) return r;
-    const uint8_t *o = p->refs + (size_t)idx * 5u;
+    size_t stride = (p->fmt_ver >= 2) ? 6u : 5u;
+    const uint8_t *o = p->refs + (size_t)idx * stride;
     r.kind = o[0];
     r.name_const = rd_u16(o + 1);
     r.capability = o[3];
     r.field = o[4];
+    r.endpoint = (p->fmt_ver >= 2) ? o[5] : 0;
     return r;
 }
 
@@ -645,7 +674,7 @@ psvm_result_t psvm_run(const psvm_prog_t *p, const psvm_ref_val_t *resolved,
             pc = (uint16_t)(pc + 2);
             break;
         }
-        case 0x52: { /* CALL_ACTION u8 kind, u16 name_const, u8 action_id
+        case 0x52: { /* CALL_ACTION u8 kind, u16 name_const, u8 action_id[, u8 endpoint]
                       * (M5b Task 10, rules dialect only). Pops the
                       * parameter as a float; negative, NaN or anything
                       * above 65535 is PSVM_ERR_TYPE rather than being
@@ -656,11 +685,17 @@ psvm_result_t psvm_run(const psvm_prog_t *p, const psvm_ref_val_t *resolved,
                       * already-bounded literal here). A NULL action_sink
                       * is PSVM_ERR_REF, the same shape an unready ref uses:
                       * a dry-run caller with no real sink wired must fail
-                      * cleanly, not crash. */
-            if ((size_t)pc + 5 > p->code_len) { res.err = PSVM_ERR_BADOP; goto done; }
+                      * cleanly, not crash. Width and endpoint are
+                      * version-gated exactly like the ref table: v2
+                      * (fmt_ver>=2) carries a trailing endpoint byte
+                      * (0 = unspecified -> lowest); v1 has none and
+                      * always decodes endpoint 0. */
+            uint16_t w = (p->fmt_ver >= 2) ? 6 : 5;
+            if ((size_t)pc + w > p->code_len) { res.err = PSVM_ERR_BADOP; goto done; }
             uint8_t kind = p->code[pc + 1];
             uint16_t name_const = rd_u16(p->code + pc + 2);
             uint8_t action_id = p->code[pc + 4];
+            uint8_t endpoint = (p->fmt_ver >= 2) ? p->code[pc + 5] : 0;
             if (sp < 1) { res.err = PSVM_ERR_STACK; goto done; }
             value_t v = stack[--sp];
             if (v.tag != V_NUM) { res.err = PSVM_ERR_TYPE; goto done; }
@@ -675,10 +710,10 @@ psvm_result_t psvm_run(const psvm_prog_t *p, const psvm_ref_val_t *resolved,
             memcpy(namebuf, nstr, nlen);
             namebuf[nlen] = '\0';
             if (!action_sink) { res.err = PSVM_ERR_REF; goto done; }
-            if (!action_sink(action_sink_ctx, kind, namebuf, action_id, param)) {
+            if (!action_sink(action_sink_ctx, kind, namebuf, action_id, param, endpoint)) {
                 res.err = PSVM_ERR_TYPE; goto done;
             }
-            pc = (uint16_t)(pc + 5);
+            pc = (uint16_t)(pc + w);
             break;
         }
         case 0x00: { /* HALT_BOOL */

@@ -5,9 +5,16 @@
 #include "action.h"
 
 /* --- minimal PSBC builder: header + consts + refs + code --- */
+/* Task 10: the header now stamps the CURRENT format version (PSVM_FMT_VER,
+ * 2) by default, matching what codegen.js emits from now on -- exactly the
+ * same "existing helper follows the real compiler" convention this file
+ * already used for fmt_ver==1. emit_header_d/emit_header stay the shared
+ * builder for every OTHER test in this file (ref-table and non-ref-table
+ * alike); v1-specific coverage builds its header by hand instead (see
+ * test_v1_legacy_blob_accepted() below). */
 static size_t emit_header_d(uint8_t *b, uint8_t dialect, uint32_t builtins, uint16_t nconst,
                             uint16_t nref, uint16_t codelen) {
-    memcpy(b, "PSBC", 4); b[4] = 1; b[5] = dialect; b[6] = b[7] = 0;
+    memcpy(b, "PSBC", 4); b[4] = PSVM_FMT_VER; b[5] = dialect; b[6] = b[7] = 0;
     memcpy(b + 8, &builtins, 4);
     memcpy(b + 12, &nconst, 2); memcpy(b + 14, &nref, 2); memcpy(b + 16, &codelen, 2);
     return 18;
@@ -20,8 +27,23 @@ static size_t emit_f32(uint8_t *b, size_t o, float v) { b[o] = 0; memcpy(b+o+1, 
 static size_t emit_str(uint8_t *b, size_t o, const char *s) {
     uint16_t l = (uint16_t)strlen(s); b[o] = 1; memcpy(b+o+1, &l, 2); memcpy(b+o+3, s, l); return o+3+l;
 }
+/* v2 (6-byte) ref entry, endpoint always 0 (unspecified -> lowest) --
+ * every existing ref-table test in this file uses this and now pairs with
+ * the v2 header emit_header_d/emit_header write above. */
 static size_t emit_ref(uint8_t *b, size_t o, uint8_t kind, uint16_t name_const,
                        uint8_t cap, uint8_t field) {
+    b[o]=kind; memcpy(b+o+1,&name_const,2); b[o+3]=cap; b[o+4]=field; b[o+5]=0; return o+6;
+}
+/* v2 ref entry with an explicit endpoint (Task 10 brief, Step 4). */
+static size_t emit_ref_ep(uint8_t *b, size_t o, uint8_t kind, uint16_t name_const,
+                          uint8_t cap, uint8_t field, uint8_t ep) {
+    b[o]=kind; memcpy(b+o+1,&name_const,2); b[o+3]=cap; b[o+4]=field; b[o+5]=ep; return o+6;
+}
+/* v1 (5-byte, legacy) ref entry -- no endpoint byte at all. Only for the
+ * hand-built v1 acceptance test (test_v1_legacy_blob_accepted() below);
+ * every other ref-table test in this file is v2 via emit_ref() above. */
+static size_t emit_ref_v1(uint8_t *b, size_t o, uint8_t kind, uint16_t name_const,
+                          uint8_t cap, uint8_t field) {
     b[o]=kind; memcpy(b+o+1,&name_const,2); b[o+3]=cap; b[o+4]=field; return o+5;
 }
 static size_t emit_push_const(uint8_t *b, size_t o, uint16_t idx) {
@@ -1024,31 +1046,37 @@ typedef struct {
     char     name[40];
     uint8_t  action_id;
     uint16_t param;
+    uint8_t  endpoint;
     int      calls;
 } action_cap_t;
 
 static bool action_capture(void *ctx, uint8_t kind, const char *name,
-                           uint8_t action_id, uint16_t param) {
+                           uint8_t action_id, uint16_t param, uint8_t endpoint) {
     action_cap_t *c = ctx;
     c->kind = kind;
     snprintf(c->name, sizeof c->name, "%s", name);
     c->action_id = action_id;
     c->param = param;
+    c->endpoint = endpoint;
     c->calls++;
     return true;
 }
 
 /* Rules-dialect blob: cond is trivially true (0.0 == 0.0), then code pushes
- * `param` and calls CALL_ACTION kind, name_const=1 ("Ficus"), action_id.
- * Const pool: [0] 0.0 (cond), [1] "Ficus" (action target name), [2] param. */
-static size_t build_call_action(uint8_t *b, uint8_t kind, uint8_t action_id, float param) {
+ * `param` and calls CALL_ACTION kind, name_const=1 ("Ficus"), action_id,
+ * endpoint. Const pool: [0] 0.0 (cond), [1] "Ficus" (action target name),
+ * [2] param. `endpoint` is the v2 CALL_ACTION operand (0 = unspecified ->
+ * lowest, exactly like a ref-table entry's own endpoint byte) -- every
+ * existing caller below passes 0, unchanged from pre-Task-10 behaviour;
+ * test_call_action_endpoint() (new) passes a real one. */
+static size_t build_call_action(uint8_t *b, uint8_t kind, uint8_t action_id, float param, uint8_t endpoint) {
     uint8_t code[] = {
         0x01, 0,0,              /* PUSH_CONST 0 (0.0) */
         0x01, 0,0,              /* PUSH_CONST 0 (0.0) */
         0x24,                   /* EQ -> true */
         0x00,                   /* HALT_BOOL */
         0x01, 2,0,              /* PUSH_CONST 2 (param) */
-        0x52, kind, 1,0, action_id, /* CALL_ACTION kind, name_const=1, action_id */
+        0x52, kind, 1,0, action_id, endpoint, /* CALL_ACTION kind, name_const=1, action_id, endpoint */
         0xFF,
     };
     size_t o = emit_header(b, 0, 3, 0, sizeof code);
@@ -1063,10 +1091,10 @@ static size_t build_call_action(uint8_t *b, uint8_t kind, uint8_t action_id, flo
  * brief, Step 1). */
 static void test_call_action_sink(void) {
     uint8_t blob[64]; psvm_prog_t p;
-    size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, 8.0f);
+    size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, 8.0f, 0);
     assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
 
-    action_cap_t cap = {0, {0}, 0, 0, 0};
+    action_cap_t cap = {0, {0}, 0, 0, 0, 0};
     psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, action_capture, &cap, true);
     assert(r.err == PSVM_OK && r.cond);
     assert(cap.calls == 1);
@@ -1074,6 +1102,24 @@ static void test_call_action_sink(void) {
     assert(strcmp(cap.name, "Ficus") == 0);
     assert(cap.action_id == ACT_IRRIGATION_OPEN);
     assert(cap.param == 8);
+    assert(cap.endpoint == 0);
+}
+
+/* Task 10 brief, Step 4 case (b): a v2 CALL_ACTION operand with a real
+ * endpoint (2) reaches the sink unchanged -- the same blob shape as
+ * test_call_action_sink() above, just with endpoint=2 instead of the
+ * "unspecified" 0. */
+static void test_call_action_endpoint(void) {
+    uint8_t blob[64]; psvm_prog_t p;
+    size_t n = build_call_action(blob, 1, ACT_SWITCH_ON, 0.0f, 2);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
+
+    action_cap_t cap = {0, {0}, 0, 0, 0, 0};
+    psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, action_capture, &cap, true);
+    assert(r.err == PSVM_OK && r.cond);
+    assert(cap.calls == 1);
+    assert(cap.action_id == ACT_SWITCH_ON);
+    assert(cap.endpoint == 2);
 }
 
 /* A run with a NULL action sink fails cleanly (PSVM_ERR_REF, the same
@@ -1082,7 +1128,7 @@ static void test_call_action_sink(void) {
  * (Task 10 brief, Step 1/3). */
 static void test_call_action_null_sink(void) {
     uint8_t blob[64]; psvm_prog_t p;
-    size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, 8.0f);
+    size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, 8.0f, 0);
     assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
 
     psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, NULL, NULL, true);
@@ -1100,24 +1146,127 @@ static void test_call_action_param_out_of_range_rejected(void) {
     psvm_prog_t p;
     uint8_t blob[64];
 
-    cap = (action_cap_t){0, {0}, 0, 0, 0};
-    { size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, -1.0f);
+    cap = (action_cap_t){0, {0}, 0, 0, 0, 0};
+    { size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, -1.0f, 0);
       assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
       psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, action_capture, &cap, true);
       assert(r.err == PSVM_ERR_TYPE && cap.calls == 0); }
 
-    cap = (action_cap_t){0, {0}, 0, 0, 0};
-    { size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, 70000.0f);
+    cap = (action_cap_t){0, {0}, 0, 0, 0, 0};
+    { size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, 70000.0f, 0);
       assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
       psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, action_capture, &cap, true);
       assert(r.err == PSVM_ERR_TYPE && cap.calls == 0); }
 
-    cap = (action_cap_t){0, {0}, 0, 0, 0};
+    cap = (action_cap_t){0, {0}, 0, 0, 0, 0};
     { float nanval; { uint32_t bits = 0x7FC00000u; memcpy(&nanval, &bits, 4); }
-      size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, nanval);
+      size_t n = build_call_action(blob, 0, ACT_IRRIGATION_OPEN, nanval, 0);
       assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
       psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, action_capture, &cap, true);
       assert(r.err == PSVM_ERR_TYPE && cap.calls == 0); }
+}
+
+/* Task 10 brief, Step 4 case (a): a v2 ref entry carrying a real endpoint
+ * (2) validates and psvm_get_ref() reports it back unchanged. Program body
+ * is irrelevant here (a bare HALT_BOOL) -- this is purely a ref-table
+ * decode check, not a resolution/run check. */
+static size_t build_ref_endpoint(uint8_t *b, uint8_t endpoint) {
+    uint8_t code[] = { 0x02, 0,0, 0x00, 0xFF }; /* LOAD_REF 0; HALT_BOOL; HALT */
+    size_t o = emit_header(b, 0, 1, 1, sizeof code);
+    o = emit_str(b, o, "d"); /* const 0: ref name_const, must be tag 1 (string) */
+    o = emit_ref_ep(b, o, 1 /* device */, 0, 2, 0, endpoint);
+    memcpy(b + o, code, sizeof code);
+    return o + sizeof code;
+}
+
+static void test_ref_endpoint_v2(void) {
+    uint8_t blob[64]; psvm_prog_t p;
+    size_t n = build_ref_endpoint(blob, 2);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
+    assert(p.fmt_ver == PSVM_FMT_VER);
+
+    psvm_ref_t r = psvm_get_ref(&p, 0);
+    assert(r.kind == 1);
+    assert(r.capability == 2);
+    assert(r.endpoint == 2);
+}
+
+/* An endpoint above 240 (psvm.h/registry_get_cap_ep()'s own device-relative
+ * bound) is PSVM_ERR_REF at validate time -- the format/range half of the
+ * validator split (brief step 8; psvm.c has no device metadata to check
+ * anything more specific than the range). */
+static void test_ref_endpoint_out_of_range_rejected(void) {
+    uint8_t blob[64]; psvm_prog_t p;
+    size_t n = build_ref_endpoint(blob, 241);
+    assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_ERR_REF);
+}
+
+/* Task 10 brief, Step 4 case (c) / migration decision: a hand-built v1
+ * blob (b[4]=1, 5-byte ref entry, 5-byte CALL_ACTION -- no endpoint byte
+ * anywhere) still validates under the CURRENT validator and decodes every
+ * endpoint as 0. This is the "recompile is impossible, the hub has no
+ * compiler" case from the task brief's migration section: an old
+ * single-endpoint .psbc must keep validating and running forever,
+ * unmodified. */
+static void test_v1_legacy_blob_accepted(void) {
+    uint8_t blob[64]; psvm_prog_t p;
+    /* LOAD_REF 0; PUSH_CONST 1 (1.0); EQ; HALT_BOOL; HALT */
+    uint8_t code[] = { 0x02, 0,0, 0x01, 1,0, 0x24, 0x00, 0xFF };
+    size_t o = emit_header(blob, 0, 2, 1, sizeof code);
+    blob[4] = 1; /* v1 header -- overrides emit_header's v2 default */
+    o = emit_str(blob, o, "d"); /* const 0: ref name_const, must be tag 1 (string) */
+    o = emit_f32(blob, o, 1.0f); /* const 1: comparison value */
+    o = emit_ref_v1(blob, o, 1 /* device */, 0, 2, 0); /* 5-byte v1 ref entry */
+    memcpy(blob + o, code, sizeof code);
+    size_t n = o + sizeof code;
+
+    assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
+    assert(p.fmt_ver == 1);
+
+    psvm_ref_t r = psvm_get_ref(&p, 0);
+    assert(r.kind == 1);
+    assert(r.capability == 2);
+    assert(r.endpoint == 0);
+
+    /* Not just format-level acceptance: the v1 blob still RUNS correctly
+     * too (5-byte ref decode feeds the resolved value through unchanged). */
+    psvm_ref_val_t vals[1] = {{ .value = 1.0f, .age_s = 0, .ready = true }};
+    psvm_result_t res = psvm_run(&p, vals, NULL, NULL, NULL, NULL, NULL, false);
+    assert(res.err == PSVM_OK && res.cond);
+}
+
+/* A v1 CALL_ACTION (5-byte operand: kind, u16 name_const, action_id -- no
+ * trailing endpoint byte) still runs and the sink observes endpoint 0,
+ * exactly like a v1 ref. Same migration case as test_v1_legacy_blob_accepted()
+ * above, for the action-dispatch half of a legacy rule. */
+static void test_v1_legacy_call_action_accepted(void) {
+    uint8_t blob[64]; psvm_prog_t p;
+    uint8_t code[] = {
+        0x01, 0,0,              /* PUSH_CONST 0 (0.0) */
+        0x01, 0,0,              /* PUSH_CONST 0 (0.0) */
+        0x24,                   /* EQ -> true */
+        0x00,                   /* HALT_BOOL */
+        0x01, 2,0,              /* PUSH_CONST 2 (param) */
+        0x52, 0, 1,0, ACT_SWITCH_ON, /* CALL_ACTION kind=0, name_const=1, action_id -- v1: no endpoint byte */
+        0xFF,
+    };
+    size_t o = emit_header(blob, 0, 3, 0, sizeof code);
+    blob[4] = 1; /* v1 header */
+    o = emit_f32(blob, o, 0.0f);
+    o = emit_str(blob, o, "Ficus");
+    o = emit_f32(blob, o, 0.0f);
+    memcpy(blob + o, code, sizeof code);
+    size_t n = o + sizeof code;
+
+    assert(psvm_validate(blob, n, PSVM_DIALECT_RULES, 4, 0, &p) == PSVM_OK);
+    assert(p.fmt_ver == 1);
+
+    action_cap_t cap = {0, {0}, 0, 0, 0, 0};
+    psvm_result_t r = psvm_run(&p, NULL, NULL, NULL, NULL, action_capture, &cap, true);
+    assert(r.err == PSVM_OK && r.cond);
+    assert(cap.calls == 1);
+    assert(cap.action_id == ACT_SWITCH_ON);
+    assert(cap.endpoint == 0);
 }
 
 int main(void) {
@@ -1686,8 +1835,16 @@ int main(void) {
 
     /* M5b Task 10: CALL_ACTION (0x52), rules dialect action path */
     test_call_action_sink();
+    test_call_action_endpoint();
     test_call_action_null_sink();
     test_call_action_param_out_of_range_rejected();
+
+    /* Task 10: PSBC v2 (@N endpoint qualifier) -- format bump + version-
+     * gated decode (both v1 and v2 must keep validating/running). */
+    test_ref_endpoint_v2();
+    test_ref_endpoint_out_of_range_rejected();
+    test_v1_legacy_blob_accepted();
+    test_v1_legacy_call_action_accepted();
 
     printf("test_psvm: all passed\n");
     return 0;

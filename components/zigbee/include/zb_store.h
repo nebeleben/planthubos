@@ -21,21 +21,28 @@
 #include <stdint.h>
 
 #define ZB_STORE_MAX_DEVICES 16
-#define ZB_STORE_MAX_CAPS    4
-#define ZB_STORE_MAX_ACTIONS 2
+#define ZB_STORE_MAX_CAPS    6
+#define ZB_STORE_MAX_ACTIONS 8
 #define ZB_STORE_NAME_MAX    24
 #define ZB_STORE_MAX_UNMAPPED 6
 
 typedef struct {
     uint8_t  eui64[8];
     uint16_t short_addr;
-    uint8_t  endpoint;
+    uint8_t  endpoint;                             /* device's primary (lowest)
+                                          * endpoint -- zigbee_store_lookup()
+                                          * and binding readers still use
+                                          * this scalar; a multi-gang device's
+                                          * OTHER endpoints live only in the
+                                          * per-cap/per-action arrays below. */
     uint8_t  interviewed;                          /* 0 = joined, not interviewed */
     uint8_t  cap_count;
     uint8_t  caps[ZB_STORE_MAX_CAPS];              /* capability ids */
     uint16_t cap_clusters[ZB_STORE_MAX_CAPS];      /* the cluster each came from */
+    uint8_t  cap_endpoints[ZB_STORE_MAX_CAPS];     /* the endpoint each cap instance lives on */
     uint8_t  action_count;
     uint8_t  actions[ZB_STORE_MAX_ACTIONS];        /* action ids */
+    uint8_t  action_endpoints[ZB_STORE_MAX_ACTIONS]; /* the endpoint each action targets */
     uint8_t  unmapped_count;
     uint16_t unmapped_clusters[ZB_STORE_MAX_UNMAPPED]; /* clusters the auto-map
                                           * could not drive at all -- M6c's
@@ -56,20 +63,25 @@ typedef struct {
  *
  * The record is written field-by-field, little-endian, and is EXACTLY:
  *   eui64 8 + short_addr 2 + endpoint 1 + interviewed 1 + cap_count 1
- *   + caps 4 + cap_clusters 8 + action_count 1 + actions 2
- *   + unmapped_count 1 + unmapped_clusters 12 + name 24 = 65.
+ *   + caps 6 + cap_clusters 12 + cap_endpoints 6 + action_count 1
+ *   + actions 8 + action_endpoints 8 + unmapped_count 1
+ *   + unmapped_clusters 12 + name 24 = 91.
  * Not sizeof(zb_device_t): struct padding is not a file format, and a
  * compiler or field-order change would silently invalidate every stored
  * file. zb_store_deserialize() requires len to equal the header plus
  * count * this exactly, which is what makes a truncated file detectable.
  *
- * Task 13 grew this from 52 to 65 (+1 unmapped_count, +12 six uint16_t
- * unmapped_clusters) and bumped ZB_STORE_VERSION alongside it -- an old
- * file fails the version check in zb_store_deserialize(), *t is left
- * untouched, and the hub starts with an empty table rather than
- * misreading the old, shorter layout. Nothing had shipped yet, so there
- * is no migration to write. */
-#define ZB_STORE_RECORD_SIZE 65
+ * Multi-endpoint caps/actions (record v3) grew this from 65 to 91:
+ * ZB_STORE_MAX_CAPS 4->6 (+2 caps, +4 cap_clusters) plus a new
+ * cap_endpoints[6] (+6), ZB_STORE_MAX_ACTIONS 2->8 (+6 actions) plus a
+ * new action_endpoints[8] (+8) -- a 4-gang device can now carry the same
+ * capability/action on several endpoints instead of only the device's
+ * single scalar `endpoint`. ZB_STORE_VERSION bumped alongside it: an old
+ * (v2, 65-byte) file is read via a version-gated legacy path in
+ * zb_store_deserialize() that fans its single `endpoint` into every new
+ * array slot, rather than being misread against the new, longer layout
+ * or silently rejected. */
+#define ZB_STORE_RECORD_SIZE 91
 #define ZB_STORE_IMAGE_MAX   (8 + ZB_STORE_MAX_DEVICES * ZB_STORE_RECORD_SIZE)
 
 void zb_store_init(zb_table_t *t);

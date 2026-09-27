@@ -15,7 +15,7 @@ every 30min`
   assert.equal(r.mode, 'edge')
   assert.equal(r.cooldown_s, 7200)
   assert.equal(r.every_s, 1800)
-  assert.deepEqual(r.refs, [{ kind: 0, name: 'Monstera', capability: 0, field: 0 }])
+  assert.deepEqual(r.refs, [{ kind: 0, name: 'Monstera', capability: 0, field: 0, endpoint: 0 }])
   const asm = disassemble(r.bytecode)
   assert.match(asm, /LOAD_REF 0/)
   assert.match(asm, /PUSH_CONST .*22/)
@@ -32,7 +32,7 @@ test('same ref deduplicates in ref table', () => {
 test('.age ref and device() ref', () => {
   const r = compile(`rule "stale"\nwhen device("AA:BB:CC:DD:EE:FF").air.temperature.age > 3600\nthen log("stale")`)
   assert.equal(r.ok, true)
-  assert.deepEqual(r.refs, [{ kind: 1, name: 'AA:BB:CC:DD:EE:FF', capability: 1, field: 1 }])
+  assert.deepEqual(r.refs, [{ kind: 1, name: 'AA:BB:CC:DD:EE:FF', capability: 1, field: 1, endpoint: 0 }])
 })
 
 test('operator precedence: and binds tighter than or, not tightest', () => {

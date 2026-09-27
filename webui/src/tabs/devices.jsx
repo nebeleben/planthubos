@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 import { loadCaps, capLabel, fmtCap } from '../lib/caps.js'
+import { multiEndpointNames, epSuffixed } from '../lib/endpoints.js'
 import { hasAiKey } from '../lib/ai/settings.js'
 import { resolveVendor } from '../lib/vendors.js'
 import {
@@ -182,7 +183,19 @@ const ACTION_CONFIRM_TIMEOUT_S = 30
 // 12 fix round 1, CRITICAL finding 1: the previous design read it to decide
 // "confirmed" vs "refused after queueing", which misreports in both
 // directions -- see resolveActionSend()'s own doc comment for exactly how).
-function ActionControl({ deviceId, action, fetchedAtS, nowS, switchConfirmedAtS }) {
+//
+// `showEndpoint` (Task 11: multi-endpoint Zigbee) is true only when this
+// action's name repeats across more than one endpoint on this same device
+// (a dual valve, a multi-gang switch) -- ActionsSection computes it once for
+// the whole d.actions list via multiEndpointNames() so every row for that
+// name gets the "· ep N" suffix consistently, while a single-endpoint
+// device's rows render with no suffix at all, byte-identical to before
+// Task 9 started emitting `endpoint` on every action object. `action.endpoint`
+// itself is always sent to the actuate route below regardless of
+// `showEndpoint`, since sending the real endpoint is safe even when it's the
+// device's only one (api_v1.c defaults it to the lowest declared endpoint
+// when the body omits it -- prior behaviour).
+function ActionControl({ deviceId, action, fetchedAtS, nowS, switchConfirmedAtS, showEndpoint }) {
   const isDuration = action.param === 'duration_s'
   const [paramStr, setParamStr] = useState('')
   // idle | sending | pending | dispatched | confirmed | refused | timeout | unauth | error
@@ -238,7 +251,7 @@ function ActionControl({ deviceId, action, fetchedAtS, nowS, switchConfirmedAtS 
       const res = await fetch(`/api/v1/devices/${deviceId}/actions/${action.name}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ param: validation.param }),
+        body: JSON.stringify({ param: validation.param, endpoint: action.endpoint }),
       })
       if (res.status === 202) {
         dispatchBaselineRef.current = lastFiredAtS
@@ -269,7 +282,7 @@ function ActionControl({ deviceId, action, fetchedAtS, nowS, switchConfirmedAtS 
 
   return (
     <div class="node-card-row action-row">
-      <span class="mono">{action.name}</span>
+      <span class="mono">{epSuffixed(action.name, action.endpoint, showEndpoint)}</span>
       {isDuration && (
         <input type="number" min="1" max={action.param_max} step="1"
                placeholder={`1–${action.param_max}s`} value={paramStr}
@@ -302,44 +315,72 @@ function ActionControl({ deviceId, action, fetchedAtS, nowS, switchConfirmedAtS 
 // capabilities table below, so the operator sees the confirmed state right
 // beside the button that moves it.
 function ActionsSection({ d, nowS, fetchedAtS, onLockoutChanged }) {
-  const switchCap = d.caps.find((c) => c.name === 'switch.state')
   const lockout = d.actions[0].lockout
-  // Rendered whenever this device declares switch.on/switch.off, not only
-  // once the capability has been confirmed at least once: on a brand-new
+  // Task 11 (multi-endpoint Zigbee): d.actions may now carry the same
+  // action `name` more than once -- one object per endpoint (a dual valve,
+  // a multi-gang switch) -- per Task 9's devices_json.c contract. This is
+  // the set of names that actually repeat, so ActionControl below can add
+  // its "· ep N" suffix ONLY where it's needed; a single-endpoint device's
+  // action names all fall outside this set and render with no suffix at
+  // all, byte-identical to before Task 9.
+  const actionMultiEp = multiEndpointNames(d.actions)
+  // Rendered whenever this device declares switch.on/switch.off on some
+  // endpoint, or has a switch.state cap on some endpoint -- not only once
+  // the capability has been confirmed at least once: on a brand-new
   // pairing the capability is absent from d.caps entirely (device_json.c
   // only lists a capability once e->caps[c].valid), and a silently missing
   // line there could read as "this device has no switch state" instead of
   // "not confirmed yet" -- the same ambiguity the brief's design points
   // warn against elsewhere. switchStateLabel(undefined) already renders
   // 'unknown' for exactly this case.
-  const hasSwitch = switchCap || d.actions.some((a) => a.name === 'switch.on' || a.name === 'switch.off')
-  // Absolute epoch second of the switch.state capability's last confirmed
-  // read -- the SAME fetchedAtS-derived shape action.last_fired_s uses
-  // (see ActionControl), so resolveActionSend() can compare it against a
-  // baseline the same way. null when the capability has never been
-  // confirmed at all (switchCap absent, or its age_s itself null) -- which
-  // is exactly "this action's dispatch can never resolve past 'dispatched'"
-  // for a wrapper with no confirm block, resolveActionSend()'s own
-  // documented ceiling for that case.
-  const switchConfirmedAtS = switchCap && switchCap.age_s != null ? fetchedAtS - switchCap.age_s : null
+  //
+  // A dual valve/multi-gang switch declares switch.on/off (and
+  // switch.state) on MORE THAN ONE endpoint, so this is now a per-endpoint
+  // list of distinct endpoints rather than a single device-wide flag --
+  // one "Switch: ..." status line per endpoint that has one, each looked
+  // up against the switch.state cap for THAT SAME endpoint (never just any
+  // switch.state cap on the device). A single-endpoint device still gets
+  // exactly one line with no "· ep N" suffix -- byte-identical to before.
+  const switchEndpoints = [...new Set([
+    ...d.caps.filter((c) => c.name === 'switch.state').map((c) => c.endpoint),
+    ...d.actions.filter((a) => a.name === 'switch.on' || a.name === 'switch.off').map((a) => a.endpoint),
+  ])].sort((x, y) => x - y)
+  const multiSwitchEp = switchEndpoints.length > 1
 
   return (
     <div class="actions-section">
       <div class="node-card-row">
         <span class="hint">Actuator controls</span>
-        {hasSwitch && (
-          <span class="hint">
-            Switch: <strong>{switchStateLabel(switchCap && switchCap.value)}</strong>
-            {switchCap ? ` (confirmed ${fmtAge(switchCap.age_s)})` : ' (not confirmed yet)'}
-          </span>
-        )}
+        {switchEndpoints.map((ep) => {
+          const switchCap = d.caps.find((c) => c.name === 'switch.state' && c.endpoint === ep)
+          return (
+            <span class="hint" key={`switch:${ep}`}>
+              {epSuffixed('Switch', ep, multiSwitchEp)}: <strong>{switchStateLabel(switchCap && switchCap.value)}</strong>
+              {switchCap ? ` (confirmed ${fmtAge(switchCap.age_s)})` : ' (not confirmed yet)'}
+            </span>
+          )
+        })}
       </div>
       <LockoutControl deviceId={d.id} firstActionName={d.actions[0].name} lockout={lockout}
                        onChanged={(newLockout) => onLockoutChanged(d.id, newLockout)} />
-      {d.actions.map((a) => (
-        <ActionControl key={a.id} deviceId={d.id} action={a} fetchedAtS={fetchedAtS} nowS={nowS}
-                        switchConfirmedAtS={switchConfirmedAtS} />
-      ))}
+      {d.actions.map((a) => {
+        // Per-endpoint switch confirmation (see the block comment above):
+        // the SAME fetchedAtS-derived shape action.last_fired_s uses (see
+        // ActionControl), so resolveActionSend() can compare it against a
+        // baseline the same way -- but now matched against THIS action's
+        // own endpoint's switch.state cap, not the device's only one. null
+        // when that endpoint's capability has never been confirmed at all
+        // (absent, or its age_s itself null) -- which is exactly "this
+        // action's dispatch can never resolve past 'dispatched'" for a
+        // wrapper with no confirm block, resolveActionSend()'s own
+        // documented ceiling for that case.
+        const switchCap = d.caps.find((c) => c.name === 'switch.state' && c.endpoint === a.endpoint)
+        const switchConfirmedAtS = switchCap && switchCap.age_s != null ? fetchedAtS - switchCap.age_s : null
+        return (
+          <ActionControl key={`${a.id}:${a.endpoint}`} deviceId={d.id} action={a} fetchedAtS={fetchedAtS} nowS={nowS}
+                          switchConfirmedAtS={switchConfirmedAtS} showEndpoint={actionMultiEp.has(a.name)} />
+        )
+      })}
     </div>
   )
 }
@@ -502,6 +543,13 @@ function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, f
   }
 
   const plantNames = d.plant_ids.map((id) => plantNameById.get(id) || `Plant ${id}`)
+  // Task 11 (multi-endpoint Zigbee): d.caps carries one object per (name,
+  // endpoint) instance per Task 9's devices_json.c contract -- a name on
+  // more than one endpoint (a dual valve, a multi-gang switch) appears as
+  // multiple rows below. Only THOSE names get a "· ep N" suffix; a
+  // single-endpoint device's caps all fall outside this set, so its table
+  // renders with no suffix at all -- byte-identical to before Task 9.
+  const capMultiEp = multiEndpointNames(d.caps)
 
   return (
     <div class={`node-card${open ? ' open' : ''}`}>
@@ -586,8 +634,8 @@ function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, f
               <thead><tr><th>Capability</th><th>Value</th><th>Age</th></tr></thead>
               <tbody>
                 {d.caps.map((c) => (
-                  <tr key={c.id}>
-                    <td>{capLabel(caps, c.id)}</td>
+                  <tr key={`${c.id}:${c.endpoint}`}>
+                    <td>{epSuffixed(capLabel(caps, c.id), c.endpoint, capMultiEp.has(c.name))}</td>
                     <td>{fmtCap(caps, c.id, c.value)}</td>
                     <td class="hint">{fmtAge(c.age_s)}</td>
                   </tr>

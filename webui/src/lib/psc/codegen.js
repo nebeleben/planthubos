@@ -125,15 +125,20 @@ class ConstPool {
 
 class RefTable {
   constructor(consts) { this.entries = []; this.consts = consts }
-  add(kind, name, capability, field) {
+  // endpoint: undefined/0 = unspecified -> lowest slot (psvm.c/registry
+  // treat 0 as "default"); PSBC v2 ref entry (Task 10) carries it as a
+  // trailing byte, so a ref naming a different endpoint on the same
+  // capability must NOT dedupe against one that doesn't.
+  add(kind, name, capability, field, endpoint) {
     const capId = CAPS[capability].id
     const fieldId = field === 'age' ? 1 : 0
+    const ep = endpoint || 0
     const idx = this.entries.findIndex(
-      (e) => e.kind === kind && e.name === name && e.capability === capId && e.field === fieldId
+      (e) => e.kind === kind && e.name === name && e.capability === capId && e.field === fieldId && e.endpoint === ep
     )
     if (idx >= 0) return idx
     const nameConstIdx = this.consts.addStr(name)
-    this.entries.push({ kind, name, capability: capId, field: fieldId, nameConstIdx })
+    this.entries.push({ kind, name, capability: capId, field: fieldId, endpoint: ep, nameConstIdx })
     return this.entries.length - 1
   }
 }
@@ -146,7 +151,7 @@ function emitExpr(node, buf, ctx) {
       return
     }
     case 'ref': {
-      const idx = ctx.refs.add(node.kind, node.name, node.capability, node.field)
+      const idx = ctx.refs.add(node.kind, node.name, node.capability, node.field, node.endpoint)
       buf.op(OPCODES.LOAD_REF); buf.u16(idx)
       return
     }
@@ -256,6 +261,7 @@ export function emit(ast) {
       const nameConstIdx = consts.addStr(action.name)
       thenBuf.op(OPCODES.CALL_ACTION)
       thenBuf.u8(action.kind); thenBuf.u16(nameConstIdx); thenBuf.u8(action.actionId)
+      thenBuf.u8(action.endpoint || 0)
     } else {
       emitStringNode(action.arg, thenBuf, ctx)
       thenBuf.op(OPCODES.CALL_BUILTIN)
@@ -270,7 +276,7 @@ export function emit(ast) {
 
   const w = new ByteWriter()
   w.raw([0x50, 0x53, 0x42, 0x43]) // "PSBC"
-  w.u8(1) // fmt_ver
+  w.u8(2) // fmt_ver (Task 10: PSBC v2 -- 6-byte ref entry / CALL_ACTION carry an endpoint byte)
   w.u8(1) // dialect (rules)
   w.u16(0) // flags — psvm.c rejects nonzero
   w.u32(builtins)
@@ -282,13 +288,13 @@ export function emit(ast) {
     else { w.u8(1); w.str(c.value) }
   }
   for (const r of refs.entries) {
-    w.u8(r.kind); w.u16(r.nameConstIdx); w.u8(r.capability); w.u8(r.field)
+    w.u8(r.kind); w.u16(r.nameConstIdx); w.u8(r.capability); w.u8(r.field); w.u8(r.endpoint || 0)
   }
   w.raw(code)
 
   return {
     bytecode: w.toUint8Array(),
-    refs: refs.entries.map((r) => ({ kind: r.kind, name: r.name, capability: r.capability, field: r.field })),
+    refs: refs.entries.map((r) => ({ kind: r.kind, name: r.name, capability: r.capability, field: r.field, endpoint: r.endpoint })),
   }
 }
 

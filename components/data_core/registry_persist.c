@@ -31,7 +31,8 @@ size_t registry_persist_serialize(const registry_t *r, uint32_t written_epoch,
 
         uint8_t ncap = 0;
         for (int c = 0; c < CAPABILITY_COUNT; c++) if (d->caps[c].valid) ncap++;
-        if (off + ROW_FIXED + (size_t)ncap * 3 > cap) return 0;
+        uint8_t nextra = d->extra_ep_cap_count;
+        if (off + ROW_FIXED + (size_t)ncap * 4 + 1 + (size_t)nextra * 4 > cap) return 0;
 
         buf[off++] = d->id.kind;
         memcpy(&buf[off], d->id.addr, 8); off += 8;
@@ -43,6 +44,15 @@ size_t registry_persist_serialize(const registry_t *r, uint32_t written_epoch,
             if (!d->caps[c].valid) continue;
             buf[off++] = (uint8_t)c;
             uint16_t raw = (uint16_t)d->caps[c].raw;
+            buf[off++] = (uint8_t)(raw & 0xFF);
+            buf[off++] = (uint8_t)(raw >> 8);
+            buf[off++] = d->cap_endpoint[c];
+        }
+        buf[off++] = nextra;
+        for (uint8_t k = 0; k < nextra; k++) {
+            buf[off++] = d->extra_ep_caps[k].cap_id;
+            buf[off++] = d->extra_ep_caps[k].endpoint;
+            uint16_t raw = (uint16_t)d->extra_ep_caps[k].slot.raw;
             buf[off++] = (uint8_t)(raw & 0xFF);
             buf[off++] = (uint8_t)(raw >> 8);
         }
@@ -69,7 +79,8 @@ bool registry_persist_deserialize(const uint8_t *buf, size_t len,
 {
     if (out) registry_init(out);
     if (!buf || !out || len < REGISTRY_PERSIST_HEADER_LEN) return false;
-    if (buf[0] != REGISTRY_PERSIST_FMT) return false;
+    uint8_t fmt = buf[0];
+    if (fmt != 1 && fmt != REGISTRY_PERSIST_FMT) return false;
 
     uint16_t stored = (uint16_t)(buf[1] | ((uint16_t)buf[2] << 8));
     uint16_t crc = crc16_update(0xFFFFu, &buf[0], 1);
@@ -80,6 +91,13 @@ bool registry_persist_deserialize(const uint8_t *buf, size_t len,
                      ((uint32_t)buf[5] << 16) | ((uint32_t)buf[6] << 24);
     uint8_t count = buf[7];
     if (count > REGISTRY_MAX_DEVICES) return false;
+
+    /* FMT 1's cap row is 3 bytes (no per-cap endpoint byte) and has no
+     * trailing extra-ep section per device; FMT 2's cap row is 4 bytes and
+     * is followed by that device's extra-ep section. An old (FMT 1)
+     * snapshot therefore loads with every cap_endpoint[]/extra_ep_cap_count
+     * left at 0 (registry_init()'s zeroing) -- untracked, not rejected. */
+    size_t cap_row_len = (fmt == 1) ? 3 : 4;
 
     size_t off = REGISTRY_PERSIST_HEADER_LEN;
     for (uint8_t i = 0; i < count; i++) {
@@ -94,7 +112,7 @@ bool registry_persist_deserialize(const uint8_t *buf, size_t len,
         memcpy(d->via_node, &buf[off], 6); off += 6;
         d->best_rssi = (int8_t)buf[off++];
         uint8_t ncap = buf[off++];
-        if (off + (size_t)ncap * 3 > len) { registry_init(out); return false; }
+        if (off + (size_t)ncap * cap_row_len > len) { registry_init(out); return false; }
         for (uint8_t k = 0; k < ncap; k++) {
             uint8_t cap_id = buf[off++];
             uint16_t raw = (uint16_t)(buf[off] | ((uint16_t)buf[off + 1] << 8));
@@ -103,6 +121,27 @@ bool registry_persist_deserialize(const uint8_t *buf, size_t len,
             d->caps[cap_id].raw = (int16_t)raw;
             d->caps[cap_id].updated_s = 0;
             d->caps[cap_id].valid = true;
+            if (fmt == 1) continue;
+            d->cap_endpoint[cap_id] = buf[off++];
+        }
+        if (fmt == 1) continue;
+
+        if (off + 1 > len) { registry_init(out); return false; }
+        uint8_t nextra = buf[off++];
+        if (off + (size_t)nextra * 4 > len) { registry_init(out); return false; }
+        if (nextra > REGISTRY_EXTRA_EP_CAPS) { registry_init(out); return false; }
+        d->extra_ep_cap_count = nextra;
+        for (uint8_t k = 0; k < nextra; k++) {
+            uint8_t cap_id = buf[off++];
+            uint8_t endpoint = buf[off++];
+            uint16_t raw = (uint16_t)(buf[off] | ((uint16_t)buf[off + 1] << 8));
+            off += 2;
+            if (cap_id >= CAPABILITY_COUNT) { registry_init(out); return false; }
+            d->extra_ep_caps[k].cap_id = cap_id;
+            d->extra_ep_caps[k].endpoint = endpoint;
+            d->extra_ep_caps[k].slot.raw = (int16_t)raw;
+            d->extra_ep_caps[k].slot.updated_s = 0;
+            d->extra_ep_caps[k].slot.valid = ((int16_t)raw != CAP_VALUE_NONE);
         }
     }
 

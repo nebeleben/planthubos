@@ -31,14 +31,31 @@
  *   [7]      device count (<= REGISTRY_MAX_DEVICES)
  *   then per device:
  *     kind(1) addr(8) via_valid(1) via(6) best_rssi(1) cap_count(1)
- *     then cap_count * { cap_id(1) raw(2) }   -- only valid caps
+ *     then cap_count * cap row   -- only valid caps
+ *
+ *   FMT 1 (old, still readable): cap row = { cap_id(1) raw(2) }, 3 bytes.
+ *   No endpoint info at all -- a FMT-1 snapshot loads with every device's
+ *   cap_endpoint[]/extra_ep_cap_count left at 0 (untracked/legacy; single-
+ *   endpoint devices are unaffected either way since registry_get_cap_ep()
+ *   treats an untracked cap_endpoint as "endpoint 0 == the main slot").
+ *
+ *   FMT 2 (current): cap row = { cap_id(1) raw(2) endpoint(1) }, 4 bytes --
+ *   the trailing `endpoint` byte is that cap's tracked DEFAULT endpoint
+ *   (cap_endpoint[cap_id] in registry.h; 0 if the device predates endpoint
+ *   tracking). Then, per device, right after that device's cap_count cap
+ *   rows, an additive side-list section for JUST that device:
+ *     extra_ep_cap_count(1)
+ *     then extra_ep_cap_count * { cap_id(1) endpoint(1) raw(2) }
+ *   mirroring registry.h's device_entry_t.extra_ep_caps 1:1 (same fields,
+ *   same order, restored valid=true since only written rows are stored).
  */
 
-#define REGISTRY_PERSIST_FMT        1
+#define REGISTRY_PERSIST_FMT        2
 #define REGISTRY_PERSIST_HEADER_LEN 8
-/* Worst case: 16 devices * (1+8+1+6+1+1 + CAPABILITY_COUNT*3) + header.
+/* Worst case (FMT 2): 16 devices * (ROW_FIXED=18 + CAPABILITY_COUNT*4 +
+ * 1 + REGISTRY_EXTRA_EP_CAPS*4) + header = 16 * (18+44+1+16) + 8 = 1272.
  * A fixed static buffer (this module is called from one task at a time). */
-#define REGISTRY_PERSIST_MAX_BYTES  1024
+#define REGISTRY_PERSIST_MAX_BYTES  1536
 
 /* Serialize the in-use rows of `r` into `buf` (capacity `cap`). Returns the
  * byte count written, or 0 if it does not fit or `r`/`buf` is NULL. */

@@ -133,10 +133,11 @@ void zb_interview_on_clusters(zb_iv_t *iv, uint8_t endpoint,
         if (cap != ZB_MAP_NONE) {
             bool dup = false;
             for (uint8_t j = 0; j < iv->dev.cap_count; j++)
-                if (iv->dev.caps[j] == cap) { dup = true; break; }
+                if (iv->dev.caps[j] == cap && iv->dev.cap_endpoints[j] == endpoint) { dup = true; break; }
             if (!dup && iv->dev.cap_count < ZB_STORE_MAX_CAPS) {
                 iv->dev.caps[iv->dev.cap_count] = cap;
                 iv->dev.cap_clusters[iv->dev.cap_count] = cluster;
+                iv->dev.cap_endpoints[iv->dev.cap_count] = endpoint;
                 iv->dev.cap_count++;
                 yielded = true;
             }
@@ -167,10 +168,11 @@ void zb_interview_on_clusters(zb_iv_t *iv, uint8_t endpoint,
         for (int k = 0; k < n_acts; k++) {
             bool dup = false;
             for (uint8_t j = 0; j < iv->dev.action_count; j++)
-                if (iv->dev.actions[j] == acts[k]) { dup = true; break; }
+                if (iv->dev.actions[j] == acts[k] && iv->dev.action_endpoints[j] == endpoint) { dup = true; break; }
             if (dup)
                 continue;
             if (iv->dev.action_count < ZB_STORE_MAX_ACTIONS) {
+                iv->dev.action_endpoints[iv->dev.action_count] = endpoint;
                 iv->dev.actions[iv->dev.action_count++] = acts[k];
                 yielded = true;
             }
@@ -181,7 +183,7 @@ void zb_interview_on_clusters(zb_iv_t *iv, uint8_t endpoint,
         if (zb_map_report_attr(cluster) != ZB_MAP_NO_ATTR) {
             bool dup = false;
             for (uint8_t j = 0; j < iv->report_count; j++)
-                if (iv->report_clusters[j] == cluster) { dup = true; break; }
+                if (iv->report_clusters[j] == cluster && iv->report_endpoints[j] == endpoint) { dup = true; break; }
             if (!dup && iv->report_count < ZB_STORE_MAX_CAPS) {
                 iv->report_clusters[iv->report_count] = cluster;
                 /* FIX 4: record which endpoint THIS cluster actually
@@ -219,6 +221,7 @@ void zb_interview_finalize(zb_iv_t *iv) {
             for (int k = i; k < iv->dev.cap_count - 1; k++) {
                 iv->dev.caps[k] = iv->dev.caps[k + 1];
                 iv->dev.cap_clusters[k] = iv->dev.cap_clusters[k + 1];
+                iv->dev.cap_endpoints[k] = iv->dev.cap_endpoints[k + 1];
             }
             iv->dev.cap_count--;
         } else i++;
@@ -226,8 +229,10 @@ void zb_interview_finalize(zb_iv_t *iv) {
     /* Remove the switch actions. */
     for (int i = 0; i < iv->dev.action_count; ) {
         if (iv->dev.actions[i] == ACT_SWITCH_ON || iv->dev.actions[i] == ACT_SWITCH_OFF) {
-            for (int k = i; k < iv->dev.action_count - 1; k++)
+            for (int k = i; k < iv->dev.action_count - 1; k++) {
                 iv->dev.actions[k] = iv->dev.actions[k + 1];
+                iv->dev.action_endpoints[k] = iv->dev.action_endpoints[k + 1];
+            }
             iv->dev.action_count--;
         } else i++;
     }

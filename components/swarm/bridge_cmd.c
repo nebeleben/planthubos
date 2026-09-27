@@ -38,8 +38,8 @@ static int slot_for_mac(bridge_router_t *r, const uint8_t mac[6], bool create)
 }
 
 bool bridge_cmd_submit(bridge_router_t *r, const uint8_t mac[6], uint8_t op, const swarm_dev_addr_t *dev,
-                       uint16_t arg, const char *name, uint8_t name_len, uint32_t ttl_s, uint32_t now_s,
-                       int actor_dev_idx, uint8_t actor_action, uint16_t actor_param)
+                       uint16_t arg, uint8_t endpoint, const char *name, uint8_t name_len, uint32_t ttl_s,
+                       uint32_t now_s, int actor_dev_idx, uint8_t actor_action, uint16_t actor_param)
 {
     int i = slot_for_mac(r, mac, true);
     if (i < 0) return false;                 /* every slot belongs to a different node */
@@ -55,6 +55,7 @@ bool bridge_cmd_submit(bridge_router_t *r, const uint8_t mac[6], uint8_t op, con
     s->op = op;
     if (dev) s->dev = *dev;
     s->arg = arg;
+    s->endpoint = endpoint;
     if (name && name_len > 0) {
         uint8_t n = name_len > SWARM_DEV_NAME_MAX ? SWARM_DEV_NAME_MAX : name_len;
         memcpy(s->name, name, n);

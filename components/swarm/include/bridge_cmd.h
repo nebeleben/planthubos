@@ -50,6 +50,14 @@ typedef struct {
     uint8_t          op;             /* SWARM_CMD_* */
     swarm_dev_addr_t dev;
     uint16_t         arg;
+    uint8_t          endpoint;       /* M8 Task 8: the target endpoint for an
+                                       * ACTUATE (swarm_command_t.endpoint on
+                                       * the wire) -- carried here so a
+                                       * retried/flushed send re-encodes the
+                                       * SAME endpoint the caller asked for.
+                                       * Opaque to this router for any other
+                                       * op (PERMIT_JOIN/REMOVE/RENAME/RESYNC
+                                       * have no endpoint of their own). */
     char             name[SWARM_DEV_NAME_MAX];
     uint8_t          name_len;
     uint32_t         sent_s;         /* last time bridge_cmd_next_send() sent this, 0 before the first send */
@@ -85,10 +93,12 @@ void bridge_cmd_init(bridge_router_t *r);
  * op that has no actor to report to. dev/name/name_len are copied
  * verbatim (name truncated to SWARM_DEV_NAME_MAX if longer -- callers are
  * expected to already respect that limit; this is a defensive clamp, not
- * a normal path). */
+ * a normal path). endpoint (M8 Task 8) is likewise opaque here -- stored
+ * verbatim and re-encoded onto every (re)send's swarm_command_t.endpoint;
+ * callers with no endpoint of their own (every op but ACTUATE) pass 1. */
 bool bridge_cmd_submit(bridge_router_t *r, const uint8_t mac[6], uint8_t op, const swarm_dev_addr_t *dev,
-                       uint16_t arg, const char *name, uint8_t name_len, uint32_t ttl_s, uint32_t now_s,
-                       int actor_dev_idx, uint8_t actor_action, uint16_t actor_param);
+                       uint16_t arg, uint8_t endpoint, const char *name, uint8_t name_len, uint32_t ttl_s,
+                       uint32_t now_s, int actor_dev_idx, uint8_t actor_action, uint16_t actor_param);
 
 /* Returns the next active slot due to (re)send, or NULL when nothing is
  * due right now. A freshly-submitted command (sends == 0) is always due

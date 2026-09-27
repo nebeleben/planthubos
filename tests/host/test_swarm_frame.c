@@ -15,7 +15,7 @@ int main(void)
         uint8_t buf[16];
         size_t n = swarm_encode_checkin(&c, buf, sizeof buf);
         assert(n == 9);
-        assert(buf[0] == 4 && buf[1] == SWARM_MSG_CHECKIN);
+        assert(buf[0] == SWARM_PROTO_VERSION && buf[1] == SWARM_MSG_CHECKIN);
         assert(buf[2] == 5 && buf[3] == 0);                 /* len = 9 - 4 */
         swarm_checkin_t out;
         assert(swarm_decode_checkin(buf, n, &out));
@@ -352,29 +352,32 @@ int main(void)
     /* v4: DEVICE_ANNOUNCE round trip, sizes, bounds */
     {
         swarm_device_announce_t a = { .dev = { .kind = 2, .addr = {1,2,3,4,5,6,7,8} },
-            .endpoint = 1, .interviewed = 1, .name_len = 5, .name = "Light",
+            .interviewed = 1, .name_len = 5, .name = "Light",
             .cap_count = 2, .cap_ids = {2, 7}, .cap_clusters = {0x0400, 0x0001},
-            .action_count = 1, .action_ids = {0} };
-        uint8_t buf[80];
+            .cap_endpoints = {1, 2},
+            .action_count = 1, .action_ids = {0}, .action_endpoints = {1} };
+        uint8_t buf[96];
         size_t n = swarm_encode_device_announce(&a, buf, sizeof buf);
-        /* 4 hdr + 1 kind + 8 addr + 1 ep + 1 iv + 1 + 5 name + 1 + 2*(1+2) + 1 + 1
-         * = 4+1+8+1+1+1+5+1+6+1+1 = 30 (the brief's own listed terms sum to 30,
-         * not the 32 its assert originally claimed -- arithmetic slip, fixed here). */
-        assert(n == 30);
+        /* 4 hdr + 1 kind + 8 addr + 1 iv + 1 + 5 name + 1 + 2*(1+2+1) + 1 + 1*(1+1)
+         * = 4+1+8+1+1+5+1+8+1+2 = 32 (the listed terms actually sum to 32, not
+         * the 30 the brief claimed -- same kind of arithmetic slip the v4
+         * version of this assert had). */
+        assert(n == 32);
         swarm_device_announce_t o;
         assert(swarm_decode_device_announce(buf, n, &o));
-        assert(o.dev.kind == 2 && o.dev.addr[7] == 8 && o.endpoint == 1 && o.interviewed == 1);
+        assert(o.dev.kind == 2 && o.dev.addr[7] == 8 && o.interviewed == 1);
         assert(o.name_len == 5 && memcmp(o.name, "Light", 5) == 0);
         assert(o.cap_count == 2 && o.cap_ids[1] == 7 && o.cap_clusters[1] == 0x0001);
-        assert(o.action_count == 1 && o.action_ids[0] == 0);
+        assert(o.cap_endpoints[0] == 1 && o.cap_endpoints[1] == 2);
+        assert(o.action_count == 1 && o.action_ids[0] == 0 && o.action_endpoints[0] == 1);
         assert(!swarm_decode_device_announce(buf, n - 1, &o));      /* short */
-        uint8_t big[80]; memcpy(big, buf, n); big[15] = 30;           /* name_len > max */
+        uint8_t big[96]; memcpy(big, buf, n); big[14] = 30;           /* name_len > max */
         assert(!swarm_decode_device_announce(big, n, &o));
-        memcpy(big, buf, n); big[21] = 5;                             /* cap_count > max */
+        memcpy(big, buf, n); big[20] = 5;                             /* cap_count > max */
         assert(!swarm_decode_device_announce(big, n, &o));
         swarm_device_announce_t z = { .dev = { .kind = 2 } };         /* empty lists, empty name */
         n = swarm_encode_device_announce(&z, buf, sizeof buf);
-        assert(n == 4 + 1 + 8 + 1 + 1 + 1 + 1 + 1);
+        assert(n == 4 + 1 + 8 + 1 + 1 + 1 + 1);
         assert(swarm_decode_device_announce(buf, n, &o) && o.cap_count == 0 && o.name_len == 0);
         assert(swarm_encode_device_announce(&a, buf, 10) == 0);       /* cap too small */
     }
@@ -388,11 +391,11 @@ int main(void)
     }
     /* v4: MEASUREMENT */
     {
-        swarm_measurement_t m = { .dev = { .kind = 2, .addr = {1} }, .cap_id = 2, .value = 16.5f, .age_s = 7 };
+        swarm_measurement_t m = { .dev = { .kind = 2, .addr = {1} }, .cap_id = 2, .endpoint = 2, .value = 16.5f, .age_s = 7 };
         uint8_t buf[32]; size_t n = swarm_encode_measurement(&m, buf, sizeof buf);
-        assert(n == 4 + 9 + 1 + 4 + 4);
+        assert(n == 4 + 9 + 1 + 1 + 4 + 4);
         swarm_measurement_t o; assert(swarm_decode_measurement(buf, n, &o));
-        assert(o.cap_id == 2 && o.value == 16.5f && o.age_s == 7);
+        assert(o.cap_id == 2 && o.endpoint == 2 && o.value == 16.5f && o.age_s == 7);
         assert(!swarm_decode_measurement(buf, n + 1, &o));
     }
     /* v4: TUYA_DP */
@@ -416,13 +419,14 @@ int main(void)
     /* v4: COMMAND / COMMAND_ACK */
     {
         swarm_command_t c = { .seq = 0x1234, .ttl_s = 30, .op = SWARM_CMD_DEVICE_RENAME,
-            .dev = { .kind = 2, .addr = {1,2,3,4,5,6,7,8} }, .arg = 0, .name_len = 3, .name = "Bob" };
+            .dev = { .kind = 2, .addr = {1,2,3,4,5,6,7,8} }, .arg = 0, .endpoint = 2, .name_len = 3, .name = "Bob" };
         uint8_t buf[64]; size_t n = swarm_encode_command(&c, buf, sizeof buf);
-        assert(n == 4 + 2 + 2 + 1 + 9 + 2 + 1 + 3);
+        assert(n == 4 + 2 + 2 + 1 + 9 + 2 + 1 + 1 + 3);
         swarm_command_t o; assert(swarm_decode_command(buf, n, &o));
         assert(o.seq == 0x1234 && o.ttl_s == 30 && o.op == SWARM_CMD_DEVICE_RENAME && o.name_len == 3 && o.name[2] == 'b');
+        assert(o.endpoint == 2);
         swarm_command_t p = { .seq = 1, .ttl_s = 5, .op = SWARM_CMD_PERMIT_JOIN };
-        n = swarm_encode_command(&p, buf, sizeof buf); assert(n == 4 + 2 + 2 + 1 + 9 + 2 + 1);
+        n = swarm_encode_command(&p, buf, sizeof buf); assert(n == 4 + 2 + 2 + 1 + 9 + 2 + 1 + 1);
         swarm_command_ack_t a = { .seq = 0x1234, .op = SWARM_CMD_ACTUATE, .status = SWARM_ACK_DONE, .detail = 0 };
         n = swarm_encode_command_ack(&a, buf, sizeof buf); assert(n == 4 + 5);
         swarm_command_ack_t ao; assert(swarm_decode_command_ack(buf, n, &ao) && ao.status == SWARM_ACK_DONE);
