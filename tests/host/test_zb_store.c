@@ -13,6 +13,7 @@ static zb_device_t mk(uint8_t last, uint8_t cap) {
     d.eui64[7]     = last;
     d.short_addr   = 0x1000 + last;
     d.endpoint     = 1;
+    d.cap_endpoints[0] = 1;
     d.interviewed  = 1;
     d.cap_count    = 1;
     d.caps[0]      = cap;
@@ -77,6 +78,72 @@ int main(void) {
         assert(ur.dev[0].unmapped_clusters[2] == 0xFC01);
     }
 
+    /* --- per-endpoint caps/actions round trip (multi-endpoint) --- */
+    {
+        zb_device_t g = mk(60, 8);   /* two gangs, one EUI-64 */
+        g.cap_count = 2;
+        g.caps[0] = 8; g.cap_clusters[0] = 0x0006; g.cap_endpoints[0] = 1;
+        g.caps[1] = 8; g.cap_clusters[1] = 0x0006; g.cap_endpoints[1] = 2;
+        g.action_count = 4;
+        g.actions[0] = 0; g.action_endpoints[0] = 1;   /* switch.on  ep1 */
+        g.actions[1] = 1; g.action_endpoints[1] = 1;   /* switch.off ep1 */
+        g.actions[2] = 0; g.action_endpoints[2] = 2;   /* switch.on  ep2 */
+        g.actions[3] = 1; g.action_endpoints[3] = 2;   /* switch.off ep2 */
+        zb_table_t gt; zb_store_init(&gt);
+        assert(zb_store_upsert(&gt, &g) == 0);
+        uint8_t gbuf[ZB_STORE_IMAGE_MAX];
+        size_t gn = zb_store_serialize(&gt, gbuf, sizeof gbuf);
+        assert(gn == 8 + ZB_STORE_RECORD_SIZE);
+        zb_table_t gr;
+        assert(zb_store_deserialize(&gr, gbuf, gn));
+        assert(gr.dev[0].cap_endpoints[1] == 2);
+        assert(gr.dev[0].action_endpoints[3] == 2);
+    }
+
+    /* --- legacy (v2, 65-byte) record migrates its single endpoint into
+     * every cap_endpoints[]/action_endpoints[] slot -- a pre-multi-gang
+     * file loads as if every cap/action lived on the device's one
+     * endpoint. Hand-assembled v2 image: caps[4]/cap_clusters[4]/
+     * actions[2], no cap_endpoints/action_endpoints, record 65. --- */
+    {
+        uint8_t v2[8 + 65];
+        memset(v2, 0, sizeof v2);
+        v2[0] = 'P'; v2[1] = 'H'; v2[2] = 'Z'; v2[3] = 'B';
+        v2[4] = 2;              /* version */
+        v2[5] = 1;              /* count */
+        uint8_t *p = v2 + 8;
+        const uint8_t eui[8] = { 0x00, 0x12, 0x4B, 0x00, 0x0A, 0x0B, 0x0C, 0x99 };
+        memcpy(p, eui, 8); p += 8;
+        p[0] = 0x34; p[1] = 0x12; p += 2;          /* short_addr = 0x1234 */
+        *p++ = 7;                                   /* endpoint = 7 */
+        *p++ = 1;                                    /* interviewed */
+        *p++ = 2;                                    /* cap_count */
+        p[0] = 8; p[1] = 0; p[2] = 0; p[3] = 0; p += 4;      /* caps[4] */
+        p[0] = 0x06; p[1] = 0x00;                    /* cap_clusters[0] = 6 */
+        p[2] = 0x06; p[3] = 0x00;                    /* cap_clusters[1] = 6 */
+        p[4] = 0; p[5] = 0; p[6] = 0; p[7] = 0;
+        p += 8;
+        *p++ = 2;                                    /* action_count */
+        p[0] = 0; p[1] = 1; p += 2;                  /* actions[2] */
+        *p++ = 0;                                    /* unmapped_count */
+        p += 12;                                     /* unmapped_clusters[6] */
+        memcpy(p, "legacy", 6);
+        p += ZB_STORE_NAME_MAX;
+        assert((size_t)(p - v2) == sizeof v2);
+
+        zb_table_t vt;
+        assert(zb_store_deserialize(&vt, v2, sizeof v2));
+        assert(vt.count == 1);
+        assert(vt.dev[0].endpoint == 7);
+        assert(vt.dev[0].cap_count == 2);
+        assert(vt.dev[0].cap_endpoints[0] == 7);
+        assert(vt.dev[0].cap_endpoints[1] == 7);
+        assert(vt.dev[0].action_count == 2);
+        assert(vt.dev[0].action_endpoints[0] == 7);
+        assert(vt.dev[0].action_endpoints[1] == 7);
+        assert(strcmp(vt.dev[0].name, "legacy") == 0);
+    }
+
     /* --- corruption is refused, never half-loaded --- */
     zb_table_t bad;
     assert(!zb_store_deserialize(&bad, buf, n - 1));    /* truncated */
@@ -96,12 +163,14 @@ int main(void) {
     {
         /* Offsets within a ZB_STORE_RECORD_SIZE record, per zb_store.h's
          * field list: eui64 8 + short_addr 2 + endpoint 1 + interviewed 1
-         * -> cap_count @ 12; + caps 4 + cap_clusters 8 -> action_count @ 25;
-         * + actions 2 -> unmapped_count @ 28 (Task 13). */
+         * -> cap_count @ 12; + cap_count 1 + caps 6 + cap_clusters 12
+         * + cap_endpoints 6 -> action_count @ 37; + action_count 1
+         * + actions 8 + action_endpoints 8 -> unmapped_count @ 54
+         * (multi-endpoint caps/actions, record v3). */
         const size_t rec0 = 8;                 /* header size */
         const size_t cap_count_off = rec0 + 12;
-        const size_t action_count_off = rec0 + 25;
-        const size_t unmapped_count_off = rec0 + 28;
+        const size_t action_count_off = rec0 + 37;
+        const size_t unmapped_count_off = rec0 + 54;
 
         uint8_t corrupt[ZB_STORE_IMAGE_MAX];
         memcpy(corrupt, buf, n);

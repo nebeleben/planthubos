@@ -13,8 +13,24 @@
 #define ZB_STORE_MAGIC3 'B'
 /* Task 13 grew the record with unmapped_count/unmapped_clusters (52 -> 65
  * bytes, see zb_store.h) -- bumped so an old file is rejected by the
- * version check below rather than misread against the new layout. */
-#define ZB_STORE_VERSION 2
+ * version check below rather than misread against the new layout.
+ *
+ * Multi-endpoint caps/actions grew the record again, 65 -> 91 bytes (new
+ * cap_endpoints[]/action_endpoints[], wider caps[]/actions[] -- see
+ * zb_store.h), and bumped this to 3. Unlike the 2->... jump, a v2 file is
+ * NOT rejected outright: zb_store_deserialize() reads it with the old
+ * 65-byte layout via get_record_v2() and fans its single `endpoint` into
+ * every new array slot, so an existing hub's persisted devices survive
+ * the upgrade instead of coming back empty. */
+#define ZB_STORE_VERSION 3
+/* The exact v2 (pre-multi-endpoint) record layout, kept only so
+ * get_record_v2() can read an old file: eui64 8 + short_addr 2
+ * + endpoint 1 + interviewed 1 + cap_count 1 + caps 4 + cap_clusters 8
+ * + action_count 1 + actions 2 + unmapped_count 1 + unmapped_clusters 12
+ * + name 24 = 65. */
+#define ZB_STORE_V2_MAX_CAPS    4
+#define ZB_STORE_V2_MAX_ACTIONS 2
+#define ZB_STORE_V2_RECORD_SIZE 65
 #define ZB_STORE_HEADER_SIZE 8
 
 void zb_store_init(zb_table_t *t) {
@@ -95,9 +111,15 @@ static uint8_t *put_record(uint8_t *p, const zb_device_t *d) {
     for (int i = 0; i < ZB_STORE_MAX_CAPS; i++) {
         p = put_u16le(p, d->cap_clusters[i]);
     }
+    for (int i = 0; i < ZB_STORE_MAX_CAPS; i++) {
+        p = put_u8(p, d->cap_endpoints[i]);
+    }
     p = put_u8(p, d->action_count);
     for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
         p = put_u8(p, d->actions[i]);
+    }
+    for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
+        p = put_u8(p, d->action_endpoints[i]);
     }
     p = put_u8(p, d->unmapped_count);
     for (int i = 0; i < ZB_STORE_MAX_UNMAPPED; i++) {
@@ -123,8 +145,49 @@ static const uint8_t *get_record(const uint8_t *p, zb_device_t *d) {
     for (int i = 0; i < ZB_STORE_MAX_CAPS; i++) {
         p = get_u16le(p, &d->cap_clusters[i]);
     }
+    for (int i = 0; i < ZB_STORE_MAX_CAPS; i++) {
+        p = get_u8(p, &d->cap_endpoints[i]);
+    }
     p = get_u8(p, &d->action_count);
     for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
+        p = get_u8(p, &d->actions[i]);
+    }
+    for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
+        p = get_u8(p, &d->action_endpoints[i]);
+    }
+    p = get_u8(p, &d->unmapped_count);
+    for (int i = 0; i < ZB_STORE_MAX_UNMAPPED; i++) {
+        p = get_u16le(p, &d->unmapped_clusters[i]);
+    }
+    memcpy(d->name, p, ZB_STORE_NAME_MAX);
+    d->name[ZB_STORE_NAME_MAX - 1] = '\0';
+    p += ZB_STORE_NAME_MAX;
+    return p;
+}
+
+/* Reads one v2 (65-byte, pre-multi-endpoint) record. `d` must already be
+ * zeroed by the caller -- this only touches the old, narrower
+ * caps[0..3]/cap_clusters[0..3]/actions[0..1] slots, leaving the new
+ * cap_endpoints[]/action_endpoints[]/wider caps[]/actions[] slots at
+ * their zeroed default until the fan-out below sets the ones that
+ * cap_count/action_count actually cover. Every cap/action a v2 record
+ * names is fanned onto the device's one scalar `endpoint`, since v2 had
+ * no per-endpoint concept at all. */
+static const uint8_t *get_record_v2(const uint8_t *p, zb_device_t *d) {
+    memcpy(d->eui64, p, 8);
+    p += 8;
+    p = get_u16le(p, &d->short_addr);
+    p = get_u8(p, &d->endpoint);
+    p = get_u8(p, &d->interviewed);
+    p = get_u8(p, &d->cap_count);
+    for (int i = 0; i < ZB_STORE_V2_MAX_CAPS; i++) {
+        p = get_u8(p, &d->caps[i]);
+    }
+    for (int i = 0; i < ZB_STORE_V2_MAX_CAPS; i++) {
+        p = get_u16le(p, &d->cap_clusters[i]);
+    }
+    p = get_u8(p, &d->action_count);
+    for (int i = 0; i < ZB_STORE_V2_MAX_ACTIONS; i++) {
         p = get_u8(p, &d->actions[i]);
     }
     p = get_u8(p, &d->unmapped_count);
@@ -134,6 +197,13 @@ static const uint8_t *get_record(const uint8_t *p, zb_device_t *d) {
     memcpy(d->name, p, ZB_STORE_NAME_MAX);
     d->name[ZB_STORE_NAME_MAX - 1] = '\0';
     p += ZB_STORE_NAME_MAX;
+
+    for (int i = 0; i < d->cap_count && i < ZB_STORE_MAX_CAPS; i++) {
+        d->cap_endpoints[i] = d->endpoint;
+    }
+    for (int i = 0; i < d->action_count && i < ZB_STORE_MAX_ACTIONS; i++) {
+        d->action_endpoints[i] = d->endpoint;
+    }
     return p;
 }
 
@@ -165,33 +235,47 @@ bool zb_store_deserialize(zb_table_t *t, const uint8_t *buf, size_t len) {
         buf[2] != ZB_STORE_MAGIC2 || buf[3] != ZB_STORE_MAGIC3) {
         return false;
     }
-    if (buf[4] != ZB_STORE_VERSION) {
+    /* v2 (pre-multi-endpoint, 65-byte record) is not rejected outright:
+     * it is read via the old layout below and its single `endpoint`
+     * fanned into the new per-cap/per-action arrays, so an existing
+     * hub's persisted devices survive the upgrade to v3 rather than the
+     * table coming back empty. Any OTHER unknown version is still
+     * rejected -- there is no layout to read it with. */
+    uint8_t ver = buf[4];
+    if (ver != ZB_STORE_VERSION && ver != 2) {
         return false;
     }
     uint8_t count = buf[5];
     if (count > ZB_STORE_MAX_DEVICES) {
         return false;
     }
-    size_t need = ZB_STORE_HEADER_SIZE + (size_t)count * ZB_STORE_RECORD_SIZE;
+    size_t rec = (ver == 2) ? ZB_STORE_V2_RECORD_SIZE : ZB_STORE_RECORD_SIZE;
+    size_t need = ZB_STORE_HEADER_SIZE + (size_t)count * rec;
     if (len != need) {
         return false;
     }
+
+    uint8_t max_caps = (ver == 2) ? ZB_STORE_V2_MAX_CAPS : ZB_STORE_MAX_CAPS;
+    uint8_t max_actions = (ver == 2) ? ZB_STORE_V2_MAX_ACTIONS : ZB_STORE_MAX_ACTIONS;
 
     zb_table_t out;
     memset(&out, 0, sizeof out);
     out.count = count;
     const uint8_t *p = buf + ZB_STORE_HEADER_SIZE;
     for (int i = 0; i < count; i++) {
-        p = get_record(p, &out.dev[i]);
+        p = (ver == 2) ? get_record_v2(p, &out.dev[i]) : get_record(p, &out.dev[i]);
         /* A cap_count/action_count beyond the fixed-size arrays they index
          * is as impossible as a bad table count -- the field exists so a
          * consumer can loop `for (i = 0; i < d->cap_count; i++)` over
          * caps[]/actions[], and a corrupted-but-length-valid file must not
          * hand back a zb_device_t that breaks that invariant. Reject the
          * whole file rather than clamp: clamping would silently alter what
-         * the file said; *t stays untouched either way. */
-        if (out.dev[i].cap_count > ZB_STORE_MAX_CAPS ||
-            out.dev[i].action_count > ZB_STORE_MAX_ACTIONS ||
+         * the file said; *t stays untouched either way. Bounds are
+         * per-version: a v2 record's real array width was narrower
+         * (caps[4]/actions[2]) than v3's, so it is checked against those,
+         * not v3's wider limits. */
+        if (out.dev[i].cap_count > max_caps ||
+            out.dev[i].action_count > max_actions ||
             out.dev[i].unmapped_count > ZB_STORE_MAX_UNMAPPED) {
             return false;
         }
