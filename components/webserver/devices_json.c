@@ -169,6 +169,15 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
     uint16_t bound = (e->id.kind == DEV_KIND_BLE) ? wrapper_bind_lookup(e->id.addr) : 0;
     cJSON_AddNumberToObject(o, "wrapper_id", bound);
 
+    /* M8 Task 9: "endpoint" on every cap object. e->cap_endpoint[c] is the
+     * DEFAULT (lowest, or untracked/legacy 0) endpoint whose value lives
+     * in caps[c] itself (registry.h's device_entry_t doc comment) --
+     * emitted on the default-slot object below. A cap the device also
+     * reports on OTHER endpoints (Task 4's extra_ep_caps side list) gets
+     * one additional object per (cap,endpoint) instance, walked right
+     * after the main loop -- a single-endpoint device has an empty side
+     * list and so emits exactly the one object it always did, plus this
+     * one new field. */
     cJSON *caps = cJSON_AddArrayToObject(o, "caps");
     for (uint8_t c = 0; c < CAPABILITY_COUNT; c++) {
         if (!e->caps[c].valid) continue;
@@ -179,8 +188,22 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
         cJSON_AddStringToObject(co, "name", cap->name);
         cJSON_AddStringToObject(co, "unit", cap->unit);
         cJSON_AddNumberToObject(co, "value", capability_decode(c, e->caps[c].raw));
+        cJSON_AddNumberToObject(co, "endpoint", e->cap_endpoint[c]);
         add_age(co, "age_s", e, now_uptime_s, e->caps[c].updated_s, snap_have, snap_age);
         cJSON_AddItemToArray(caps, co);
+    }
+    for (uint8_t x = 0; x < e->extra_ep_cap_count; x++) {
+        const capability_t *xc = capability_get(e->extra_ep_caps[x].cap_id);
+        if (!xc || !e->extra_ep_caps[x].slot.valid) continue;
+        cJSON *xo = cJSON_CreateObject();
+        cJSON_AddNumberToObject(xo, "id", e->extra_ep_caps[x].cap_id);
+        cJSON_AddStringToObject(xo, "name", xc->name);
+        cJSON_AddStringToObject(xo, "unit", xc->unit);
+        cJSON_AddNumberToObject(xo, "value",
+            capability_decode(e->extra_ep_caps[x].cap_id, e->extra_ep_caps[x].slot.raw));
+        cJSON_AddNumberToObject(xo, "endpoint", e->extra_ep_caps[x].endpoint);
+        add_age(xo, "age_s", e, now_uptime_s, e->extra_ep_caps[x].slot.updated_s, snap_have, snap_age);
+        cJSON_AddItemToArray(caps, xo);
     }
 
     cJSON *plant_ids = cJSON_AddArrayToObject(o, "plant_ids");
@@ -260,48 +283,63 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
      * declared" enumeration accessor. */
     cJSON *actions = NULL;
     bool lockout = false;
+    /* M8 Task 9: one entry per declared (action, endpoint) pair, not per
+     * action id alone -- a multi-gang device can declare the same action
+     * independently on more than one endpoint (actor_declare_ep(), Task
+     * 7/Task 5). There is no accessor that lists which (action,endpoint)
+     * pairs are actually declared (actor_table.h keeps that private), so
+     * this probes every endpoint 1..ACTOR_MAX_ACTIONS for each action id
+     * via actor_pair_state_ep() and keeps whichever answer true -- the
+     * same brute-force-over-a-small-fixed-space approach this loop's own
+     * ACTION_COUNT probe already uses one level up. A single-endpoint
+     * device is declared at endpoint 1 only, so this still emits exactly
+     * one entry per action -- endpoint:1 -- unchanged shape plus the one
+     * new field. */
     for (uint8_t aid = 0; aid < ACTION_COUNT; aid++) {
-        actor_pair_state_t ps;
-        if (!actor_pair_state(dev_idx, aid, &ps)) continue;
-        if (!actions) {
-            actions = cJSON_AddArrayToObject(o, "actions");
-            /* Device-level (actor_table.h: lockout is the operator's stop
-             * button for the WHOLE device, not per action) -- read once,
-             * the same value rendered on every entry below. */
-            actor_lockout(dev_idx, &lockout);
+        for (uint8_t ep = 1; ep <= ACTOR_MAX_ACTIONS; ep++) {
+            actor_pair_state_t ps;
+            if (!actor_pair_state_ep(dev_idx, aid, ep, &ps)) continue;
+            if (!actions) {
+                actions = cJSON_AddArrayToObject(o, "actions");
+                /* Device-level (actor_table.h: lockout is the operator's stop
+                 * button for the WHOLE device, not per action) -- read once,
+                 * the same value rendered on every entry below. */
+                actor_lockout(dev_idx, &lockout);
+            }
+            const action_t *a = action_get(aid);
+            cJSON *ao = cJSON_CreateObject();
+            cJSON_AddNumberToObject(ao, "id", aid);
+            cJSON_AddStringToObject(ao, "name", a ? a->name : "?");
+            cJSON_AddStringToObject(ao, "param", action_param_str(a ? a->param : ACTION_PARAM_NONE));
+            cJSON_AddNumberToObject(ao, "param_max", ps.param_max);
+            cJSON_AddNumberToObject(ao, "cooldown_s", ps.cooldown_s);
+            cJSON_AddNumberToObject(ao, "max_per_hour", ps.max_per_hour);
+            cJSON_AddNumberToObject(ao, "activations_this_hour", ps.activations_this_hour);
+            cJSON_AddBoolToObject(ao, "lockout", lockout);
+            cJSON_AddNumberToObject(ao, "endpoint", ep);
+            if (ps.has_fired) {
+                cJSON_AddNumberToObject(ao, "last_fired_s", age_s(now_uptime_s, ps.last_fire_s));
+            } else {
+                cJSON_AddNullToObject(ao, "last_fired_s");
+            }
+            /* NOT the outcome of the last command that actually fired -- see
+             * live_verdict_str()'s own comment and actor_table.h's live_verdict
+             * doc (actor_table_check()'s "reachable" list there: OK, COOLDOWN or
+             * RATE only). This is a PRE-CHECK of a hypothetical MANUAL press
+             * made RIGHT NOW, recomputed fresh on every read. Named
+             * "would_refuse_now" rather than the "last_result" this shipped
+             * under in Task 11 (webui review, Task 12 fix round 1) precisely
+             * because a name implying "what happened" invites exactly the
+             * misread that name caused: a command that just fired dispatches
+             * INTO its own fresh cooldown, so at the instant after a genuinely
+             * successful dispatch this reads "cooldown", not "ok" -- and a
+             * command that failed at the GATT layer with no cooldown configured
+             * reads "ok", not "failed". A real outcome needs last_fired_s
+             * advancing (dispatch) and/or a capability confirm read landing
+             * (confirmation), not this field. */
+            cJSON_AddStringToObject(ao, "would_refuse_now", live_verdict_str(ps.live_verdict));
+            cJSON_AddItemToArray(actions, ao);
         }
-        const action_t *a = action_get(aid);
-        cJSON *ao = cJSON_CreateObject();
-        cJSON_AddNumberToObject(ao, "id", aid);
-        cJSON_AddStringToObject(ao, "name", a ? a->name : "?");
-        cJSON_AddStringToObject(ao, "param", action_param_str(a ? a->param : ACTION_PARAM_NONE));
-        cJSON_AddNumberToObject(ao, "param_max", ps.param_max);
-        cJSON_AddNumberToObject(ao, "cooldown_s", ps.cooldown_s);
-        cJSON_AddNumberToObject(ao, "max_per_hour", ps.max_per_hour);
-        cJSON_AddNumberToObject(ao, "activations_this_hour", ps.activations_this_hour);
-        cJSON_AddBoolToObject(ao, "lockout", lockout);
-        if (ps.has_fired) {
-            cJSON_AddNumberToObject(ao, "last_fired_s", age_s(now_uptime_s, ps.last_fire_s));
-        } else {
-            cJSON_AddNullToObject(ao, "last_fired_s");
-        }
-        /* NOT the outcome of the last command that actually fired -- see
-         * live_verdict_str()'s own comment and actor_table.h's live_verdict
-         * doc (actor_table_check()'s "reachable" list there: OK, COOLDOWN or
-         * RATE only). This is a PRE-CHECK of a hypothetical MANUAL press
-         * made RIGHT NOW, recomputed fresh on every read. Named
-         * "would_refuse_now" rather than the "last_result" this shipped
-         * under in Task 11 (webui review, Task 12 fix round 1) precisely
-         * because a name implying "what happened" invites exactly the
-         * misread that name caused: a command that just fired dispatches
-         * INTO its own fresh cooldown, so at the instant after a genuinely
-         * successful dispatch this reads "cooldown", not "ok" -- and a
-         * command that failed at the GATT layer with no cooldown configured
-         * reads "ok", not "failed". A real outcome needs last_fired_s
-         * advancing (dispatch) and/or a capability confirm read landing
-         * (confirmation), not this field. */
-        cJSON_AddStringToObject(ao, "would_refuse_now", live_verdict_str(ps.live_verdict));
-        cJSON_AddItemToArray(actions, ao);
     }
 
     return o;
