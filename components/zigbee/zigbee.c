@@ -1024,6 +1024,13 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
  * bench fallback, not implemented here. */
 static void zb_read_identity(uint16_t short_addr, uint8_t endpoint)
 {
+    /* Fix round 1: a zero-mapped-cluster device (an empty-descriptor Tuya
+     * device, e.g. the ZS-301Z/WK35 -- this feature's primary target) has
+     * dev->endpoint == 0, since zb_interview_on_clusters() never set it;
+     * its Basic cluster still lives on endpoint 1, the near-universal
+     * home for it, so target that instead of the ZDO endpoint 0. */
+    if (endpoint == 0) endpoint = 1;
+
     static uint16_t id_attrs[] = { 0x0004, 0x0005 };
     esp_zb_zcl_read_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
