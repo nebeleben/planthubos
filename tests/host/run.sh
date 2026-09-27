@@ -350,3 +350,13 @@ $CC -Wall -Wextra -Werror -I../../components/dev_profiles/include -I../../compon
     ../../components/dev_profiles/dev_profiles_builtin.c ../../components/capability/capability.c \
     -o test_dev_profiles -lm
 ./test_dev_profiles
+
+# mapping_engine (Task 5, device-mapping-profiles): pure submit/drop/record
+# and proposal-diff decisions. Links dev_profiles + tuya_dp + capability.
+$CC -Wall -Wextra -Werror -I../../components/dev_profiles/include -I../../components/tuya_dp/include \
+    -I../../components/capability/include \
+    test_mapping_engine.c ../../components/dev_profiles/mapping_engine.c \
+    ../../components/dev_profiles/dev_profiles.c ../../components/dev_profiles/dev_profiles_builtin.c \
+    ../../components/tuya_dp/tuya_dp.c ../../components/capability/capability.c \
+    ../../components/capability/device_id.c -o test_mapping_engine -lm
+./test_mapping_engine
