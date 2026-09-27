@@ -985,9 +985,10 @@ static void bridge_task(void *arg)
                  * takes no parameter -- same as zigbee.c's own actor_declare()
                  * call site (zb_register_restored_devices()). */
                 for (uint8_t i = 0; i < it.u.ann.action_count; i++) {
-                    if (!actor_declare(idx, it.u.ann.action_ids[i], 0, 0)) {
-                        ESP_LOGW(TAG, "device %d: could not declare action %u from " MACSTR "'s announce",
-                                 idx, (unsigned)it.u.ann.action_ids[i], MAC2STR(it.mac));
+                    if (!actor_declare_ep(idx, it.u.ann.action_ids[i], it.u.ann.action_endpoints[i], 0, 0)) {
+                        ESP_LOGW(TAG, "device %d: could not declare action %u@ep%u from " MACSTR "'s announce",
+                                 idx, (unsigned)it.u.ann.action_ids[i], (unsigned)it.u.ann.action_endpoints[i],
+                                 MAC2STR(it.mac));
                     }
                 }
                 /* An announce carries the device's FULL current action set,
@@ -1059,10 +1060,11 @@ static void bridge_task(void *arg)
                     ESP_LOGI(TAG, "bridge: event from " MACSTR " cap %u code %d -> %s",
                              MAC2STR(it.mac), it.u.meas.cap_id, (int)it.u.meas.value, ok ? "queued" : "dropped");
                 } else {
-                    ok = data_core_submit_cap_id_aged(&id, it.u.meas.cap_id, it.u.meas.value, age_for_data_core);
-                    ESP_LOGI(TAG, "bridge: measurement from " MACSTR " cap %u value %.3f age %us -> %s",
-                             MAC2STR(it.mac), it.u.meas.cap_id, (double)it.u.meas.value, (unsigned)age_for_data_core,
-                             ok ? "accepted" : "rejected");
+                    ok = data_core_submit_cap_id_ep(&id, it.u.meas.cap_id, it.u.meas.endpoint, it.u.meas.value,
+                                                     age_for_data_core);
+                    ESP_LOGI(TAG, "bridge: measurement from " MACSTR " cap %u ep %u value %.3f age %us -> %s",
+                             MAC2STR(it.mac), it.u.meas.cap_id, (unsigned)it.u.meas.endpoint,
+                             (double)it.u.meas.value, (unsigned)age_for_data_core, ok ? "accepted" : "rejected");
                 }
                 if (ok) rules_notify_value_update();
                 break;
