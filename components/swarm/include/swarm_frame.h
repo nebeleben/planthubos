@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SWARM_PROTO_VERSION 5
+#define SWARM_PROTO_VERSION 6
 #define SWARM_HDR_LEN 4      /* version(1) + type(1) + len(2) */
 #define SWARM_LMK_LEN 16
 
@@ -348,6 +348,7 @@ typedef struct __attribute__((packed)) {
 #define SWARM_DEV_NAME_MAX 24
 #define SWARM_DEV_MAX_CAPS 6
 #define SWARM_DEV_MAX_ACTIONS 8
+#define SWARM_DEV_STR_MAX 32   /* v6: manufacturer/model, length-prefixed; Tuya names ~16 chars */
 
 /* Command ops (swarm_command_t.op) */
 enum { SWARM_CMD_PERMIT_JOIN = 1, SWARM_CMD_DEVICE_REMOVE = 2, SWARM_CMD_DEVICE_RENAME = 3,
@@ -372,13 +373,17 @@ typedef struct {                       /* in-memory form; wire form is field-ser
     uint8_t  cap_endpoints[SWARM_DEV_MAX_CAPS];
     uint8_t  action_count; uint8_t action_ids[SWARM_DEV_MAX_ACTIONS];
     uint8_t  action_endpoints[SWARM_DEV_MAX_ACTIONS];
+    uint8_t  manuf_len; char manufacturer[SWARM_DEV_STR_MAX];   /* v6 Basic 0x0004 */
+    uint8_t  model_len; char model[SWARM_DEV_STR_MAX];          /* v6 Basic 0x0005 */
 } swarm_device_announce_t;
 
 /* Bridge -> hub. A previously announced device has left the network. */
 typedef struct { swarm_dev_addr_t dev; } swarm_device_gone_t;
 
-/* Bridge -> hub. One capability reading from one zigbee end device. */
-typedef struct { swarm_dev_addr_t dev; uint8_t cap_id; uint8_t endpoint; float value; uint32_t age_s; } swarm_measurement_t;
+/* Bridge -> hub. One capability reading from one zigbee end device. v6:
+ * source_cluster is the originating ZCL cluster for a standard cluster-
+ * derived cap (so the hub can suppress by origin); 0 when not tied to one. */
+typedef struct { swarm_dev_addr_t dev; uint8_t cap_id; uint8_t endpoint; float value; uint32_t age_s; uint16_t source_cluster; } swarm_measurement_t;
 
 /* Bridge -> hub. One raw Tuya EF00 datapoint (dp_id/dp_type/value) from a
  * Tuya zigbee end device -- the hub-side Tuya decoding (dp_type-specific
