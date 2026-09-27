@@ -164,6 +164,21 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
         cJSON_AddNullToObject(o, "name");
     }
 
+    /* Device-mapping-profiles Task 7: announced identity
+     * (data_core_set_identity(), swarm.c's SWARM_MSG_DEVICE_ANNOUNCE case),
+     * read straight off *e -- this function already holds the full
+     * device_entry_t (a snapshot copy, not a live index), so there's no
+     * need to round-trip through data_core_get_identity()'s idx-keyed
+     * accessor the way a caller without *e in hand would. Omitted entirely
+     * (no key at all) rather than emitted empty, same "absent beats null
+     * string" choice this file already makes for e.g. "via" above -- but
+     * as an omitted key, not cJSON_AddNullToObject(), since a device that
+     * has never announced identity is the common case, not an error one. */
+    if (e->manufacturer[0] || e->model[0]) {
+        cJSON_AddStringToObject(o, "manufacturer", e->manufacturer);
+        cJSON_AddStringToObject(o, "model", e->model);
+    }
+
     /* Per-device wrapper binding (0 = none). BLE only -- bindings key on a
      * BLE MAC (e->id.addr is display order for a BLE device). */
     uint16_t bound = (e->id.kind == DEV_KIND_BLE) ? wrapper_bind_lookup(e->id.addr) : 0;

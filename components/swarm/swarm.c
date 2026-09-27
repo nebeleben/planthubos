@@ -22,6 +22,7 @@
 #include "registry.h"
 #include "capability.h"
 #include "tuya_dp.h"
+#include "mapping_engine.h"
 #include "mibeacon.h"
 #include "app_config.h"
 #include "rules.h"
@@ -988,6 +989,19 @@ static void bridge_task(void *arg)
                 int idx = data_core_find_or_create_index(&id, now_s);
                 if (idx < 0) break;   /* registry full: already counted/logged by data_core */
                 data_core_set_via(idx, it.mac);
+                /* Device-mapping-profiles Task 7: mirror the announce's
+                 * manufacturer/model (v6 swarm_device_announce_t, Task 1)
+                 * into the registry so /api/v1/devices can surface them
+                 * (Task 8/9) -- only when the announce actually carries at
+                 * least one of the two, so a re-announce that omits them
+                 * doesn't blank out an identity captured earlier. */
+                if (it.u.ann.manuf_len || it.u.ann.model_len) {
+                    char mf[SWARM_DEV_STR_MAX + 1] = { 0 };
+                    char md[SWARM_DEV_STR_MAX + 1] = { 0 };
+                    memcpy(mf, it.u.ann.manufacturer, it.u.ann.manuf_len);
+                    memcpy(md, it.u.ann.model, it.u.ann.model_len);
+                    data_core_set_identity(idx, mf, md);
+                }
                 /* param_max=0, no flags: every action a zigbee bridge announces
                  * today (On/Off, via zb_map.c on the bridge node's own side)
                  * takes no parameter -- same as zigbee.c's own actor_declare()
@@ -1043,6 +1057,26 @@ static void bridge_task(void *arg)
                     need_resync = true;
                     break;
                 }
+                /* Device-mapping-profiles Task 7: a standard-cluster
+                 * reading (source_cluster != 0, v6 swarm_measurement_t,
+                 * Task 1) whose cluster is in THIS device's suppress-set
+                 * (the ZS-301Z soil-on-0x0405 flap, tuya_dp.h) never
+                 * reaches data_core -- suppression is decided purely by
+                 * the engine (mapping_engine.h), fed this device's OWN
+                 * suppress-set via tuya_dp_suppress_list(&id, ...), never
+                 * a cross-device/global one. Cluster 0 (Tuya EF00 raw DPs,
+                 * handled entirely by the SWARM_MSG_TUYA_DP case below) is
+                 * never suppressed here -- mapping_measurement() itself
+                 * treats source_cluster==0 as a no-op. */
+                if (it.u.meas.source_cluster != 0) {
+                    uint16_t sset[TUYA_SUPPRESS_MAX];
+                    int sn = tuya_dp_suppress_list(&id, sset, TUYA_SUPPRESS_MAX);
+                    if (mapping_measurement(it.u.meas.source_cluster, sset, sn) == MAP_DROP) {
+                        ESP_LOGD(TAG, "bridge: measurement from " MACSTR " cluster 0x%04x suppressed",
+                                 MAC2STR(it.mac), it.u.meas.source_cluster);
+                        break;
+                    }
+                }
                 /* I4 fix: mirror the BLE relay path's honesty
                  * (data_core_submit_from()'s age policy) instead of always
                  * stamping this as "now". it.u.meas.age_s is the bridge
@@ -1086,13 +1120,34 @@ static void bridge_task(void *arg)
                  * own devices -- not gated on data_core_find_index() the
                  * way MEASUREMENT is above. */
                 tuya_dp_observe(&id, it.u.tuya_dp.dp_id, it.u.tuya_dp.dp_type, it.u.tuya_dp.value, now_s);
-                uint8_t cap; float scale;
-                if (tuya_dp_map_get(&id, it.u.tuya_dp.dp_id, &cap, &scale)) {
-                    bool ok = data_core_submit_cap_id(&id, cap, (float)it.u.tuya_dp.value * scale);
+                /* Device-mapping-profiles Task 7: apply THIS device's
+                 * offset-aware DP-map (tuya_dp.h v2: value*scale+offset,
+                 * tuya_dp_apply_off()) via the pure engine
+                 * (mapping_engine.h) instead of the old scale-only
+                 * tuya_dp_map_get()+literal-multiply. tuya_dp_map_list()
+                 * returns a FLAT table across every Tuya device (Task 5
+                 * review carry-forward, mapping_engine.h's own doc
+                 * comment) -- filtered here to THIS device's own entries
+                 * BEFORE it ever reaches mapping_dp(), so a dp_id mapped
+                 * for one device can never be misapplied to a different
+                 * device that happens to report the same dp_id. */
+                tuya_dp_map_t all[TUYA_MAP_MAX];
+                int total = tuya_dp_map_list(all, TUYA_MAP_MAX);
+                tuya_dp_map_t applied[TUYA_MAP_MAX];
+                int an = 0;
+                for (int i = 0; i < total; i++) {
+                    if (device_id_equal(&all[i].id, &id)) applied[an++] = all[i];
+                }
+                uint8_t cap; float mapped;
+                if (mapping_dp(it.u.tuya_dp.dp_id, it.u.tuya_dp.value, applied, an, &cap, &mapped) == MAP_SUBMIT) {
+                    bool ok = data_core_submit_cap_id(&id, cap, mapped);
                     ESP_LOGI(TAG, "bridge: tuya dp 0x%02x from " MACSTR " cap %u -> %s",
                              it.u.tuya_dp.dp_id, MAC2STR(it.mac), cap, ok ? "accepted" : "rejected");
                     if (ok) rules_notify_value_update();
                 }
+                /* else MAP_RECORD_UNMAPPED: already recorded by
+                 * tuya_dp_observe() above for the UI/AI to see and
+                 * eventually map -- unchanged from the prior behavior. */
                 break;
             }
             case SWARM_MSG_COORD_STATUS: {

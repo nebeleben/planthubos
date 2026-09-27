@@ -60,6 +60,17 @@ typedef struct {
      * marked stale by devices_json instead of reading as just-seen. Cleared
      * the moment a live value arrives for the device. */
     bool     snapshot_only;
+    /* Device identity (device-mapping-profiles Task 7): captured from a
+     * Zigbee announce's manufacturer/model strings (swarm.c's
+     * SWARM_MSG_DEVICE_ANNOUNCE case, via data_core_set_identity()), so
+     * /api/v1/devices can surface them and dev_profiles matching (a later
+     * task) has something to key a profile lookup on. Plain in-RAM mirror
+     * only -- empty ("") until an announce carrying them arrives, and never
+     * itself persisted here: registry_persist.c serializes fields
+     * explicitly and does not include these, and zb_store (Task 2) already
+     * owns durable manufacturer/model storage for zigbee bridge devices. */
+    char     manufacturer[32];
+    char     model[32];
 } device_entry_t;
 
 typedef struct { device_entry_t devices[REGISTRY_MAX_DEVICES]; } registry_t;
