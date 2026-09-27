@@ -170,6 +170,16 @@ static int64_t  s_permit_join_deadline_us; /* 0 == window closed */
  * all -- see zb_iv_pump() below. */
 #define ZB_IV_TICK_MS 1000
 
+/* Task 6 (2026-09-27 power-metering spec): the blind-probe/poll sweep's
+ * cluster/attrs/cadence. Defined up here (not down by zb_meter_poll_cb's
+ * own definition, after zb_handle_read_attr_resp) because record_net_info()
+ * above needs ZB_METER_POLL_MS to arm the first sweep, and this file's own
+ * convention (see zb_store_save()'s forward-declaration comment) is
+ * "declare/define ahead of first use, don't reorder the file for it". */
+#define ZB_METER_CLUSTER   0x0B04   /* Electrical Measurement */
+#define ZB_METER_POLL_MS   30000   /* sweep cadence: probe UNKNOWN, poll PRESENT */
+static const uint16_t ZB_METER_ATTRS[3] = { 0x050B, 0x0505, 0x0508 }; /* ActivePower, RMSVoltage, RMSCurrent */
+
 /* s_store is read by zigbee_device_list()/zigbee_device_rename()/
  * zigbee_device_remove() (a webserver task) as well as written by the
  * interview (the stack task), so -- unlike s_mux above -- it needs a real
@@ -231,6 +241,14 @@ static void zb_iv_active_ep_cb(esp_zb_zdp_status_t status, uint8_t ep_count,
 static void zb_iv_simple_desc_cb(esp_zb_zdp_status_t status,
                                   esp_zb_af_simple_desc_1_1_t *simple_desc, void *user_ctx);
 
+/* Task 6 (2026-09-27 power-metering spec): the blind-probe/poll sweep --
+ * forward-declared here so record_net_info() below can arm the first one
+ * (same "declare ahead of first use" discipline as zb_store_save() above).
+ * Definition and the rest of the metering section sit after
+ * zb_handle_read_attr_resp(), which is the response path this drives. */
+static void zb_meter_poll_cb(uint8_t param);
+static bool s_meter_poll_armed;
+
 /* Uptime seconds -- the same now_s() convention data_core.c/ble_collector.c
  * already use (esp_timer_get_time() is microseconds since boot). Named
  * zb_now_s(), not now_s(), so it cannot be confused with the many local
@@ -262,6 +280,19 @@ static void record_net_info(uint8_t *out_channel, uint16_t *out_pan_id)
      * node's COORD_STATUS goes out the moment its network actually exists,
      * not just after its next CHECKIN. */
     if (s_status_observer) s_status_observer();
+
+    /* Task 6: arm the metering blind-probe/poll sweep exactly once per
+     * boot, right here -- this function is the single point (both the
+     * comment above and its two signal-handler callers agree) at which
+     * the network actually exists, whether formed fresh or restored.
+     * esp_zb_scheduler_alarm() runs its callback on this same stack task,
+     * so arming it here (also stack task, inside the signal handler) is
+     * safe with no lock. The guard just protects against a hypothetical
+     * third caller ever arming a second, redundant sweep. */
+    if (!s_meter_poll_armed) {
+        s_meter_poll_armed = true;
+        esp_zb_scheduler_alarm(zb_meter_poll_cb, 0, ZB_METER_POLL_MS);
+    }
 }
 
 /* Required by the esp-zigbee-lib SDK: every signal the stack raises (BDB
@@ -995,12 +1026,41 @@ static void zb_handle_read_attr_resp(const esp_zb_zcl_cmd_read_attr_resp_message
              msg->info.cluster, found ? "" : " (unrecognised device; ignored)");
     if (!found) return;
 
+    /* Task 6: any_success/any_error are tracked in the same pass that
+     * ingests SUCCESS variables -- no second walk of the list. */
+    bool any_success = false;
+    bool any_error = false;
     for (const esp_zb_zcl_read_attr_resp_variable_t *v = msg->variables; v; v = v->next) {
-        if (v->status != ESP_ZB_ZCL_STATUS_SUCCESS) continue;
+        if (v->status != ESP_ZB_ZCL_STATUS_SUCCESS) { any_error = true; continue; }
+        any_success = true;
         zb_ingest_reading(eui64, msg->info.cluster, v->attribute.id,
                           msg->info.src_endpoint, &v->attribute.data);
     }
-    /* Task 6: meter_state transitions here */
+
+    /* Task 6: meter_state transitions here. This response is only ever a
+     * reply to the blind-probe/poll's own Read Attributes on 0x0B04 (the
+     * metering path is the only caller of esp_zb_zcl_read_attr_cmd_req in
+     * this file), so any cluster-0x0B04 read-attr-resp is metering
+     * evidence: >=1 SUCCESS means the device answered as a meter ->
+     * PRESENT; all-error (e.g. UNSUP_ATTRIB/UNSUP_CLUSTER) means it does
+     * not -> ABSENT. Looked up fresh by eui64 here (not the `idx` found
+     * above) because this file's own store mutations all run on this same
+     * stack task except zigbee_device_rename()/_remove() (a webserver
+     * task, both mutex-guarded) -- idx could have gone stale across the
+     * gap since it was taken. */
+    if (msg->info.cluster == ZB_METER_CLUSTER) {
+        (void)any_error; /* implied by !any_success; named for readability */
+        zb_meter_state_t new_state = any_success ? ZB_METER_PRESENT : ZB_METER_ABSENT;
+        xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+        int mi = zb_store_find(&s_store, eui64);
+        if (mi >= 0 && s_store.dev[mi].meter_state != (uint8_t)new_state) {
+            s_store.dev[mi].meter_state = (uint8_t)new_state;
+            zb_store_save();
+            ESP_LOGI(TAG, "meter_state: dev idx %d ep %u -> %s", mi, msg->info.src_endpoint,
+                     new_state == ZB_METER_PRESENT ? "PRESENT" : "ABSENT");
+        }
+        xSemaphoreGive(s_store_mutex);
+    }
 }
 
 /* Task 8: the SDK allows exactly one ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID
@@ -1321,6 +1381,187 @@ static void zb_iv_send_config_report(void)
         .record_field = &record,
     };
     esp_zb_zcl_config_report_cmd_req(&cmd);
+}
+
+/* ---------------------------------------------------------------------
+ * Task 6 (2026-09-27 power-metering spec): the blind-probe + 30 s poll
+ * sweep for 0x0B04 (Electrical Measurement) on every switch.state device.
+ * There is no ZCL way to ask "do you support this cluster" other than
+ * trying it -- hence "blind probe": every sweep, an UNKNOWN device is
+ * (re)probed (bind + Configure Reporting + a Read Attributes), a PRESENT
+ * device is just polled (Read Attributes only), and an ABSENT device is
+ * left alone. meter_state itself only ever moves in
+ * zb_handle_read_attr_resp() above, driven by what comes back (or
+ * doesn't).
+ *
+ * Placed after zb_iv_send_config_report()/zb_iv_on_bind() (not up by
+ * zb_handle_read_attr_resp(), which only needed ZB_METER_CLUSTER/
+ * ZB_METER_POLL_MS -- moved next to ZB_IV_TICK_MS for that) so the probe
+ * below can reuse zb_iv_on_bind as its bind-result callback without a
+ * second forward declaration.
+ * --------------------------------------------------------------------- */
+
+/* The per-sweep candidate copy. Commit ec75ed0 rebooted the board in a
+ * loop by copying a full zb_device_t[] (ZB_STORE_MAX_DEVICES entries,
+ * each carrying caps/actions/name arrays) onto a task stack -- this
+ * struct carries only what the sweep needs per candidate (12 bytes), so
+ * ZB_STORE_MAX_DEVICES of them (16 today) is 192 bytes on the stack
+ * task's 8192-byte stack: nothing. */
+typedef struct {
+    uint8_t  eui64[8];
+    uint16_t short_addr;
+    uint8_t  endpoint;
+    uint8_t  meter_state;
+} zb_meter_candidate_t;
+
+/* Endpoint choice: the endpoint CAP_SWITCH_STATE itself lives on
+ * (cap_endpoints[] at the matching caps[] slot) -- NOT dev->endpoint,
+ * which zb_store.h documents as only the device's first-mapped endpoint.
+ * A dual-gang plug's second switch instance can live on a different
+ * endpoint than the one that would answer 0x0B04, so this has to track
+ * the switch, not the device's arbitrary "primary". Falls back to
+ * dev->endpoint if no caps[] slot matches CAP_SWITCH_STATE, which should
+ * not happen for a device this sweep ever selects as a candidate (see
+ * zb_meter_poll_cb's own CAP_SWITCH_STATE filter below). */
+static uint8_t zb_meter_switch_endpoint(const zb_device_t *dev)
+{
+    for (uint8_t k = 0; k < dev->cap_count; k++) {
+        if (dev->caps[k] == CAP_SWITCH_STATE) return dev->cap_endpoints[k];
+    }
+    return dev->endpoint;
+}
+
+/* The Read Attributes both PROBE and POLL send on 0x0B04 -- exactly the
+ * shape the Task 6 dispatch specifies. The response (SUCCESS/error, or no
+ * response at all) is what zb_handle_read_attr_resp() above turns into a
+ * meter_state transition; this function never touches meter_state. */
+static void zb_meter_read_attrs(uint16_t short_addr, uint8_t endpoint)
+{
+    esp_zb_zcl_read_attr_cmd_t cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = short_addr,
+            .dst_endpoint = endpoint,
+            .src_endpoint = ZB_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = ZB_METER_CLUSTER,
+        .attr_number = 3,
+        .attr_field = (uint16_t *)ZB_METER_ATTRS,
+    };
+    esp_zb_zcl_read_attr_cmd_req(&cmd);
+}
+
+/* UNKNOWN device: bind + Configure-Reporting on 0x0B04 for the three
+ * metering attrs (mirrors zb_iv_send_config_report()'s bind+config shape
+ * above -- see that function's own comment for why the bind has to
+ * happen at all: a device only reports to a bound destination), then the
+ * same Read Attributes zb_meter_read_attrs() sends every sweep. Leaves
+ * meter_state alone -- only a response (or repeated silence) moves it.
+ * A device that never answers is simply probed again next sweep; there
+ * is deliberately no persistent "already probed" flag (Task 6 dispatch:
+ * UNKNOWN already means "keep trying", and a bridge->device 802.15.4
+ * probe is cheap). */
+static void zb_meter_probe(const uint8_t eui64[8], uint16_t short_addr, uint8_t endpoint)
+{
+    int16_t  change_power = 1; /* ActivePower, S16 */
+    uint16_t change_volt  = 1; /* RMSVoltage, U16 */
+    uint16_t change_curr  = 1; /* RMSCurrent, U16 */
+    esp_zb_zcl_config_report_record_t records[3] = {
+        {
+            .direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND,
+            .attributeID = ZB_METER_ATTRS[0], /* 0x050B ActivePower */
+            .attrType = ESP_ZB_ZCL_ATTR_TYPE_S16,
+            .min_interval = 1,
+            .max_interval = 3600,
+            .reportable_change = &change_power,
+        },
+        {
+            .direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND,
+            .attributeID = ZB_METER_ATTRS[1], /* 0x0505 RMSVoltage */
+            .attrType = ESP_ZB_ZCL_ATTR_TYPE_U16,
+            .min_interval = 1,
+            .max_interval = 3600,
+            .reportable_change = &change_volt,
+        },
+        {
+            .direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND,
+            .attributeID = ZB_METER_ATTRS[2], /* 0x0508 RMSCurrent */
+            .attrType = ESP_ZB_ZCL_ATTR_TYPE_U16,
+            .min_interval = 1,
+            .max_interval = 3600,
+            .reportable_change = &change_curr,
+        },
+    };
+
+    esp_zb_zdo_bind_req_param_t bind = {
+        .src_endp = endpoint,
+        .cluster_id = ZB_METER_CLUSTER,
+        .dst_addr_mode = ESP_ZB_ZDO_BIND_DST_ADDR_MODE_64_BIT_EXTENDED,
+        .dst_endp = ZB_ENDPOINT,
+        .req_dst_addr = short_addr,
+    };
+    memcpy(bind.src_address, eui64, sizeof(bind.src_address));
+    esp_zb_get_long_address(bind.dst_address_u.addr_long);
+    esp_zb_zdo_device_bind_req(&bind, zb_iv_on_bind, (void *)(uintptr_t)ZB_METER_CLUSTER);
+
+    esp_zb_zcl_config_report_cmd_t cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = short_addr,
+            .dst_endpoint = endpoint,
+            .src_endpoint = ZB_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = ZB_METER_CLUSTER,
+        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+        .record_number = 3,
+        .record_field = records,
+    };
+    esp_zb_zcl_config_report_cmd_req(&cmd);
+
+    zb_meter_read_attrs(short_addr, endpoint);
+}
+
+/* The sweep itself: one pass over the store every ZB_METER_POLL_MS,
+ * self-rearmed at the end exactly like zb_iv_tick_cb() above. Runs on the
+ * stack task (esp_zb_scheduler_alarm() callbacks always do), so every
+ * esp_zb_* call in this function and the two helpers above needs no
+ * esp_zb_lock_acquire -- contrast the permit/actuate paths elsewhere in
+ * this file, which run on OTHER tasks and do lock. s_store_mutex is held
+ * only long enough to copy the tiny candidate list; it is released before
+ * any esp_zb call. */
+static void zb_meter_poll_cb(uint8_t param)
+{
+    (void)param;
+
+    zb_meter_candidate_t cand[ZB_STORE_MAX_DEVICES];
+    int n = 0;
+
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+    for (int i = 0; i < s_store.count && n < ZB_STORE_MAX_DEVICES; i++) {
+        const zb_device_t *d = &s_store.dev[i];
+        if (d->meter_state == ZB_METER_ABSENT) continue; /* never probe/poll again */
+        bool has_switch = false;
+        for (uint8_t k = 0; k < d->cap_count; k++) {
+            if (d->caps[k] == CAP_SWITCH_STATE) { has_switch = true; break; }
+        }
+        if (!has_switch) continue;
+        memcpy(cand[n].eui64, d->eui64, 8);
+        cand[n].short_addr = d->short_addr;
+        cand[n].endpoint = zb_meter_switch_endpoint(d);
+        cand[n].meter_state = d->meter_state;
+        n++;
+    }
+    xSemaphoreGive(s_store_mutex);
+
+    for (int i = 0; i < n; i++) {
+        if (cand[i].meter_state == ZB_METER_UNKNOWN) {
+            zb_meter_probe(cand[i].eui64, cand[i].short_addr, cand[i].endpoint);
+        } else { /* ZB_METER_PRESENT */
+            zb_meter_read_attrs(cand[i].short_addr, cand[i].endpoint);
+        }
+    }
+
+    esp_zb_scheduler_alarm(zb_meter_poll_cb, 0, ZB_METER_POLL_MS);
 }
 
 /* ZB_IV_ACT_STORE (Task 6 step 4): persist the interview result, then --
