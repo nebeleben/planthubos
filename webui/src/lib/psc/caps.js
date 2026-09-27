@@ -27,6 +27,12 @@ export const CAPS = {
   'switch.state': { id: 8, unit: '', aliases: [] },
   'button.action': { id: 9, unit: '', aliases: [] },
   'dim.rotate': { id: 10, unit: '', aliases: [] },
+  // Ids 11-13, added to components/capability/capability.c by the
+  // power-metering feature (CAP_ELECTRIC_POWER/VOLTAGE/CURRENT). Units W/V/A
+  // are single ASCII letters, lexable by UNIT_CHAR ([A-Za-z%°]) directly.
+  'electric.power': { id: 11, unit: 'W', aliases: ['W'] },
+  'electric.voltage': { id: 12, unit: 'V', aliases: ['V'] },
+  'electric.current': { id: 13, unit: 'A', aliases: ['A'] },
 }
 
 export const CAPS_BY_ID = Object.fromEntries(
