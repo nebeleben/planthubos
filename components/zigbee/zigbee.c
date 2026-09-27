@@ -1004,6 +1004,63 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
                       msg->src_endpoint, &msg->attribute.data);
 }
 
+/* device-mapping-profiles (Task 6): fire-and-forget Basic cluster (0x0000)
+ * Read Attributes for ManufacturerName (0x0004) + ModelIdentifier (0x0005).
+ * The response returns through zb_handle_read_attr_resp() below, same as
+ * the metering 0x0B04 read (zb_meter_read_attrs() below) -- and, like that
+ * function, this one takes no esp_zb_lock: every call site is already on
+ * the stack task. zb_iv_handle_store() calls it directly (interview
+ * completion, a scheduler-alarm/interview context -- see
+ * zb_meter_poll_cb()'s header comment for why an "inside" caller must not
+ * lock). zigbee_read_identity() below (the on-demand "outside" entry point
+ * for Task 8's /identify route) takes the stack lock itself around this
+ * call, the same way zigbee_permit_join()/zigbee_device_remove() do for
+ * their own SDK calls -- so the lock lives at the one call site that
+ * actually needs it, not inside a helper shared with an "inside" caller.
+ *
+ * Bench caveat: some Tuya devices only answer a wider attribute set -- if
+ * this two-attr read comes back empty, add {0x0000,0x0001,0x0007,0xFFFE}
+ * to id_attrs[] below (Zigbee2MQTT's set) and rebuild. Left as a one-line
+ * bench fallback, not implemented here. */
+static void zb_read_identity(uint16_t short_addr, uint8_t endpoint)
+{
+    static uint16_t id_attrs[] = { 0x0004, 0x0005 };
+    esp_zb_zcl_read_attr_cmd_t cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = short_addr,
+            .dst_endpoint = endpoint,
+            .src_endpoint = ZB_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = 0x0000,   /* Basic */
+        .attr_number = sizeof(id_attrs) / sizeof(id_attrs[0]),
+        .attr_field = id_attrs,
+    };
+    esp_zb_zcl_read_attr_cmd_req(&cmd);
+}
+
+/* device-mapping-profiles (Task 6): look a device up by eui64 and forward
+ * its current record to the hub (s_observer) plus refresh this bridge's
+ * own actor-table registration -- the same two calls the cap/action
+ * backfill in zb_ingest_reading() above already makes when a device's
+ * record changes after it was first announced. Used by the identity
+ * read-resp branch below so a Basic-cluster reply that updates
+ * manufacturer/model reaches the hub without waiting for the device's
+ * next real report. Never called with s_store_mutex held (matches every
+ * other s_observer call site in this file). */
+static void zb_reannounce_device(const uint8_t eui64[8])
+{
+    zb_device_t dev_copy = {0};
+    bool have_copy = false;
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+    int idx = zb_store_find(&s_store, eui64);
+    if (idx >= 0) { dev_copy = s_store.dev[idx]; have_copy = true; }
+    xSemaphoreGive(s_store_mutex);
+    if (!have_copy) return;
+    if (s_observer) s_observer(&dev_copy, false);
+    zb_bridge_register_device_actors(&dev_copy, zb_now_s());
+}
+
 /* ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID handler. The blind-probe/poll
  * (metering) path reads 0x0B04 attributes explicitly; the response is a
  * linked list of (status, attribute) variables. Each SUCCESS variable is
@@ -1025,6 +1082,49 @@ static void zb_handle_read_attr_resp(const esp_zb_zcl_cmd_read_attr_resp_message
     ESP_LOGI(TAG, "read-resp: ep %u cluster 0x%04x%s", msg->info.src_endpoint,
              msg->info.cluster, found ? "" : " (unrecognised device; ignored)");
     if (!found) return;
+
+    /* device-mapping-profiles (Task 6): a Basic-cluster (0x0000) reply is
+     * always the answer to zb_read_identity()'s own Read Attributes on
+     * {0x0004,0x0005} -- routed here by cluster, additive to the
+     * ZB_METER_CLUSTER handling below, which it returns before reaching.
+     * ZCL character strings are length-prefixed: the first octet is the
+     * length, then that many raw (non-null-terminated) chars. */
+    if (msg->info.cluster == 0x0000) {
+        bool changed = false;
+        char manuf[ZB_STORE_STR_MAX] = { 0 };
+        char model[ZB_STORE_STR_MAX] = { 0 };
+        bool have_manuf = false, have_model = false;
+        for (const esp_zb_zcl_read_attr_resp_variable_t *v = msg->variables; v; v = v->next) {
+            if (v->status != ESP_ZB_ZCL_STATUS_SUCCESS || !v->attribute.data.value) continue;
+            const uint8_t *zs = (const uint8_t *)v->attribute.data.value;
+            uint8_t slen = zs[0];
+            if (slen >= ZB_STORE_STR_MAX) slen = ZB_STORE_STR_MAX - 1;
+            if (v->attribute.id == 0x0004) {
+                memcpy(manuf, zs + 1, slen); manuf[slen] = '\0'; have_manuf = true;
+            } else if (v->attribute.id == 0x0005) {
+                memcpy(model, zs + 1, slen); model[slen] = '\0'; have_model = true;
+            }
+        }
+        xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+        int mi = zb_store_find(&s_store, eui64);
+        if (mi >= 0) {
+            if (have_manuf && strncmp(s_store.dev[mi].manufacturer, manuf, ZB_STORE_STR_MAX) != 0) {
+                snprintf(s_store.dev[mi].manufacturer, ZB_STORE_STR_MAX, "%s", manuf);
+                changed = true;
+            }
+            if (have_model && strncmp(s_store.dev[mi].model, model, ZB_STORE_STR_MAX) != 0) {
+                snprintf(s_store.dev[mi].model, ZB_STORE_STR_MAX, "%s", model);
+                changed = true;
+            }
+            if (changed) zb_store_save();
+        }
+        xSemaphoreGive(s_store_mutex);
+        if (changed) {
+            ESP_LOGI(TAG, "identity: dev idx %d manuf='%s' model='%s'", mi, manuf, model);
+            zb_reannounce_device(eui64);
+        }
+        return;
+    }
 
     /* Task 6: any_success/any_error are tracked in the same pass that
      * ingests SUCCESS variables -- no second walk of the list. */
@@ -1677,6 +1777,16 @@ static void zb_iv_handle_store(void)
     ESP_LOGI(TAG, "device %d interviewed: %u capability(ies), %u action(s)", dev_idx,
              (unsigned)dev->cap_count, (unsigned)dev->action_count);
 
+    /* device-mapping-profiles (Task 6): fire the Basic-cluster identity
+     * read now that the interview succeeded (dev->interviewed is true past
+     * this point) -- unconditionally, including a device that enumerated
+     * zero clusters (dev->cap_count == 0), since it may still answer a
+     * plain Basic read. Fire-and-forget: the response (if any) lands in
+     * zb_handle_read_attr_resp() above and re-announces on its own. No
+     * esp_zb_lock here -- this whole function runs on the stack task (see
+     * zb_read_identity()'s own header comment). */
+    zb_read_identity(dev->short_addr, dev->endpoint);
+
     /* M7 Task 5: a zigbee-role node's forwarder announces this device to
      * the hub now that its interview succeeded. `dev` is s_iv.dev, a
      * complete record -- the same shape zigbee_device_list() hands out. */
@@ -2292,6 +2402,48 @@ bool zigbee_device_remove(const uint8_t eui64[8])
     esp_zb_zdo_device_leave_req(&req, NULL, NULL);
     esp_zb_lock_release();
     return true;
+}
+
+/* device-mapping-profiles (Task 6): on-demand re-read of an already-joined
+ * device's identity (no re-pair), for Task 8's /identify route. Looks the
+ * device up by eui64 for its current short_addr/endpoint, then fires the
+ * same Basic-cluster Read Attributes the interview-complete path fires
+ * automatically (zb_read_identity(), above) -- the response lands in
+ * zb_handle_read_attr_resp() and re-announces on its own; nothing here
+ * waits for it. An "outside" caller (a webserver task), same as
+ * zigbee_permit_join()/zigbee_device_remove() above -- must hold the stack
+ * lock for this SDK call, which is why it lives here and not inside
+ * zb_read_identity() itself (that helper also runs bare from the
+ * interview-finalize path, already on the stack task). A safe no-op when
+ * eui64 is not in the store, or Zigbee is disabled/not started. */
+void zigbee_read_identity(const uint8_t eui64[8])
+{
+    if (!eui64) return;
+    bool started;
+    portENTER_CRITICAL(&s_mux);
+    started = s_started;
+    portEXIT_CRITICAL(&s_mux);
+    if (!started) return;
+
+    uint16_t short_addr = 0;
+    uint8_t endpoint = 0;
+    bool found = false;
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+    int idx = zb_store_find(&s_store, eui64);
+    if (idx >= 0) {
+        short_addr = s_store.dev[idx].short_addr;
+        endpoint = s_store.dev[idx].endpoint;
+        found = true;
+    }
+    xSemaphoreGive(s_store_mutex);
+    if (!found) return;
+
+    if (!esp_zb_lock_acquire(pdMS_TO_TICKS(ZB_LOCK_WAIT_MS))) {
+        ESP_LOGW(TAG, "could not acquire the Zigbee stack lock; identity re-read not sent");
+        return;
+    }
+    zb_read_identity(short_addr, endpoint);
+    esp_zb_lock_release();
 }
 
 /* Task 8: zb_cmd.c's one need from the store this file owns. Copies out

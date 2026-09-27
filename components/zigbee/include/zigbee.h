@@ -123,6 +123,16 @@ bool zigbee_device_rename(const uint8_t eui64[8], const char *name);
  * on restart. Do not attempt to add registry deletion in this milestone. */
 bool zigbee_device_remove(const uint8_t eui64[8]);
 
+/* device-mapping-profiles (Task 6): on-demand re-read of a device's Basic
+ * cluster (0x0000) manufacturer/model, for an already-joined device -- no
+ * re-pair, no new interview FSM state. Fires the same fire-and-forget
+ * ZCL Read Attributes the interview-complete path fires automatically;
+ * the response lands in zb_handle_read_attr_resp() (zigbee.c), which
+ * stores manufacturer/model on the matching zb_device_t and re-announces
+ * it. A safe no-op when eui64 is not in the store or Zigbee is disabled/
+ * not started. For Task 8's /identify route. */
+void zigbee_read_identity(const uint8_t eui64[8]);
+
 /* ---------------------------------------------------------------------
  * Task 8: the Zigbee command engine (zb_cmd.c). Split across this header's
  * two owners the same way the rest of this file is: zigbee.c owns the
