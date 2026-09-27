@@ -794,6 +794,153 @@ static bool zcl_attr_to_i32(const esp_zb_zcl_attribute_data_t *data, int32_t *ou
     }
 }
 
+/* The one place a single ZCL reading (from a report OR a read-attr
+ * response) becomes a capability: route (cluster, attr) -> cap, gate the
+ * attribute, convert to the cap's unit, submit to data_core by endpoint,
+ * then backfill the cap/action into zb_store and re-announce. Both the
+ * report handler and the read-attr-response handler resolve the device to
+ * an eui64 first, then hand the reading here. */
+static void zb_ingest_reading(const uint8_t eui64[8], uint16_t cluster,
+                              uint16_t attr, uint8_t endpoint,
+                              const esp_zb_zcl_attribute_data_t *data)
+{
+    /* Cluster unmapped, or the value is one of ZCL's not-a-reading
+     * sentinels: dropped silently, never substituted -- a fabricated
+     * reading in a plant's history is worse than a gap (zb_map.h). */
+    uint8_t cap = zb_map_attr_to_cap(cluster, attr);
+    if (cap == ZB_MAP_NONE) { ESP_LOGI(TAG, "report: cluster 0x%04x unmapped; dropped", cluster); return; }
+
+    /* Whole-branch review, FIX 3: zb_map_zcl_to_value() converts whatever
+     * raw value arrived, on the assumption the attribute it is being
+     * handed is the one zb_map_report_attr() named for this cluster when
+     * Configure Reporting was set up. Nothing upstream of this function
+     * enforced that -- a device that reports a DIFFERENT attribute on the
+     * same cluster (e.g. Power Configuration's BatteryVoltage, 0x0020, 100
+     * mV units, instead of BatteryPercentageRemaining, 0x0021) would
+     * otherwise have its raw units silently reinterpreted as the wrong
+     * capability's units and land in history as a fabricated reading.
+     * zb_map_accepts_attr()/zb_map_zcl_attr_to_value() now gate and convert
+     * per (cluster, attribute): BatteryVoltage 0x0020 is ACCEPTED and mapped
+     * to a percentage (Xiaomi coin-cell sensors report only voltage), while
+     * an unrelated attribute on a mapped cluster is still dropped. */
+    if (!zb_map_accepts_attr(cluster, attr)) {
+        ESP_LOGI(TAG, "report: attr 0x%04x not a mapped reading for cluster 0x%04x; dropped",
+                 attr, cluster);
+        return;
+    }
+
+    int32_t raw;
+    if (!zcl_attr_to_i32(data, &raw)) {
+        ESP_LOGI(TAG, "report: attr type 0x%02x not convertible; dropped", data->type);
+        return;
+    }
+
+    float value;
+    if (!zb_map_zcl_attr_to_value(cluster, attr, raw, &value)) {
+        ESP_LOGI(TAG, "report: raw %ld is a ZCL sentinel for cluster 0x%04x attr 0x%04x; dropped",
+                 (long)raw, cluster, attr);
+        return;
+    }
+
+    device_id_t id = { .kind = DEV_KIND_ZIGBEE };
+    memcpy(id.addr, eui64, 8);
+    const capability_t *cdef = capability_get(cap);
+    bool accepted;
+    if (cdef && cdef->event) {
+        accepted = data_core_submit_event(&id, cap, (int16_t)value);
+        ESP_LOGI(TAG, "report: event cap %u code %d -> %s", cap, (int)value, accepted ? "queued" : "dropped");
+    } else {
+        /* Task 6 (multi-endpoint-zigbee): route by src_endpoint instead of
+         * always targeting the device's default/main slot -- a dual On/Off
+         * device (two switch.state instances, endpoints {1,2}) must land
+         * each report in its own instance, not clobber the other's value.
+         * A single-endpoint device (the overwhelming majority) reports on
+         * its one and only endpoint, so this is unchanged behavior for it:
+         * that endpoint becomes (and stays) the tracked default. */
+        accepted = data_core_submit_cap_id_ep(&id, cap, endpoint, value, 0);
+        ESP_LOGI(TAG, "report: cap %u ep %u value %.3f -> data_core %s", cap, endpoint,
+                 (double)value, accepted ? "accepted" : "rejected (device not in registry?)");
+    }
+
+    /* Cap-list backfill (2026-09-10): a device can stream a real value on a
+     * mapped cluster the interview never enumerated -- Xiaomi's older
+     * temp/humidity sensors answer the simple-descriptor query with zero
+     * clusters, yet report temperature/humidity fine. When an ACCEPTED
+     * reading proves a capability the stored record is missing, add it (up
+     * to ZB_STORE_MAX_CAPS) and re-announce, so the hub's device list shows
+     * what the device actually sends. Gated on `accepted`, so a sentinel or
+     * a rejected value never invents a capability; fires at most once per
+     * (device, cap) since the presence check then finds it. The observer,
+     * like every s_observer call in this file, only queues (Task 5). */
+    if (accepted) {
+        bool changed = false;
+        zb_device_t dev_copy = {0};
+        xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+        int bi = zb_store_find(&s_store, eui64);
+        if (bi >= 0) {
+            zb_device_t *d = &s_store.dev[bi];
+            /* Task 6: presence is now keyed on (cap, endpoint), not cap
+             * alone -- a dual On/Off device's second gang reports the same
+             * cap on a DIFFERENT endpoint, and that must backfill a SECOND
+             * instance, not be swallowed as "already have switch.state". */
+            bool present = false;
+            for (int k = 0; k < d->cap_count; k++)
+                if (d->caps[k] == cap && d->cap_endpoints[k] == endpoint) { present = true; break; }
+            if (!present && d->cap_count < ZB_STORE_MAX_CAPS) {
+                d->caps[d->cap_count] = cap;
+                d->cap_clusters[d->cap_count] = cluster;
+                d->cap_endpoints[d->cap_count] = endpoint;
+                d->cap_count++;
+                changed = true;
+            }
+            /* On/Off ACTION backfill: the cap backfill above rescues
+             * switch.state, but a device that interviewed with no clusters
+             * (a Tuya plug) also needs its switch.on/switch.off ACTIONS to be
+             * controllable -- the interview never registered them. Add the
+             * missing ones (zb_map_onoff_backfill_actions returns none for a
+             * button/knob, so a stray On/Off report never re-arms the switch
+             * actions knob_reclassify strips). */
+            if (cluster == 0x0006 /* On/Off */) {
+                uint8_t acts[ZB_STORE_MAX_ACTIONS];
+                int na = zb_map_onoff_backfill_actions(d->caps, d->cap_count, acts, ZB_STORE_MAX_ACTIONS);
+                for (int a = 0; a < na && d->action_count < ZB_STORE_MAX_ACTIONS; a++) {
+                    bool ap = false;
+                    /* Endpoint-aware, matching the cap backfill above: the
+                     * same action on a DIFFERENT endpoint is a distinct
+                     * instance and must be backfilled too. Without the
+                     * endpoint compare, an empty-descriptor On/Off device
+                     * whose actions were recorded on one endpoint (e.g. a
+                     * pre-v5 single-endpoint record migrated with endpoint 0)
+                     * would never get its real-endpoint actions from a fresh
+                     * report -- leaving it uncontrollable until re-paired. */
+                    for (int j = 0; j < d->action_count; j++)
+                        if (d->actions[j] == acts[a] && d->action_endpoints[j] == endpoint) { ap = true; break; }
+                    if (!ap) {
+                        d->action_endpoints[d->action_count] = endpoint;
+                        d->actions[d->action_count++] = acts[a];
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) { zb_store_save(); dev_copy = *d; }
+        }
+        xSemaphoreGive(s_store_mutex);
+        if (changed) {
+            ESP_LOGI(TAG, "backfilled caps/actions (cluster 0x%04x) from a report; re-announcing", cluster);
+            if (s_observer) s_observer(&dev_copy, false);
+            /* A cap-only backfill leaves the bridge's own actor table alone
+             * (nothing new to declare), but an ACTION backfill just added an
+             * entry to dev_copy that this bridge's actor table does not
+             * know about yet -- re-announcing to s_observer only tells the
+             * HUB. Without this call the just-backfilled action is refused
+             * locally (ACTOR_REFUSED_UNKNOWN) until the next reboot replays
+             * zb_register_restored_devices(). Harmless no-op for a 0-action
+             * (sensor/cap-only) backfill, same as the other two callers. */
+            zb_bridge_register_device_actors(&dev_copy, zb_now_s());
+        }
+    }
+}
+
 /* ESP_ZB_CORE_REPORT_ATTR_CB_ID handler (registered in zb_task() below).
  * Runs on the stack task, same as every other callback in this file. */
 static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
@@ -822,141 +969,38 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
              msg->attribute.data.type, found ? "" : " (unrecognised device; ignored)");
     if (!found) return;
 
-    /* Cluster unmapped, or the value is one of ZCL's not-a-reading
-     * sentinels: dropped silently, never substituted -- a fabricated
-     * reading in a plant's history is worse than a gap (zb_map.h). */
-    uint8_t cap = zb_map_cluster_to_cap(msg->cluster);
-    if (cap == ZB_MAP_NONE) { ESP_LOGI(TAG, "report: cluster 0x%04x unmapped; dropped", msg->cluster); return; }
+    zb_ingest_reading(eui64, msg->cluster, msg->attribute.id,
+                      msg->src_endpoint, &msg->attribute.data);
+}
 
-    /* Whole-branch review, FIX 3: zb_map_zcl_to_value() converts whatever
-     * raw value arrived, on the assumption the attribute it is being
-     * handed is the one zb_map_report_attr() named for this cluster when
-     * Configure Reporting was set up. Nothing upstream of this function
-     * enforced that -- a device that reports a DIFFERENT attribute on the
-     * same cluster (e.g. Power Configuration's BatteryVoltage, 0x0020, 100
-     * mV units, instead of BatteryPercentageRemaining, 0x0021) would
-     * otherwise have its raw units silently reinterpreted as the wrong
-     * capability's units and land in history as a fabricated reading.
-     * zb_map_accepts_attr()/zb_map_zcl_attr_to_value() now gate and convert
-     * per (cluster, attribute): BatteryVoltage 0x0020 is ACCEPTED and mapped
-     * to a percentage (Xiaomi coin-cell sensors report only voltage), while
-     * an unrelated attribute on a mapped cluster is still dropped. */
-    if (!zb_map_accepts_attr(msg->cluster, msg->attribute.id)) {
-        ESP_LOGI(TAG, "report: attr 0x%04x not a mapped reading for cluster 0x%04x; dropped",
-                 msg->attribute.id, msg->cluster);
-        return;
-    }
+/* ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID handler. The blind-probe/poll
+ * (metering) path reads 0x0B04 attributes explicitly; the response is a
+ * linked list of (status, attribute) variables. Each SUCCESS variable is
+ * ingested exactly like a report. Endpoint/cluster/source live under .info. */
+static void zb_handle_read_attr_resp(const esp_zb_zcl_cmd_read_attr_resp_message_t *msg)
+{
+    if (!msg) return;
 
-    int32_t raw;
-    if (!zcl_attr_to_i32(&msg->attribute.data, &raw)) {
-        ESP_LOGI(TAG, "report: attr type 0x%02x not convertible; dropped", msg->attribute.data.type);
-        return;
-    }
+    uint8_t eui64[8];
+    bool found;
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+    int idx = (msg->info.src_address.addr_type == ESP_ZB_ZCL_ADDR_TYPE_IEEE)
+                  ? zb_store_find(&s_store, msg->info.src_address.u.ieee_addr)
+                  : zb_store_find_by_short(msg->info.src_address.u.short_addr);
+    found = idx >= 0;
+    if (found) memcpy(eui64, s_store.dev[idx].eui64, 8);
+    xSemaphoreGive(s_store_mutex);
 
-    float value;
-    if (!zb_map_zcl_attr_to_value(msg->cluster, msg->attribute.id, raw, &value)) {
-        ESP_LOGI(TAG, "report: raw %ld is a ZCL sentinel for cluster 0x%04x attr 0x%04x; dropped",
-                 (long)raw, msg->cluster, msg->attribute.id);
-        return;
-    }
+    ESP_LOGI(TAG, "read-resp: ep %u cluster 0x%04x%s", msg->info.src_endpoint,
+             msg->info.cluster, found ? "" : " (unrecognised device; ignored)");
+    if (!found) return;
 
-    device_id_t id = { .kind = DEV_KIND_ZIGBEE };
-    memcpy(id.addr, eui64, 8);
-    const capability_t *cdef = capability_get(cap);
-    bool accepted;
-    if (cdef && cdef->event) {
-        accepted = data_core_submit_event(&id, cap, (int16_t)value);
-        ESP_LOGI(TAG, "report: event cap %u code %d -> %s", cap, (int)value, accepted ? "queued" : "dropped");
-    } else {
-        /* Task 6 (multi-endpoint-zigbee): route by src_endpoint instead of
-         * always targeting the device's default/main slot -- a dual On/Off
-         * device (two switch.state instances, endpoints {1,2}) must land
-         * each report in its own instance, not clobber the other's value.
-         * A single-endpoint device (the overwhelming majority) reports on
-         * its one and only endpoint, so this is unchanged behavior for it:
-         * that endpoint becomes (and stays) the tracked default. */
-        accepted = data_core_submit_cap_id_ep(&id, cap, msg->src_endpoint, value, 0);
-        ESP_LOGI(TAG, "report: cap %u ep %u value %.3f -> data_core %s", cap, msg->src_endpoint,
-                 (double)value, accepted ? "accepted" : "rejected (device not in registry?)");
+    for (const esp_zb_zcl_read_attr_resp_variable_t *v = msg->variables; v; v = v->next) {
+        if (v->status != ESP_ZB_ZCL_STATUS_SUCCESS) continue;
+        zb_ingest_reading(eui64, msg->info.cluster, v->attribute.id,
+                          msg->info.src_endpoint, &v->attribute.data);
     }
-
-    /* Cap-list backfill (2026-09-10): a device can stream a real value on a
-     * mapped cluster the interview never enumerated -- Xiaomi's older
-     * temp/humidity sensors answer the simple-descriptor query with zero
-     * clusters, yet report temperature/humidity fine. When an ACCEPTED
-     * reading proves a capability the stored record is missing, add it (up
-     * to ZB_STORE_MAX_CAPS) and re-announce, so the hub's device list shows
-     * what the device actually sends. Gated on `accepted`, so a sentinel or
-     * a rejected value never invents a capability; fires at most once per
-     * (device, cap) since the presence check then finds it. The observer,
-     * like every s_observer call in this file, only queues (Task 5). */
-    if (accepted) {
-        bool changed = false;
-        zb_device_t dev_copy = {0};
-        xSemaphoreTake(s_store_mutex, portMAX_DELAY);
-        int bi = zb_store_find(&s_store, eui64);
-        if (bi >= 0) {
-            zb_device_t *d = &s_store.dev[bi];
-            /* Task 6: presence is now keyed on (cap, endpoint), not cap
-             * alone -- a dual On/Off device's second gang reports the same
-             * cap on a DIFFERENT endpoint, and that must backfill a SECOND
-             * instance, not be swallowed as "already have switch.state". */
-            bool present = false;
-            for (int k = 0; k < d->cap_count; k++)
-                if (d->caps[k] == cap && d->cap_endpoints[k] == msg->src_endpoint) { present = true; break; }
-            if (!present && d->cap_count < ZB_STORE_MAX_CAPS) {
-                d->caps[d->cap_count] = cap;
-                d->cap_clusters[d->cap_count] = msg->cluster;
-                d->cap_endpoints[d->cap_count] = msg->src_endpoint;
-                d->cap_count++;
-                changed = true;
-            }
-            /* On/Off ACTION backfill: the cap backfill above rescues
-             * switch.state, but a device that interviewed with no clusters
-             * (a Tuya plug) also needs its switch.on/switch.off ACTIONS to be
-             * controllable -- the interview never registered them. Add the
-             * missing ones (zb_map_onoff_backfill_actions returns none for a
-             * button/knob, so a stray On/Off report never re-arms the switch
-             * actions knob_reclassify strips). */
-            if (msg->cluster == 0x0006 /* On/Off */) {
-                uint8_t acts[ZB_STORE_MAX_ACTIONS];
-                int na = zb_map_onoff_backfill_actions(d->caps, d->cap_count, acts, ZB_STORE_MAX_ACTIONS);
-                for (int a = 0; a < na && d->action_count < ZB_STORE_MAX_ACTIONS; a++) {
-                    bool ap = false;
-                    /* Endpoint-aware, matching the cap backfill above: the
-                     * same action on a DIFFERENT endpoint is a distinct
-                     * instance and must be backfilled too. Without the
-                     * endpoint compare, an empty-descriptor On/Off device
-                     * whose actions were recorded on one endpoint (e.g. a
-                     * pre-v5 single-endpoint record migrated with endpoint 0)
-                     * would never get its real-endpoint actions from a fresh
-                     * report -- leaving it uncontrollable until re-paired. */
-                    for (int j = 0; j < d->action_count; j++)
-                        if (d->actions[j] == acts[a] && d->action_endpoints[j] == msg->src_endpoint) { ap = true; break; }
-                    if (!ap) {
-                        d->action_endpoints[d->action_count] = msg->src_endpoint;
-                        d->actions[d->action_count++] = acts[a];
-                        changed = true;
-                    }
-                }
-            }
-            if (changed) { zb_store_save(); dev_copy = *d; }
-        }
-        xSemaphoreGive(s_store_mutex);
-        if (changed) {
-            ESP_LOGI(TAG, "backfilled caps/actions (cluster 0x%04x) from a report; re-announcing", msg->cluster);
-            if (s_observer) s_observer(&dev_copy, false);
-            /* A cap-only backfill leaves the bridge's own actor table alone
-             * (nothing new to declare), but an ACTION backfill just added an
-             * entry to dev_copy that this bridge's actor table does not
-             * know about yet -- re-announcing to s_observer only tells the
-             * HUB. Without this call the just-backfilled action is refused
-             * locally (ACTOR_REFUSED_UNKNOWN) until the next reboot replays
-             * zb_register_restored_devices(). Harmless no-op for a 0-action
-             * (sensor/cap-only) backfill, same as the other two callers. */
-            zb_bridge_register_device_actors(&dev_copy, zb_now_s());
-        }
-    }
+    /* Task 6: meter_state transitions here */
 }
 
 /* Task 8: the SDK allows exactly one ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID
@@ -982,6 +1026,9 @@ static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callbac
         return ESP_OK;
     case ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID:
         zb_handle_default_resp((const esp_zb_zcl_cmd_default_resp_message_t *)message);
+        return ESP_OK;
+    case ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID:
+        zb_handle_read_attr_resp((const esp_zb_zcl_cmd_read_attr_resp_message_t *)message);
         return ESP_OK;
     default:
         ESP_LOGD(TAG, "unhandled ZCL core action 0x%x", (unsigned)callback_id);
