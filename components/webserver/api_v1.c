@@ -3739,7 +3739,11 @@ static esp_err_t devices_dp_map_post(httpd_req_t *req, const char *idbuf, uint8_
     }
 
     if (!tuya_dp_map_set(&dev, dp_id, cap_id, scale)) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to set mapping");
+        /* cap_id and scale were already validated above (400), so the only
+         * way map_set fails here is a full mapping table (TUYA_MAP_MAX). Say
+         * so plainly; esp_http_server has no 4xx/507 for a capacity refusal,
+         * hence 500 with an accurate message rather than "server error". */
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "datapoint mapping table full");
         return ESP_OK;
     }
     tuya_dp_map_save();

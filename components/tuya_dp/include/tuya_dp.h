@@ -8,9 +8,10 @@
  * reported (RAM only, boot-scoped) and the operator's DP -> capability
  * mapping (persisted). Deliberately pure/host-testable, same split as
  * data_core/registry.c (RAM store) + wrappers/wrapper_bind.c (persisted
- * table): this component only stores and does the pure apply arithmetic --
- * a later task wires tuya_dp_observe() into swarm dispatch and
- * tuya_dp_map_set/clear() into the API/WebUI (never done here).
+ * table): this component only stores and does the pure apply arithmetic.
+ * swarm.c's bridge dispatch wires tuya_dp_observe() in, and the
+ * /api/v1/devices/{id}/datapoints routes wire tuya_dp_map_set/clear() in
+ * (both live outside this file -- this component takes no such dependency).
  *
  * device_id_t here is always DEV_KIND_ZIGBEE; nothing in this file enforces
  * that (a caller-side concern, same as registry.c not caring which kind it
@@ -59,10 +60,12 @@ bool tuya_dp_map_clear(const device_id_t *id, uint8_t dp_id);
 bool tuya_dp_map_get(const device_id_t *id, uint8_t dp_id, uint8_t *cap_id_out, float *scale_out);
 int  tuya_dp_map_list(tuya_dp_map_t *out, int max);
 
-/* Pure apply arithmetic a later task uses once it has (value, scale) from
- * tuya_dp_map_get(): DP raw value -> the capability's own unit. Exact
- * float multiply, no rounding/clamping -- capability_encode() (capability.h)
- * does the storage-side scaling from there. */
+/* Pure apply arithmetic: DP raw value -> the capability's own unit, given
+ * (value, scale) from tuya_dp_map_get(). Exact float multiply, no
+ * rounding/clamping -- capability_encode() (capability.h) does the
+ * storage-side scaling from there. swarm.c's dispatch inlines this same
+ * `(float)value * scale`; this helper is its host-testable expression and
+ * is available to any caller that prefers it over the literal. */
 float tuya_dp_apply(int32_t value, float scale);
 
 /* File format (little-endian), CRC-16/CCITT-FALSE over every byte but the
