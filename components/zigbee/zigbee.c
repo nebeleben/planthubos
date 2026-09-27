@@ -661,6 +661,52 @@ static int zb_store_find_by_short(uint16_t short_addr)
     return -1;
 }
 
+/* Registers one device's actions on the bridge's own local actor table:
+ * build its device_id_t from eui64, find-or-create its registry slot,
+ * declare every action it currently has recorded (endpoint-aware), then
+ * set its device key and restore its persisted guard image. This is the
+ * exact sequence zb_register_restored_devices() and zb_iv_handle_store()
+ * both need -- factored out here so a THIRD caller (the report-path
+ * backfill in zb_handle_report_attr()) can bring the bridge's actor table
+ * back in line with a zb_store record it just changed, without duplicating
+ * the sequence a third time. now_s is the caller's timestamp for
+ * data_core_find_or_create_index() (boot replay's `t`, zb_now_s() at
+ * interview-finalize and backfill time). A device with 0 actions still
+ * gets its key set and guard image restored -- the loop below just runs
+ * zero times -- so calling this for a pure sensor (or a cap-only backfill)
+ * is harmless. */
+static void zb_bridge_register_device_actors(const zb_device_t *dev, uint32_t now_s)
+{
+    device_id_t id = { .kind = DEV_KIND_ZIGBEE };
+    memcpy(id.addr, dev->eui64, 8);
+    int dev_idx = data_core_find_or_create_index(&id, now_s);
+    if (dev_idx < 0) {
+        ESP_LOGW(TAG, "registry full; device has no registry entry");
+        return;
+    }
+    for (uint8_t a = 0; a < dev->action_count; a++) {
+        /* param_max=0, no flags: every action zb_map.c hands out today
+         * (On/Off) takes no parameter -- zb_map.h's own comment. */
+        if (!actor_declare_ep(dev_idx, dev->actions[a], dev->action_endpoints[a], 0, 0)) {
+            ESP_LOGW(TAG, "device %d: could not declare action %u", dev_idx,
+                     (unsigned)dev->actions[a]);
+        }
+    }
+
+    /* Whole-branch review, FIX 1/2: without a device key, actor_service()
+     * can never resolve a dispatch hook for this device (actor.c) and
+     * actor_table_guard_merge() will never carry its guards to flash
+     * (actor_table.c) -- every command silently drops and an operator's
+     * lockout silently un-persists. id is this device's stable EUI-64
+     * identity, already ACTOR_DEVICE_KEY_LEN (9) bytes, exactly as
+     * ble_collector.c's on_gatt_disc_result() does it. Restoring the
+     * guard image here (not just setting the key) is what brings the
+     * operator's lockout, cooldown and spent budget back after this
+     * same reboot instead of only after the next one. */
+    actor_set_device_key(dev_idx, (const uint8_t *)&id);
+    actor_persist_restore_device(dev_idx, (const uint8_t *)&id);
+}
+
 /* Registers every ALREADY-INTERVIEWED device the store restored from flash.
  * The registry and the actor table are both RAM-only and start empty every
  * boot, so they have no memory of a device this hub already knows from
@@ -681,35 +727,7 @@ static void zb_register_restored_devices(void)
         const zb_device_t *dev = &s_store.dev[i];
         if (!dev->interviewed) continue;
 
-        device_id_t id = { .kind = DEV_KIND_ZIGBEE };
-        memcpy(id.addr, dev->eui64, 8);
-        int dev_idx = data_core_find_or_create_index(&id, t);
-        if (dev_idx < 0) {
-            ESP_LOGW(TAG, "registry full; a restored Zigbee device has no registry entry "
-                          "this boot");
-            continue;
-        }
-        for (uint8_t a = 0; a < dev->action_count; a++) {
-            /* param_max=0, no flags: every action zb_map.c hands out today
-             * (On/Off) takes no parameter -- zb_map.h's own comment. */
-            if (!actor_declare_ep(dev_idx, dev->actions[a], dev->action_endpoints[a], 0, 0)) {
-                ESP_LOGW(TAG, "device %d: could not re-declare action %u after restore",
-                         dev_idx, (unsigned)dev->actions[a]);
-            }
-        }
-
-        /* Whole-branch review, FIX 1/2: without a device key, actor_service()
-         * can never resolve a dispatch hook for this device (actor.c) and
-         * actor_table_guard_merge() will never carry its guards to flash
-         * (actor_table.c) -- every command silently drops and an operator's
-         * lockout silently un-persists. id is this device's stable EUI-64
-         * identity, already ACTOR_DEVICE_KEY_LEN (9) bytes, exactly as
-         * ble_collector.c's on_gatt_disc_result() does it. Restoring the
-         * guard image here (not just setting the key) is what brings the
-         * operator's lockout, cooldown and spent budget back after this
-         * same reboot instead of only after the next one. */
-        actor_set_device_key(dev_idx, (const uint8_t *)&id);
-        actor_persist_restore_device(dev_idx, (const uint8_t *)&id);
+        zb_bridge_register_device_actors(dev, t);
     }
 }
 
@@ -928,6 +946,15 @@ static void zb_handle_report_attr(const esp_zb_zcl_report_attr_message_t *msg)
         if (changed) {
             ESP_LOGI(TAG, "backfilled caps/actions (cluster 0x%04x) from a report; re-announcing", msg->cluster);
             if (s_observer) s_observer(&dev_copy, false);
+            /* A cap-only backfill leaves the bridge's own actor table alone
+             * (nothing new to declare), but an ACTION backfill just added an
+             * entry to dev_copy that this bridge's actor table does not
+             * know about yet -- re-announcing to s_observer only tells the
+             * HUB. Without this call the just-backfilled action is refused
+             * locally (ACTOR_REFUSED_UNKNOWN) until the next reboot replays
+             * zb_register_restored_devices(). Harmless no-op for a 0-action
+             * (sensor/cap-only) backfill, same as the other two callers. */
+            zb_bridge_register_device_actors(&dev_copy, zb_now_s());
         }
     }
 }
@@ -1345,14 +1372,6 @@ static void zb_iv_handle_store(void)
                  device_id_format(&id, idbuf, sizeof idbuf));
         return;
     }
-    for (uint8_t a = 0; a < dev->action_count; a++) {
-        /* param_max=0, no flags: every action zb_map.c hands out today
-         * (On/Off) takes no parameter -- zb_map.h's own comment. */
-        if (!actor_declare_ep(dev_idx, dev->actions[a], dev->action_endpoints[a], 0, 0)) {
-            ESP_LOGW(TAG, "device %d: could not declare action %u", dev_idx,
-                     (unsigned)dev->actions[a]);
-        }
-    }
 
     /* Whole-branch review, FIX 1/2: same reasoning as
      * zb_register_restored_devices() above -- without this key
@@ -1361,9 +1380,11 @@ static void zb_iv_handle_store(void)
      * actor_table.c skips an unset key). Restoring the guard image now
      * also means a device re-interviewed after a mid-session rejoin gets
      * back any lockout/cooldown/budget it already had, same as
-     * ble_collector.c's on_gatt_disc_result(). */
-    actor_set_device_key(dev_idx, (const uint8_t *)&id);
-    actor_persist_restore_device(dev_idx, (const uint8_t *)&id);
+     * ble_collector.c's on_gatt_disc_result(). id/dev_idx above are
+     * recomputed (idempotently) inside zb_bridge_register_device_actors()
+     * -- kept local here too because dev_idx is still needed below, for
+     * this site's own "device %d interviewed" log. */
+    zb_bridge_register_device_actors(dev, zb_now_s());
 
     ESP_LOGI(TAG, "device %d interviewed: %u capability(ies), %u action(s)", dev_idx,
              (unsigned)dev->cap_count, (unsigned)dev->action_count);
