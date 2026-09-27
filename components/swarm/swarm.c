@@ -4240,7 +4240,14 @@ esp_err_t swarm_start_node(void)
         zigbee_set_device_observer(zb_observer);
         zigbee_set_status_observer(zb_status_observer);
         zigbee_set_tuya_dp_observer(zb_tuya_dp_observer);
-        if (xTaskCreate(zb_boot_replay_task, "swarm_zb_replay", 3072, NULL, 3, NULL) != pdPASS) {
+        /* 4096, up from 3072 (multi-endpoint fix): replay_announces() puts a
+         * zb_device_t[ZB_STORE_MAX_DEVICES] on the stack, and the per-endpoint
+         * arrays (cap_endpoints[6]/action_endpoints[8]) plus the 4->6 / 2->8
+         * cap/action bumps grew that array by ~416 B (to ~1.47 KB). At 3072
+         * the boot replay overflowed (Stack protection fault in swarm_zb_replay
+         * -> reboot loop). command_task, the other replay_announces() caller,
+         * was already at 4096 (its I5 fix); this matches it. */
+        if (xTaskCreate(zb_boot_replay_task, "swarm_zb_replay", 4096, NULL, 3, NULL) != pdPASS) {
             ESP_LOGE(TAG, "failed to create zigbee boot replay task; the hub will not learn "
                           "this bridge's already-known devices until they next announce");
         }
