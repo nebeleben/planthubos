@@ -64,3 +64,37 @@ const dev_profile_t *dev_profile_match(const char *manuf, const char *model,
 /* Embedded read-only seed (dev_profiles_builtin.c). */
 int                  dev_profile_builtin_count(void);
 const dev_profile_t *dev_profile_builtin(int i);
+
+/* --- dev_profiles_json.c: cJSON parse/emit + LittleFS persistence ---
+ * (device-mapping-profiles Task 3; declared here rather than in the pure
+ * core above ONLY because this header is the one public interface for the
+ * whole component -- the cJSON dependency itself stays confined to
+ * dev_profiles_json.c's .c file, per this component's own "Pure and
+ * host-testable" doc comment up top; dev_profiles.c/dev_profiles_builtin.c/
+ * mapping_engine.c never call any of these four and stay cJSON-free.) */
+
+/* Parses the spec section 3 schema ({"match":{...}, "label"?, "entries":[...]})
+ * into *out. false (contents of *out are then undefined) on malformed JSON,
+ * a missing/non-string match.manufacturer or .model, a missing/non-array
+ * entries, an unknown entry "kind", an unresolvable cap NAME
+ * (dev_profile_resolve_cap()), or a result that fails dev_profile_validate() --
+ * every rejection reason a caller (api_v1.c) should turn into an honest 400
+ * rather than storing a half-parsed profile. */
+bool dev_profile_from_json(const char *json, dev_profile_t *out);
+/* Inverse of dev_profile_from_json() above. Caller-frees (free()) the
+ * returned buffer; NULL on allocation failure. */
+char *dev_profile_to_json(const dev_profile_t *p);
+
+/* Loads the user/AI profile store from LittleFS (DEV_PROFILE_PATH,
+ * dev_profiles_json.c) into *s, always via dev_profile_store_init() first --
+ * an absent file, a corrupt/non-array JSON body, or an individual entry
+ * that fails dev_profile_from_json() all degrade to "leave that one entry
+ * out" (a corrupt STORE reads as empty, a corrupt single ENTRY within an
+ * otherwise-good store is just skipped), never a crash or a partially
+ * memcpy'd struct. */
+void dev_profile_user_load(dev_profile_store_t *s);
+/* Serializes *s (every entry via dev_profile_to_json()) and writes it
+ * atomically (tmp+rename, same discipline as tuya_dp_map_save()). false on
+ * any allocation/write/rename failure -- the previous on-disk file is left
+ * untouched either way. */
+bool dev_profile_user_save(const dev_profile_store_t *s);
