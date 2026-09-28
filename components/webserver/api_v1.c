@@ -401,48 +401,27 @@ static esp_err_t wifi_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* GET /api/v1/devices -- the device+capability surface (Task 6, spec
- * §6/§7): every physical device across radios, each with its live
- * capability readings (device_json(), devices_json.h) and which plants (if
- * any) currently bind it. Unauthenticated, like every GET here.
- *
- * plants_snapshot() is safe to call even when plants_init() never ran (see
- * its own doc comment) -- a pair-failed-portal NODE's webserver hits this
- * route too, and gets an all-unbound device list rather than a crash.
- *
- * `deprecated` also drives the GET /api/v1/sensors alias right below: same
- * body, plus a top-level "deprecated":true (task-6 brief: kept for one
- * milestone since it's what M1's own tooling calls). */
-static cJSON *devices_root(bool deprecated)
-{
-    /* s_api_reg_snap/s_api_plant_snap: too big for the httpd task stack;
-     * shared across this file's handlers, see their declaration comment (L5). */
-    data_core_snapshot(&s_api_reg_snap);
-    plants_snapshot(&s_api_plant_snap);
-    uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON *arr = cJSON_AddArrayToObject(root, "devices");
-    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
-        if (!s_api_reg_snap.devices[i].in_use) continue;
-        cJSON_AddItemToArray(arr, device_json(&s_api_reg_snap.devices[i], &s_api_plant_snap, now_uptime_s));
-    }
-    if (deprecated) cJSON_AddBoolToObject(root, "deprecated", true);
-    return root;
-}
+/* GET /api/v1/devices and its deprecated GET /api/v1/sensors alias:
+ * devices_send_chunked() (defined further down, near unknown_get(), because
+ * it shares that handler's s_http_body coalescing buffer -- s_http_body
+ * isn't declared until later in this file). Forward-declared here so
+ * devices_get()/sensors_get() can sit next to the route table's other
+ * simple wrappers. */
+static esp_err_t devices_send_chunked(httpd_req_t *req, bool deprecated);
 
 static esp_err_t devices_get(httpd_req_t *req)
 {
-    return send_json(req, devices_root(false));
+    return devices_send_chunked(req, false);
 }
 
 /* GET /api/v1/sensors -- deprecated alias of GET /api/v1/devices, see
- * devices_root()'s comment above. Per-sensor history and rename routes are
- * gone (spec §4/§6) -- only POST /api/v1/sensors/{mac} (rename, still mac-keyed)
- * survives below, unchanged. */
+ * devices_send_chunked()'s comment (near unknown_get(), further down).
+ * Per-sensor history and rename routes are gone (spec §4/§6) -- only POST
+ * /api/v1/sensors/{mac} (rename, still mac-keyed) survives below,
+ * unchanged. */
 static esp_err_t sensors_get(httpd_req_t *req)
 {
-    return send_json(req, devices_root(true));
+    return devices_send_chunked(req, true);
 }
 
 /* Parse 12 uppercase/lowercase hex chars into mac[6]; returns false on malformed input. */
@@ -3310,6 +3289,129 @@ static esp_err_t wrappers_post_dispatch(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* GET /api/v1/devices -- the device+capability surface (Task 6, spec
+ * §6/§7): every physical device across radios, each with its live
+ * capability readings (device_json(), devices_json.h) and which plants (if
+ * any) currently bind it. Unauthenticated, like every GET here.
+ *
+ * plants_snapshot() is safe to call even when plants_init() never ran (see
+ * its own doc comment) -- a pair-failed-portal NODE's webserver hits this
+ * route too, and gets an all-unbound device list rather than a crash.
+ *
+ * `deprecated` drives the GET /api/v1/sensors alias (devices_get()/
+ * sensors_get(), above): same body, plus a top-level "deprecated":true
+ * (task-6 brief: kept for one milestone since it's what M1's own tooling
+ * calls).
+ *
+ * Streamed and coalesced into s_http_body exactly the way unknown_get()
+ * below does, for both halves of the same reason documented there:
+ *   - built as one cJSON tree and printed to one contiguous buffer (this
+ *     route's original shape), the print can fail on the hub's fragmented
+ *     ~35KB heap even with plenty of *total* free heap left -- 503 "out of
+ *     memory serialising response" was observed on both the WebUI Devices
+ *     and Plants tabs, since both fetch this route on load;
+ *   - sent as one httpd_resp_send_chunk() PER DEVICE instead (this route's
+ *     first fix), the allocation failure is gone but traded for a latency
+ *     failure: unknown_get()'s own doc comment below measured 1.3-5.6s per
+ *     small TCP write with WiFi power-save on, 18s timeouts, and a wedged
+ *     socket pool for ~90s after any one timeout. This route is the
+ *     most-loaded one in the whole API (both Devices and Plants tabs fetch
+ *     it on load, and its device count can run well past unknown_get()'s),
+ *     so it can least afford that trade.
+ * Building one small cJSON device object at a time keeps peak HEAP
+ * allocation at one device; coalescing into s_http_body keeps the common
+ * case at ONE TCP write for the whole response -- both properties at once,
+ * same as unknown_get() achieves below. */
+static esp_err_t devices_send_chunked(httpd_req_t *req, bool deprecated)
+{
+    /* s_api_reg_snap/s_api_plant_snap: too big for the httpd task stack;
+     * shared across this file's handlers, see their declaration comment (L5). */
+    data_core_snapshot(&s_api_reg_snap);
+    plants_snapshot(&s_api_plant_snap);
+    uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    httpd_resp_set_type(req, "application/json");
+
+    /* Whether anything has actually been written yet -- NOT the same as
+     * "device index > 0": a per-device OOM skip below can leave an earlier
+     * iteration having produced nothing, and deciding comma placement from
+     * the loop index would then emit either a leading comma or a doubled
+     * one. Same `emitted` reasoning as unknown_get() below. */
+    bool emitted = false;
+
+    /* Bytes pending in s_http_body -- see the coalescing comment in the
+     * loop below (and unknown_get()'s own, further down) for why this is a
+     * buffer-fill-then-flush, not a chunk-per-device. The opening literal
+     * starts the buffer rather than being its own write, so the common
+     * case is exactly one TCP write for the whole response. */
+    static const char open_lit[] = "{\"devices\":[";
+    size_t used = sizeof(open_lit) - 1;
+    memcpy(s_http_body, open_lit, used);
+
+    for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
+        if (!s_api_reg_snap.devices[i].in_use) continue;
+
+        cJSON *o = device_json(&s_api_reg_snap.devices[i], &s_api_plant_snap, now_uptime_s);
+        char *body = o ? cJSON_PrintUnformatted(o) : NULL;
+        cJSON_Delete(o);
+
+        if (!body) {
+            /* Per-device OOM -- should be rare, one device object is small.
+             * Skip it without touching `emitted` or writing a separator;
+             * partial data beats a broken/truncated response on extreme
+             * low memory. Unlike unknown_get()'s single "close the list
+             * early" abort, this route's devices are independent rows
+             * (not samples of one device), so skipping just this one row
+             * and continuing is the more useful degrade. */
+            ESP_LOGW(TAG, "devices: skipping device %d, out of memory serialising it", i);
+            continue;
+        }
+
+        /* Coalesce into s_http_body rather than writing each device as its
+         * own chunk -- see unknown_get()'s hardware-measured reasoning
+         * below: per-device chunks trade the OOM this fixes for a
+         * WiFi-power-save latency/timeout failure instead, and this route
+         * (both Devices and Plants tabs fetch it on load) can least afford
+         * that trade. */
+        size_t need = strlen(body) + (emitted ? 1 : 0);
+        if (used + need > sizeof(s_http_body)) {
+            if (used > 0 && httpd_resp_send_chunk(req, s_http_body, used) != ESP_OK) {
+                free(body);
+                return ESP_FAIL;   /* client/socket gone; don't keep writing to a dead connection */
+            }
+            used = 0;
+            /* A single device larger than the whole buffer cannot be split
+             * without emitting malformed JSON -- same "cannot render this
+             * row" case as the per-device OOM skip above. */
+            if (need > sizeof(s_http_body)) {
+                ESP_LOGW(TAG, "devices: device %d too large for s_http_body, skipping", i);
+                free(body);
+                continue;
+            }
+        }
+        if (emitted) s_http_body[used++] = ',';
+        memcpy(s_http_body + used, body, need - (emitted ? 1 : 0));
+        used += need - (emitted ? 1 : 0);
+        free(body);
+        emitted = true;
+    }
+
+    /* Close the array (+ the deprecated tail, if any) in the same buffer,
+     * so the common case leaves the handler having done exactly one TCP
+     * write -- same trick as unknown_get()'s own closing block below. */
+    const char *tail = deprecated ? "],\"deprecated\":true}" : "]}";
+    size_t tail_len = strlen(tail);
+    if (used + tail_len > sizeof(s_http_body)) {
+        if (httpd_resp_send_chunk(req, s_http_body, used) != ESP_OK) return ESP_FAIL;
+        used = 0;
+    }
+    memcpy(s_http_body + used, tail, tail_len);
+    used += tail_len;
+    if (httpd_resp_send_chunk(req, s_http_body, used) != ESP_OK) return ESP_FAIL;
+    httpd_resp_sendstr_chunk(req, NULL);   /* end chunked response */
+    return ESP_OK;
+}
+
 /* GET /api/v1/unknown -- unauthenticated (spec §5/§6). This exact shape is
  * M4's input contract: {devices:[{id,rssi,last_seen_s,samples:[{hex,len,
  * ts}]}]} -- do not vary it. */
@@ -3623,10 +3725,10 @@ static bool parse_device_dp_path(const char *tail, char *idbuf, size_t idbuf_cap
  * device plus each one's DP->capability mapping (Task 6, 2026-09-27
  * tuya-ef00-datapoints spec). tuya_dp_list() is RAM-only and boot-scoped
  * (tuya_dp.h) -- a device with none observed yet returns "datapoints":[]
- * (200), same "empty is not missing" convention devices_root() uses for an
+ * (200), same "empty is not missing" convention devices_send_chunked() uses for an
  * all-unbound device list, rather than 404. cap_id/scale are null when
  * tuya_dp_map_get() reports no mapping for that dp_id. age_s uses the same
- * esp_timer_get_time()/1e6 uptime clock devices_root() stamps its own
+ * esp_timer_get_time()/1e6 uptime clock devices_send_chunked() stamps its own
  * "now" with -- tuya_dp_obs_t.updated_s is written from that same clock
  * (tuya_dp.c). Called from devices_get_dispatch() below with idbuf already
  * extracted; unauthenticated, like every other GET in this file
@@ -4976,7 +5078,7 @@ static cJSON *coordinator_json_bridge(const bridge_node_t *b)
  * device announce from (swarm_bridge_snapshot(), in table order, skipping
  * !in_use slots). A wifi_only hub with no bridges ever seen reports
  * {"coordinators":[]}. Unauthenticated, like every GET in this file
- * (devices_root()'s comment above). */
+ * (devices_send_chunked()'s comment above). */
 static esp_err_t zigbee_get(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
