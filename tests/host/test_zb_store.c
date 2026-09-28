@@ -251,8 +251,14 @@ int main(void) {
         int i = zb_store_find(&back, eui);
         assert(i >= 0 && back.dev[i].meter_state == ZB_METER_PRESENT);
     }
-    /* record size grew by exactly the meter_state byte */
-    assert(ZB_STORE_RECORD_SIZE == 92);
+    /* record size grew by exactly the meter_state byte (v3 91 -> v4 92) --
+     * a historical fact about v4, no longer checkable against
+     * ZB_STORE_RECORD_SIZE (that macro now names the *current*, v5,
+     * 156-byte record; see the v5 test below for the live assertion
+     * against it). The 92 fact itself is pinned concretely by the
+     * `assert(sizeof v4 == 8 + 92)` in the v4 legacy-read test below,
+     * and by the `8 + 92 - 1` in the v3 legacy-read test right after
+     * this comment. */
 
     /* --- legacy (v3, 91-byte) record defaults meter_state to
      * ZB_METER_UNKNOWN -- a pre-power-metering file loads as if the
@@ -284,7 +290,7 @@ int main(void) {
         memcpy(p, "v3dev", 5);
         p += ZB_STORE_NAME_MAX;
         assert((size_t)(p - v3) == sizeof v3);
-        assert(sizeof v3 == 8 + ZB_STORE_RECORD_SIZE - 1);  /* v3 = v4 minus meter_state */
+        assert(sizeof v3 == 8 + 92 - 1);  /* v3 (91) = v4 (92) minus meter_state */
 
         zb_table_t vt3;
         assert(zb_store_deserialize(&vt3, v3, sizeof v3));
@@ -292,6 +298,51 @@ int main(void) {
         assert(vt3.dev[0].endpoint == 3);
         assert(strcmp(vt3.dev[0].name, "v3dev") == 0);
         assert(vt3.dev[0].meter_state == ZB_METER_UNKNOWN);
+    }
+
+    /* --- v5: identity round-trip --- */
+    {
+        zb_table_t t5; zb_store_init(&t5);
+        zb_device_t d = mk(7, 0);
+        snprintf(d.manufacturer, sizeof d.manufacturer, "_TZE284_o9ofysmo");
+        snprintf(d.model, sizeof d.model, "TS0601");
+        d.meter_state = 1;
+        assert(zb_store_upsert(&t5, &d) == 0);
+        uint8_t buf[ZB_STORE_IMAGE_MAX];
+        size_t n = zb_store_serialize(&t5, buf, sizeof buf);
+        assert(n == 8 + ZB_STORE_RECORD_SIZE);            /* one 156-byte record */
+        assert(buf[4] == ZB_STORE_VERSION);               /* == 5 */
+        zb_table_t r5; zb_store_init(&r5);
+        assert(zb_store_deserialize(&r5, buf, n));
+        assert(strcmp(r5.dev[0].manufacturer, "_TZE284_o9ofysmo") == 0);
+        assert(strcmp(r5.dev[0].model, "TS0601") == 0);
+        assert(r5.dev[0].meter_state == 1);
+    }
+
+    /* --- v4 legacy read: identity defaults empty --- */
+    {
+        /* Build a v4 image by hand: header with version 4 + one 92-byte
+         * record. The record is a v5 serialize truncated to the pre-identity
+         * length, with the version byte forced to 4. */
+        zb_table_t t; zb_store_init(&t);
+        zb_device_t d = mk(9, 5);
+        assert(zb_store_upsert(&t, &d) == 0);
+        uint8_t buf[ZB_STORE_IMAGE_MAX];
+        size_t n = zb_store_serialize(&t, buf, sizeof buf);
+        (void)n;
+        /* forge a v4 image: version=4, record length 92 (drop the trailing 64
+         * identity bytes of the single record) */
+        uint8_t v4[8 + 92];
+        assert(sizeof v4 == 8 + 92);   /* pins the v4 (pre-identity) record at 92 bytes */
+        memcpy(v4, buf, 8);
+        v4[4] = 4;
+        memcpy(v4 + 8, buf + 8, 92);
+        zb_table_t r; zb_store_init(&r);
+        assert(zb_store_deserialize(&r, v4, sizeof v4));
+        assert(r.count == 1);
+        assert(r.dev[0].manufacturer[0] == '\0');
+        assert(r.dev[0].model[0] == '\0');
+        assert(r.dev[0].caps[0] == 5);                    /* rest survived */
     }
 
     printf("test_zb_store: OK\n");

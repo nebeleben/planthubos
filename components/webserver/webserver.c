@@ -72,10 +72,9 @@ static const static_asset_t ASSETS[] = {
 esp_err_t webserver_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    /* Registered total, recounted at the per-device wrapper binding
-     * feature's final fix wave: 54
+    /* Registered total, recounted at device-mapping-profiles Task 8: 60
      *   3 static assets (ASSETS above)
-     *  49 in api_v1_register()
+     *  55 in api_v1_register()
      *   1 SSE (sse_init)
      *   1 captive-portal fallback
      * M3 Task 7 added seven wrapper/unknown/bind-key routes, which took the
@@ -89,12 +88,18 @@ esp_err_t webserver_start(void)
      *
      * M6b Task 9 added the four Zigbee routes, which took the total from 49
      * to 53. The per-device wrapper binding feature added one DELETE route
-     * (.../wrapper), which took the total from 53 to 54. Raised to 60, not
-     * just to 54, for the same reason as before:
-     * sized with real headroom rather than to clear today's count. Each
-     * slot is one pointer in the server's handler array, so the 6 spare
-     * cost 24 B of heap. */
-    cfg.max_uri_handlers = 60;
+     * (.../wrapper), which took the total from 53 to 54. Task 8
+     * (device-mapping-profiles) added six routes -- GET /api/v1/profiles,
+     * GET/PUT/DELETE on its own wildcarded "/api/v1/profiles/" + "*" form,
+     * and GET/PUT /api/v1/config/ai -- which took the total from 54 to 60;
+     * ".../identify", ".../mapping" and
+     * ".../ai-prompt-inputs" ride ALREADY-registered wildcard routes
+     * (api_v1.c's own comments explain each), so they cost nothing here.
+     * Raised to 72, not just to 60, for the same reason as every previous
+     * raise: sized with real headroom rather than to clear today's count.
+     * Each slot is one pointer in the server's handler array, so the 12
+     * spare cost 48 B of heap. */
+    cfg.max_uri_handlers = 72;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 8192; /* wifi_scan_get's records buffer + cJSON work no longer fit in 4K */
     /* Without this, abandoned sockets (phone walks away from the portal, tab

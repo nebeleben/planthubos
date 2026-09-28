@@ -123,6 +123,16 @@ bool zigbee_device_rename(const uint8_t eui64[8], const char *name);
  * on restart. Do not attempt to add registry deletion in this milestone. */
 bool zigbee_device_remove(const uint8_t eui64[8]);
 
+/* device-mapping-profiles (Task 6): on-demand re-read of a device's Basic
+ * cluster (0x0000) manufacturer/model, for an already-joined device -- no
+ * re-pair, no new interview FSM state. Fires the same fire-and-forget
+ * ZCL Read Attributes the interview-complete path fires automatically;
+ * the response lands in zb_handle_read_attr_resp() (zigbee.c), which
+ * stores manufacturer/model on the matching zb_device_t and re-announces
+ * it. A safe no-op when eui64 is not in the store or Zigbee is disabled/
+ * not started. For Task 8's /identify route. */
+void zigbee_read_identity(const uint8_t eui64[8]);
+
 /* ---------------------------------------------------------------------
  * Task 8: the Zigbee command engine (zb_cmd.c). Split across this header's
  * two owners the same way the rest of this file is: zigbee.c owns the
@@ -143,6 +153,15 @@ bool zigbee_device_remove(const uint8_t eui64[8]);
  * untouched) when eui64 is not in the store, or Zigbee is disabled/not
  * started. */
 bool zigbee_store_lookup(const uint8_t eui64[8], uint16_t *short_addr, uint8_t *endpoint);
+
+/* Whole-branch review, Critical 2: the source ZCL cluster for a device's
+ * (cap_id, endpoint) instance, or 0 if unknown/not a zigbee device. Used
+ * by swarm.c's measurement forwarder to stamp swarm_measurement_t.
+ * source_cluster so the hub's suppress-check can fire (e.g. the ZS-301Z
+ * soil-on-humidity cluster 0x0405 suppression). Copies out under the
+ * store's own lock and returns immediately, same contract as
+ * zigbee_store_lookup() above. */
+uint16_t zigbee_cap_cluster(const uint8_t eui64[8], uint8_t cap_id, uint8_t endpoint);
 
 /* The coordinator's own ZCL source endpoint (zigbee.c's private
  * ZB_ENDPOINT) -- exposed rather than duplicated as a second magic-number

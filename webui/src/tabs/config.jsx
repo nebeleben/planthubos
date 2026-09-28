@@ -50,6 +50,19 @@ export function ConfigTab() {
   const [aiTestDetail, setAiTestDetail] = useState('')
   const aiTestAbortRef = useRef(null)   // current in-flight aiComplete()'s AbortController, for the Cancel button
 
+  // AI mapping assist (device-mapping-profiles Task 10): a SEPARATE,
+  // hub-persisted config (GET/PUT /api/v1/config/ai, Task 8) for the
+  // Devices tab's "Ask AI" mapping flow -- base_url/api_key/model stored
+  // on the hub's LittleFS, not in this browser's localStorage, because the
+  // *browser* still makes the call (the hub only hands the config back to
+  // whichever WebUI asks). Deliberately not merged with the `ai` state
+  // above: that one is a different feature (wrapper/rule generation) with
+  // a different storage contract (key never leaves the browser).
+  const [mapAi, setMapAi] = useState({ base_url: '', api_key: '', model: '' })
+  const [mapAiLoaded, setMapAiLoaded] = useState(false)   // guards Save the same way cfgLoaded guards Integrations
+  const [mapAiLoadError, setMapAiLoadError] = useState(false)
+  const [mapAiMsg, setMapAiMsg] = useState('')
+
   function refresh() {
     fetch('/api/v1/status')
       .then((r) => r.json())
@@ -78,6 +91,24 @@ export function ConfigTab() {
       .catch(() => setCfgLoadError(true))
   }
   useEffect(() => { refreshConfig() }, [])
+
+  // GET /api/v1/config/ai (Task 8) is auth-gated on a claimed hub -- it
+  // hands back the real api_key so the browser can call the provider
+  // itself, which is exactly why this one route is not left open like
+  // every other unauthenticated GET on this page. A failed/unauthorized
+  // load leaves mapAiLoaded false, same "never wholesale-replace over an
+  // unloaded config" discipline refreshConfig() uses for Integrations.
+  function refreshMapAi() {
+    setMapAiLoaded(false); setMapAiLoadError(false)
+    fetch('/api/v1/config/ai', { headers: authHeaders() })
+      .then((r) => { if (!r.ok) throw new Error(String(r.status)); return r.json() })
+      .then((c) => {
+        setMapAi({ base_url: c.base_url || '', api_key: c.api_key || '', model: c.model || '' })
+        setMapAiLoaded(true)
+      })
+      .catch(() => setMapAiLoadError(true))
+  }
+  useEffect(() => { refreshMapAi() }, [])
 
   // The hub's role_change_ok() gate requires either AP mode (this
   // device's own setup network) or a valid claim key. A pair-failed node
@@ -359,6 +390,39 @@ export function ConfigTab() {
 
   function onCancelTestAi() {
     if (aiTestAbortRef.current) aiTestAbortRef.current.abort()
+  }
+
+  // PUT /api/v1/config/ai full-replaces base_url/api_key/model (Task 8's
+  // own contract, mirrored in api_v1.c's doc comment) -- all three are
+  // always sent, unlike Integrations' MQTT/influx sections where an
+  // omitted secret means "leave it unchanged"; there is no such carve-out
+  // here, so a blanked api_key field really does clear it on Save.
+  async function doSaveMapAi(e) {
+    e.preventDefault()
+    if (!mapAiLoaded) return
+    setBusy('mapai'); setMapAiMsg('')
+    try {
+      const res = await fetch('/api/v1/config/ai', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+          base_url: normEndpoint(mapAi.base_url),
+          api_key: mapAi.api_key,
+          model: mapAi.model,
+        }),
+      })
+      if (res.ok) {
+        setMapAi((a) => ({ ...a, base_url: normEndpoint(a.base_url) }))
+        setMapAiMsg('Saved.')
+      } else if (res.status === 401) {
+        setMapAiMsg('Unauthorized — set the hub key above.')
+      } else {
+        let msg = 'Save failed.'
+        try { const d = await res.json(); if (d.error) msg = d.error } catch { /* non-JSON body */ }
+        setMapAiMsg(msg)
+      }
+    } catch { setMapAiMsg('hub not reachable') }
+    setBusy('')
   }
 
   if (error) return <p class="error">Hub not reachable.</p>
@@ -724,6 +788,62 @@ export function ConfigTab() {
             )}
           </p>
         )}
+      </div>
+
+      <div class="panel">
+        <h2>AI mapping assist</h2>
+        <p class="hint">
+          Powers the "Ask AI" button on a device's Capability mapping section (Devices tab) --
+          a separate feature from "AI assist" above. This config is stored on the{' '}
+          <strong>hub</strong>, not in this browser, so the same setup follows you to any
+          browser you open the WebUI from.
+        </p>
+        {mapAiLoadError && (
+          <p class="error">
+            Couldn't load current settings — retry.{' '}
+            <button type="button" onClick={refreshMapAi}>Retry</button>
+          </p>
+        )}
+        <form onSubmit={doSaveMapAi}>
+          <p>
+            <label>
+              Base URL
+              <input value={mapAi.base_url} placeholder="http://localhost:11434/v1"
+                     onInput={(e) => setMapAi((a) => ({ ...a, base_url: e.currentTarget.value }))}
+                     disabled={!mapAiLoaded} />
+            </label>
+          </p>
+          <p>
+            <label>
+              Model
+              <input value={mapAi.model} placeholder="e.g. llama3.1 or gpt-4o-mini"
+                     onInput={(e) => setMapAi((a) => ({ ...a, model: e.currentTarget.value }))}
+                     disabled={!mapAiLoaded} />
+            </label>
+          </p>
+          <label class="keyrow">
+            API key
+            <input type="password" value={mapAi.api_key} placeholder="leave blank for a local endpoint with no key"
+                   onInput={(e) => setMapAi((a) => ({ ...a, api_key: e.currentTarget.value }))}
+                   disabled={!mapAiLoaded} />
+          </label>
+          <p class="infobox">
+            <strong>CORS note:</strong> the call to this endpoint is made by your{' '}
+            <strong>browser</strong>, not the hub — the endpoint must be reachable from the
+            browser and allow cross-origin requests from it. A local LLM (e.g. Ollama, LM
+            Studio) on your network typically works out of the box; a vanilla hosted/cloud
+            endpoint that blocks browser CORS (most do, by default) will fail here with a
+            network/CORS error — put a CORS-enabled proxy in front of it, or point this at a
+            local model instead. The key is stored on the hub's flash so the browser can fetch
+            it back to make the call; it is never used by the hub itself.
+          </p>
+          <p>
+            <button type="submit" class="btn-primary" disabled={busy === 'mapai' || !mapAiLoaded}>
+              {busy === 'mapai' ? 'Saving…' : 'Save mapping AI settings'}
+            </button>
+          </p>
+        </form>
+        {mapAiMsg && <p class="hint">{mapAiMsg}</p>}
       </div>
     </div>
   )

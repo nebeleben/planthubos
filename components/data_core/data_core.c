@@ -15,6 +15,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <string.h>
+#include <stdio.h>
 
 #define MACSTR_FMT "%02X:%02X:%02X:%02X:%02X:%02X"
 #define MAC_ARG(m) (m)[0], (m)[1], (m)[2], (m)[3], (m)[4], (m)[5]
@@ -346,6 +347,27 @@ void data_core_clear_via(int dev_idx)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     registry_clear_via(&s_registry, dev_idx);
     xSemaphoreGive(s_mutex);
+}
+
+void data_core_set_identity(int dev_idx, const char *manufacturer, const char *model)
+{
+    if (dev_idx < 0 || dev_idx >= REGISTRY_MAX_DEVICES) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    device_entry_t *d = &s_registry.devices[dev_idx];
+    if (manufacturer) snprintf(d->manufacturer, sizeof d->manufacturer, "%s", manufacturer);
+    if (model)        snprintf(d->model, sizeof d->model, "%s", model);
+    xSemaphoreGive(s_mutex);
+}
+
+bool data_core_get_identity(int dev_idx, char *manuf_out, char *model_out, size_t cap)
+{
+    if (dev_idx < 0 || dev_idx >= REGISTRY_MAX_DEVICES) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    const device_entry_t *d = &s_registry.devices[dev_idx];
+    if (manuf_out) snprintf(manuf_out, cap, "%s", d->manufacturer);
+    if (model_out) snprintf(model_out, cap, "%s", d->model);
+    xSemaphoreGive(s_mutex);
+    return true;
 }
 
 bool data_core_submit_battery(const uint8_t mac[6], uint8_t pct)

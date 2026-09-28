@@ -29,6 +29,8 @@
 #include "radio_role.h"
 #include "swarm_rules.h"
 #include "tuya_dp.h"
+#include "dev_profiles.h"
+#include "mapping_engine.h"
 #include "cJSON.h"
 #include "mbedtls/base64.h"
 #include "esp_littlefs.h"
@@ -40,6 +42,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -77,6 +80,17 @@ static zb_device_t s_api_zb_snap[ZB_STORE_MAX_DEVICES];
  * s_api_zb_snap above, and safe as a file-static for the same reason:
  * esp_http_server serialises every handler on one task. */
 static bridge_table_t s_api_bridge_snap;
+
+/* Task 8 (device-mapping-profiles): shared by profiles_list_get()/
+ * profiles_key_get()/profiles_key_put()/profiles_key_delete()/
+ * devices_mapping_get()/devices_mapping_post() below -- DEV_PROFILE_MAX_USER
+ * (32) * sizeof(dev_profile_t) is close to 12KB, far past the httpd task's
+ * 8KB stack (cfg.stack_size, webserver.c), same file-static-because-
+ * one-handler-at-a-time reasoning as s_api_reg_snap/s_api_plant_snap/
+ * s_api_zb_snap/s_api_bridge_snap above. Every reader calls
+ * dev_profile_user_load() to refresh it before use -- there is no cross-
+ * request caching here, just a shared scratch buffer. */
+static dev_profile_store_t s_api_profile_store;
 
 /* mqtt_pub.c: MQTT retained-topic cleanup on plant delete / capability
  * unbind (spec Sec.6, M2 Task 7) -- same "no header of its own" convention
@@ -3653,8 +3667,220 @@ static esp_err_t devices_datapoints_get(httpd_req_t *req, const char *idbuf)
     return send_json(req, root);
 }
 
-/* GET "/api/v1/devices/" + wildcard dispatcher -- currently the only
- * GET-able suffix on this wildcard is ".../datapoints" (Task 6). Any
+/* Device-mapping-profiles Task 8: the string form of TUYA_PROV_* (tuya_dp.h)
+ * for the mapping surface's wire format (spec §3/§6) -- any value other
+ * than the two named ones (including a future enumerator this file hasn't
+ * been taught yet) reads as "manual", the same fallback tuya_dp.h's own
+ * TUYA_PROV_MANUAL == 0 default gives an unset/legacy fmt-1 entry. */
+static const char *prov_str(uint8_t provenance)
+{
+    switch (provenance) {
+    case TUYA_PROV_PROFILE: return "profile";
+    case TUYA_PROV_AI:      return "ai";
+    default:                return "manual";
+    }
+}
+
+/* Inverse of prov_str() above, for POST /api/v1/devices/{id}/mapping's
+ * request body -- an absent/unrecognised provenance string defaults to
+ * TUYA_PROV_MANUAL, same "the safest, least-trusted provenance wins on
+ * ambiguity" posture as prov_str()'s own default case. */
+static uint8_t prov_from_str(const char *s)
+{
+    if (s && strcmp(s, "profile") == 0) return TUYA_PROV_PROFILE;
+    if (s && strcmp(s, "ai") == 0) return TUYA_PROV_AI;
+    return TUYA_PROV_MANUAL;
+}
+
+/* Renders one dev_profile_entry_t (a profile entry OR a mapping_proposals()
+ * output -- same type) for the mapping surface's "proposals" array and
+ * POST body round-trip (device-mapping-profiles Task 8). Deliberately NOT
+ * dev_profile_to_json()'s own per-entry shape (dev_profiles_json.c): that
+ * format renders a suppress entry's cluster as a "0x"-prefixed hex STRING
+ * (its own established wire format for Task 3's profiles CRUD, kept as-is
+ * there), whereas this file's OWN mapping endpoints (brief step 4's
+ * `suppress:[{cluster,provenance}...]`) already render "cluster" as a
+ * plain JSON NUMBER -- picking one shape and using it consistently across
+ * this one surface (applied/suppress/proposals/POST entries) matters more
+ * here than matching a different endpoint's own established convention. */
+static cJSON *mapping_entry_json(const dev_profile_entry_t *e)
+{
+    cJSON *o = cJSON_CreateObject();
+    if (e->kind == DEV_PROFILE_KIND_DP) {
+        const capability_t *c = capability_get(e->cap_id);
+        cJSON_AddStringToObject(o, "kind", "dp");
+        cJSON_AddNumberToObject(o, "dp_id", e->dp_id);
+        cJSON_AddStringToObject(o, "cap", c ? c->name : "");
+        cJSON_AddNumberToObject(o, "scale", e->scale);
+        cJSON_AddNumberToObject(o, "offset", e->offset);
+    } else {
+        cJSON_AddStringToObject(o, "kind", "suppress");
+        cJSON_AddNumberToObject(o, "cluster", e->source_cluster);
+    }
+    return o;
+}
+
+/* GET /api/v1/devices/{id}/mapping -- this device's applied DP->capability
+ * map + suppress-set (each entry's own provenance), its observed-but-
+ * unmapped DPs, and the proposals its matched profile (if any) still has
+ * outstanding (device-mapping-profiles Task 8, spec §3/§6). tuya_dp_map_list()
+ * is the ONE cross-device table (tuya_dp.h) -- filtered here to this
+ * device via device_id_equal(), same filter shape mapping_proposals()
+ * itself expects its `applied` array pre-filtered to. tuya_dp_suppress_list()
+ * and tuya_dp_list() are already per-device (their own `id` parameter).
+ * The profile lookup keys on this device's ANNOUNCED identity
+ * (data_core_get_device()'s manufacturer/model mirror, Task 7) -- an
+ * unknown device or one that has never announced identity simply gets an
+ * empty "proposals" array, not an error, same "absent beats error" posture
+ * this file already uses for e.g. devices_json.c's own identity fields.
+ * Unauthenticated, like every other GET in this file. */
+static esp_err_t devices_mapping_get(httpd_req_t *req, const char *idbuf)
+{
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+
+    tuya_dp_map_t all_maps[TUYA_MAP_MAX];
+    int n_all = tuya_dp_map_list(all_maps, TUYA_MAP_MAX);
+    tuya_dp_map_t applied[TUYA_MAP_MAX];
+    int n_applied = 0;
+    for (int i = 0; i < n_all; i++) {
+        if (device_id_equal(&all_maps[i].id, &dev)) applied[n_applied++] = all_maps[i];
+    }
+
+    uint16_t suppress[TUYA_SUPPRESS_MAX];
+    int n_suppress = tuya_dp_suppress_list(&dev, suppress, TUYA_SUPPRESS_MAX);
+
+    tuya_dp_obs_t obs[TUYA_DP_MAX_PER_DEVICE];
+    int n_obs = tuya_dp_list(&dev, obs, TUYA_DP_MAX_PER_DEVICE);
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+
+    cJSON *root = cJSON_CreateObject();
+
+    cJSON *applied_j = cJSON_AddArrayToObject(root, "applied");
+    for (int i = 0; i < n_applied; i++) {
+        const capability_t *c = capability_get(applied[i].cap_id);
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "dp_id", applied[i].dp_id);
+        cJSON_AddStringToObject(o, "cap", c ? c->name : "");
+        cJSON_AddNumberToObject(o, "scale", applied[i].scale);
+        cJSON_AddNumberToObject(o, "offset", applied[i].offset);
+        cJSON_AddStringToObject(o, "provenance", prov_str(applied[i].provenance));
+        cJSON_AddItemToArray(applied_j, o);
+    }
+
+    cJSON *suppress_j = cJSON_AddArrayToObject(root, "suppress");
+    for (int i = 0; i < n_suppress; i++) {
+        uint8_t prov = TUYA_PROV_MANUAL;
+        tuya_dp_suppress_provenance(&dev, suppress[i], &prov);
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "cluster", suppress[i]);
+        cJSON_AddStringToObject(o, "provenance", prov_str(prov));
+        cJSON_AddItemToArray(suppress_j, o);
+    }
+
+    cJSON *unmapped_j = cJSON_AddArrayToObject(root, "observed_unmapped");
+    for (int i = 0; i < n_obs; i++) {
+        bool mapped = false;
+        for (int j = 0; j < n_applied; j++) {
+            if (applied[j].dp_id == obs[i].dp_id) { mapped = true; break; }
+        }
+        if (mapped) continue;
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "dp_id", obs[i].dp_id);
+        cJSON_AddNumberToObject(o, "type", obs[i].type);
+        cJSON_AddNumberToObject(o, "value", obs[i].value);
+        uint32_t age_s = now_s >= obs[i].updated_s ? now_s - obs[i].updated_s : 0;
+        cJSON_AddNumberToObject(o, "age_s", age_s);
+        cJSON_AddItemToArray(unmapped_j, o);
+    }
+
+    cJSON *proposals_j = cJSON_AddArrayToObject(root, "proposals");
+    device_entry_t de;
+    if (data_core_get_device(&dev, &de) && (de.manufacturer[0] || de.model[0])) {
+        dev_profile_user_load(&s_api_profile_store);
+        const dev_profile_t *p = dev_profile_match(de.manufacturer, de.model, &s_api_profile_store);
+        if (p) {
+            dev_profile_entry_t props[DEV_PROFILE_MAX_ENTRIES];
+            int n_props = mapping_proposals(p, applied, n_applied, suppress, n_suppress,
+                                            props, DEV_PROFILE_MAX_ENTRIES);
+            for (int i = 0; i < n_props; i++) {
+                cJSON_AddItemToArray(proposals_j, mapping_entry_json(&props[i]));
+            }
+        }
+    }
+
+    return send_json(req, root);
+}
+
+/* GET /api/v1/devices/{id}/ai-prompt-inputs -- the raw data an AI-assisted
+ * mapping suggestion is built from (device-mapping-profiles Task 8, spec
+ * §5): the device's fingerprint, its observed-but-not-yet-interpreted DPs,
+ * the canonical capability list (name/unit -- capability.h's own
+ * CAPABILITY_COUNT table, so this list changes exactly when the firmware's
+ * own capability set does), and which of those the device already has a
+ * live value for. THE HUB ASSEMBLES DATA ONLY -- no prompt text, no call to
+ * any AI provider; that happens client-side against GET/PUT
+ * /api/v1/config/ai's stored base_url/api_key (below). Unauthenticated,
+ * like every other GET in this file: nothing here is more sensitive than
+ * GET /api/v1/devices/{id}/datapoints already is. */
+static esp_err_t devices_ai_prompt_inputs_get(httpd_req_t *req, const char *idbuf)
+{
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+
+    device_entry_t de;
+    bool have_de = data_core_get_device(&dev, &de);
+    cJSON *fp = cJSON_AddObjectToObject(root, "fingerprint");
+    cJSON_AddStringToObject(fp, "manufacturer", have_de ? de.manufacturer : "");
+    cJSON_AddStringToObject(fp, "model", have_de ? de.model : "");
+
+    tuya_dp_obs_t obs[TUYA_DP_MAX_PER_DEVICE];
+    int n_obs = tuya_dp_list(&dev, obs, TUYA_DP_MAX_PER_DEVICE);
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    cJSON *odps = cJSON_AddArrayToObject(root, "observed_dps");
+    for (int i = 0; i < n_obs; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "dp_id", obs[i].dp_id);
+        cJSON_AddNumberToObject(o, "type", obs[i].type);
+        cJSON_AddNumberToObject(o, "value", obs[i].value);
+        uint32_t age_s = now_s >= obs[i].updated_s ? now_s - obs[i].updated_s : 0;
+        cJSON_AddNumberToObject(o, "age_s", age_s);
+        cJSON_AddItemToArray(odps, o);
+    }
+
+    cJSON *caps_j = cJSON_AddArrayToObject(root, "caps");
+    for (uint8_t c = 0; c < CAPABILITY_COUNT; c++) {
+        const capability_t *cap = capability_get(c);
+        if (!cap) continue;
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "name", cap->name);
+        cJSON_AddStringToObject(o, "unit", cap->unit ? cap->unit : "");
+        cJSON_AddItemToArray(caps_j, o);
+    }
+
+    cJSON *active_j = cJSON_AddArrayToObject(root, "active_caps");
+    if (have_de) {
+        for (uint8_t c = 0; c < CAPABILITY_COUNT; c++) {
+            if (!de.caps[c].valid) continue;
+            const capability_t *cap = capability_get(c);
+            if (cap) cJSON_AddItemToArray(active_j, cJSON_CreateString(cap->name));
+        }
+    }
+
+    return send_json(req, root);
+}
+
+/* GET "/api/v1/devices/" + wildcard dispatcher -- GET-able suffixes on this
+ * wildcard are ".../datapoints" (Task 6), ".../mapping" and
+ * ".../ai-prompt-inputs" (Task 8, device-mapping-profiles). Any
  * other/no suffix is a 404 rather than falling through to devices_get()'s
  * list: each GET sub-route earns its own explicit branch here, so a future
  * GET sub-resource under this prefix doesn't silently collide with this
@@ -3669,22 +3895,49 @@ static esp_err_t devices_get_dispatch(httpd_req_t *req)
 {
     const char *tail = req->uri + strlen("/api/v1/devices/");
     size_t taillen = strcspn(tail, "?");
+    char idbuf[40];
 
     static const char dp_suffix[] = "/datapoints";
-    size_t suflen = sizeof(dp_suffix) - 1;
-    if (taillen <= suflen || strncmp(tail + taillen - suflen, dp_suffix, suflen) != 0) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
-        return ESP_OK;
+    size_t dp_suflen = sizeof(dp_suffix) - 1;
+    if (taillen > dp_suflen && strncmp(tail + taillen - dp_suflen, dp_suffix, dp_suflen) == 0) {
+        size_t idlen = taillen - dp_suflen;
+        if (idlen == 0 || idlen >= sizeof(idbuf)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+            return ESP_OK;
+        }
+        memcpy(idbuf, tail, idlen);
+        idbuf[idlen] = '\0';
+        return devices_datapoints_get(req, idbuf);
     }
-    size_t idlen = taillen - suflen;
-    char idbuf[40];
-    if (idlen == 0 || idlen >= sizeof(idbuf)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
-        return ESP_OK;
+
+    static const char mapping_suffix[] = "/mapping";
+    size_t map_suflen = sizeof(mapping_suffix) - 1;
+    if (taillen > map_suflen && strncmp(tail + taillen - map_suflen, mapping_suffix, map_suflen) == 0) {
+        size_t idlen = taillen - map_suflen;
+        if (idlen == 0 || idlen >= sizeof(idbuf)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+            return ESP_OK;
+        }
+        memcpy(idbuf, tail, idlen);
+        idbuf[idlen] = '\0';
+        return devices_mapping_get(req, idbuf);
     }
-    memcpy(idbuf, tail, idlen);
-    idbuf[idlen] = '\0';
-    return devices_datapoints_get(req, idbuf);
+
+    static const char ai_suffix[] = "/ai-prompt-inputs";
+    size_t ai_suflen = sizeof(ai_suffix) - 1;
+    if (taillen > ai_suflen && strncmp(tail + taillen - ai_suflen, ai_suffix, ai_suflen) == 0) {
+        size_t idlen = taillen - ai_suflen;
+        if (idlen == 0 || idlen >= sizeof(idbuf)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+            return ESP_OK;
+        }
+        memcpy(idbuf, tail, idlen);
+        idbuf[idlen] = '\0';
+        return devices_ai_prompt_inputs_get(req, idbuf);
+    }
+
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+    return ESP_OK;
 }
 
 /* POST /api/v1/devices/{id}/datapoints/{dp_id} {"cap_id":N,"scale":F} --
@@ -3780,6 +4033,191 @@ static esp_err_t devices_dp_map_delete(httpd_req_t *req, const char *idbuf, uint
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
+}
+
+/* POST /api/v1/devices/{id}/mapping request-body scratch (device-mapping-
+ * profiles Task 8) -- a private buffer rather than joining the rules/
+ * wrappers s_http_body share above: that buffer's own doc comment
+ * enumerates its exact owner list and the two conditions every addition
+ * must re-verify, and a body sized for this route's own worst case (up to
+ * TUYA_MAP_MAX + TUYA_SUPPRESS_MAX entries, ~32, each ~110 B of JSON) is
+ * simpler to reason about on its own than folded into that list. */
+static char s_api_mapping_body[4096];
+
+/* POST /api/v1/devices/{id}/mapping {"entries":[...], "save_as_profile":?}
+ * -- confirms/applies a set of DP->capability and suppress entries (device-
+ * mapping-profiles Task 8, spec §3/§6). Each entry names its own
+ * "provenance" (manual/profile/ai, prov_from_str() above): a hand-added
+ * entry sends "manual", confirming a matched-profile proposal sends
+ * "profile", confirming an AI suggestion sends "ai" -- this handler trusts
+ * whatever the caller sends (the UI is the one that knows which flow it
+ * confirmed) and does no provenance inference of its own. A `kind:"dp"`
+ * entry's cap NAME is resolved via dev_profile_resolve_cap() (400 on
+ * unknown, same pre-validate-before-mutate discipline devices_dp_map_post()
+ * above uses) before ever calling tuya_dp_map_set_ex(); a `kind:"suppress"`
+ * entry's cluster accepts a JSON number or a "0x..." string (parse_cluster()
+ * -like leniency, matching dev_profiles_json.c's own parser) and is rejected
+ * (400) if it parses to 0 -- tuya_dp_suppress_set() rejects that anyway, but
+ * pre-checking turns its silent false into an honest 400 the same way. Every
+ * accepted entry is followed by tuya_dp_map_save() (idempotent, tmp+rename)
+ * so a later entry in the same array that turns out invalid never leaves an
+ * unpersisted partial write behind it -- each entry's effect is durable the
+ * moment it is accepted, same "no batched all-or-nothing commit" posture
+ * dev_profile_from_json()'s OWN caller-loads-then-upserts flow has.
+ * "save_as_profile":true additionally assembles a dev_profile_t from this
+ * device's ANNOUNCED identity (data_core_get_device()) plus its now-current
+ * applied map/suppress-set and upserts+saves it to the user profile store --
+ * silently skipped (not an error) when the device has no announced
+ * identity, since a profile keyed on an empty manufacturer/model could
+ * never be matched back onto a device anyway. Replies with the SAME shape
+ * GET .../mapping returns (devices_mapping_get() above, defined earlier in
+ * this file so this forward call is well-defined) -- the new applied
+ * state, not a bare {"ok":true} -- so the caller can see exactly what
+ * landed without a second round-trip. Auth already checked by
+ * devices_post_dispatch() before this is ever reached. */
+static esp_err_t devices_mapping_post(httpd_req_t *req, const char *idbuf)
+{
+    device_id_t dev;
+    if (!device_id_parse(idbuf, &dev)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+
+    if (req->content_len == 0 || req->content_len > sizeof(s_api_mapping_body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, s_api_mapping_body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    s_api_mapping_body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(s_api_mapping_body);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return ESP_OK;
+    }
+
+    const cJSON *entries = cJSON_GetObjectItem(json, "entries");
+    if (!cJSON_IsArray(entries)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing entries");
+        return ESP_OK;
+    }
+
+    const cJSON *e;
+    cJSON_ArrayForEach(e, entries) {
+        const cJSON *kind_j = cJSON_GetObjectItem(e, "kind");
+        const cJSON *prov_j = cJSON_GetObjectItem(e, "provenance");
+        uint8_t prov = prov_from_str(cJSON_IsString(prov_j) ? prov_j->valuestring : NULL);
+
+        if (!cJSON_IsString(kind_j)) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing kind");
+            return ESP_OK;
+        }
+
+        if (strcmp(kind_j->valuestring, "dp") == 0) {
+            const cJSON *dp_j = cJSON_GetObjectItem(e, "dp_id");
+            const cJSON *cap_j = cJSON_GetObjectItem(e, "cap");
+            const cJSON *scale_j = cJSON_GetObjectItem(e, "scale");
+            const cJSON *offset_j = cJSON_GetObjectItem(e, "offset");
+            if (!cJSON_IsNumber(dp_j) || dp_j->valuedouble < 0 || dp_j->valuedouble > 255 ||
+                !cJSON_IsString(cap_j)) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad dp entry");
+                return ESP_OK;
+            }
+            uint8_t cap_id;
+            if (!dev_profile_resolve_cap(cap_j->valuestring, &cap_id)) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown capability");
+                return ESP_OK;
+            }
+            float scale = cJSON_IsNumber(scale_j) ? (float)scale_j->valuedouble : 1.0f;
+            float offset = cJSON_IsNumber(offset_j) ? (float)offset_j->valuedouble : 0.0f;
+            if (!isfinite(scale) || !isfinite(offset)) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad scale/offset");
+                return ESP_OK;
+            }
+            if (!tuya_dp_map_set_ex(&dev, (uint8_t)dp_j->valuedouble, cap_id, scale, offset, prov)) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "datapoint mapping table full");
+                return ESP_OK;
+            }
+            tuya_dp_map_save();
+        } else if (strcmp(kind_j->valuestring, "suppress") == 0) {
+            const cJSON *cluster_j = cJSON_GetObjectItem(e, "cluster");
+            uint16_t cluster = 0;
+            if (cJSON_IsNumber(cluster_j)) {
+                cluster = (uint16_t)cluster_j->valuedouble;
+            } else if (cJSON_IsString(cluster_j) && cluster_j->valuestring) {
+                cluster = (uint16_t)strtol(cluster_j->valuestring, NULL, 0);
+            }
+            if (cluster == 0) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad cluster");
+                return ESP_OK;
+            }
+            if (!tuya_dp_suppress_set(&dev, cluster, prov)) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "suppress table full");
+                return ESP_OK;
+            }
+            tuya_dp_map_save();
+        } else {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown kind");
+            return ESP_OK;
+        }
+    }
+
+    bool save_as_profile = cJSON_IsTrue(cJSON_GetObjectItem(json, "save_as_profile"));
+    cJSON_Delete(json);
+
+    if (save_as_profile) {
+        device_entry_t de;
+        if (data_core_get_device(&dev, &de) && (de.manufacturer[0] || de.model[0])) {
+            dev_profile_t prof;
+            memset(&prof, 0, sizeof prof);
+            snprintf(prof.manufacturer, sizeof prof.manufacturer, "%s", de.manufacturer);
+            snprintf(prof.model, sizeof prof.model, "%s", de.model);
+
+            tuya_dp_map_t all_maps[TUYA_MAP_MAX];
+            int n_all = tuya_dp_map_list(all_maps, TUYA_MAP_MAX);
+            for (int i = 0; i < n_all && prof.entry_count < DEV_PROFILE_MAX_ENTRIES; i++) {
+                if (!device_id_equal(&all_maps[i].id, &dev)) continue;
+                dev_profile_entry_t *slot = &prof.entries[prof.entry_count++];
+                slot->kind = DEV_PROFILE_KIND_DP;
+                slot->dp_id = all_maps[i].dp_id;
+                slot->cap_id = all_maps[i].cap_id;
+                slot->scale = all_maps[i].scale;
+                slot->offset = all_maps[i].offset;
+            }
+            uint16_t suppress[TUYA_SUPPRESS_MAX];
+            int n_sup = tuya_dp_suppress_list(&dev, suppress, TUYA_SUPPRESS_MAX);
+            for (int i = 0; i < n_sup && prof.entry_count < DEV_PROFILE_MAX_ENTRIES; i++) {
+                dev_profile_entry_t *slot = &prof.entries[prof.entry_count++];
+                slot->kind = DEV_PROFILE_KIND_SUPPRESS;
+                slot->source_cluster = suppress[i];
+            }
+            if (dev_profile_validate(&prof)) {
+                dev_profile_user_load(&s_api_profile_store);
+                if (dev_profile_store_upsert(&s_api_profile_store, &prof) >= 0) {
+                    dev_profile_user_save(&s_api_profile_store);
+                }
+            }
+        }
+    }
+
+    return devices_mapping_get(req, idbuf);
 }
 
 /* POST /api/v1/devices/{id}/actions/{action} {"param":N,"endpoint":N} --
@@ -4145,6 +4583,24 @@ static esp_err_t devices_post_dispatch(httpd_req_t *req)
         return devices_wrapper_post(req, idbuf);
     }
 
+    /* ".../mapping" (Task 8, device-mapping-profiles): a distinct suffix
+     * shape from "/wrapper"/"/datapoints/{dp_id}"/"/key" below, so trying
+     * it here (before the dp-path parse, which only matches its own
+     * "/datapoints/" marker shape anyway) cannot misfire on any of them. */
+    static const char mapping_suffix[] = "/mapping";
+    size_t map_suflen = sizeof(mapping_suffix) - 1;
+    if (taillen > map_suflen && strncmp(tail + taillen - map_suflen, mapping_suffix, map_suflen) == 0) {
+        size_t idlen = taillen - map_suflen;
+        char idbuf[40];
+        if (idlen == 0 || idlen >= sizeof(idbuf)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+            return ESP_OK;
+        }
+        memcpy(idbuf, tail, idlen);
+        idbuf[idlen] = '\0';
+        return devices_mapping_post(req, idbuf);
+    }
+
     char dp_idbuf[40];
     uint8_t dp_id;
     if (parse_device_dp_path(tail, dp_idbuf, sizeof(dp_idbuf), &dp_id)) {
@@ -4337,6 +4793,20 @@ static cJSON *zb_device_json(const zb_device_t *d)
     for (uint8_t i = 0; i < d->unmapped_count; i++) {
         cJSON_AddItemToArray(clusters, cJSON_CreateNumber(d->unmapped_clusters[i]));
     }
+
+    /* device-mapping-profiles Task 8: fingerprint (Basic 0x0004/0x0005),
+     * read straight off zb_device_t -- zb_store.c already keeps these as
+     * plain NUL-terminated C strings (zb_store_deserialize() explicitly
+     * NUL-pads short reads, and zigbee.c's identity-read path
+     * snprintf()s into them), so no length-prefixed decode is needed here
+     * the way announce_device_json() below needs one. Omitted entirely (no
+     * key at all) when neither has been read yet, same "absent beats null
+     * string" choice devices_json.c's own manufacturer/model fields make
+     * (Task 7). */
+    if (d->manufacturer[0] || d->model[0]) {
+        cJSON_AddStringToObject(o, "manufacturer", d->manufacturer);
+        cJSON_AddStringToObject(o, "model", d->model);
+    }
     return o;
 }
 
@@ -4401,6 +4871,25 @@ static cJSON *announce_device_json(const swarm_device_announce_t *a)
     }
 
     cJSON_AddArrayToObject(o, "clusters");
+
+    /* device-mapping-profiles Task 8: fingerprint (v6 swarm_device_announce_t,
+     * length-prefixed like `name`/namebuf above) -- manuf_len/model_len are
+     * NOT guaranteed NUL-terminated when they fill the field exactly
+     * (SWARM_DEV_STR_MAX), so copy through a local buffer the same way
+     * `namebuf` above does, rather than trusting the raw array. Omitted
+     * entirely when neither has ever been announced, same as
+     * zb_device_json()'s own choice just above. */
+    if (a->manuf_len || a->model_len) {
+        char manuf[SWARM_DEV_STR_MAX + 1], model[SWARM_DEV_STR_MAX + 1];
+        uint8_t mlen = a->manuf_len > SWARM_DEV_STR_MAX ? SWARM_DEV_STR_MAX : a->manuf_len;
+        memcpy(manuf, a->manufacturer, mlen);
+        manuf[mlen] = '\0';
+        uint8_t dlen = a->model_len > SWARM_DEV_STR_MAX ? SWARM_DEV_STR_MAX : a->model_len;
+        memcpy(model, a->model, dlen);
+        model[dlen] = '\0';
+        cJSON_AddStringToObject(o, "manufacturer", manuf);
+        cJSON_AddStringToObject(o, "model", model);
+    }
     return o;
 }
 
@@ -4676,6 +5165,38 @@ static esp_err_t zb_bridge_cmd_respond(httpd_req_t *req, esp_err_t err, const ch
     return ESP_OK;
 }
 
+/* POST /api/v1/zigbee/devices/{id}/identify -- triggers the Basic-cluster
+ * (0x0000) manufacturer/model re-read for an already-joined device
+ * (device-mapping-profiles Task 8, spec §6). zigbee_read_identity() itself
+ * is a void, silent no-op on an unknown eui64 or a lock timeout (zigbee.h's
+ * own doc comment) -- it cannot report "not found" back to us, so the
+ * device's presence is checked HERE, first, via zigbee_store_lookup()
+ * (a pure existence check over the same store, same idiom swarm.c's I5 fix
+ * already relies on) so an unknown device still gets an honest 404 instead
+ * of a 202 that lied. A found device gets 202 Accepted: the read itself is
+ * fire-and-forget (the answer lands asynchronously on
+ * zb_handle_read_attr_resp() and re-announces the device, per zigbee.h),
+ * so this handler cannot wait for it. Local-store-only, deliberately NOT
+ * extended to a bridge-owned device (unlike rename/remove just below): a
+ * bridge node's own on-demand identity re-read is out of this task's scope
+ * (no swarm_bridge_* verb for it exists yet). */
+static esp_err_t zigbee_identify_post(httpd_req_t *req, const char *idbuf)
+{
+    device_id_t id;
+    if (!device_id_parse(idbuf, &id) || id.kind != (uint8_t)DEV_KIND_ZIGBEE) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+        return ESP_OK;
+    }
+    if (!zigbee_store_lookup(id.addr, NULL, NULL)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown zigbee device");
+        return ESP_OK;
+    }
+    zigbee_read_identity(id.addr);
+    httpd_resp_set_status(req, "202 Accepted");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"status\":\"reading\"}");
+}
+
 /* POST /api/v1/zigbee/devices/{id} {"name":"..."} -- renames a joined
  * device. A missing/non-string "name" is a 400 (bad request, same as
  * sensors_rename_post()'s "bad name" shape above). The local zigbee store
@@ -4684,12 +5205,37 @@ static esp_err_t zb_bridge_cmd_respond(httpd_req_t *req, esp_err_t err, const ch
  * doc comment) -- and only on that false does Task 9's bridge-owner lookup
  * run: found -> swarm_bridge_rename() (zb_bridge_cmd_respond() above maps
  * the result); not found anywhere -> the same 404 this route always sent
- * for an unknown device. */
+ * for an unknown device.
+ *
+ * Task 8's ".../identify" suffix is checked FIRST, before
+ * zb_devices_parse_id() ever runs: that helper requires the WHOLE tail (up
+ * to a query string) to be one device id with no further suffix, so an
+ * "/identify"-suffixed tail must be peeled off and routed to
+ * zigbee_identify_post() above before falling through to this function's
+ * own rename body -- same suffix-first-then-fallback shape
+ * devices_post_dispatch() already uses for its own "/wrapper"/"/key"
+ * suffixes on a sibling wildcard route. */
 static esp_err_t zigbee_devices_post(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
 
     const char *tail = req->uri + strlen("/api/v1/zigbee/devices/");
+
+    static const char identify_suffix[] = "/identify";
+    size_t taillen = strcspn(tail, "?");
+    size_t isuflen = sizeof(identify_suffix) - 1;
+    if (taillen > isuflen && strncmp(tail + taillen - isuflen, identify_suffix, isuflen) == 0) {
+        size_t idlen = taillen - isuflen;
+        char idbuf[40];
+        if (idlen == 0 || idlen >= sizeof(idbuf)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad device id");
+            return ESP_OK;
+        }
+        memcpy(idbuf, tail, idlen);
+        idbuf[idlen] = '\0';
+        return zigbee_identify_post(req, idbuf);
+    }
+
     uint8_t eui64[8];
     if (!zb_devices_parse_id(req, tail, eui64)) return ESP_OK;
 
@@ -4761,6 +5307,417 @@ static esp_err_t zigbee_devices_delete(httpd_req_t *req)
     }
     esp_err_t err = swarm_bridge_remove(b->mac, eui64);
     return zb_bridge_cmd_respond(req, err, "remove failed");
+}
+
+/* ---------------------------------------------------------------------
+ * Task 8 (device-mapping-profiles, spec §3): device profiles CRUD
+ * (GET /api/v1/profiles[/{key}], PUT/DELETE /api/v1/profiles/{key}).
+ * dev_profiles_json.c (Task 3) owns the pure cJSON<->dev_profile_t
+ * parse/emit and the LittleFS load/save; this block only wires HTTP to it,
+ * per the brief's own layout note.
+ * --------------------------------------------------------------------- */
+
+/* dev_profile_to_json(p) already renders the full { "match":{...}, "label"?,
+ * "entries":[...] } shape (dev_profiles_json.c) -- this only adds the
+ * "builtin" flag GET /api/v1/profiles[/{key}] tags every profile with
+ * (brief step 3), by parsing that string back into a cJSON tree rather
+ * than duplicating dev_profile_to_json()'s own field-by-field emission
+ * here. NULL (caller skips it) on any allocation failure along the way,
+ * same "degrade, don't crash" posture send_json()'s own OOM path takes. */
+static cJSON *profile_json_tagged(const dev_profile_t *p, bool builtin)
+{
+    char *s = dev_profile_to_json(p);
+    if (!s) return NULL;
+    cJSON *o = cJSON_Parse(s);
+    free(s);
+    if (!o) return NULL;
+    cJSON_AddBoolToObject(o, "builtin", builtin);
+    return o;
+}
+
+/* GET /api/v1/profiles -- every built-in profile (dev_profile_builtin(),
+ * "builtin":true) followed by every user/AI profile in the persisted store
+ * ("builtin":false). Unauthenticated, like every other GET in this file --
+ * a profile is a mapping RECIPE, not a secret. */
+static esp_err_t profiles_list_get(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *arr = cJSON_AddArrayToObject(root, "profiles");
+
+    for (int i = 0; i < dev_profile_builtin_count(); i++) {
+        cJSON *o = profile_json_tagged(dev_profile_builtin(i), true);
+        if (o) cJSON_AddItemToArray(arr, o);
+    }
+
+    dev_profile_user_load(&s_api_profile_store);
+    for (int i = 0; i < s_api_profile_store.count; i++) {
+        cJSON *o = profile_json_tagged(&s_api_profile_store.p[i], false);
+        if (o) cJSON_AddItemToArray(arr, o);
+    }
+
+    return send_json(req, root);
+}
+
+/* Splits and percent-decodes "{key}" = "<manufacturer>|<model>" out of a
+ * /api/v1/profiles/{key} wildcard tail (brief step 3). false (outputs
+ * untouched) on any decode/shape failure -- an empty manufacturer, an
+ * empty model, or no unescaped '|' at all -- which the caller reports as
+ * 400. Truncates each half into the fixed DEV_PROFILE_STR_MAX field width
+ * via snprintf, same overflow discipline dev_profiles_json.c's own parse
+ * path (dev_profile_from_json()) already uses; hexval() is this file's own
+ * helper, defined well above (devices_post_dispatch()'s key-hex parse). */
+static bool parse_profile_key(const char *tail, char *manuf_out, char *model_out)
+{
+    size_t taillen = strcspn(tail, "?");
+    if (taillen == 0 || taillen >= 96) return false;
+
+    char decoded[96];
+    size_t oi = 0;
+    for (size_t i = 0; i < taillen; i++) {
+        if (oi >= sizeof(decoded) - 1) return false;
+        char c = tail[i];
+        if (c == '%') {
+            if (i + 2 >= taillen) return false;
+            int hi = hexval(tail[i + 1]), lo = hexval(tail[i + 2]);
+            if (hi < 0 || lo < 0) return false;
+            decoded[oi++] = (char)((hi << 4) | lo);
+            i += 2;
+        } else {
+            decoded[oi++] = c;
+        }
+    }
+    decoded[oi] = '\0';
+
+    char *bar = strchr(decoded, '|');
+    if (!bar || bar == decoded || bar[1] == '\0') return false;
+    *bar = '\0';
+
+    /* Manual truncating copy, not snprintf(dst, DEV_PROFILE_STR_MAX, "%s", ...)
+     * -- `decoded`'s buffer size (96) is a compile-time-visible upper bound
+     * exceeding DEV_PROFILE_STR_MAX (32), which trips -Wformat-truncation
+     * (treated as an error, build-wide); same reasoning announce_device_json()
+     * above already gives for its own manual memcpy+NUL over a length-bounded
+     * field, just with a strnlen()-found length here instead of a wire
+     * length-prefix. */
+    size_t mlen = strnlen(decoded, DEV_PROFILE_STR_MAX - 1);
+    memcpy(manuf_out, decoded, mlen);
+    manuf_out[mlen] = '\0';
+    size_t dlen = strnlen(bar + 1, DEV_PROFILE_STR_MAX - 1);
+    memcpy(model_out, bar + 1, dlen);
+    model_out[dlen] = '\0';
+    return true;
+}
+
+/* GET /api/v1/profiles/{key} -- one profile, user store checked first
+ * (dev_profile_match()'s own precedence), tagged "builtin" by testing
+ * whether the returned pointer aliases s_api_profile_store.p[] (the user
+ * store just loaded) or dev_profile_builtin()'s own static array -- cheaper
+ * and just as correct as a second named lookup, since dev_profile_match()
+ * already did the search this would repeat. 404 when neither store has
+ * this key. Unauthenticated, same reasoning as profiles_list_get() above. */
+static esp_err_t profiles_key_get(httpd_req_t *req)
+{
+    const char *tail = req->uri + strlen("/api/v1/profiles/");
+    char manuf[DEV_PROFILE_STR_MAX], model[DEV_PROFILE_STR_MAX];
+    if (!parse_profile_key(tail, manuf, model)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad profile key");
+        return ESP_OK;
+    }
+
+    dev_profile_user_load(&s_api_profile_store);
+    const dev_profile_t *p = dev_profile_match(manuf, model, &s_api_profile_store);
+    if (!p) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown profile");
+        return ESP_OK;
+    }
+    bool builtin = !(p >= s_api_profile_store.p && p < s_api_profile_store.p + s_api_profile_store.count);
+    cJSON *o = profile_json_tagged(p, builtin);
+    if (!o) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "serialization failed");
+        return ESP_OK;
+    }
+    return send_json(req, o);
+}
+
+/* PUT /api/v1/profiles/{key} request-body scratch -- a dev_profile_t's
+ * worst-case JSON (DEV_PROFILE_MAX_ENTRIES=16 entries, each ~110 B) is well
+ * under this; kept private rather than joining the rules/wrappers
+ * s_http_body share for the same "own doc-commented owner list" reason
+ * s_api_mapping_body above gives. */
+static char s_api_profile_body[2048];
+
+/* PUT /api/v1/profiles/{key} -- create/replace a USER profile (brief step 3;
+ * fix round 1, controller ruling: spec §3 makes a user profile OVERRIDING a
+ * built-in with the SAME match key the documented primary route to that
+ * override, and dev_profile_match() already prefers a user entry over a
+ * built-in with the same key -- so this handler always upserts into the
+ * USER store via dev_profile_store_upsert(), unconditionally, whether or
+ * not {key} also names a built-in. "Built-ins are read-only" means only
+ * that the embedded seed array (dev_profiles_builtin.c) itself is never
+ * mutated -- true here regardless, since this function never touches it.
+ * An EARLIER revision of this handler 409'd here whenever {key} matched a
+ * built-in and no user override yet existed -- a circular check (the
+ * override this route exists to create could only ever exist by first
+ * passing the very check that rejected it), permanently blocking spec §3's
+ * override feature. Removed; see git history/task-8-report.md for detail.
+ * The body's own "match" block (dev_profile_from_json(), Task 3) must
+ * still name the SAME device the URL's {key} already committed to --
+ * rejected (400) otherwise, since silently upserting under the URL's key
+ * while storing the body's own (different) match values would corrupt
+ * dev_profile_match()'s lookup either way. */
+static esp_err_t profiles_key_put(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/profiles/");
+    char manuf[DEV_PROFILE_STR_MAX], model[DEV_PROFILE_STR_MAX];
+    if (!parse_profile_key(tail, manuf, model)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad profile key");
+        return ESP_OK;
+    }
+
+    dev_profile_user_load(&s_api_profile_store);
+
+    if (req->content_len == 0 || req->content_len > sizeof(s_api_profile_body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, s_api_profile_body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    s_api_profile_body[received] = '\0';
+
+    dev_profile_t prof;
+    if (!dev_profile_from_json(s_api_profile_body, &prof)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid profile");
+        return ESP_OK;
+    }
+
+    if (strncmp(prof.manufacturer, manuf, DEV_PROFILE_STR_MAX) != 0 ||
+        strncmp(prof.model, model, DEV_PROFILE_STR_MAX) != 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body match does not match URL key");
+        return ESP_OK;
+    }
+
+    if (dev_profile_store_upsert(&s_api_profile_store, &prof) < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "profile store full");
+        return ESP_OK;
+    }
+    if (!dev_profile_user_save(&s_api_profile_store)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to save profile");
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* DELETE /api/v1/profiles/{key} -- removes a USER profile (brief step 3).
+ * Idempotent-with-a-twist: absent from the user store AND matching a
+ * built-in -> 409 (read-only, same posture as the PUT route above); absent
+ * from BOTH -> 404 (genuinely unknown, not "nothing to do" -- unlike e.g.
+ * devices_dp_map_delete()'s clear, a profile key names a specific known
+ * catalogue, so deleting one that never existed at all is a client error,
+ * not a no-op). */
+static esp_err_t profiles_key_delete(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    const char *tail = req->uri + strlen("/api/v1/profiles/");
+    char manuf[DEV_PROFILE_STR_MAX], model[DEV_PROFILE_STR_MAX];
+    if (!parse_profile_key(tail, manuf, model)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad profile key");
+        return ESP_OK;
+    }
+
+    dev_profile_user_load(&s_api_profile_store);
+    if (!dev_profile_store_remove(&s_api_profile_store, manuf, model)) {
+        for (int i = 0; i < dev_profile_builtin_count(); i++) {
+            const dev_profile_t *b = dev_profile_builtin(i);
+            if (strncmp(b->manufacturer, manuf, DEV_PROFILE_STR_MAX) == 0 &&
+                strncmp(b->model, model, DEV_PROFILE_STR_MAX) == 0) {
+                return send_409(req, "built-in profile is read-only");
+            }
+        }
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown profile");
+        return ESP_OK;
+    }
+
+    if (!dev_profile_user_save(&s_api_profile_store)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to save profile store");
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+/* ---------------------------------------------------------------------
+ * Task 8 (device-mapping-profiles, spec §5): the hub-persisted AI config
+ * (GET/PUT /api/v1/config/ai). Own small load/save here, tmp+rename like
+ * dev_profile_user_save()/tuya_dp_map_save() -- deliberately NOT routed
+ * through dev_profiles_json.c (that module owns dev_profile_t persistence
+ * only) or through webui/src/lib/ai/settings.js's existing "key never on
+ * flash / never sent to the hub" wrapper-authoring config (a DIFFERENT
+ * feature's AI settings, untouched by this task -- brief step 7's own
+ * note). This one deliberately DOES persist the key on the hub, because
+ * the WebUI's mapping-assist flow needs the hub to hand it back on GET so
+ * the BROWSER can call the AI provider directly (spec §5) -- an accepted,
+ * explicit divergence, not an oversight.
+ * --------------------------------------------------------------------- */
+
+#define AI_CONFIG_PATH     "/storage/ai_config.json"
+#define AI_CONFIG_TMP_PATH "/storage/ai_config.tmp"
+#define AI_CONFIG_STR_MAX  192   /* generous for a base_url / api_key / model name */
+
+typedef struct {
+    char base_url[AI_CONFIG_STR_MAX];
+    char api_key[AI_CONFIG_STR_MAX];
+    char model[AI_CONFIG_STR_MAX];
+} ai_config_t;
+
+/* *out is zeroed first, so a missing/corrupt/absent file (false) still
+ * leaves it in the same "nothing configured yet" shape a caller would want
+ * to hand back on GET -- same "degrade to empty, never to garbage" posture
+ * dev_profile_user_load() gives its own store on a bad/missing file. */
+static bool ai_config_load(ai_config_t *out)
+{
+    memset(out, 0, sizeof *out);
+    FILE *f = fopen(AI_CONFIG_PATH, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0 || n > 4096) { fclose(f); return false; }
+    char buf[4097];
+    size_t rd = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[rd] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return false;
+    const cJSON *bu = cJSON_GetObjectItem(root, "base_url");
+    const cJSON *ak = cJSON_GetObjectItem(root, "api_key");
+    const cJSON *md = cJSON_GetObjectItem(root, "model");
+    if (cJSON_IsString(bu)) snprintf(out->base_url, sizeof out->base_url, "%s", bu->valuestring);
+    if (cJSON_IsString(ak)) snprintf(out->api_key, sizeof out->api_key, "%s", ak->valuestring);
+    if (cJSON_IsString(md)) snprintf(out->model, sizeof out->model, "%s", md->valuestring);
+    cJSON_Delete(root);
+    return true;
+}
+
+/* tmp+rename, same atomicity discipline tuya_dp_map_save()/
+ * dev_profile_user_save() already use elsewhere in this file's components:
+ * a crash/power-loss mid-write leaves the OLD file intact rather than a
+ * half-written one. */
+static bool ai_config_save(const ai_config_t *cfg)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "base_url", cfg->base_url);
+    cJSON_AddStringToObject(root, "api_key", cfg->api_key);
+    cJSON_AddStringToObject(root, "model", cfg->model);
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!out) return false;
+
+    FILE *f = fopen(AI_CONFIG_TMP_PATH, "wb");
+    if (!f) { free(out); return false; }
+    size_t len = strlen(out);
+    bool ok = fwrite(out, 1, len, f) == len;
+    if (fclose(f) != 0) ok = false;
+    free(out);
+    if (!ok) { remove(AI_CONFIG_TMP_PATH); return false; }
+    if (rename(AI_CONFIG_TMP_PATH, AI_CONFIG_PATH) != 0) { remove(AI_CONFIG_TMP_PATH); return false; }
+    return true;
+}
+
+/* GET /api/v1/config/ai -- returns {base_url, api_key, model} UNREDACTED
+ * (brief step 7: "GET returns the stored config to the authenticated
+ * WebUI ... the browser needs it to make the call"). Auth-gated, unlike
+ * every other GET in this file: this is the one GET route in api_v1.c that
+ * hands back a live third-party API secret, so the usual "every GET here
+ * is unauthenticated" posture does not apply -- same reasoning
+ * role_change_ok()'s own comment gives for departing from a file-wide
+ * default when the stakes for THIS one route are different. An absent/
+ * corrupt file reads as an all-empty config (ai_config_load()'s own "false
+ * still zeroes *out" contract), not an error -- "nothing configured yet"
+ * is a normal, expected state before the user's first PUT. */
+static esp_err_t config_ai_get(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    ai_config_t cfg;
+    ai_config_load(&cfg);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "base_url", cfg.base_url);
+    cJSON_AddStringToObject(root, "api_key", cfg.api_key);
+    cJSON_AddStringToObject(root, "model", cfg.model);
+    return send_json(req, root);
+}
+
+static char s_api_ai_body[512];
+
+/* PUT /api/v1/config/ai {"base_url":"...","api_key":"...","model":"..."} --
+ * full replace (brief step 7: "PUT stores base_url/api_key/model"); all
+ * three must be present as strings (empty string is a valid way to clear
+ * one, e.g. api_key, without clearing the others -- send the current GET
+ * response back with just that one field blanked). */
+static esp_err_t config_ai_put(httpd_req_t *req)
+{
+    if (!api_auth_ok(req)) return api_send_401(req);
+
+    if (req->content_len == 0 || req->content_len > sizeof(s_api_ai_body) - 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_OK;
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, s_api_ai_body + received, req->content_len - received);
+        if (r <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "read error");
+            return ESP_OK;
+        }
+        received += (size_t)r;
+    }
+    s_api_ai_body[received] = '\0';
+
+    cJSON *json = cJSON_Parse(s_api_ai_body);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid json");
+        return ESP_OK;
+    }
+
+    const cJSON *bu = cJSON_GetObjectItem(json, "base_url");
+    const cJSON *ak = cJSON_GetObjectItem(json, "api_key");
+    const cJSON *md = cJSON_GetObjectItem(json, "model");
+    if (!cJSON_IsString(bu) || !cJSON_IsString(ak) || !cJSON_IsString(md)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing base_url/api_key/model");
+        return ESP_OK;
+    }
+
+    ai_config_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    snprintf(cfg.base_url, sizeof cfg.base_url, "%s", bu->valuestring);
+    snprintf(cfg.api_key, sizeof cfg.api_key, "%s", ak->valuestring);
+    snprintf(cfg.model, sizeof cfg.model, "%s", md->valuestring);
+    cJSON_Delete(json);
+
+    if (!ai_config_save(&cfg)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to store ai config");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
 }
 
 void api_v1_register(httpd_handle_t server)
@@ -4937,4 +5894,30 @@ void api_v1_register(httpd_handle_t server)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &zigbee_devices_post_u));
     httpd_uri_t zigbee_devices_del = { .uri = "/api/v1/zigbee/devices/*", .method = HTTP_DELETE, .handler = zigbee_devices_delete };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &zigbee_devices_del));
+
+    /* Device profiles CRUD (Task 8, device-mapping-profiles spec §3).
+     * "/api/v1/profiles" (exact GET) and its wildcarded "/api/v1/profiles/"
+     * + "*" form (GET/PUT/DELETE, one distinct handler per method) are
+     * distinct URI templates to ESP-IDF's matcher, same non-collision every
+     * other exact+wildcard group in this function already relies on.
+     * ".../identify" (Task 8) needs no separate registration here -- it is
+     * dispatched inside zigbee_devices_post() above, on the SAME already-
+     * registered wildcarded "/api/v1/zigbee/devices/" + "*" POST route
+     * (its own comment explains the suffix-first-then-fallback ordering);
+     * likewise ".../mapping" and ".../ai-prompt-inputs" ride the existing
+     * "/api/v1/devices/" + "*" GET/POST routes registered above. */
+    httpd_uri_t profiles_g = { .uri = "/api/v1/profiles", .method = HTTP_GET, .handler = profiles_list_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &profiles_g));
+    httpd_uri_t profiles_get1 = { .uri = "/api/v1/profiles/*", .method = HTTP_GET, .handler = profiles_key_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &profiles_get1));
+    httpd_uri_t profiles_put = { .uri = "/api/v1/profiles/*", .method = HTTP_PUT, .handler = profiles_key_put };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &profiles_put));
+    httpd_uri_t profiles_del = { .uri = "/api/v1/profiles/*", .method = HTTP_DELETE, .handler = profiles_key_delete };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &profiles_del));
+
+    /* Hub-persisted AI config (Task 8, device-mapping-profiles spec §5). */
+    httpd_uri_t config_ai_g = { .uri = "/api/v1/config/ai", .method = HTTP_GET, .handler = config_ai_get };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &config_ai_g));
+    httpd_uri_t config_ai_p = { .uri = "/api/v1/config/ai", .method = HTTP_PUT, .handler = config_ai_put };
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &config_ai_p));
 }

@@ -6,6 +6,7 @@
 #include "mibeacon.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 ESP_EVENT_DECLARE_BASE(PLANTHUB_DATA_EVENT);
 enum { DATA_EVENT_SENSOR_UPDATE };
@@ -109,6 +110,30 @@ void      data_core_set_via(int dev_idx, const uint8_t node_mac[6]);
  * registry accessor here; see registry_clear_via()'s own doc comment. A
  * no-op if dev_idx is out of range or not currently in_use. */
 void      data_core_clear_via(int dev_idx);
+
+/* Device-mapping-profiles Task 7: mirrors a device's manufacturer/model
+ * strings (announced identity) into the registry row at dev_idx (a slot
+ * already resolved via data_core_find_or_create_index(), same precondition
+ * as data_core_set_via()). Either pointer may be NULL to leave that field
+ * untouched (an announce that only carries one of the two strings, or
+ * neither -- swarm.c only calls this when at least one is non-empty).
+ * Truncates to the fixed 32-byte field width (registry.h's device_entry_t)
+ * via snprintf, same overflow discipline as this file's other string
+ * setters. Takes s_mutex, same as every other registry mutator here. A
+ * no-op if dev_idx is out of range. Persistence of identity is zb_store's
+ * job (Task 2), not data_core's -- this is a plain in-RAM mirror. */
+void      data_core_set_identity(int dev_idx, const char *manufacturer, const char *model);
+
+/* Copies dev_idx's mirrored manufacturer/model (data_core_set_identity())
+ * into manuf_out/model_out (each cap bytes, NUL-terminated, "" if never
+ * set) under s_mutex. Either output pointer may be NULL to fetch only the
+ * other field. Returns false (outputs untouched) when dev_idx is out of
+ * range; true otherwise, including when the device slot is not currently
+ * in_use or the strings are still empty -- callers that care distinguish
+ * that from a genuine identity via the returned strings' emptiness, same
+ * as data_core_get_device() leaves "not found" to the caller by way of its
+ * own return value rather than by a distinct error code here. */
+bool      data_core_get_identity(int dev_idx, char *manuf_out, char *model_out, size_t cap);
 
 /* A MiFlora battery poll result (battery_poll.c, M6): applies pct to mac's
  * CAP_BATTERY_LEVEL slot (creating the device if this is its first

@@ -229,7 +229,8 @@ static void raddr(rd_t *r, swarm_dev_addr_t *a) { a->kind = r8(r); rbytes(r, a->
 size_t swarm_encode_device_announce(const swarm_device_announce_t *in, uint8_t *out, size_t cap)
 {
     if (!in || in->name_len > SWARM_DEV_NAME_MAX || in->cap_count > SWARM_DEV_MAX_CAPS ||
-        in->action_count > SWARM_DEV_MAX_ACTIONS) return 0;
+        in->action_count > SWARM_DEV_MAX_ACTIONS ||
+        in->manuf_len > SWARM_DEV_STR_MAX || in->model_len > SWARM_DEV_STR_MAX) return 0;
     wr_t w = { out, cap, 0, out != NULL };
     whdr(&w, SWARM_MSG_DEVICE_ANNOUNCE);
     waddr(&w, &in->dev);
@@ -239,6 +240,8 @@ size_t swarm_encode_device_announce(const swarm_device_announce_t *in, uint8_t *
     for (uint8_t i = 0; i < in->cap_count; i++) { w8(&w, in->cap_ids[i]); w16(&w, in->cap_clusters[i]); w8(&w, in->cap_endpoints[i]); }
     w8(&w, in->action_count);
     for (uint8_t i = 0; i < in->action_count; i++) { w8(&w, in->action_ids[i]); w8(&w, in->action_endpoints[i]); }
+    w8(&w, in->manuf_len); wbytes(&w, in->manufacturer, in->manuf_len);
+    w8(&w, in->model_len);  wbytes(&w, in->model, in->model_len);
     return wfinish(&w);
 }
 
@@ -257,6 +260,12 @@ bool swarm_decode_device_announce(const uint8_t *buf, size_t len, swarm_device_a
     out->action_count = r8(&r);
     if (out->action_count > SWARM_DEV_MAX_ACTIONS) return false;
     for (uint8_t i = 0; i < out->action_count; i++) { out->action_ids[i] = r8(&r); out->action_endpoints[i] = r8(&r); }
+    out->manuf_len = r8(&r);
+    if (out->manuf_len > SWARM_DEV_STR_MAX) return false;
+    rbytes(&r, out->manufacturer, out->manuf_len);
+    out->model_len = r8(&r);
+    if (out->model_len > SWARM_DEV_STR_MAX) return false;
+    rbytes(&r, out->model, out->model_len);
     return rend(&r);
 }
 
@@ -288,6 +297,7 @@ size_t swarm_encode_measurement(const swarm_measurement_t *in, uint8_t *out, siz
     uint32_t vbits; memcpy(&vbits, &in->value, sizeof(vbits));
     w32(&w, vbits);
     w32(&w, in->age_s);
+    w16(&w, in->source_cluster);
     return wfinish(&w);
 }
 
@@ -301,6 +311,7 @@ bool swarm_decode_measurement(const uint8_t *buf, size_t len, swarm_measurement_
     uint32_t vbits = r32(&r);
     memcpy(&out->value, &vbits, sizeof(out->value));
     out->age_s = r32(&r);
+    out->source_cluster = r16(&r);
     return rend(&r);
 }
 

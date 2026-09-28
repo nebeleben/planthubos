@@ -21,7 +21,12 @@
 #define TUYA_DP_MAX_DEVICES    8
 #define TUYA_DP_MAX_PER_DEVICE 12
 #define TUYA_MAP_MAX           16
-#define TUYA_DP_MAP_FMT        1
+#define TUYA_SUPPRESS_MAX      16
+#define TUYA_DP_MAP_FMT        2   /* v2 adds per-entry offset + provenance + a suppress-set block */
+
+/* Where an applied mapping came from (device-mapping-profiles §3 provenance),
+ * folded into the fmt-2 bump -- no extra format version. */
+enum { TUYA_PROV_MANUAL = 0, TUYA_PROV_PROFILE = 1, TUYA_PROV_AI = 2 };
 
 typedef struct {
     uint8_t  dp_id;
@@ -35,6 +40,8 @@ typedef struct {
     uint8_t     dp_id;
     uint8_t     cap_id;
     float       scale;
+    float       offset;      /* v2: applied value = value*scale + offset */
+    uint8_t     provenance;  /* v2: TUYA_PROV_* */
 } tuya_dp_map_t;
 
 /* --- Observed store (RAM only, cleared at boot) ---
@@ -60,6 +67,22 @@ bool tuya_dp_map_clear(const device_id_t *id, uint8_t dp_id);
 bool tuya_dp_map_get(const device_id_t *id, uint8_t dp_id, uint8_t *cap_id_out, float *scale_out);
 int  tuya_dp_map_list(tuya_dp_map_t *out, int max);
 
+/* Offset-/provenance-aware variants (device-mapping-profiles). The original
+ * 4-arg tuya_dp_map_set / 4-arg tuya_dp_map_get and 2-arg tuya_dp_apply are
+ * kept as back-compat wrappers (offset 0, provenance TUYA_PROV_MANUAL). */
+bool tuya_dp_map_set_ex(const device_id_t *id, uint8_t dp_id, uint8_t cap_id, float scale, float offset, uint8_t provenance);
+bool tuya_dp_map_get_ex(const device_id_t *id, uint8_t dp_id, uint8_t *cap_id_out, float *scale_out, float *offset_out, uint8_t *provenance_out);
+float tuya_dp_apply_off(int32_t value, float scale, float offset);
+
+/* Per-device suppress-set: a source_cluster whose standard-cluster
+ * measurements the hub must drop (the ZS-301Z soil-on-0x0405 flap). Each entry
+ * carries its provenance. Persisted in the same map file (fmt 2). */
+bool tuya_dp_suppress_set(const device_id_t *id, uint16_t source_cluster, uint8_t provenance);
+bool tuya_dp_suppress_clear(const device_id_t *id, uint16_t source_cluster);
+bool tuya_dp_suppressed(const device_id_t *id, uint16_t source_cluster);
+int  tuya_dp_suppress_list(const device_id_t *id, uint16_t *out, int max);
+bool tuya_dp_suppress_provenance(const device_id_t *id, uint16_t source_cluster, uint8_t *provenance_out);
+
 /* Pure apply arithmetic: DP raw value -> the capability's own unit, given
  * (value, scale) from tuya_dp_map_get(). Exact float multiply, no
  * rounding/clamping -- capability_encode() (capability.h) does the
@@ -69,14 +92,22 @@ int  tuya_dp_map_list(tuya_dp_map_t *out, int max);
 float tuya_dp_apply(int32_t value, float scale);
 
 /* File format (little-endian), CRC-16/CCITT-FALSE over every byte but the
- * crc field: [0]=fmt(=1) [1..2]=crc [3]=count, then count * {
- * id.kind(1), id.addr[8], dp_id(1), cap_id(1), scale as 4 raw float bytes }.
- * Mirrors wrapper_bind.c's layout discipline verbatim. */
+ * crc field: [0]=fmt(1 or 2) [1..2]=crc [3]=count, then count * {
+ * id.kind(1), id.addr[8], dp_id(1), cap_id(1), scale as 4 raw float bytes,
+ * [fmt 2 only: offset as 4 raw float bytes, provenance(1)] }, then [fmt 2
+ * only: sup_count(1), then sup_count * { id.kind(1), id.addr[8],
+ * cluster(2 LE), provenance(1) }]. Mirrors wrapper_bind.c's layout
+ * discipline verbatim. A fmt-1 file still reads (offset=0,
+ * provenance=TUYA_PROV_MANUAL, empty suppress-set). */
 size_t tuya_dp_map_serialize(uint8_t *buf, size_t cap);
 /* Resets the map table first (same as wrapper_bind_deserialize): a
  * corrupt/truncated/wrong-fmt buffer leaves the map empty and returns
  * false, never a partially-applied table. */
 bool   tuya_dp_map_deserialize(const uint8_t *buf, size_t len);
+
+/* Test-only helper (host build): rewrite a fmt-2 image as a fmt-1 image
+ * (drop offsets + suppress block) so the fmt-1 read path can be exercised. */
+size_t tuya_dp_map_downgrade_fmt1(const uint8_t *in, size_t in_len, uint8_t *out, size_t cap);
 
 #ifdef ESP_PLATFORM
 /* Load the persisted map at boot (no-op leaving an empty map if the file is

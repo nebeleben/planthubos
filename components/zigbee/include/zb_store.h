@@ -25,6 +25,7 @@
 #define ZB_STORE_MAX_ACTIONS 8
 #define ZB_STORE_NAME_MAX    24
 #define ZB_STORE_MAX_UNMAPPED 6
+#define ZB_STORE_STR_MAX     32   /* v5: manufacturer/model (Basic 0x0004/0x0005) */
 
 typedef enum {
     ZB_METER_UNKNOWN = 0,   /* not yet probed */
@@ -59,6 +60,8 @@ typedef struct {
                                           * rather than a guarantee. */
     char     name[ZB_STORE_NAME_MAX];
     uint8_t  meter_state;   /* zb_meter_state_t; blind-probe result, persisted */
+    char     manufacturer[ZB_STORE_STR_MAX];   /* v5: Basic 0x0004, "" until read */
+    char     model[ZB_STORE_STR_MAX];          /* v5: Basic 0x0005, "" until read */
 } zb_device_t;
 
 typedef struct {
@@ -94,9 +97,21 @@ typedef struct {
  * device answered the 0x0B04 blind-probe. ZB_STORE_VERSION bumped
  * alongside it: an old (v3, 91-byte) file is read via a version-gated
  * legacy path in zb_store_deserialize() that defaults meter_state to
- * ZB_METER_UNKNOWN, same treatment as the v2 path above it. */
-#define ZB_STORE_RECORD_SIZE 92
+ * ZB_METER_UNKNOWN, same treatment as the v2 path above it.
+ *
+ * Device identity (record v5) grew this again, 92 -> 156 bytes: two fixed
+ * 32-byte fields, manufacturer + model (Basic 0x0004/0x0005). ZB_STORE_VERSION
+ * bumped to 5; a v4 (92-byte) file is read via get_record_v4(), which
+ * defaults both identity strings empty -- same version-gated pattern the v2
+ * and v3 paths use. */
+#define ZB_STORE_RECORD_SIZE 156
 #define ZB_STORE_IMAGE_MAX   (8 + ZB_STORE_MAX_DEVICES * ZB_STORE_RECORD_SIZE)
+
+/* On-disk format version (buf[4] of a serialized image). See the version
+ * history above ZB_STORE_RECORD_SIZE and in zb_store.c's per-bump comments
+ * for what each value means; zb_store_deserialize() also accepts older
+ * versions (currently 2, 3 and 4) via version-gated legacy readers. */
+#define ZB_STORE_VERSION 5
 
 void zb_store_init(zb_table_t *t);
 

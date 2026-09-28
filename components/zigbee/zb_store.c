@@ -26,8 +26,17 @@
  * Power metering grew the record again, 91 -> 92 bytes (a trailing
  * meter_state byte -- see zb_store.h), and bumped this to 4. A v3 file is
  * likewise not rejected: it is read via get_record_v3(), which defaults
- * meter_state to ZB_METER_UNKNOWN. */
-#define ZB_STORE_VERSION 4
+ * meter_state to ZB_METER_UNKNOWN.
+ *
+ * Device identity grew the record again, 92 -> 156 bytes (manufacturer +
+ * model, 32 bytes each -- see zb_store.h), and bumped this to 5. A v4 file
+ * is likewise not rejected: it is read via get_record_v4(), which defaults
+ * manufacturer/model to empty strings.
+ *
+ * ZB_STORE_VERSION itself lives in zb_store.h (same as SWARM_PROTO_VERSION
+ * in swarm_frame.h): it is part of the on-disk contract a caller can
+ * legitimately check (e.g. against a freshly serialized image's buf[4]),
+ * not an implementation detail private to this file. */
 /* The exact v2 (pre-multi-endpoint) record layout, kept only so
  * get_record_v2() can read an old file: eui64 8 + short_addr 2
  * + endpoint 1 + interviewed 1 + cap_count 1 + caps 4 + cap_clusters 8
@@ -40,6 +49,10 @@
  * get_record_v3() can read an old file: identical to the current record
  * minus the trailing meter_state byte -- see zb_store.h. */
 #define ZB_STORE_V3_RECORD_SIZE 91
+/* The exact v4 (pre-identity) record layout, kept only so get_record_v4()
+ * can read an old file: identical to the current record minus the
+ * trailing manufacturer/model fields -- see zb_store.h. */
+#define ZB_STORE_V4_RECORD_SIZE 92   /* pre-identity: through meter_state */
 #define ZB_STORE_HEADER_SIZE 8
 
 void zb_store_init(zb_table_t *t) {
@@ -139,6 +152,12 @@ static uint8_t *put_record(uint8_t *p, const zb_device_t *d) {
     memcpy(p, d->name, nlen);
     p += ZB_STORE_NAME_MAX;
     p = put_u8(p, d->meter_state);
+    memset(p, 0, ZB_STORE_STR_MAX);
+    memcpy(p, d->manufacturer, strnlen(d->manufacturer, ZB_STORE_STR_MAX - 1));
+    p += ZB_STORE_STR_MAX;
+    memset(p, 0, ZB_STORE_STR_MAX);
+    memcpy(p, d->model, strnlen(d->model, ZB_STORE_STR_MAX - 1));
+    p += ZB_STORE_STR_MAX;
     return p;
 }
 
@@ -173,6 +192,51 @@ static const uint8_t *get_record(const uint8_t *p, zb_device_t *d) {
     d->name[ZB_STORE_NAME_MAX - 1] = '\0';
     p += ZB_STORE_NAME_MAX;
     p = get_u8(p, &d->meter_state);
+    memcpy(d->manufacturer, p, ZB_STORE_STR_MAX);
+    d->manufacturer[ZB_STORE_STR_MAX - 1] = '\0';
+    p += ZB_STORE_STR_MAX;
+    memcpy(d->model, p, ZB_STORE_STR_MAX);
+    d->model[ZB_STORE_STR_MAX - 1] = '\0';
+    p += ZB_STORE_STR_MAX;
+    return p;
+}
+
+/* Reads one v4 (92-byte, pre-identity) record. `d` must already be zeroed.
+ * Identical to get_record() through meter_state; v4 had no identity strings,
+ * so manufacturer/model are left empty -- same treatment as the v3 path. */
+static const uint8_t *get_record_v4(const uint8_t *p, zb_device_t *d) {
+    memcpy(d->eui64, p, 8);
+    p += 8;
+    p = get_u16le(p, &d->short_addr);
+    p = get_u8(p, &d->endpoint);
+    p = get_u8(p, &d->interviewed);
+    p = get_u8(p, &d->cap_count);
+    for (int i = 0; i < ZB_STORE_MAX_CAPS; i++) {
+        p = get_u8(p, &d->caps[i]);
+    }
+    for (int i = 0; i < ZB_STORE_MAX_CAPS; i++) {
+        p = get_u16le(p, &d->cap_clusters[i]);
+    }
+    for (int i = 0; i < ZB_STORE_MAX_CAPS; i++) {
+        p = get_u8(p, &d->cap_endpoints[i]);
+    }
+    p = get_u8(p, &d->action_count);
+    for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
+        p = get_u8(p, &d->actions[i]);
+    }
+    for (int i = 0; i < ZB_STORE_MAX_ACTIONS; i++) {
+        p = get_u8(p, &d->action_endpoints[i]);
+    }
+    p = get_u8(p, &d->unmapped_count);
+    for (int i = 0; i < ZB_STORE_MAX_UNMAPPED; i++) {
+        p = get_u16le(p, &d->unmapped_clusters[i]);
+    }
+    memcpy(d->name, p, ZB_STORE_NAME_MAX);
+    d->name[ZB_STORE_NAME_MAX - 1] = '\0';
+    p += ZB_STORE_NAME_MAX;
+    p = get_u8(p, &d->meter_state);
+    d->manufacturer[0] = '\0';
+    d->model[0] = '\0';
     return p;
 }
 
@@ -286,15 +350,17 @@ bool zb_store_deserialize(zb_table_t *t, const uint8_t *buf, size_t len) {
         buf[2] != ZB_STORE_MAGIC2 || buf[3] != ZB_STORE_MAGIC3) {
         return false;
     }
-    /* v2 (pre-multi-endpoint, 65-byte record) and v3 (pre-power-metering,
-     * 91-byte record) are not rejected outright: each is read via its own
-     * legacy layout below -- v2 fanning its single `endpoint` into the
-     * new per-cap/per-action arrays, v3 defaulting the new meter_state --
-     * so an existing hub's persisted devices survive the upgrade rather
-     * than the table coming back empty. Any OTHER unknown version is
-     * still rejected -- there is no layout to read it with. */
+    /* v2 (pre-multi-endpoint, 65-byte record), v3 (pre-power-metering,
+     * 91-byte record) and v4 (pre-identity, 92-byte record) are not
+     * rejected outright: each is read via its own legacy layout below --
+     * v2 fanning its single `endpoint` into the new per-cap/per-action
+     * arrays, v3 defaulting the new meter_state, v4 defaulting the new
+     * manufacturer/model -- so an existing hub's persisted devices survive
+     * the upgrade rather than the table coming back empty. Any OTHER
+     * unknown version is still rejected -- there is no layout to read it
+     * with. */
     uint8_t ver = buf[4];
-    if (ver != ZB_STORE_VERSION && ver != 3 && ver != 2) {
+    if (ver != ZB_STORE_VERSION && ver != 4 && ver != 3 && ver != 2) {
         return false;
     }
     uint8_t count = buf[5];
@@ -303,6 +369,7 @@ bool zb_store_deserialize(zb_table_t *t, const uint8_t *buf, size_t len) {
     }
     size_t rec = (ver == 2) ? ZB_STORE_V2_RECORD_SIZE
                : (ver == 3) ? ZB_STORE_V3_RECORD_SIZE
+               : (ver == 4) ? ZB_STORE_V4_RECORD_SIZE
                : ZB_STORE_RECORD_SIZE;
     size_t need = ZB_STORE_HEADER_SIZE + (size_t)count * rec;
     if (len != need) {
@@ -319,6 +386,7 @@ bool zb_store_deserialize(zb_table_t *t, const uint8_t *buf, size_t len) {
     for (int i = 0; i < count; i++) {
         p = (ver == 2) ? get_record_v2(p, &out.dev[i])
           : (ver == 3) ? get_record_v3(p, &out.dev[i])
+          : (ver == 4) ? get_record_v4(p, &out.dev[i])
           : get_record(p, &out.dev[i]);
         /* A cap_count/action_count beyond the fixed-size arrays they index
          * is as impossible as a bad table count -- the field exists so a

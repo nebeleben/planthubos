@@ -340,3 +340,23 @@ $CC -Wall -Wextra -Werror -I../../components/capability/include -I../../componen
     test_tuya_dp.c ../../components/tuya_dp/tuya_dp.c ../../components/capability/capability.c \
     ../../components/capability/device_id.c -o test_tuya_dp -lm
 ./test_tuya_dp
+
+# dev_profiles pure core (Task 3, device-mapping-profiles): profile struct,
+# match precedence (user > built-in), validate, and the embedded ZS-301Z
+# seed. dev_profiles_json.c is device-only (cJSON) and deliberately not built
+# here -- the pure core is what carries the match/validate logic.
+$CC -Wall -Wextra -Werror -I../../components/dev_profiles/include -I../../components/capability/include \
+    test_dev_profiles.c ../../components/dev_profiles/dev_profiles.c \
+    ../../components/dev_profiles/dev_profiles_builtin.c ../../components/capability/capability.c \
+    -o test_dev_profiles -lm
+./test_dev_profiles
+
+# mapping_engine (Task 5, device-mapping-profiles): pure submit/drop/record
+# and proposal-diff decisions. Links dev_profiles + tuya_dp + capability.
+$CC -Wall -Wextra -Werror -I../../components/dev_profiles/include -I../../components/tuya_dp/include \
+    -I../../components/capability/include \
+    test_mapping_engine.c ../../components/dev_profiles/mapping_engine.c \
+    ../../components/dev_profiles/dev_profiles.c ../../components/dev_profiles/dev_profiles_builtin.c \
+    ../../components/tuya_dp/tuya_dp.c ../../components/capability/capability.c \
+    ../../components/capability/device_id.c -o test_mapping_engine -lm
+./test_mapping_engine

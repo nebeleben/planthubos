@@ -133,6 +133,63 @@ int main(void) {
     assert(fabsf(tuya_dp_apply(256, 0.1f) - 25.6f) < 1e-4f);
     assert(fabsf(tuya_dp_apply(-50, 2.0f) - (-100.0f)) < 1e-4f);
     assert(fabsf(tuya_dp_apply(0, 3.7f) - 0.0f) < 1e-4f);
+    /* offset-aware apply */
+    assert(fabsf(tuya_dp_apply_off(256, 0.1f, 5.0f) - 30.6f) < 1e-4f);
+    assert(fabsf(tuya_dp_apply_off(-50, 2.0f, -1.0f) - (-101.0f)) < 1e-4f);
+
+    /* --- offset + provenance persist through the map --- */
+    tuya_dp_map_deserialize((const uint8_t[]){ 0 }, 1);   /* reset -> empty */
+    float off_out = -1.0f; uint8_t prov_out = 0xFF;
+    assert(tuya_dp_map_set_ex(&a, 7, CAP_AIR_TEMPERATURE, 0.1f, 2.5f, TUYA_PROV_PROFILE));
+    assert(tuya_dp_map_get_ex(&a, 7, &cap_id_out, &scale_out, &off_out, &prov_out));
+    assert(fabsf(off_out - 2.5f) < 1e-4f && prov_out == TUYA_PROV_PROFILE);
+    /* the 4-arg back-compat wrapper defaults provenance to manual */
+    assert(tuya_dp_map_set(&a, 8, CAP_SOIL_MOISTURE, 1.0f));
+    prov_out = 0xFF;
+    assert(tuya_dp_map_get_ex(&a, 8, &cap_id_out, &scale_out, &off_out, &prov_out));
+    assert(prov_out == TUYA_PROV_MANUAL);
+    uint8_t sbuf[512];
+    size_t slen = tuya_dp_map_serialize(sbuf, sizeof sbuf);
+    assert(slen > 0 && sbuf[0] == 2);                     /* fmt 2 */
+    off_out = -1.0f; prov_out = 0xFF;
+    assert(tuya_dp_map_deserialize(sbuf, slen));
+    assert(tuya_dp_map_get_ex(&a, 7, &cap_id_out, &scale_out, &off_out, &prov_out));
+    assert(fabsf(off_out - 2.5f) < 1e-4f && prov_out == TUYA_PROV_PROFILE);
+
+    /* --- suppress set/query/persist round trip (with provenance) --- */
+    assert(!tuya_dp_suppressed(&a, 0x0405));
+    assert(tuya_dp_suppress_set(&a, 0x0405, TUYA_PROV_AI));
+    assert(tuya_dp_suppressed(&a, 0x0405));
+    assert(!tuya_dp_suppressed(&b, 0x0405));              /* per device */
+    prov_out = 0xFF;
+    assert(tuya_dp_suppress_provenance(&a, 0x0405, &prov_out) && prov_out == TUYA_PROV_AI);
+    slen = tuya_dp_map_serialize(sbuf, sizeof sbuf);
+    assert(tuya_dp_map_deserialize(sbuf, slen));
+    assert(tuya_dp_suppressed(&a, 0x0405));               /* survived persist */
+    prov_out = 0xFF;
+    assert(tuya_dp_suppress_provenance(&a, 0x0405, &prov_out) && prov_out == TUYA_PROV_AI);
+    assert(tuya_dp_suppress_clear(&a, 0x0405));
+    assert(!tuya_dp_suppressed(&a, 0x0405));
+
+    /* --- fmt-1 back-compat: a fmt-1 image loads with offset defaulted to 0
+     * and an empty suppress-set. Hand-forging a fmt-1 CRC is fiddly, so build
+     * a fmt-2 image with the real serializer, downgrade it byte-for-byte to
+     * fmt 1 with the test-only helper (drops the offset bytes + suppress
+     * block, recomputes the CRC), then read it back. --- */
+    {
+        tuya_dp_map_deserialize((const uint8_t[]){ 0 }, 1);   /* reset -> empty */
+        assert(tuya_dp_map_set_ex(&a, 9, CAP_SOIL_MOISTURE, 0.5f, 3.0f, TUYA_PROV_PROFILE));
+        uint8_t v2[512];
+        size_t v2len = tuya_dp_map_serialize(v2, sizeof v2);   /* fmt 2, with offset + provenance */
+        assert(v2[0] == 2);
+        uint8_t v1[512];
+        size_t n1 = tuya_dp_map_downgrade_fmt1(v2, v2len, v1, sizeof v1);
+        assert(n1 > 0 && v1[0] == 1);
+        float o = 9.0f; uint8_t p = 0xFF;
+        assert(tuya_dp_map_deserialize(v1, n1));
+        assert(tuya_dp_map_get_ex(&a, 9, &cap_id_out, &scale_out, &o, &p));
+        assert(fabsf(scale_out - 0.5f) < 1e-4f && o == 0.0f && p == TUYA_PROV_MANUAL); /* both defaulted */
+    }
 
     printf("test_tuya_dp: OK\n");
     return 0;

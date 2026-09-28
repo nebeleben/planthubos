@@ -358,11 +358,9 @@ int main(void)
             .action_count = 1, .action_ids = {0}, .action_endpoints = {1} };
         uint8_t buf[96];
         size_t n = swarm_encode_device_announce(&a, buf, sizeof buf);
-        /* 4 hdr + 1 kind + 8 addr + 1 iv + 1 + 5 name + 1 + 2*(1+2+1) + 1 + 1*(1+1)
-         * = 4+1+8+1+1+5+1+8+1+2 = 32 (the listed terms actually sum to 32, not
-         * the 30 the brief claimed -- same kind of arithmetic slip the v4
-         * version of this assert had). */
-        assert(n == 32);
+        /* v6: added 1 + 1 for manuf_len/model_len (manufacturer and model are zero-length
+         * in this test), so 32 + 2 = 34 */
+        assert(n == 34);
         swarm_device_announce_t o;
         assert(swarm_decode_device_announce(buf, n, &o));
         assert(o.dev.kind == 2 && o.dev.addr[7] == 8 && o.interviewed == 1);
@@ -377,7 +375,7 @@ int main(void)
         assert(!swarm_decode_device_announce(big, n, &o));
         swarm_device_announce_t z = { .dev = { .kind = 2 } };         /* empty lists, empty name */
         n = swarm_encode_device_announce(&z, buf, sizeof buf);
-        assert(n == 4 + 1 + 8 + 1 + 1 + 1 + 1);
+        assert(n == 4 + 1 + 8 + 1 + 1 + 1 + 1 + 1 + 1);  /* v6: +1+1 for manuf_len/model_len */
         assert(swarm_decode_device_announce(buf, n, &o) && o.cap_count == 0 && o.name_len == 0);
         assert(swarm_encode_device_announce(&a, buf, 10) == 0);       /* cap too small */
     }
@@ -393,7 +391,7 @@ int main(void)
     {
         swarm_measurement_t m = { .dev = { .kind = 2, .addr = {1} }, .cap_id = 2, .endpoint = 2, .value = 16.5f, .age_s = 7 };
         uint8_t buf[32]; size_t n = swarm_encode_measurement(&m, buf, sizeof buf);
-        assert(n == 4 + 9 + 1 + 1 + 4 + 4);
+        assert(n == 4 + 9 + 1 + 1 + 4 + 4 + 2);  /* v6: +2 for source_cluster */
         swarm_measurement_t o; assert(swarm_decode_measurement(buf, n, &o));
         assert(o.cap_id == 2 && o.endpoint == 2 && o.value == 16.5f && o.age_s == 7);
         assert(!swarm_decode_measurement(buf, n + 1, &o));
@@ -466,6 +464,51 @@ int main(void)
         memcpy(bad, pbuf, 4);
         bad[2] = 1; bad[4] = 0xAA;   /* declared len=1, one extra body byte */
         assert(swarm_frame_type(bad, sizeof bad) == -1);
+    }
+
+    /* --- v6: measurement carries source_cluster --- */
+    {
+        swarm_measurement_t m = {
+            .dev = { .kind = 2, .addr = { 1, 2, 3, 4, 5, 6, 7, 8 } },
+            .cap_id = 5, .endpoint = 1, .value = 41.5f, .age_s = 7,
+            .source_cluster = 0x0405,
+        };
+        uint8_t mb[64];
+        size_t mn = swarm_encode_measurement(&m, mb, sizeof mb);
+        assert(mn > 0);
+        assert(mb[0] == SWARM_PROTO_VERSION);            /* == 6 now */
+        swarm_measurement_t mo;
+        assert(swarm_decode_measurement(mb, mn, &mo));
+        assert(mo.source_cluster == 0x0405);
+        assert(mo.cap_id == 5 && mo.endpoint == 1 && mo.age_s == 7);
+        assert(mo.value > 41.4f && mo.value < 41.6f);
+        /* a v5 frame is rejected by the version guard */
+        mb[0] = 5;
+        assert(!swarm_decode_measurement(mb, mn, &mo));
+    }
+
+    /* --- v6: announce carries manufacturer + model --- */
+    {
+        swarm_device_announce_t a;
+        memset(&a, 0, sizeof a);
+        a.dev.kind = 2; a.dev.addr[0] = 0xFD; a.dev.addr[7] = 0xA4;
+        a.interviewed = 1;
+        a.name_len = 3; memcpy(a.name, "soi", 3);
+        a.cap_count = 1; a.cap_ids[0] = 0; a.cap_clusters[0] = 0x0408; a.cap_endpoints[0] = 1;
+        a.action_count = 0;
+        const char *mf = "_TZE284_o9ofysmo"; const char *md = "TS0601";
+        a.manuf_len = (uint8_t)strlen(mf); memcpy(a.manufacturer, mf, a.manuf_len);
+        a.model_len = (uint8_t)strlen(md); memcpy(a.model, md, a.model_len);
+        uint8_t ab[128];
+        size_t an = swarm_encode_device_announce(&a, ab, sizeof ab);
+        assert(an > 0);
+        swarm_device_announce_t ao;
+        assert(swarm_decode_device_announce(ab, an, &ao));
+        assert(ao.manuf_len == a.manuf_len && memcmp(ao.manufacturer, mf, a.manuf_len) == 0);
+        assert(ao.model_len == a.model_len && memcmp(ao.model, md, a.model_len) == 0);
+        assert(ao.cap_count == 1 && ao.cap_clusters[0] == 0x0408);
+        ab[0] = 5;                                        /* v5 rejected */
+        assert(!swarm_decode_device_announce(ab, an, &ao));
     }
 
     printf("test_swarm_frame: OK\n");
