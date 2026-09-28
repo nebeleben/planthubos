@@ -5,7 +5,9 @@ import { multiEndpointNames, epSuffixed } from '../lib/endpoints.js'
 import {
   previewEntry, validateEntry, shapeMapping, provenanceLabel, clusterHex, proposalKey, proposalDraft, toWireEntry,
 } from '../lib/mapping.js'
-import { hasAiKey } from '../lib/ai/settings.js'
+import { hasAiKey, normEndpoint } from '../lib/ai/settings.js'
+import { aiComplete, AiError } from '../lib/ai/provider.js'
+import { buildProfilePrompt, parseAiProfile } from '../lib/ai/profileFromAi.js'
 import { resolveVendor } from '../lib/vendors.js'
 import {
   fmtRemainingCooldown, fmtBudget, verdictLabel, switchStateLabel, resolveActionSend, validateDuration,
@@ -698,6 +700,22 @@ function MappingSection({ deviceId, caps, open }) {
   const [mapping, setMapping] = useState(null)
   const [mapError, setMapError] = useState(false)
 
+  // Task 10 (device-mapping-profiles, WebUI AI assist): the hub-persisted
+  // AI config (GET /api/v1/config/ai, Task 8) -- base_url/api_key/model
+  // for the SAME OpenAI-compatible dialect provider.js already speaks,
+  // deliberately distinct from ../lib/ai/settings.js's browser-local
+  // config (a different feature, used by wrapper/rule generation). null
+  // while unfetched or on any failure (including a 401 on a claimed hub
+  // with no key set) -- "Ask AI" simply stays disabled/hidden rather than
+  // guessing at a config that didn't load.
+  const [aiCfg, setAiCfg] = useState(null)
+  const [aiBusy, setAiBusy] = useState(false)
+  const [aiError, setAiError] = useState('')
+  // AI-sourced proposals, kept separate from the matched-profile's own
+  // `mapping.proposals` so each row can carry its own provenance ("ai" vs
+  // "profile") into ProposalRow/toWireEntry -- see the render below.
+  const [aiProposals, setAiProposals] = useState([])
+
   function refresh(signal) {
     return fetch(`/api/v1/devices/${deviceId}/mapping`, { signal })
       .then((r) => r.json())
@@ -708,6 +726,21 @@ function MappingSection({ deviceId, caps, open }) {
     if (!open) return
     const controller = new AbortController()
     refresh(controller.signal).catch((err) => { if (err.name !== 'AbortError') setMapError(true) })
+    return () => controller.abort()
+  }, [open, deviceId])
+
+  // Fetched only while the card is open, same discipline as the mapping
+  // fetch just above -- and auth-gated on a claimed hub (config_ai_get()
+  // hands back the real api_key, unlike every other unauthenticated GET
+  // on this tab), so a missing/expired key here just means "Ask AI" stays
+  // disabled rather than throwing.
+  useEffect(() => {
+    if (!open) return
+    const controller = new AbortController()
+    fetch('/api/v1/config/ai', { signal: controller.signal, headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : null))
+      .then(setAiCfg)
+      .catch(() => {})
     return () => controller.abort()
   }, [open, deviceId])
 
@@ -741,6 +774,64 @@ function MappingSection({ deviceId, caps, open }) {
     setMapping((prev) => ({ ...prev, proposals: prev.proposals.filter((p) => proposalKey(p) !== key) }))
   }
 
+  function rejectAiProposal(key) {
+    setAiProposals((prev) => prev.filter((p) => proposalKey(p) !== key))
+  }
+
+  // "Ask AI" (Task 10, spec §5): fetch this device's prompt-inputs from
+  // the hub (Task 8 -- fingerprint/observed DPs/canonical caps, no prompt
+  // text and no provider call on that end), assemble the prompt, call the
+  // configured OpenAI-compatible endpoint DIRECTLY FROM THE BROWSER
+  // (aiComplete/provider.js -- the hub never sees the response), then
+  // validate every returned entry against THIS device's own canonical cap
+  // list before it is ever shown. Nothing here writes anything -- a valid
+  // entry becomes an aiProposals row, reviewed through the exact same
+  // ProposalRow preview/Confirm/Edit/Reject gate the matched-profile's own
+  // proposals use below, just tagged provenance "ai" instead of "profile".
+  // Every failure mode (unreachable/CORS, bad key, bad JSON, a
+  // hallucinated cap name) lands in aiError as a plain message and leaves
+  // manual mapping (ManualAddForm, further below) untouched -- never a
+  // crash, never an auto-applied entry.
+  async function askAi() {
+    if (!aiCfg || !aiCfg.base_url) return
+    setAiBusy(true)
+    setAiError('')
+    try {
+      const inpRes = await fetch(`/api/v1/devices/${deviceId}/ai-prompt-inputs`)
+      if (!inpRes.ok) throw new Error(`could not read prompt inputs from the hub (${inpRes.status})`)
+      const inputs = await inpRes.json()
+      const { system, user } = buildProfilePrompt(inputs)
+      const text = await aiComplete({
+        system,
+        user,
+        settings: {
+          kind: 'openai',
+          endpoint: normEndpoint(aiCfg.base_url),
+          model: aiCfg.model || '',
+          key: aiCfg.api_key || '',
+        },
+      })
+      // Validated against THIS call's own canonical cap list (from
+      // ai-prompt-inputs), not the wider webui `caps` table passed into
+      // this component -- the two are expected to agree, but the
+      // hub-supplied list is the one the prompt itself was built from.
+      const capNameSet = new Set((inputs.caps || []).map((c) => c.name))
+      const result = parseAiProfile(text, capNameSet)
+      if (!result.ok) {
+        setAiError(result.error || 'the AI response could not be used')
+      } else {
+        setAiProposals((prev) => {
+          const merged = new Map(prev.map((p) => [proposalKey(p), p]))
+          for (const e of result.entries) merged.set(proposalKey(e), e)
+          return [...merged.values()]
+        })
+      }
+    } catch (err) {
+      setAiError(err instanceof AiError ? err.message : (err && err.message) || 'AI request failed')
+    }
+    setAiBusy(false)
+  }
+
   if (!mapping) return mapError ? <p class="hint">Mapping unavailable.</p> : null
 
   const capNames = new Set([...caps.values()].map((c) => c.name))
@@ -751,9 +842,20 @@ function MappingSection({ deviceId, caps, open }) {
     return o ? { value: o.value } : null
   }
 
+  const askAiTitle = aiCfg && aiCfg.base_url
+    ? undefined
+    : 'Configure the mapping AI endpoint in Config → AI mapping assist'
+
   return (
     <div class="node-card-row">
       <span class="hint">Capability mapping</span>
+      <span class="node-card-row">
+        <button type="button" class="btn-secondary" onClick={askAi}
+                disabled={!aiCfg || !aiCfg.base_url || aiBusy} title={askAiTitle}>
+          {aiBusy ? 'Asking AI…' : 'Ask AI'}
+        </button>
+        {aiError && <span class="error"> AI: {aiError}</span>}
+      </span>
       {mapping.applied.length === 0 && mapping.suppress.length === 0 ? (
         <p class="hint">No mappings applied yet.</p>
       ) : (
@@ -790,6 +892,28 @@ function MappingSection({ deviceId, caps, open }) {
                   <ProposalRow key={proposalKey(p)} proposal={p} caps={caps} capNames={capNames} unitByCap={unitByCap}
                                provenance="profile" sample={p.kind === 'dp' ? sampleFor(p.dp_id) : null}
                                onConfirm={apply} onReject={() => rejectProposal(proposalKey(p))} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+      {aiProposals.length > 0 && (
+        <>
+          <span class="hint">Proposed (from AI — review before confirming)</span>
+          <div class="table-scroll">
+            <table class="devices">
+              <thead><tr><th>Proposal</th><th>Preview</th><th>Entry</th><th>Actions</th></tr></thead>
+              <tbody>
+                {aiProposals.map((p) => (
+                  <ProposalRow key={proposalKey(p)} proposal={p} caps={caps} capNames={capNames} unitByCap={unitByCap}
+                               provenance="ai" sample={p.kind === 'dp' ? sampleFor(p.dp_id) : null}
+                               onConfirm={async (entry) => {
+                                 const status = await apply(entry)
+                                 if (status === 'ok') rejectAiProposal(proposalKey(p))
+                                 return status
+                               }}
+                               onReject={() => rejectAiProposal(proposalKey(p))} />
                 ))}
               </tbody>
             </table>
