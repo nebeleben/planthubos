@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 import { loadCaps, capLabel, fmtCap } from '../lib/caps.js'
 import { multiEndpointNames, epSuffixed } from '../lib/endpoints.js'
+import { previewEntry, validateEntry, shapeMapping, provenanceLabel } from '../lib/mapping.js'
 import { hasAiKey } from '../lib/ai/settings.js'
 import { resolveVendor } from '../lib/vendors.js'
 import {
@@ -519,6 +520,379 @@ function DatapointsSection({ deviceId, caps, open }) {
   )
 }
 
+// "0x0405" style hex string for a raw ZCL cluster id, matching
+// dev_profiles_json.c's own established "0x"-prefixed-string convention
+// for a cluster (this file's OWN mapping endpoints render it as a plain
+// number on the wire -- api_v1.c's mapping_entry_json() doc comment -- so
+// this is purely a display choice, not a wire-format one).
+function clusterHex(cluster) {
+  return `0x${Number(cluster).toString(16).padStart(4, '0')}`
+}
+
+// "soil.moisture" -> "Soil Moisture", same humanisation rule caps.js'
+// capLabel() applies to a capability id's own `.name` -- duplicated here
+// (rather than imported) because every value this mapping surface renders
+// a capability THROUGH is already the dotted name string itself (the
+// mapping wire format's own convention, api_v1.c's mapping_entry_json()),
+// never a numeric id, so there is no `caps.get(id)` lookup to route
+// through capLabel in the first place.
+function capNameLabel(name) {
+  if (!name) return ''
+  return name.split('.').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
+}
+
+// Device-mapping-profiles Task 9: converts this component's own editable
+// draft shape (dp_id/cap/scale/offset as possibly-still-being-typed
+// strings, or a suppress draft's `source_cluster` -- previewEntry/
+// validateEntry's own field name, mapping.js) into the wire entry POST
+// /api/v1/devices/{id}/mapping expects: numeric dp_id/scale/offset, and
+// `cluster` (not `source_cluster` -- api_v1.c's devices_mapping_post()
+// reads "cluster", same field name its own GET proposals already use).
+// `cluster` is sent as whatever string the operator typed rather than
+// pre-parsed to a number -- devices_mapping_post() itself already accepts
+// either a JSON number or a "0x..."/decimal STRING for that field (its own
+// leniency, matching dev_profiles_json.c's parser), so there's no need to
+// duplicate that parsing here.
+function toWireEntry(entry, provenance) {
+  if (entry.kind === 'suppress') {
+    return { kind: 'suppress', cluster: entry.source_cluster, provenance }
+  }
+  return {
+    kind: 'dp',
+    dp_id: Number(entry.dp_id),
+    cap: entry.cap,
+    scale: Number(entry.scale),
+    offset: Number(entry.offset || 0),
+    provenance,
+  }
+}
+
+// Inverse-ish of toWireEntry above, for a proposal entry as GET
+// .../mapping's own "proposals" array renders it (api_v1.c's
+// mapping_entry_json(): kind/dp_id/cap/scale/offset for "dp", kind/cluster
+// for "suppress") -- reshaped into the SAME draft shape toWireEntry expects
+// back, so a proposal row's Edit control and the manual-add form can share
+// one field-editing component (EntryFields below) and one validate/preview
+// call each.
+function proposalDraft(p) {
+  if (p.kind === 'suppress') return { kind: 'suppress', source_cluster: clusterHex(p.cluster) }
+  return { kind: 'dp', dp_id: p.dp_id, cap: p.cap, scale: p.scale, offset: p.offset }
+}
+
+// Shared editable fields for one dp/suppress draft entry -- used by both
+// ProposalRow's Edit control (kind fixed to whatever the proposal already
+// is; `allowKindChange` false) and ManualAddForm (operator picks the kind
+// first; `allowKindChange` true). `caps` is the full loaded capability
+// table (lib/caps.js's loadCaps()), not just this device's own live `caps`
+// list -- a mapping can legitimately target a capability this device
+// hasn't reported a live value for yet (dev_profile_resolve_cap() on the
+// hub side validates by name, not by "already seen on this device").
+function EntryFields({ draft, onChange, caps, allowKindChange, disabled }) {
+  function set(patch) { onChange({ ...draft, ...patch }) }
+  function setKind(kind) {
+    onChange(kind === 'suppress'
+      ? { kind: 'suppress', source_cluster: '' }
+      : { kind: 'dp', dp_id: '', cap: '', scale: '1', offset: '0' })
+  }
+  return (
+    <span class="assign-control">
+      {allowKindChange && (
+        <select value={draft.kind} onChange={(e) => setKind(e.currentTarget.value)} disabled={disabled}>
+          <option value="dp">Map a DP</option>
+          <option value="suppress">Suppress a cluster</option>
+        </select>
+      )}
+      {draft.kind === 'suppress' ? (
+        <input value={draft.source_cluster} placeholder="0x0405 or 1029" size="10"
+               onInput={(e) => set({ source_cluster: e.currentTarget.value })} disabled={disabled} />
+      ) : (
+        <>
+          <input type="number" min="0" max="255" value={draft.dp_id} placeholder="DP id" size="4"
+                 onInput={(e) => set({ dp_id: e.currentTarget.value })} disabled={disabled} />
+          <select value={draft.cap} onChange={(e) => set({ cap: e.currentTarget.value })} disabled={disabled}>
+            <option value="">— capability —</option>
+            {[...caps.values()].map((c) => (
+              <option key={c.id} value={c.name}>{capLabel(caps, c.id)}</option>
+            ))}
+          </select>
+          <input type="number" step="any" value={draft.scale} placeholder="scale" size="4"
+                 onInput={(e) => set({ scale: e.currentTarget.value })} disabled={disabled} />
+          <input type="number" step="any" value={draft.offset} placeholder="offset" size="4"
+                 onInput={(e) => set({ offset: e.currentTarget.value })} disabled={disabled} />
+        </>
+      )}
+    </span>
+  )
+}
+
+// One proposed entry (device-mapping-profiles Task 9, spec §4/§6): the
+// preview row IS the review safety gate -- previewEntry evaluates the
+// proposal against its own latest observed sample (or reports "no sample
+// yet" rather than a misleading guess) so the operator sees what a
+// Confirm would actually apply before ever pressing it. Edit re-runs that
+// same preview/validate against whatever the operator changes, live, and
+// Confirm is disabled until validateEntry says the (possibly-edited) draft
+// is well-formed. Reject is LOCAL ONLY -- there is no dismiss/hide
+// endpoint on the hub, so a rejected proposal simply drops out of this
+// card's own in-memory list; nothing is written until Confirm is pressed
+// (Confirm is the only control here that ever calls fetch).
+function ProposalRow({ proposal, sample, caps, capNames, unitByCap, provenance, onConfirm, onReject }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(() => proposalDraft(proposal))
+  const [state, setState] = useState('idle') // idle | busy | error | unauth
+
+  const preview = previewEntry(draft, sample, unitByCap)
+  const check = validateEntry(draft, capNames)
+
+  async function confirm() {
+    if (!check.ok) return
+    setState('busy')
+    const status = await onConfirm(toWireEntry(draft, provenance))
+    setState(status === 'ok' ? 'idle' : status)
+  }
+
+  return (
+    <tr>
+      <td>{preview.label}</td>
+      <td class="mono">{preview.value}</td>
+      <td>
+        {editing
+          ? <EntryFields draft={draft} onChange={setDraft} caps={caps} allowKindChange={false} disabled={state === 'busy'} />
+          : (
+            <span class="hint">
+              {draft.kind === 'suppress' ? `suppress ${draft.source_cluster}` : `${capNameLabel(draft.cap)} × ${draft.scale}${Number(draft.offset) ? ` + ${draft.offset}` : ''}`}
+            </span>
+          )}
+      </td>
+      <td>
+        <button type="button" class="btn-primary" onClick={confirm} disabled={!check.ok || state === 'busy'}>
+          {state === 'busy' ? '…' : 'Confirm'}
+        </button>
+        {' '}
+        <button type="button" class="btn-secondary" onClick={() => setEditing((e) => !e)} disabled={state === 'busy'}>
+          {editing ? 'Done' : 'Edit'}
+        </button>
+        {' '}
+        <button type="button" class="btn-destructive" onClick={onReject} disabled={state === 'busy'}>
+          Reject
+        </button>
+        {editing && !check.ok && <span class="error">{check.error}</span>}
+        {state === 'error' && <span class="error">failed</span>}
+        {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
+      </td>
+    </tr>
+  )
+}
+
+// Hand-added mapping (device-mapping-profiles Task 9): the manual-add path
+// for a DP the device has reported (observed-unmapped, below) but no
+// profile proposes a mapping for, or a suppress the operator wants without
+// waiting on a proposal at all. Submit is disabled until validateEntry
+// accepts the current draft, same gate ProposalRow's Confirm uses --
+// nothing here ever reaches fetch() on a draft the hub would 400 anyway.
+function ManualAddForm({ caps, capNames, onAdd }) {
+  const [draft, setDraft] = useState({ kind: 'dp', dp_id: '', cap: '', scale: '1', offset: '0' })
+  const [state, setState] = useState('idle') // idle | busy | error | unauth
+  const [touched, setTouched] = useState(false)
+
+  const check = validateEntry(draft, capNames)
+
+  async function submit(e) {
+    e.preventDefault()
+    if (!check.ok) return
+    setState('busy')
+    const status = await onAdd(toWireEntry(draft, 'manual'))
+    setState(status === 'ok' ? 'idle' : status)
+    if (status === 'ok') {
+      setDraft({ kind: 'dp', dp_id: '', cap: '', scale: '1', offset: '0' })
+      setTouched(false)
+    }
+  }
+
+  return (
+    <form onSubmit={submit} class="assign-control">
+      <EntryFields draft={draft} onChange={(d) => { setDraft(d); setTouched(true) }} caps={caps}
+                   allowKindChange disabled={state === 'busy'} />
+      <button type="submit" class="btn-primary" disabled={!check.ok || state === 'busy'}>
+        {state === 'busy' ? '…' : 'Add mapping'}
+      </button>
+      {touched && !check.ok && <span class="error">{check.error}</span>}
+      {state === 'error' && <span class="error">failed</span>}
+      {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
+    </form>
+  )
+}
+
+// The device-mapping-profiles Task 9 mapping surface: applied caps +
+// suppress entries (each with its own provenance tag), the matched
+// profile's outstanding proposals (each reviewed live via ProposalRow's
+// preview before Confirm), observed-but-unmapped DPs, and the manual-add
+// path -- GET/POST /api/v1/devices/{id}/mapping (Task 8). Fetched only
+// while the card is open, same discipline as DatapointsSection just above
+// (a detail the operator isn't looking at is not worth polling), and a
+// POST's response (devices_mapping_post() replies with the SAME shape its
+// own GET does) is applied directly to this component's state instead of
+// triggering a second round-trip fetch.
+function MappingSection({ deviceId, caps, open }) {
+  const [mapping, setMapping] = useState(null)
+  const [mapError, setMapError] = useState(false)
+
+  function refresh(signal) {
+    return fetch(`/api/v1/devices/${deviceId}/mapping`, { signal })
+      .then((r) => r.json())
+      .then((body) => { setMapping(shapeMapping(body)); setMapError(false) })
+  }
+
+  useEffect(() => {
+    if (!open) return
+    const controller = new AbortController()
+    refresh(controller.signal).catch((err) => { if (err.name !== 'AbortError') setMapError(true) })
+    return () => controller.abort()
+  }, [open, deviceId])
+
+  // POST reply carries the mapping's whole new state (applied/suppress/
+  // proposals recomputed against it, observed_unmapped unchanged) -- no
+  // separate re-fetch needed after a successful apply.
+  async function apply(entry) {
+    try {
+      const res = await fetch(`/api/v1/devices/${deviceId}/mapping`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ entries: [entry] }),
+      })
+      if (res.ok) {
+        setMapping(shapeMapping(await res.json()))
+        return 'ok'
+      }
+      return res.status === 401 ? 'unauth' : 'error'
+    } catch {
+      return 'error'
+    }
+  }
+
+  function rejectProposal(idx) {
+    setMapping((prev) => ({ ...prev, proposals: prev.proposals.filter((_, i) => i !== idx) }))
+  }
+
+  if (!mapping) return mapError ? <p class="hint">Mapping unavailable.</p> : null
+
+  const capNames = new Set([...caps.values()].map((c) => c.name))
+  const unitByCap = {}
+  for (const c of caps.values()) unitByCap[c.name] = c.unit
+  function sampleFor(dpId) {
+    const o = mapping.observed.find((x) => x.dp_id === dpId)
+    return o ? { value: o.value } : null
+  }
+
+  return (
+    <div class="node-card-row">
+      <span class="hint">Capability mapping</span>
+      {mapping.applied.length === 0 && mapping.suppress.length === 0 ? (
+        <p class="hint">No mappings applied yet.</p>
+      ) : (
+        <div class="table-scroll">
+          <table class="devices">
+            <thead><tr><th>DP</th><th>Capability</th><th>Scale</th><th>Offset</th><th>Source</th></tr></thead>
+            <tbody>
+              {mapping.applied.map((a) => (
+                <tr key={a.dp_id}>
+                  <td class="mono">DP 0x{fmtDpId(a.dp_id)}</td>
+                  <td>{capNameLabel(a.cap)}</td>
+                  <td>{a.scale}</td>
+                  <td>{a.offset}</td>
+                  <td><span class="hint">{provenanceLabel(a.provenance)}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {mapping.suppress.length > 0 && (
+        <p class="hint">
+          Suppressed clusters: {mapping.suppress.map((s) => `${clusterHex(s.cluster)} (${provenanceLabel(s.provenance)})`).join(', ')}
+        </p>
+      )}
+      {mapping.proposals.length > 0 && (
+        <>
+          <span class="hint">Proposed (from matched profile)</span>
+          <div class="table-scroll">
+            <table class="devices">
+              <thead><tr><th>Proposal</th><th>Preview</th><th>Entry</th><th>Actions</th></tr></thead>
+              <tbody>
+                {mapping.proposals.map((p, i) => (
+                  <ProposalRow key={i} proposal={p} caps={caps} capNames={capNames} unitByCap={unitByCap}
+                               provenance="profile" sample={p.kind === 'dp' ? sampleFor(p.dp_id) : null}
+                               onConfirm={apply} onReject={() => rejectProposal(i)} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+      {mapping.observed.length > 0 && (
+        <>
+          <span class="hint">Observed, not yet mapped</span>
+          <div class="table-scroll">
+            <table class="devices">
+              <thead><tr><th>DP</th><th>Type</th><th>Raw</th><th>Age</th></tr></thead>
+              <tbody>
+                {mapping.observed.map((o) => (
+                  <tr key={o.dp_id}>
+                    <td class="mono">DP 0x{fmtDpId(o.dp_id)}</td>
+                    <td>{o.type}</td>
+                    <td>{o.value}</td>
+                    <td class="hint">{fmtAge(o.age_s)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+      <span class="hint">Add a mapping</span>
+      <ManualAddForm caps={caps} capNames={capNames} onAdd={apply} />
+    </div>
+  )
+}
+
+// Zigbee-only (device-mapping-profiles Task 8's ".../identify" route 400s
+// on anything else): triggers a Basic-cluster (0x0000) manufacturer/model
+// re-read for an already-joined device. Fire-and-forget on the hub side
+// (zigbee_read_identity() is void -- the answer lands asynchronously via a
+// re-announce, api_v1.c's own doc comment), so a 202 here only means
+// "queued", not "identity updated yet" -- the next GET /api/v1/devices poll
+// picks up a changed manufacturer/model on its own, same as every other
+// live field on this tab.
+function IdentifyButton({ deviceId }) {
+  const [state, setState] = useState('idle') // idle | busy | done | notfound | unauth | error
+
+  async function onClick() {
+    setState('busy')
+    try {
+      const res = await fetch(`/api/v1/zigbee/devices/${deviceId}/identify`, {
+        method: 'POST',
+        headers: authHeaders(),
+      })
+      if (res.ok) setState('done')
+      else setState(res.status === 404 ? 'notfound' : res.status === 401 ? 'unauth' : 'error')
+    } catch {
+      setState('error')
+    }
+  }
+
+  return (
+    <span class="namef">
+      <button type="button" class="btn-secondary" onClick={onClick} disabled={state === 'busy'}>
+        {state === 'busy' ? '…' : 'Re-read identity'}
+      </button>
+      {state === 'done' && <span class="hint">requested — check back shortly</span>}
+      {state === 'notfound' && <span class="error">device not found</span>}
+      {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
+      {state === 'error' && <span class="error">failed</span>}
+    </span>
+  )
+}
+
 // Same collapsible-card shape as nodes.jsx's NodeCard / rules.jsx's
 // RuleCard: name/id + last-seen while collapsed, details in the body.
 function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, fetchedAtS, onLockoutChanged, wrappers, onUnassignWrapper }) {
@@ -583,6 +957,21 @@ function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, f
         <div class="node-card-row">
           <span class="hint">{d.via ? `via ${d.via}` : 'direct'} · {d.rssi} dBm</span>
         </div>
+        {/* Device-mapping-profiles Task 9: the announced fingerprint
+            (manufacturer/model, Task 7's devices_json.c emission) --
+            omitted entirely by the hub until a Basic-cluster read lands, so
+            a Zigbee device with none yet still gets this row (with the
+            re-read control) rather than disappearing; a non-Zigbee kind
+            with no fingerprint (the common case today) renders nothing at
+            all, matching this file's own "absent beats null" convention. */}
+        {(d.manufacturer || d.model || d.kind === 'zb') && (
+          <div class="node-card-row">
+            <span class="hint">
+              Fingerprint: {(d.manufacturer || d.model) ? `${d.manufacturer || '?'} ${d.model || ''}`.trim() : 'not read yet'}
+            </span>
+            {d.kind === 'zb' && <IdentifyButton deviceId={d.id} />}
+          </div>
+        )}
         {/* M5a Task 7 (spec §5, amended): GATT read status. Present only for
             devices whose matched wrapper declares a connect plan
             (devices_json.c) -- an advertisement-only device gets no
@@ -645,6 +1034,7 @@ function DeviceCard({ d, caps, plantNameById, open, onToggle, onRenamed, nowS, f
           </div>
         )}
         <DatapointsSection deviceId={d.id} caps={caps} open={open} />
+        <MappingSection deviceId={d.id} caps={caps} open={open} />
         <div class="node-card-row">
           <span class="hint">
             {plantNames.length > 0 ? `Bound to ${plantNames.join(', ')}` : 'Not bound to any plant'}
