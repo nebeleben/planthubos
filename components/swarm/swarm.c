@@ -2866,6 +2866,15 @@ static void on_sensor_update(void *arg, esp_event_base_t base, int32_t id, void 
         o.u.meas.endpoint = best_ep;
         o.u.meas.value = capability_decode(best_cap, best_raw);
         o.u.meas.age_s = 0;
+        /* Whole-branch review, Critical 2: the originating ZCL cluster for
+         * this (cap, endpoint) instance, so the hub's suppress-check
+         * (it.u.meas.source_cluster != 0) can fire -- data_core's
+         * device_entry_t has no per-cap cluster, only the bridge's own
+         * zb_store does (cap_clusters[], parallel to caps[]/
+         * cap_endpoints[]). 0 (safe: "not suppressible") when this isn't
+         * actually a zigbee EUI-64 in that store, e.g. a race with a
+         * concurrent remove. */
+        o.u.meas.source_cluster = zigbee_cap_cluster(dev_id->addr, best_cap, best_ep);
         if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
             ESP_LOGW(TAG, "forward queue full, dropping measurement");
         return;
@@ -3223,6 +3232,16 @@ static void zb_observer(const zb_device_t *dev, bool gone)
             /* Task 6: per-action endpoint, same source (dev->action_endpoints[i]). */
             a->action_endpoints[i] = dev->action_endpoints[i];
         }
+        /* Whole-branch review, Critical 1: manufacturer/model (Basic
+         * 0x0004/0x0005), same length-prefixed copy pattern as a->name
+         * above -- without this every announce goes out with
+         * manuf_len==model_len==0, so the hub's identity mirror never
+         * populates and dev_profile_match() never has a fingerprint to
+         * match against. */
+        a->manuf_len = (uint8_t)strnlen(dev->manufacturer, SWARM_DEV_STR_MAX);
+        memcpy(a->manufacturer, dev->manufacturer, a->manuf_len);
+        a->model_len = (uint8_t)strnlen(dev->model, SWARM_DEV_STR_MAX);
+        memcpy(a->model, dev->model, a->model_len);
     }
     if (!s_fwd_queue || xQueueSend(s_fwd_queue, &o, 0) != pdTRUE)
         ESP_LOGW(TAG, "forward queue full, dropping %s", gone ? "device-gone" : "device-announce");

@@ -154,6 +154,15 @@ void zigbee_read_identity(const uint8_t eui64[8]);
  * started. */
 bool zigbee_store_lookup(const uint8_t eui64[8], uint16_t *short_addr, uint8_t *endpoint);
 
+/* Whole-branch review, Critical 2: the source ZCL cluster for a device's
+ * (cap_id, endpoint) instance, or 0 if unknown/not a zigbee device. Used
+ * by swarm.c's measurement forwarder to stamp swarm_measurement_t.
+ * source_cluster so the hub's suppress-check can fire (e.g. the ZS-301Z
+ * soil-on-humidity cluster 0x0405 suppression). Copies out under the
+ * store's own lock and returns immediately, same contract as
+ * zigbee_store_lookup() above. */
+uint16_t zigbee_cap_cluster(const uint8_t eui64[8], uint8_t cap_id, uint8_t endpoint);
+
 /* The coordinator's own ZCL source endpoint (zigbee.c's private
  * ZB_ENDPOINT) -- exposed rather than duplicated as a second magic-number
  * 1 in zb_cmd.c that could silently drift from the real one. */

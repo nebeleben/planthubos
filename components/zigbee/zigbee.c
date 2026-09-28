@@ -2478,6 +2478,38 @@ bool zigbee_store_lookup(const uint8_t eui64[8], uint16_t *short_addr, uint8_t *
     return found;
 }
 
+/* Whole-branch review, Critical 2: swarm.c's measurement forwarder has no
+ * per-cap cluster of its own (data_core's device_entry_t doesn't carry
+ * one) -- this store does, in cap_clusters[], parallel to caps[]/
+ * cap_endpoints[]. Same "copy out under the lock, return immediately"
+ * contract as zigbee_store_lookup() above. 0 (not just "unknown cluster"
+ * but also this function's own not-found signal) when eui64 isn't in the
+ * store or the (cap_id, endpoint) pair doesn't match any of its slots. */
+uint16_t zigbee_cap_cluster(const uint8_t eui64[8], uint8_t cap_id, uint8_t endpoint)
+{
+    if (!eui64) return 0;
+    bool started;
+    portENTER_CRITICAL(&s_mux);
+    started = s_started;
+    portEXIT_CRITICAL(&s_mux);
+    if (!started) return 0;
+
+    xSemaphoreTake(s_store_mutex, portMAX_DELAY);
+    uint16_t cluster = 0;
+    int idx = zb_store_find(&s_store, eui64);
+    if (idx >= 0) {
+        const zb_device_t *d = &s_store.dev[idx];
+        for (uint8_t k = 0; k < d->cap_count; k++) {
+            if (d->caps[k] == cap_id && d->cap_endpoints[k] == endpoint) {
+                cluster = d->cap_clusters[k];
+                break;
+            }
+        }
+    }
+    xSemaphoreGive(s_store_mutex);
+    return cluster;
+}
+
 /* Task 8: the coordinator's own ZCL source endpoint, for zb_cmd.c to stamp
  * on an outgoing command without a second, independently-drifting copy of
  * the magic number ZB_ENDPOINT already is. */
