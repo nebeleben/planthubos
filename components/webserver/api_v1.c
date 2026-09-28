@@ -412,8 +412,18 @@ static esp_err_t wifi_post(httpd_req_t *req)
  *
  * `deprecated` also drives the GET /api/v1/sensors alias right below: same
  * body, plus a top-level "deprecated":true (task-6 brief: kept for one
- * milestone since it's what M1's own tooling calls). */
-static cJSON *devices_root(bool deprecated)
+ * milestone since it's what M1's own tooling calls).
+ *
+ * Streamed with HTTP chunked transfer rather than built as one cJSON tree
+ * and printed to a single contiguous buffer (the old devices_root() +
+ * send_json() shape): on the hub's fragmented ~35KB heap, one buffer big
+ * enough for the whole fleet's JSON can fail to allocate even when plenty
+ * of *total* free heap remains, and did -- 503 "out of memory serialising
+ * response" on both the WebUI Devices and Plants tabs, since both fetch
+ * this route on load. Serialising one device object at a time keeps peak
+ * memory at one device + its own small print buffer, never the whole
+ * fleet. */
+static esp_err_t devices_send_chunked(httpd_req_t *req, bool deprecated)
 {
     /* s_api_reg_snap/s_api_plant_snap: too big for the httpd task stack;
      * shared across this file's handlers, see their declaration comment (L5). */
@@ -421,28 +431,56 @@ static cJSON *devices_root(bool deprecated)
     plants_snapshot(&s_api_plant_snap);
     uint32_t now_uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
 
-    cJSON *root = cJSON_CreateObject();
-    cJSON *arr = cJSON_AddArrayToObject(root, "devices");
+    httpd_resp_set_type(req, "application/json");
+
+    esp_err_t err = httpd_resp_send_chunk(req, "{\"devices\":[", HTTPD_RESP_USE_STRLEN);
+    if (err != ESP_OK) return err;
+
+    bool first = true;
     for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
         if (!s_api_reg_snap.devices[i].in_use) continue;
-        cJSON_AddItemToArray(arr, device_json(&s_api_reg_snap.devices[i], &s_api_plant_snap, now_uptime_s));
+
+        cJSON *o = device_json(&s_api_reg_snap.devices[i], &s_api_plant_snap, now_uptime_s);
+        char *s = o ? cJSON_PrintUnformatted(o) : NULL;
+        cJSON_Delete(o);
+
+        if (!s) {
+            /* Per-device OOM -- should be rare, one device object is small.
+             * Skip it without emitting a separator; partial data beats a
+             * broken/truncated response on extreme low memory. */
+            ESP_LOGW(TAG, "devices: skipping device %d, out of memory serialising it", i);
+            continue;
+        }
+
+        if (!first) {
+            err = httpd_resp_send_chunk(req, ",", HTTPD_RESP_USE_STRLEN);
+            if (err != ESP_OK) { free(s); return err; }
+        }
+        err = httpd_resp_send_chunk(req, s, strlen(s));
+        free(s);
+        if (err != ESP_OK) return err;
+        first = false;
     }
-    if (deprecated) cJSON_AddBoolToObject(root, "deprecated", true);
-    return root;
+
+    const char *tail = deprecated ? "],\"deprecated\":true}" : "]}";
+    err = httpd_resp_send_chunk(req, tail, HTTPD_RESP_USE_STRLEN);
+    if (err != ESP_OK) return err;
+
+    return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 static esp_err_t devices_get(httpd_req_t *req)
 {
-    return send_json(req, devices_root(false));
+    return devices_send_chunked(req, false);
 }
 
 /* GET /api/v1/sensors -- deprecated alias of GET /api/v1/devices, see
- * devices_root()'s comment above. Per-sensor history and rename routes are
- * gone (spec §4/§6) -- only POST /api/v1/sensors/{mac} (rename, still mac-keyed)
- * survives below, unchanged. */
+ * devices_send_chunked()'s comment above. Per-sensor history and rename
+ * routes are gone (spec §4/§6) -- only POST /api/v1/sensors/{mac} (rename,
+ * still mac-keyed) survives below, unchanged. */
 static esp_err_t sensors_get(httpd_req_t *req)
 {
-    return send_json(req, devices_root(true));
+    return devices_send_chunked(req, true);
 }
 
 /* Parse 12 uppercase/lowercase hex chars into mac[6]; returns false on malformed input. */
@@ -3623,10 +3661,10 @@ static bool parse_device_dp_path(const char *tail, char *idbuf, size_t idbuf_cap
  * device plus each one's DP->capability mapping (Task 6, 2026-09-27
  * tuya-ef00-datapoints spec). tuya_dp_list() is RAM-only and boot-scoped
  * (tuya_dp.h) -- a device with none observed yet returns "datapoints":[]
- * (200), same "empty is not missing" convention devices_root() uses for an
+ * (200), same "empty is not missing" convention devices_send_chunked() uses for an
  * all-unbound device list, rather than 404. cap_id/scale are null when
  * tuya_dp_map_get() reports no mapping for that dp_id. age_s uses the same
- * esp_timer_get_time()/1e6 uptime clock devices_root() stamps its own
+ * esp_timer_get_time()/1e6 uptime clock devices_send_chunked() stamps its own
  * "now" with -- tuya_dp_obs_t.updated_s is written from that same clock
  * (tuya_dp.c). Called from devices_get_dispatch() below with idbuf already
  * extracted; unauthenticated, like every other GET in this file
@@ -4976,7 +5014,7 @@ static cJSON *coordinator_json_bridge(const bridge_node_t *b)
  * device announce from (swarm_bridge_snapshot(), in table order, skipping
  * !in_use slots). A wifi_only hub with no bridges ever seen reports
  * {"coordinators":[]}. Unauthenticated, like every GET in this file
- * (devices_root()'s comment above). */
+ * (devices_send_chunked()'s comment above). */
 static esp_err_t zigbee_get(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
