@@ -2583,12 +2583,23 @@ bool zigbee_device_remove(const uint8_t eui64[8])
     return false;
 }
 
+void zigbee_read_identity(const uint8_t eui64[8])
+{
+    (void)eui64;
+}
+
 bool zigbee_store_lookup(const uint8_t eui64[8], uint16_t *short_addr, uint8_t *endpoint)
 {
     (void)eui64;
     (void)short_addr;
     (void)endpoint;
     return false;
+}
+
+uint16_t zigbee_cap_cluster(const uint8_t eui64[8], uint8_t cap_id, uint8_t endpoint)
+{
+    (void)eui64; (void)cap_id; (void)endpoint;
+    return 0;
 }
 
 uint8_t zigbee_coordinator_endpoint(void)
