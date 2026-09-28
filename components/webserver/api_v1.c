@@ -5446,18 +5446,25 @@ static esp_err_t profiles_key_get(httpd_req_t *req)
  * s_api_mapping_body above gives. */
 static char s_api_profile_body[2048];
 
-/* PUT /api/v1/profiles/{key} -- create/replace a USER profile (brief step 3).
- * Built-ins are read-only: a key that is not already a user override AND
- * matches a built-in exactly is refused with 409 before the body is even
- * read (same "PUT/DELETE act on the user store only" line the routes
- * summary states for both verbs) -- this route can never be used to shadow
- * or edit a built-in's entries, only to define an entirely new
- * (manufacturer, model) pair as a user profile. The body's own "match"
- * block (dev_profile_from_json(), Task 3) must name the SAME device the
- * URL's {key} already committed to -- rejected (400) otherwise, since
- * silently upserting under the URL's key while storing the body's own
- * (different) match values would corrupt dev_profile_match()'s lookup
- * either way. */
+/* PUT /api/v1/profiles/{key} -- create/replace a USER profile (brief step 3;
+ * fix round 1, controller ruling: spec §3 makes a user profile OVERRIDING a
+ * built-in with the SAME match key the documented primary route to that
+ * override, and dev_profile_match() already prefers a user entry over a
+ * built-in with the same key -- so this handler always upserts into the
+ * USER store via dev_profile_store_upsert(), unconditionally, whether or
+ * not {key} also names a built-in. "Built-ins are read-only" means only
+ * that the embedded seed array (dev_profiles_builtin.c) itself is never
+ * mutated -- true here regardless, since this function never touches it.
+ * An EARLIER revision of this handler 409'd here whenever {key} matched a
+ * built-in and no user override yet existed -- a circular check (the
+ * override this route exists to create could only ever exist by first
+ * passing the very check that rejected it), permanently blocking spec §3's
+ * override feature. Removed; see git history/task-8-report.md for detail.
+ * The body's own "match" block (dev_profile_from_json(), Task 3) must
+ * still name the SAME device the URL's {key} already committed to --
+ * rejected (400) otherwise, since silently upserting under the URL's key
+ * while storing the body's own (different) match values would corrupt
+ * dev_profile_match()'s lookup either way. */
 static esp_err_t profiles_key_put(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
@@ -5470,23 +5477,6 @@ static esp_err_t profiles_key_put(httpd_req_t *req)
     }
 
     dev_profile_user_load(&s_api_profile_store);
-    bool in_user = false;
-    for (int i = 0; i < s_api_profile_store.count; i++) {
-        if (strncmp(s_api_profile_store.p[i].manufacturer, manuf, DEV_PROFILE_STR_MAX) == 0 &&
-            strncmp(s_api_profile_store.p[i].model, model, DEV_PROFILE_STR_MAX) == 0) {
-            in_user = true;
-            break;
-        }
-    }
-    if (!in_user) {
-        for (int i = 0; i < dev_profile_builtin_count(); i++) {
-            const dev_profile_t *b = dev_profile_builtin(i);
-            if (strncmp(b->manufacturer, manuf, DEV_PROFILE_STR_MAX) == 0 &&
-                strncmp(b->model, model, DEV_PROFILE_STR_MAX) == 0) {
-                return send_409(req, "built-in profile is read-only");
-            }
-        }
-    }
 
     if (req->content_len == 0 || req->content_len > sizeof(s_api_profile_body) - 1) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
