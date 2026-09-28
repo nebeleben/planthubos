@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'preact/hooks'
 import { authHeaders } from '../lib/auth.js'
 import { loadCaps, capLabel, fmtCap } from '../lib/caps.js'
 import { multiEndpointNames, epSuffixed } from '../lib/endpoints.js'
-import { previewEntry, validateEntry, shapeMapping, provenanceLabel } from '../lib/mapping.js'
+import {
+  previewEntry, validateEntry, shapeMapping, provenanceLabel, clusterHex, proposalKey, proposalDraft, toWireEntry,
+} from '../lib/mapping.js'
 import { hasAiKey } from '../lib/ai/settings.js'
 import { resolveVendor } from '../lib/vendors.js'
 import {
@@ -520,15 +522,6 @@ function DatapointsSection({ deviceId, caps, open }) {
   )
 }
 
-// "0x0405" style hex string for a raw ZCL cluster id, matching
-// dev_profiles_json.c's own established "0x"-prefixed-string convention
-// for a cluster (this file's OWN mapping endpoints render it as a plain
-// number on the wire -- api_v1.c's mapping_entry_json() doc comment -- so
-// this is purely a display choice, not a wire-format one).
-function clusterHex(cluster) {
-  return `0x${Number(cluster).toString(16).padStart(4, '0')}`
-}
-
 // "soil.moisture" -> "Soil Moisture", same humanisation rule caps.js'
 // capLabel() applies to a capability id's own `.name` -- duplicated here
 // (rather than imported) because every value this mapping surface renders
@@ -541,43 +534,11 @@ function capNameLabel(name) {
   return name.split('.').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')
 }
 
-// Device-mapping-profiles Task 9: converts this component's own editable
-// draft shape (dp_id/cap/scale/offset as possibly-still-being-typed
-// strings, or a suppress draft's `source_cluster` -- previewEntry/
-// validateEntry's own field name, mapping.js) into the wire entry POST
-// /api/v1/devices/{id}/mapping expects: numeric dp_id/scale/offset, and
-// `cluster` (not `source_cluster` -- api_v1.c's devices_mapping_post()
-// reads "cluster", same field name its own GET proposals already use).
-// `cluster` is sent as whatever string the operator typed rather than
-// pre-parsed to a number -- devices_mapping_post() itself already accepts
-// either a JSON number or a "0x..."/decimal STRING for that field (its own
-// leniency, matching dev_profiles_json.c's parser), so there's no need to
-// duplicate that parsing here.
-function toWireEntry(entry, provenance) {
-  if (entry.kind === 'suppress') {
-    return { kind: 'suppress', cluster: entry.source_cluster, provenance }
-  }
-  return {
-    kind: 'dp',
-    dp_id: Number(entry.dp_id),
-    cap: entry.cap,
-    scale: Number(entry.scale),
-    offset: Number(entry.offset || 0),
-    provenance,
-  }
-}
-
-// Inverse-ish of toWireEntry above, for a proposal entry as GET
-// .../mapping's own "proposals" array renders it (api_v1.c's
-// mapping_entry_json(): kind/dp_id/cap/scale/offset for "dp", kind/cluster
-// for "suppress") -- reshaped into the SAME draft shape toWireEntry expects
-// back, so a proposal row's Edit control and the manual-add form can share
-// one field-editing component (EntryFields below) and one validate/preview
-// call each.
-function proposalDraft(p) {
-  if (p.kind === 'suppress') return { kind: 'suppress', source_cluster: clusterHex(p.cluster) }
-  return { kind: 'dp', dp_id: p.dp_id, cap: p.cap, scale: p.scale, offset: p.offset }
-}
+// toWireEntry/proposalDraft/clusterHex/proposalKey now live in
+// ../lib/mapping.js (fix round 1: moved out of this file so the identity
+// keying that fixes the proposals-list stale-row bug -- see proposalKey's
+// own doc comment -- has pure, node:test-reachable coverage; devices.jsx
+// has no component-level test harness of its own).
 
 // Shared editable fields for one dp/suppress draft entry -- used by both
 // ProposalRow's Edit control (kind fixed to whatever the proposal already
@@ -770,8 +731,14 @@ function MappingSection({ deviceId, caps, open }) {
     }
   }
 
-  function rejectProposal(idx) {
-    setMapping((prev) => ({ ...prev, proposals: prev.proposals.filter((_, i) => i !== idx) }))
+  // Keyed by proposalKey() identity, not array index -- fix round 1: an
+  // index-based removal (and the matching index-based `key` the list used
+  // to render with) let Preact hand the next proposal that shifted into a
+  // removed row's slot the SAME component instance, stale `draft` and all.
+  // Filtering by identity here keeps this in step with the identity `key`
+  // the proposals list is now rendered with below.
+  function rejectProposal(key) {
+    setMapping((prev) => ({ ...prev, proposals: prev.proposals.filter((p) => proposalKey(p) !== key) }))
   }
 
   if (!mapping) return mapError ? <p class="hint">Mapping unavailable.</p> : null
@@ -819,10 +786,10 @@ function MappingSection({ deviceId, caps, open }) {
             <table class="devices">
               <thead><tr><th>Proposal</th><th>Preview</th><th>Entry</th><th>Actions</th></tr></thead>
               <tbody>
-                {mapping.proposals.map((p, i) => (
-                  <ProposalRow key={i} proposal={p} caps={caps} capNames={capNames} unitByCap={unitByCap}
+                {mapping.proposals.map((p) => (
+                  <ProposalRow key={proposalKey(p)} proposal={p} caps={caps} capNames={capNames} unitByCap={unitByCap}
                                provenance="profile" sample={p.kind === 'dp' ? sampleFor(p.dp_id) : null}
-                               onConfirm={apply} onReject={() => rejectProposal(i)} />
+                               onConfirm={apply} onReject={() => rejectProposal(proposalKey(p))} />
                 ))}
               </tbody>
             </table>

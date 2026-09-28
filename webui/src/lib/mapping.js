@@ -50,3 +50,59 @@ export function provenanceLabel(provenance) {
   if (provenance === 'ai') return 'via AI'
   return 'manual'
 }
+
+// "0x0405" style hex string for a raw ZCL cluster id, matching
+// dev_profiles_json.c's own established "0x"-prefixed-string convention
+// for a cluster (the mapping wire format itself renders it as a plain
+// NUMBER -- api_v1.c's mapping_entry_json() doc comment -- so this is
+// purely a display choice, not a wire-format one).
+export function clusterHex(cluster) {
+  return `0x${Number(cluster).toString(16).padStart(4, '0')}`
+}
+
+// A STABLE identity for one proposal entry, independent of its position
+// in whatever array currently holds it. Devices-tab fix round 1: a list
+// rendered with an array-INDEX key lets Preact reuse a row's component
+// instance (and its own local `draft` state) for whatever entry shifts
+// into that slot after a reject/confirm shrinks the array -- the row then
+// shows a stale preview for the wrong proposal, and Confirm would POST
+// that stale draft. Every proposal/observed/applied row in this file is
+// now keyed by this identity instead of its index, so Preact remounts (or
+// correctly re-associates) by the actual entry, never by slot position.
+export function proposalKey(entry) {
+  return entry.kind === 'suppress' ? `suppress:${entry.cluster}` : `dp:${entry.dp_id}`
+}
+
+// Reshapes one GET .../mapping "proposals" entry (kind/dp_id/cap/scale/
+// offset for "dp", kind/cluster for "suppress" -- api_v1.c's
+// mapping_entry_json()) into the draft shape previewEntry/validateEntry
+// above expect back (a suppress draft's cluster field is `source_cluster`,
+// not the wire's `cluster`). A pure, single-argument function of the one
+// proposal passed in -- never touches array position -- so a caller that
+// re-derives a row's draft from THIS on every relevant re-render (keyed by
+// proposalKey(), not index) can never end up with another entry's data.
+export function proposalDraft(p) {
+  if (p.kind === 'suppress') return { kind: 'suppress', source_cluster: clusterHex(p.cluster) }
+  return { kind: 'dp', dp_id: p.dp_id, cap: p.cap, scale: p.scale, offset: p.offset }
+}
+
+// Inverse-ish of proposalDraft, for POSTing a (possibly hand-edited) draft
+// back to /api/v1/devices/{id}/mapping: numeric dp_id/scale/offset, and
+// `cluster` (not `source_cluster` -- devices_mapping_post() reads
+// "cluster", the same field name GET's own proposals already use).
+// `cluster` is sent as whatever string was typed/derived rather than
+// pre-parsed to a number -- the hub already accepts either a JSON number
+// or a "0x..."/decimal string for that field (its own parser leniency).
+export function toWireEntry(entry, provenance) {
+  if (entry.kind === 'suppress') {
+    return { kind: 'suppress', cluster: entry.source_cluster, provenance }
+  }
+  return {
+    kind: 'dp',
+    dp_id: Number(entry.dp_id),
+    cap: entry.cap,
+    scale: Number(entry.scale),
+    offset: Number(entry.offset || 0),
+    provenance,
+  }
+}
