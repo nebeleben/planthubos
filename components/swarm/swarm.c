@@ -23,6 +23,7 @@
 #include "capability.h"
 #include "tuya_dp.h"
 #include "mapping_engine.h"
+#include "swarm_ingest.h"
 #include "mibeacon.h"
 #include "app_config.h"
 #include "rules.h"
@@ -984,172 +985,44 @@ static void bridge_task(void *arg)
                     }
                     break;
                 }
-                device_id_t id = { .kind = (device_kind_t)it.u.ann.dev.kind };
-                memcpy(id.addr, it.u.ann.dev.addr, SWARM_ADDR_LEN);
-                int idx = data_core_find_or_create_index(&id, now_s);
-                if (idx < 0) break;   /* registry full: already counted/logged by data_core */
-                data_core_set_via(idx, it.mac);
-                /* Device-mapping-profiles Task 7: mirror the announce's
-                 * manufacturer/model (v6 swarm_device_announce_t, Task 1)
-                 * into the registry so /api/v1/devices can surface them
-                 * (Task 8/9) -- only when the announce actually carries at
-                 * least one of the two, so a re-announce that omits them
-                 * doesn't blank out an identity captured earlier. */
-                if (it.u.ann.manuf_len || it.u.ann.model_len) {
-                    char mf[SWARM_DEV_STR_MAX + 1] = { 0 };
-                    char md[SWARM_DEV_STR_MAX + 1] = { 0 };
-                    memcpy(mf, it.u.ann.manufacturer, it.u.ann.manuf_len);
-                    memcpy(md, it.u.ann.model, it.u.ann.model_len);
-                    data_core_set_identity(idx, mf, md);
-                }
-                /* param_max=0, no flags: every action a zigbee bridge announces
-                 * today (On/Off, via zb_map.c on the bridge node's own side)
-                 * takes no parameter -- same as zigbee.c's own actor_declare()
-                 * call site (zb_register_restored_devices()). */
-                for (uint8_t i = 0; i < it.u.ann.action_count; i++) {
-                    if (!actor_declare_ep(idx, it.u.ann.action_ids[i], it.u.ann.action_endpoints[i], 0, 0)) {
-                        ESP_LOGW(TAG, "device %d: could not declare action %u@ep%u from " MACSTR "'s announce",
-                                 idx, (unsigned)it.u.ann.action_ids[i], (unsigned)it.u.ann.action_endpoints[i],
-                                 MAC2STR(it.mac));
-                    }
-                }
-                /* An announce carries the device's FULL current action set,
-                 * so any action declared earlier but absent now has genuinely
-                 * gone -- drop it (and free the row if it empties). Without
-                 * this the actor table is add-only: a device runtime-
-                 * reclassified from a switch to an input (a Zigbee knob that
-                 * shed its phantom switch.on/off on re-announce) would keep
-                 * offering non-functional switch actions forever. Survivors
-                 * keep their guards; see actor_table_prune_absent(). */
-                actor_prune_absent(idx, it.u.ann.action_ids, it.u.ann.action_count);
-                actor_set_device_key(idx, (const uint8_t *)&id);
+                /* Registry row + identity mirror + action (re)declare: the
+                 * transport-neutral body, shared verbatim with the wired-UART
+                 * (H2) path. it.mac is the forwarding node's attribution; the
+                 * bridge_table_upsert above and mark_bridge_dirty below are
+                 * ESP-NOW routing/persist state the shared body deliberately
+                 * leaves to this caller (see swarm_ingest.h). */
+                swarm_ingest_announce(&it.u.ann, it.mac, now_s);
                 mark_bridge_dirty(now_s);
                 break;
             }
             case SWARM_MSG_DEVICE_GONE: {
                 bridge_table_remove(&s_bridges, it.mac, &it.u.gone.dev);
                 mark_bridge_dirty(now_s);
-                /* M7 Task 7 fix round 1 (critical #2): the registry never
-                 * deletes rows (registry.h), so the device entry survives
-                 * this device leaving its bridge's zigbee network -- but its
-                 * via_node attribution is now stale (this bridge no longer
-                 * reports it) and must not keep pointing at it. A later
-                 * re-ANNOUNCE (this device rejoining, here or elsewhere)
-                 * re-attributes via data_core_set_via() the same as any
-                 * first-time announce does. */
-                device_id_t id = { .kind = (device_kind_t)it.u.gone.dev.kind };
-                memcpy(id.addr, it.u.gone.dev.addr, SWARM_ADDR_LEN);
-                int idx = data_core_find_index(&id);
-                if (idx >= 0) data_core_clear_via(idx);
+                /* Clears the device's now-stale via attribution (the registry
+                 * never deletes rows); shared verbatim with the UART path. */
+                swarm_ingest_device_gone(&it.u.gone);
                 break;
             }
             case SWARM_MSG_MEASUREMENT: {
-                device_id_t id = { .kind = (device_kind_t)it.u.meas.dev.kind };
-                memcpy(id.addr, it.u.meas.dev.addr, SWARM_ADDR_LEN);
-                if (data_core_find_index(&id) < 0) {
-                    /* Unknown device: this bridge is reporting a reading for
-                     * something it never announced (or this hub dropped/never
-                     * saw the announce, e.g. it booted after the device already
-                     * joined) -- ask it to resync rather than silently
-                     * dropping forever. */
+                /* Honest age: the frame's own transmit-time age_s plus the
+                 * time this item spent queued on s_bridge_queue since receipt
+                 * (hub_rx_cb's item.recv_us). The suppress-check + submit are
+                 * the shared body; an unknown device returns false, which is
+                 * the ESP-NOW path's cue to ask this node to resync. */
+                int64_t queued_us = esp_timer_get_time() - it.recv_us;
+                uint32_t queued_s = queued_us > 0 ? (uint32_t)(queued_us / 1000000) : 0;
+                if (!swarm_ingest_measurement(&it.u.meas, queued_s, now_s)) {
                     ESP_LOGW(TAG, "MEASUREMENT for unannounced device from " MACSTR ", requesting resync",
                              MAC2STR(it.mac));
                     need_resync = true;
-                    break;
                 }
-                /* Device-mapping-profiles Task 7: a standard-cluster
-                 * reading (source_cluster != 0, v6 swarm_measurement_t,
-                 * Task 1) whose cluster is in THIS device's suppress-set
-                 * (the ZS-301Z soil-on-0x0405 flap, tuya_dp.h) never
-                 * reaches data_core -- suppression is decided purely by
-                 * the engine (mapping_engine.h), fed this device's OWN
-                 * suppress-set via tuya_dp_suppress_list(&id, ...), never
-                 * a cross-device/global one. Cluster 0 (Tuya EF00 raw DPs,
-                 * handled entirely by the SWARM_MSG_TUYA_DP case below) is
-                 * never suppressed here -- mapping_measurement() itself
-                 * treats source_cluster==0 as a no-op. */
-                if (it.u.meas.source_cluster != 0) {
-                    uint16_t sset[TUYA_SUPPRESS_MAX];
-                    int sn = tuya_dp_suppress_list(&id, sset, TUYA_SUPPRESS_MAX);
-                    if (mapping_measurement(it.u.meas.source_cluster, sset, sn) == MAP_DROP) {
-                        ESP_LOGD(TAG, "bridge: measurement from " MACSTR " cluster 0x%04x suppressed",
-                                 MAC2STR(it.mac), it.u.meas.source_cluster);
-                        break;
-                    }
-                }
-                /* I4 fix: mirror the BLE relay path's honesty
-                 * (data_core_submit_from()'s age policy) instead of always
-                 * stamping this as "now". it.u.meas.age_s is the bridge
-                 * node's own transmit-time age (already inclusive of any
-                 * backlog wait, see forward_task()'s recompute); add on the
-                 * time this item spent decoded-but-unprocessed (queued on
-                 * s_bridge_queue since hub_rx_cb's item.recv_us) to get the
-                 * TOTAL age as of right now. Clamped at UINT16_MAX the same
-                 * way the node's own recompute is -- data_core_submit_cap_id_aged()
-                 * drops anything past DATA_CORE_MAX_AGE_S (1800 s) long
-                 * before that clamp could matter. */
-                int64_t queued_us = esp_timer_get_time() - it.recv_us;
-                uint32_t queued_s = queued_us > 0 ? (uint32_t)(queued_us / 1000000) : 0;
-                uint32_t total_age_s = it.u.meas.age_s + queued_s;
-                uint16_t age_for_data_core = (total_age_s > UINT16_MAX) ? UINT16_MAX : (uint16_t)total_age_s;
-                /* data_core_submit_cap_id_aged() already logs its own
-                 * reason (too old, out-of-range value, or registry full)
-                 * on a false return -- nothing further to log here. */
-                const capability_t *mc = capability_get(it.u.meas.cap_id);
-                bool ok;
-                if (mc && mc->event) {
-                    ok = data_core_submit_event(&id, it.u.meas.cap_id, (int16_t)it.u.meas.value);
-                    ESP_LOGI(TAG, "bridge: event from " MACSTR " cap %u code %d -> %s",
-                             MAC2STR(it.mac), it.u.meas.cap_id, (int)it.u.meas.value, ok ? "queued" : "dropped");
-                } else {
-                    ok = data_core_submit_cap_id_ep(&id, it.u.meas.cap_id, it.u.meas.endpoint, it.u.meas.value,
-                                                     age_for_data_core);
-                    ESP_LOGI(TAG, "bridge: measurement from " MACSTR " cap %u ep %u value %.3f age %us -> %s",
-                             MAC2STR(it.mac), it.u.meas.cap_id, (unsigned)it.u.meas.endpoint,
-                             (double)it.u.meas.value, (unsigned)age_for_data_core, ok ? "accepted" : "rejected");
-                }
-                if (ok) rules_notify_value_update();
                 break;
             }
-            case SWARM_MSG_TUYA_DP: {
-                device_id_t id = { .kind = (device_kind_t)it.u.tuya_dp.dev.kind };
-                memcpy(id.addr, it.u.tuya_dp.dev.addr, SWARM_ADDR_LEN);
-                /* Discovery, not a registry write: record the raw DP
-                 * regardless of whether it's mapped yet, same as
-                 * zb_tuya_dp_observer() does for the local coordinator's
-                 * own devices -- not gated on data_core_find_index() the
-                 * way MEASUREMENT is above. */
-                tuya_dp_observe(&id, it.u.tuya_dp.dp_id, it.u.tuya_dp.dp_type, it.u.tuya_dp.value, now_s);
-                /* Device-mapping-profiles Task 7: apply THIS device's
-                 * offset-aware DP-map (tuya_dp.h v2: value*scale+offset,
-                 * tuya_dp_apply_off()) via the pure engine
-                 * (mapping_engine.h) instead of the old scale-only
-                 * tuya_dp_map_get()+literal-multiply. tuya_dp_map_list()
-                 * returns a FLAT table across every Tuya device (Task 5
-                 * review carry-forward, mapping_engine.h's own doc
-                 * comment) -- filtered here to THIS device's own entries
-                 * BEFORE it ever reaches mapping_dp(), so a dp_id mapped
-                 * for one device can never be misapplied to a different
-                 * device that happens to report the same dp_id. */
-                tuya_dp_map_t all[TUYA_MAP_MAX];
-                int total = tuya_dp_map_list(all, TUYA_MAP_MAX);
-                tuya_dp_map_t applied[TUYA_MAP_MAX];
-                int an = 0;
-                for (int i = 0; i < total; i++) {
-                    if (device_id_equal(&all[i].id, &id)) applied[an++] = all[i];
-                }
-                uint8_t cap; float mapped;
-                if (mapping_dp(it.u.tuya_dp.dp_id, it.u.tuya_dp.value, applied, an, &cap, &mapped) == MAP_SUBMIT) {
-                    bool ok = data_core_submit_cap_id(&id, cap, mapped);
-                    ESP_LOGI(TAG, "bridge: tuya dp 0x%02x from " MACSTR " cap %u -> %s",
-                             it.u.tuya_dp.dp_id, MAC2STR(it.mac), cap, ok ? "accepted" : "rejected");
-                    if (ok) rules_notify_value_update();
-                }
-                /* else MAP_RECORD_UNMAPPED: already recorded by
-                 * tuya_dp_observe() above for the UI/AI to see and
-                 * eventually map -- unchanged from the prior behavior. */
+            case SWARM_MSG_TUYA_DP:
+                /* Observe-for-discovery + offset-aware DP-map apply: the
+                 * shared body, identical to the UART path. */
+                swarm_ingest_tuya_dp(&it.u.tuya_dp, now_s);
                 break;
-            }
             case SWARM_MSG_COORD_STATUS: {
                 bridge_node_t *b = bridge_table_node(&s_bridges, it.mac, true);
                 if (!b) {

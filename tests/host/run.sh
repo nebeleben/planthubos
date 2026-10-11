@@ -68,6 +68,21 @@ $CC -Wall -Wextra -Werror -I../../components/uart_framer/include -I../../compone
     -o test_uart_framer -lm
 ./test_uart_framer
 
+$CC -Wall -Wextra -Werror -Iesp_shims -I../../components/swarm/include \
+    -I../../components/data_core/include -I../../components/capability/include \
+    -I../../components/tuya_dp/include -I../../components/dev_profiles/include \
+    -I../../components/actions/include -I../../components/actors/include \
+    -I../../components/rules/include -I../../components/psvm/include \
+    -I../../components/event_log/include -I../../components/mibeacon/include \
+    test_swarm_ingest.c ../../components/swarm/swarm_ingest.c \
+    ../../components/data_core/data_core.c ../../components/data_core/registry.c \
+    ../../components/capability/capability.c ../../components/capability/device_id.c \
+    ../../components/tuya_dp/tuya_dp.c ../../components/dev_profiles/mapping_engine.c \
+    ../../components/dev_profiles/dev_profiles.c ../../components/dev_profiles/dev_profiles_builtin.c \
+    ../../components/actions/action.c \
+    -o test_swarm_ingest -lm
+./test_swarm_ingest
+
 $CC -Wall -Wextra -Werror -I../../components/swarm/include \
     test_swarm_buf.c ../../components/swarm/swarm_buf.c -o test_swarm_buf
 ./test_swarm_buf
