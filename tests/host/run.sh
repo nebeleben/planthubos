@@ -59,16 +59,16 @@ $CC -Wall -Wextra -Werror -I../../components/claiming/include \
     test_authtok.c ../../components/claiming/authtok.c -o test_authtok
 ./test_authtok
 
-$CC -Wall -Wextra -Werror -I../../components/swarm/include \
-    test_swarm_frame.c ../../components/swarm/swarm_frame.c -o test_swarm_frame
+$CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/swarm_codec/include \
+    test_swarm_frame.c ../../components/swarm_codec/swarm_frame.c -o test_swarm_frame
 ./test_swarm_frame
 
-$CC -Wall -Wextra -Werror -I../../components/uart_framer/include -I../../components/swarm/include \
-    test_uart_framer.c ../../components/uart_framer/uart_framer.c ../../components/swarm/swarm_frame.c \
+$CC -Wall -Wextra -Werror -I../../components/uart_framer/include -I../../components/swarm/include -I../../components/swarm_codec/include \
+    test_uart_framer.c ../../components/uart_framer/uart_framer.c ../../components/swarm_codec/swarm_frame.c \
     -o test_uart_framer -lm
 ./test_uart_framer
 
-$CC -Wall -Wextra -Werror -Iesp_shims -I../../components/swarm/include \
+$CC -Wall -Wextra -Werror -Iesp_shims -I../../components/swarm/include -I../../components/swarm_codec/include \
     -I../../components/data_core/include -I../../components/capability/include \
     -I../../components/tuya_dp/include -I../../components/dev_profiles/include \
     -I../../components/actions/include -I../../components/actors/include \
@@ -83,7 +83,7 @@ $CC -Wall -Wextra -Werror -Iesp_shims -I../../components/swarm/include \
     -o test_swarm_ingest -lm
 ./test_swarm_ingest
 
-$CC -Wall -Wextra -Werror -I../../components/swarm/include \
+$CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/swarm_codec/include \
     test_swarm_buf.c ../../components/swarm/swarm_buf.c -o test_swarm_buf
 ./test_swarm_buf
 
@@ -101,7 +101,7 @@ $CC -Wall -Wextra -Werror -I../../components/ble_collector/include \
     test_battery_sched.c ../../components/ble_collector/battery_sched.c -o test_battery_sched
 ./test_battery_sched
 
-$CC -Wall -Wextra -Werror -I../../components/swarm/include \
+$CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/swarm_codec/include \
     test_batt_cycle.c ../../components/swarm/batt_cycle.c -o test_batt_cycle
 ./test_batt_cycle
 
@@ -332,15 +332,15 @@ $CC -Wall -Wextra -Werror -I../../components/radio_role/include \
 # Node radio/power compatibility rules (M7 Task 3) -- pure so they run here
 # without NVS. swarm_rules.h pulls swarm_power_mode.h, not swarm_store.h
 # (esp_err.h isn't available under plain cc).
-$CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/radio_role/include \
+$CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/swarm_codec/include -I../../components/radio_role/include \
     test_swarm_rules.c ../../components/swarm/swarm_rules.c -o test_swarm_rules
 ./test_swarm_rules
 
 # Hub-side bridge table (M7 Task 7): upsert/remove/find/serialize round
 # trip. Pure C, links swarm_frame.c for the device-announce codec its
 # serialize/deserialize reuse.
-$CC -Wall -Wextra -Werror -I../../components/swarm/include \
-    test_bridge_table.c ../../components/swarm/bridge_table.c ../../components/swarm/swarm_frame.c -o test_bridge_table
+$CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/swarm_codec/include \
+    test_bridge_table.c ../../components/swarm/bridge_table.c ../../components/swarm_codec/swarm_frame.c -o test_bridge_table
 ./test_bridge_table
 
 # Hub-side command router (M7 Task 8): per-node submit/in-flight refusal,
@@ -348,7 +348,7 @@ $CC -Wall -Wextra -Werror -I../../components/swarm/include \
 # seq ignored) and TTL expiry. Pure C -- links swarm_frame.c for
 # swarm_command_ack_t's SWARM_ACK_* values only (no encode/decode needed
 # here, bridge_cmd.c never touches the wire format itself).
-$CC -Wall -Wextra -Werror -I../../components/swarm/include \
+$CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/swarm_codec/include \
     test_bridge_cmd.c ../../components/swarm/bridge_cmd.c -o test_bridge_cmd
 ./test_bridge_cmd
 
