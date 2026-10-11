@@ -83,6 +83,20 @@ void zigbee_set_tuya_dp_observer(zigbee_tuya_dp_observer_t fn);
 typedef void (*zigbee_status_observer_t)(void);
 void zigbee_set_status_observer(zigbee_status_observer_t fn);
 
+/* Two-chip (C6 + H2) integration: a per-reading egress observer, fired from
+ * zb_ingest_reading() the moment a ZCL report/read-response has been mapped
+ * to (cap_id, endpoint, value). It is the ONLY Zigbee egress that is not
+ * already an observer -- on the bridge, measurements leave via the hub's
+ * data_core poll, so this stays unset there and the C6 build is unchanged.
+ * The H2 coordinator registers it to forward each reading over the UART.
+ * `source_cluster` is the originating ZCL cluster (the value the hub's
+ * dev_profiles suppress-check keys on), 0 when not tied to one. Same
+ * non-blocking-queue-only contract as the observers above: fired on the
+ * stack task, must do nothing but queue. */
+typedef void (*zigbee_measurement_observer_t)(const uint8_t eui64[8], uint8_t cap_id,
+                                              uint8_t endpoint, float value, uint16_t source_cluster);
+void zigbee_set_measurement_observer(zigbee_measurement_observer_t fn);
+
 /* Current network state for the UI. Returns false when Zigbee is disabled
  * at build time or the stack has not started. */
 bool zigbee_net_info(uint8_t *channel, uint16_t *pan_id, bool *formed);

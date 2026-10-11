@@ -80,10 +80,12 @@ static const char *TAG = "zigbee";
 static zigbee_device_observer_t s_observer;
 static zigbee_status_observer_t s_status_observer;
 static zigbee_tuya_dp_observer_t s_tuya_dp_observer;
+static zigbee_measurement_observer_t s_meas_observer;
 
 void zigbee_set_device_observer(zigbee_device_observer_t fn) { s_observer = fn; }
 void zigbee_set_status_observer(zigbee_status_observer_t fn) { s_status_observer = fn; }
 void zigbee_set_tuya_dp_observer(zigbee_tuya_dp_observer_t fn) { s_tuya_dp_observer = fn; }
+void zigbee_set_measurement_observer(zigbee_measurement_observer_t fn) { s_meas_observer = fn; }
 
 /* Whole-branch review, FIX 6: main.c's log_heap("after ble_collector_start")
  * fires before zigbee_start() is even called, and this stack forms/restores
@@ -892,6 +894,14 @@ static void zb_ingest_reading(const uint8_t eui64[8], uint16_t cluster,
         ESP_LOGI(TAG, "report: cap %u ep %u value %.3f -> data_core %s", cap, endpoint,
                  (double)value, accepted ? "accepted" : "rejected (device not in registry?)");
     }
+
+    /* Two-chip (C6 + H2) egress: forward this reading to whoever registered
+     * a measurement observer -- fired regardless of the local data_core
+     * result, since the H2 keeps no registry of record and the C6 submit
+     * above is only transient scaffolding on that chip. Unset on the C6
+     * bridge (its measurements leave via the data_core poll), so this is a
+     * no-op there. `cluster` is the originating ZCL cluster = source_cluster. */
+    if (s_meas_observer) s_meas_observer(eui64, cap, endpoint, value, cluster);
 
     /* Cap-list backfill (2026-09-10): a device can stream a real value on a
      * mapped cluster the interview never enumerated -- Xiaomi's older
@@ -2566,6 +2576,11 @@ void zigbee_set_status_observer(zigbee_status_observer_t fn)
 }
 
 void zigbee_set_tuya_dp_observer(zigbee_tuya_dp_observer_t fn)
+{
+    (void)fn;
+}
+
+void zigbee_set_measurement_observer(zigbee_measurement_observer_t fn)
 {
     (void)fn;
 }
