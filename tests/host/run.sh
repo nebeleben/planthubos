@@ -63,6 +63,11 @@ $CC -Wall -Wextra -Werror -I../../components/swarm/include \
     test_swarm_frame.c ../../components/swarm/swarm_frame.c -o test_swarm_frame
 ./test_swarm_frame
 
+$CC -Wall -Wextra -Werror -I../../components/uart_framer/include -I../../components/swarm/include \
+    test_uart_framer.c ../../components/uart_framer/uart_framer.c ../../components/swarm/swarm_frame.c \
+    -o test_uart_framer -lm
+./test_uart_framer
+
 $CC -Wall -Wextra -Werror -I../../components/swarm/include \
     test_swarm_buf.c ../../components/swarm/swarm_buf.c -o test_swarm_buf
 ./test_swarm_buf

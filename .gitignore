@@ -60,3 +60,5 @@ tests/host/test_zb_tuya
 tests/host/test_registry_persist
 tests/host/test_tuya_dp
 tests/host/test_dev_profiles
+tests/host/test_mapping_engine
+tests/host/test_uart_framer
