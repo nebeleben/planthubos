@@ -1,0 +1,14 @@
+menu "PlantHub H2 link"
+
+config PLANTHUB_H2_LINK_ENABLED
+    bool "Enable the wired H2 Zigbee coordinator link"
+    default n
+    help
+        The two-chip (C6 + H2) appliance transport: a framed UART1 link to a
+        dedicated ESP32-H2 Zigbee coordinator. The C6 brain owns the H2 as a
+        local radio over this link instead of running its own 802.15.4 stack.
+        Set this together with CONFIG_PLANTHUB_ZB_ENABLED=n (the C6 has no
+        local Zigbee radio in the two-chip appliance) -- h2_link then backs
+        the webserver's local-coordinator permit/status seam.
+
+endmenu

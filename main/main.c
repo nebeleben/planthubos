@@ -20,6 +20,7 @@
 #include "sampler.h"
 #include "ota_post.h"
 #include "swarm.h"
+#include "h2_link.h"
 #include "swarm_store.h"
 #include "integrations.h"
 #include "plants.h"
@@ -329,6 +330,15 @@ void app_main(void)
              * plus two 3 KB-stack responder tasks, and round 3's trace could
              * not tell those apart from BLE's much larger footprint. */
             log_heap("after swarm_start_main");
+
+#if CONFIG_PLANTHUB_H2_LINK_ENABLED
+            /* Two-chip appliance: bring up the wired H2 Zigbee coordinator
+             * link. MUST run after swarm_start_main() so it wins the
+             * DEV_KIND_ZIGBEE actuate dispatch hook (see h2_link.h). */
+            esp_err_t herr = h2_link_start();
+            if (herr != ESP_OK) ESP_LOGE(TAG, "h2_link start failed (%s)", esp_err_to_name(herr));
+            log_heap("after h2_link_start");
+#endif
 
             /* M8 Task 2: hub-only plant registry, NVS-backed -- see
              * plants.h. Hub role only (nodes keep no plants), so this lives

@@ -1,0 +1,4 @@
+# Two-chip (C6 + H2) appliance hub variant: the C6 brain has NO local Zigbee
+# radio (the H2 is the coordinator, reached over the wired h2_link UART).
+CONFIG_PLANTHUB_ZB_ENABLED=n
+CONFIG_PLANTHUB_H2_LINK_ENABLED=y

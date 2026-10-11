@@ -10,6 +10,9 @@
 #include "claim.h"
 #include "ota_post.h"
 #include "swarm.h"
+#if CONFIG_PLANTHUB_H2_LINK_ENABLED
+#include "h2_link.h"
+#endif
 #include "swarm_store.h"
 #include "bridge_table.h"
 #include "ble_collector.h"
@@ -5003,6 +5006,27 @@ static cJSON *announce_device_json(const swarm_device_announce_t *a)
  * UI tells the two apart on "node" being null vs a MAC12 string). */
 static cJSON *coordinator_json_local(void)
 {
+#if CONFIG_PLANTHUB_H2_LINK_ENABLED
+    /* Two-chip appliance: the "local coordinator" is the wired H2. Its
+     * network state comes from the last COORD_STATUS over the UART; its
+     * devices live in the data_core registry (/api/v1/devices), since the
+     * H2 is a local radio, not a swarm node. Returns NULL until the first
+     * status arrives (same "nothing to report" posture as a not-started
+     * local stack below). */
+    swarm_coord_status_t st;
+    if (!h2_link_coord_status(&st)) return NULL;
+    cJSON *hc = cJSON_CreateObject();
+    cJSON_AddNullToObject(hc, "node");
+    cJSON_AddNullToObject(hc, "name");
+    cJSON_AddBoolToObject(hc, "enabled", true);
+    cJSON_AddBoolToObject(hc, "formed", st.formed);
+    cJSON_AddNumberToObject(hc, "channel", st.channel);
+    cJSON_AddNumberToObject(hc, "pan_id", st.pan_id);
+    cJSON_AddNumberToObject(hc, "permit_s", st.permit_s);
+    cJSON_AddStringToObject(hc, "reported_role", "zigbee");
+    cJSON_AddArrayToObject(hc, "devices");
+    return hc;
+#else
     uint8_t channel = 0;
     uint16_t pan_id = 0;
     bool formed = false;
@@ -5029,6 +5053,7 @@ static cJSON *coordinator_json_local(void)
         cJSON_AddItemToArray(devices, zb_device_json(&s_api_zb_snap[i]));
     }
     return c;
+#endif
 }
 
 /* One bridge node's coordinator entry -- "node" is its MAC12, "name" its
@@ -5183,6 +5208,15 @@ static esp_err_t zigbee_permit_post(httpd_req_t *req)
         return send_json(req, root);
     }
 
+#if CONFIG_PLANTHUB_H2_LINK_ENABLED
+    /* Two-chip appliance: the "local coordinator" is the wired H2. Permit is
+     * sent over the UART; the H2 opens its own join window. */
+    h2_link_permit();
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddBoolToObject(root, "queued", true);
+    return send_json(req, root);
+#else
     if (!zigbee_permit_join()) {
         return send_409(req, "no formed Zigbee network to join");
     }
@@ -5191,6 +5225,7 @@ static esp_err_t zigbee_permit_post(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "ok", true);
     cJSON_AddNumberToObject(root, "permit_s", zigbee_permit_join_remaining());
     return send_json(req, root);
+#endif
 }
 
 /* Shared by zigbee_devices_post()/zigbee_devices_delete() below: extracts
