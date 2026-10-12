@@ -16,8 +16,8 @@
 #define TAG "h2_link"
 
 #define HL_PORT    UART_NUM_1
-#define HL_TX_GPIO 4
-#define HL_RX_GPIO 5
+#define HL_TX_GPIO 10
+#define HL_RX_GPIO 11
 #define HL_BAUD    921600
 #define HL_BUF     1024
 
