@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
+#include "app_config.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -21,6 +22,7 @@ static char s_tab_path[64];
 static uint16_t s_boot_id;
 static bool s_synced;
 static bool s_sntp_started;
+static char s_server[64];   /* live SNTP server string; esp_netif_sntp holds this pointer */
 static SemaphoreHandle_t s_mutex;
 
 static uint32_t uptime_s(void) { return (uint32_t)(esp_timer_get_time() / 1000000); }
@@ -42,16 +44,27 @@ static void on_epoch_learned(void *arg, esp_event_base_t base, int32_t id, void 
     timekeeper_set_epoch(*(uint32_t *)data);
 }
 
+/* Start SNTP once the network is up, pointed at the operator-configured
+ * server (app_config's ntp_server; default "pool.ntp.org"). An empty server
+ * means the operator disabled SNTP. A config change persists to NVS and the
+ * settings save reboots, so this one-shot read-at-GOT_IP is all that's needed
+ * to pick up a new server. s_server is static because esp_netif_sntp holds
+ * this pointer for the life of the SNTP client. */
 static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
+    (void)arg; (void)base; (void)id; (void)data;
     if (s_sntp_started) return;
+    app_config_ntp_server(s_server);
+    if (s_server[0] == '\0') { ESP_LOGI(TAG, "SNTP disabled (no server configured)"); return; }
     s_sntp_started = true;
-    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(s_server);
     cfg.sync_cb = on_sntp_sync;
     esp_err_t err = esp_netif_sntp_init(&cfg);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "sntp init failed: %s", esp_err_to_name(err));
         s_sntp_started = false;
+    } else {
+        ESP_LOGI(TAG, "SNTP server = %s", s_server);
     }
 }
 

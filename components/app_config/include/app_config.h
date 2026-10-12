@@ -15,6 +15,12 @@ esp_err_t app_config_set_wifi(const wifi_creds_t *c);   /* ESP_ERR_INVALID_ARG i
 esp_err_t app_config_clear_wifi(void);
 void      app_config_hub_name(char out[16]);            /* operator-set name, else "PlantHub-XXXX" */
 esp_err_t app_config_set_hub_name(const char *name);    /* [A-Za-z0-9_-]{0,15}; "" = back to default */
+/* SNTP server for timekeeper. Returns the operator-set value, or the build
+ * default ("pool.ntp.org") when never configured; an empty result means the
+ * operator disabled SNTP. Set "" to disable, a hostname to (re)enable. */
+void      app_config_ntp_server(char out[64]);
+esp_err_t app_config_set_ntp_server(const char *server);   /* ""=off; charset [A-Za-z0-9.-], <=63 */
+
 esp_err_t app_config_set_sensor_name(const uint8_t mac[6], const char *name);
 bool      app_config_get_sensor_name(const uint8_t mac[6], char out[33]);
 esp_err_t app_config_clear_sensor_name(const uint8_t mac[6]);   /* erase; == set_sensor_name(mac, "") */

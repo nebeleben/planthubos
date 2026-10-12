@@ -40,6 +40,8 @@ export function ConfigTab() {
   const [radioMsg, setRadioMsg] = useState('')
   const [hubName, setHubName] = useState('')
   const [nameMsg, setNameMsg] = useState('')
+  const [ntpServer, setNtpServer] = useState('')     // SNTP server; '' = NTP off
+  const [ntpMsg, setNtpMsg] = useState('')
   const [fresetMsg, setFresetMsg] = useState('')
 
   // AI assist (M4): browser-local only -- read once from localStorage via
@@ -83,6 +85,7 @@ export function ConfigTab() {
         setRadioRole(c.radio_role ?? 'ble')
         setRadioRunning(c.radio_role ?? '')
         setHubName(c.name ?? '')
+        setNtpServer(c.ntp_server ?? '')
         setCfgLoaded(true)
       })
       // Leave cfgLoaded false on failure: the form would otherwise render
@@ -309,6 +312,27 @@ export function ConfigTab() {
     setBusy('')
   }
 
+  async function doSaveNtp() {
+    setBusy('ntp'); setNtpMsg('')
+    try {
+      const res = await fetch('/api/v1/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ ntp_server: ntpServer }),
+      })
+      if (res.ok) {
+        rebootCountdown(setNtpMsg)
+      } else if (res.status === 401) {
+        setNtpMsg('Unauthorized — set the hub key below.')
+      } else {
+        let msg = 'Save failed.'
+        try { const d = await res.json(); if (d.error) msg = d.error } catch { /* non-JSON body */ }
+        setNtpMsg(msg)
+      }
+    } catch { setNtpMsg('hub not reachable') }
+    setBusy('')
+  }
+
   async function doFactoryReset(wipe) {
     const q = wipe
       ? 'Factory reset AND ERASE ALL DATA? Plants, history and every setting are wiped — the hub returns to a fresh install and starts its setup WiFi.'
@@ -481,6 +505,23 @@ export function ConfigTab() {
           Home Assistant will rediscover the plants under the new topics.
         </p>
         {nameMsg && <p class="hint">{nameMsg}</p>}
+        <p>
+          <label>
+            NTP server
+            <input value={ntpServer} maxLength={63} placeholder="pool.ntp.org"
+                   onInput={(e) => setNtpServer(e.currentTarget.value)} />
+          </label>
+          {' '}
+          <button class="btn-primary" onClick={doSaveNtp}
+                  disabled={busy === 'ntp' || !cfgLoaded || ntpServer === (cfg?.ntp_server ?? '')}>
+            {busy === 'ntp' ? 'Saving…' : 'Save NTP'}
+          </button>
+        </p>
+        <p class="infobox">
+          Time server used when no RTC is fitted — and to keep a fitted RTC trained.
+          Leave blank to turn NTP off. Saving reboots the hub.
+        </p>
+        {ntpMsg && <p class="hint">{ntpMsg}</p>}
       </div>
 
       {st.role !== 'node' && (

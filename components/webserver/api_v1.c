@@ -1074,7 +1074,13 @@ static esp_err_t time_post(httpd_req_t *req)
     cJSON *json = cJSON_Parse(body);
     const cJSON *epoch = cJSON_GetObjectItem(json, "epoch_s");
     bool ok = cJSON_IsNumber(epoch) && epoch->valuedouble > 1e9 && epoch->valuedouble < 4e9;
-    if (ok) timekeeper_set_epoch((uint32_t)epoch->valuedouble);
+    if (ok) {
+        /* Post the authoritative epoch rather than setting it directly, so
+         * both timekeeper (set_epoch) AND the optional DS3231 trainer react
+         * -- the same event SNTP posts. */
+        uint32_t learned = (uint32_t)epoch->valuedouble;
+        esp_event_post(PLANTHUB_TIME_EVENT, TIME_EVENT_EPOCH_LEARNED, &learned, sizeof learned, 0);
+    }
     cJSON_Delete(json);
     if (!ok) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid epoch"); return ESP_OK; }
     httpd_resp_set_type(req, "application/json");
@@ -1662,6 +1668,12 @@ static esp_err_t config_get(httpd_req_t *req)
     /* Effective radio role -- the Settings select shows what is running. */
     cJSON_AddStringToObject(root, "radio_role", radio_role_str(radio_role_get()));
 
+    /* SNTP server (app_config). Empty string = SNTP disabled; the default
+     * when never set is "pool.ntp.org" (app_config fills it in). */
+    char ntp[64];
+    app_config_ntp_server(ntp);
+    cJSON_AddStringToObject(root, "ntp_server", ntp);
+
     cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
     cJSON_AddBoolToObject(mqtt, "enabled", cfg.mqtt.enabled);
     cJSON_AddStringToObject(mqtt, "uri", cfg.mqtt.uri);
@@ -1745,6 +1757,22 @@ static esp_err_t config_post(httpd_req_t *req)
             httpd_resp_set_status(req, "400 Bad Request");
             httpd_resp_set_type(req, "application/json");
             httpd_resp_sendstr(req, "{\"error\":\"bad name: letters, digits, - and _ only, max 15\"}");
+            return ESP_OK;
+        }
+    }
+
+    /* "ntp_server": SNTP server (app_config, NVS). "" disables SNTP; a
+     * hostname sets it. The reboot below applies it -- timekeeper reads it
+     * at GOT_IP. Absent key leaves it untouched. */
+    const cJSON *ntp_j = cJSON_GetObjectItem(json, "ntp_server");
+    if (ntp_j) {
+        esp_err_t ntp_err = cJSON_IsString(ntp_j)
+            ? app_config_set_ntp_server(ntp_j->valuestring) : ESP_ERR_INVALID_ARG;
+        if (ntp_err != ESP_OK) {
+            cJSON_Delete(json);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"error\":\"bad ntp_server: hostname chars only, max 63\"}");
             return ESP_OK;
         }
     }

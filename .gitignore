@@ -63,3 +63,4 @@ tests/host/test_dev_profiles
 tests/host/test_mapping_engine
 tests/host/test_uart_framer
 tests/host/test_swarm_ingest
+tests/host/test_rtc_ds3231

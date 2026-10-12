@@ -133,6 +133,39 @@ esp_err_t app_config_set_hub_name(const char *name)
     return err;
 }
 
+/* NTP server (SNTP): the key's absence means "never configured" -> the
+ * build default; a stored empty string means the operator deliberately
+ * disabled SNTP. timekeeper reads this; an empty result turns SNTP off. */
+#define NTP_DEFAULT "pool.ntp.org"
+
+void app_config_ntp_server(char out[64])
+{
+    out[0] = '\0';
+    bool found = false;
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = 64;
+        found = nvs_get_str(h, "ntp_server", out, &len) == ESP_OK;
+        nvs_close(h);
+    }
+    if (!found) strlcpy(out, NTP_DEFAULT, 64);   /* unset -> default; "" stays "" (off) */
+}
+
+esp_err_t app_config_set_ntp_server(const char *server)
+{
+    if (!server || strlen(server) > 63) return ESP_ERR_INVALID_ARG;
+    for (const char *p = server; *p; p++) {   /* hostname charset; "" allowed (disable) */
+        if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-') return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(h, "ntp_server", server);   /* "" is stored = explicitly off */
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
 static void name_key(char out[16], const uint8_t mac[6])
 {
     snprintf(out, 16, "nm_%02X%02X%02X%02X%02X%02X",

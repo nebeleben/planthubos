@@ -2,3 +2,5 @@
 # radio (the H2 is the coordinator, reached over the wired h2_link UART).
 CONFIG_PLANTHUB_ZB_ENABLED=n
 CONFIG_PLANTHUB_H2_LINK_ENABLED=y
+# The appliance carries the optional DS3231 RTC on the C6's I2C (GPIO6/7).
+CONFIG_PLANTHUB_RTC_DS3231=y

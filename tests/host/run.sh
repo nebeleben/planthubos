@@ -380,3 +380,10 @@ $CC -Wall -Wextra -Werror -I../../components/dev_profiles/include -I../../compon
     ../../components/tuya_dp/tuya_dp.c ../../components/capability/capability.c \
     ../../components/capability/device_id.c -o test_mapping_engine -lm
 ./test_mapping_engine
+
+# rtc_ds3231 pure core (optional DS3231 RTC): DS3231 register <-> epoch +
+# validity, cross-checked against the host's timegm(). No ESP-IDF; the
+# device I2C layer (rtc_ds3231.c) is device-only and not built here.
+$CC -Wall -Wextra -Werror -I../../components/rtc_ds3231/include -Iesp_shims \
+    test_rtc_ds3231.c ../../components/rtc_ds3231/rtc_ds3231_core.c -o test_rtc_ds3231
+./test_rtc_ds3231

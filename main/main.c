@@ -17,6 +17,7 @@
 #include "tuya_dp.h"
 #include "radio_role.h"
 #include "timekeeper.h"
+#include "rtc_ds3231.h"
 #include "sampler.h"
 #include "ota_post.h"
 #include "swarm.h"
@@ -218,6 +219,22 @@ void app_main(void)
      * unsynced (timekeeper_synced() == false) instead of failing outright. */
     esp_err_t tk_err = timekeeper_init("/storage");
     if (tk_err != ESP_OK) ESP_LOGE(TAG, "timekeeper_init failed (%s); time sync unavailable", esp_err_to_name(tk_err));
+
+#if CONFIG_PLANTHUB_RTC_DS3231
+    /* Optional DS3231: seed the clock from the battery-backed RTC now, before
+     * WiFi/SNTP, so timestamps are right the moment the hub boots offline.
+     * Absent/invalid -> fall back to SNTP exactly as before. rtc_ds3231_init()
+     * also registers the trainer that keeps the chip accurate from SNTP. */
+    if (rtc_ds3231_init() == ESP_OK) {
+        uint32_t rtc_epoch;
+        if (rtc_ds3231_read_epoch(&rtc_epoch)) {
+            timekeeper_set_epoch(rtc_epoch);
+            ESP_LOGI(TAG, "clock seeded from DS3231 (epoch=%lu)", (unsigned long)rtc_epoch);
+        } else {
+            ESP_LOGW(TAG, "DS3231 present but time invalid; waiting for SNTP/manual set");
+        }
+    }
+#endif
 
     ESP_ERROR_CHECK(data_core_init());
     /* Seed the registry with each device's last-known values from the boot

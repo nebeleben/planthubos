@@ -1,0 +1,13 @@
+menu "PlantHub RTC"
+
+config PLANTHUB_RTC_DS3231
+    bool "Enable the optional DS3231 I2C RTC"
+    default n
+    help
+        Read a DS3231 real-time clock over I2C (SDA=GPIO6, SCL=GPIO7, addr
+        0x68) at boot to seed the hub's wall clock before WiFi/SNTP, and keep
+        it trained from SNTP / browser time-sets. Absent-tolerant: with no
+        module fitted the hub falls back to SNTP exactly as before. See
+        docs/esplayout/h2-link-wiring.md.
+
+endmenu
