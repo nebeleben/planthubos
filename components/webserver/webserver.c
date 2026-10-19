@@ -107,13 +107,20 @@ esp_err_t webserver_start(void)
      * fails with ENFILE meanwhile -- observed on hardware as the portal simply
      * refusing to load for ~45 s. Purge the least-recently-used one instead. */
     cfg.lru_purge_enable = true;
-    /* The default is 5 s per send(). On the two-chip hub, WiFi throughput is
-     * heavily throttled by concurrent BLE scanning (both share the one 2.4 GHz
-     * radio), so a large asset -- the gzipped app.js (~30 KB) -- cannot drain
-     * within 5 s; send() then returns EAGAIN and httpd_resp_send() aborts the
-     * response, so the webUI never finishes loading (bench: "httpd_sock_err:
-     * error in send : 11"). Give a slow transfer room to complete. Harmless on
-     * fast links -- it only matters when a send is actually blocked. */
+    /* The HTTPD default pool is 7 sockets. The webUI holds up to
+     * SSE_MAX_CLIENTS (4) long-lived event streams, and a loading browser
+     * fires several parallel asset/API requests on top of those; at 7 the
+     * stream slots + a reconnect + the parallel loads collided and requests
+     * stalled ("error in accept"/"error in send : 11" -- bench 2026-10-20).
+     * Nine leaves room for 4 streams plus a browser's parallel loads. Needs
+     * CONFIG_LWIP_MAX_SOCKETS >= 9 + 3 (set to 12 in the esp32c6 defaults). */
+    cfg.max_open_sockets = 9;
+    /* The default is 5 s per send(). A genuinely slow transfer (weak signal,
+     * or WiFi time-sliced by concurrent BLE scanning) can take longer, after
+     * which send() returns EAGAIN and httpd_resp_send() aborts the response.
+     * 20 s is a harmless safety margin -- it only matters when a send is
+     * actually blocked. (NB: the 2026-10 "UI won't load" was SSE-slot/socket
+     * exhaustion above, not send throughput; curl pulled app.js at 280 KB/s.) */
     cfg.send_wait_timeout = 20;
     esp_err_t err = httpd_start(&s_server, &cfg);
     if (err != ESP_OK) return err;

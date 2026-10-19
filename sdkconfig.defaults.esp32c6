@@ -56,3 +56,11 @@ CONFIG_MBEDTLS_HARDWARE_SHA=n
 
 # Load-bearing for the zigbee role's LAN; see radio-role-config spec §8.
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# httpd serves the webUI with up to SSE_MAX_CLIENTS (4) long-lived event
+# streams plus a loading browser's parallel asset/API requests. webserver.c
+# raises the httpd pool to max_open_sockets=9, which requires the lwIP socket
+# table to hold that + httpd's 3 reserved (listener etc.). The IDF default is
+# 10; 12 covers the 9+3 with a little slack. (2026-10: the "UI won't load"
+# turned out to be slot/socket exhaustion, not heap -- see sse.c/webserver.c.)
+CONFIG_LWIP_MAX_SOCKETS=12

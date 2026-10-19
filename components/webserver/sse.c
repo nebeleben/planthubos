@@ -14,7 +14,15 @@
 #include <stdio.h>
 
 static const char *TAG = "sse";
-#define SSE_MAX_CLIENTS 2
+/* Each open dashboard holds one live event-stream slot, and EventSource
+ * silently reconnects on any blip (leaving the old stream briefly occupying a
+ * slot until the heartbeat/peek reaps it). Two slots was too tight: a phone +
+ * a laptop, or a single tab mid-reconnect alongside another, exhausts it and
+ * new dashboards get 503 and stall at "Loading..." (bench, 2026-10-20 -- the
+ * whole "UI won't load" hunt was slot contention, not heap/RF). Four gives
+ * real multi-client headroom; httpd's socket pool (webserver.c) is sized to
+ * fit these plus a browser's parallel asset/API requests. */
+#define SSE_MAX_CLIENTS 4
 
 static httpd_req_t *s_clients[SSE_MAX_CLIENTS];
 static SemaphoreHandle_t s_mutex;
