@@ -19,7 +19,7 @@
 #define HL_TX_GPIO 10
 #define HL_RX_GPIO 11
 #define HL_BAUD    921600
-#define HL_BUF     1024
+#define HL_RX_BUF  512         /* frames are <256 B at a few/s; 512 is ample */
 
 static SemaphoreHandle_t s_tx_mtx;
 
@@ -188,7 +188,10 @@ static void hl_uart_init(void)
         .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT,
     };
-    ESP_ERROR_CHECK(uart_driver_install(HL_PORT, HL_BUF, HL_BUF, 0, NULL, 0));
+    /* tx_buffer_size 0 = blocking writes straight to the FIFO (no TX ring):
+     * frames are tiny and infrequent, and this reclaims ~1 KB of the
+     * heap-starved hub's budget (see the browser-unreachable bench finding). */
+    ESP_ERROR_CHECK(uart_driver_install(HL_PORT, HL_RX_BUF, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(HL_PORT, &c));
     ESP_ERROR_CHECK(uart_set_pin(HL_PORT, HL_TX_GPIO, HL_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     uart_set_rx_timeout(HL_PORT, 2);
@@ -204,7 +207,7 @@ esp_err_t h2_link_start(void)
      * overwriting whatever swarm_start_main() registered is correct -- hence
      * the "start after swarm_start_main()" contract (see h2_link.h). */
     actor_set_dispatch_hook(DEV_KIND_ZIGBEE, h2_link_dispatch);
-    xTaskCreate(rx_task, "h2_rx", 4096, NULL, 6, NULL);
+    xTaskCreate(rx_task, "h2_rx", 3072, NULL, 6, NULL);
     send_resync();   /* ask the H2 to replay its device list on our boot */
     ESP_LOGI(TAG, "h2_link up on UART%d (tx=%d rx=%d @ %d)", HL_PORT, HL_TX_GPIO, HL_RX_GPIO, HL_BAUD);
     return ESP_OK;
