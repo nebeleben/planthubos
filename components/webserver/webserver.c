@@ -107,6 +107,14 @@ esp_err_t webserver_start(void)
      * fails with ENFILE meanwhile -- observed on hardware as the portal simply
      * refusing to load for ~45 s. Purge the least-recently-used one instead. */
     cfg.lru_purge_enable = true;
+    /* The default is 5 s per send(). On the two-chip hub, WiFi throughput is
+     * heavily throttled by concurrent BLE scanning (both share the one 2.4 GHz
+     * radio), so a large asset -- the gzipped app.js (~30 KB) -- cannot drain
+     * within 5 s; send() then returns EAGAIN and httpd_resp_send() aborts the
+     * response, so the webUI never finishes loading (bench: "httpd_sock_err:
+     * error in send : 11"). Give a slow transfer room to complete. Harmless on
+     * fast links -- it only matters when a send is actually blocked. */
+    cfg.send_wait_timeout = 20;
     esp_err_t err = httpd_start(&s_server, &cfg);
     if (err != ESP_OK) return err;
 
