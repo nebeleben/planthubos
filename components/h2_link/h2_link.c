@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "swarm_frame.h"
@@ -194,6 +195,14 @@ static void hl_uart_init(void)
     ESP_ERROR_CHECK(uart_driver_install(HL_PORT, HL_RX_BUF, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(HL_PORT, &c));
     ESP_ERROR_CHECK(uart_set_pin(HL_PORT, HL_TX_GPIO, HL_RX_GPIO, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    /* Idle the RX line HIGH (UART idle level) with an internal pull-up. When
+     * the H2 is unpowered or not driving (switch open, or mid-boot), its TX
+     * output floats; without this, a floating 921600-baud RX line picks up
+     * noise that the UART reads as an endless stream of bytes, and the RX task
+     * then spins forever -- which starved the webserver/WiFi and made the UI
+     * unreachable (bench, 2026-10-20). A pull-up keeps RX idle (no frames) when
+     * nothing drives it. */
+    gpio_set_pull_mode(HL_RX_GPIO, GPIO_PULLUP_ONLY);
     uart_set_rx_timeout(HL_PORT, 2);
 }
 
@@ -207,7 +216,10 @@ esp_err_t h2_link_start(void)
      * overwriting whatever swarm_start_main() registered is correct -- hence
      * the "start after swarm_start_main()" contract (see h2_link.h). */
     actor_set_dispatch_hook(DEV_KIND_ZIGBEE, h2_link_dispatch);
-    xTaskCreate(rx_task, "h2_rx", 3072, NULL, 6, NULL);
+    /* Priority 4: BELOW the httpd server task (tskIDLE+5) so a busy UART --
+     * even a noise storm on a floating RX -- can never starve the webserver
+     * or WiFi. A few frames/s at this priority drains the 512 B RX ring fine. */
+    xTaskCreate(rx_task, "h2_rx", 3072, NULL, 4, NULL);
     send_resync();   /* ask the H2 to replay its device list on our boot */
     ESP_LOGI(TAG, "h2_link up on UART%d (tx=%d rx=%d @ %d)", HL_PORT, HL_TX_GPIO, HL_RX_GPIO, HL_BAUD);
     return ESP_OK;
