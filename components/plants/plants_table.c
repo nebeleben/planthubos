@@ -198,10 +198,5 @@ int plants_table_action_slot(const plants_table_t *t, uint8_t plant_id, uint8_t 
     if (idx < 0) {
         return -1;
     }
-    for (uint8_t s = 0; s < PLANT_ACTION_SLOTS; s++) {
-        if (t->p[idx].act_bound[s] && t->p[idx].act_id[s] == action_id) {
-            return s;
-        }
-    }
-    return -1;
+    return plant_entry_action_slot(&t->p[idx], action_id);
 }

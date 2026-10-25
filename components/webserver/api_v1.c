@@ -73,16 +73,15 @@ static plants_table_t s_api_plant_snap;
  * rather than joining that pair's comment. */
 static zb_device_t s_api_zb_snap[ZB_STORE_MAX_DEVICES];
 
-/* Task 9: zigbee_get()'s copy of swarm_bridge_snapshot()'s output (the
- * hub's bridge-node bookkeeping, bridge_table.h) -- also reused by
- * zigbee_devices_post()/zigbee_devices_delete() to find which bridge node
- * (if any) owns a given eui64 via bridge_table_find_device(). At
- * BRIDGE_MAX_NODES(6) * sizeof(bridge_node_t) (each carrying up to
- * BRIDGE_MAX_DEVICES(16) swarm_device_announce_t records), this is well
- * into the same "too big for the httpd task stack" territory as
- * s_api_zb_snap above, and safe as a file-static for the same reason:
+/* Task 9: zigbee_get()'s one-node scratch for swarm_bridge_node_at() (the
+ * hub's bridge-node bookkeeping, bridge_table.h). One bridge_node_t (up to
+ * BRIDGE_MAX_DEVICES(16) swarm_device_announce_t records, ~2.3 KB) rather
+ * than the whole BRIDGE_MAX_NODES table (~14 KB) it used to copy -- the
+ * coordinator list is built one node at a time anyway (2026-10 heap
+ * reclaim). Still too big for the httpd task stack alongside cJSON work,
+ * and safe as a file-static for the same reason as s_api_zb_snap above:
  * esp_http_server serialises every handler on one task. */
-static bridge_table_t s_api_bridge_snap;
+static bridge_node_t s_api_bridge_node;
 
 /* Task 8 (device-mapping-profiles): shared by profiles_list_get()/
  * profiles_key_get()/profiles_key_put()/profiles_key_delete()/
@@ -90,7 +89,7 @@ static bridge_table_t s_api_bridge_snap;
  * (32) * sizeof(dev_profile_t) is close to 12KB, far past the httpd task's
  * 8KB stack (cfg.stack_size, webserver.c), same file-static-because-
  * one-handler-at-a-time reasoning as s_api_reg_snap/s_api_plant_snap/
- * s_api_zb_snap/s_api_bridge_snap above. Every reader calls
+ * s_api_zb_snap/s_api_bridge_node above. Every reader calls
  * dev_profile_user_load() to refresh it before use -- there is no cross-
  * request caching here, just a shared scratch buffer. */
 static dev_profile_store_t s_api_profile_store;
@@ -5128,7 +5127,7 @@ static cJSON *coordinator_json_bridge(const bridge_node_t *b)
 /* GET /api/v1/zigbee -- every coordinator this hub knows about (spec §5.3):
  * its own, when it runs the zigbee radio role (coordinator_json_local()),
  * followed by one entry per bridge node it has ever heard a COORD_STATUS/
- * device announce from (swarm_bridge_snapshot(), in table order, skipping
+ * device announce from (swarm_bridge_node_at(), in table order, skipping
  * !in_use slots). A wifi_only hub with no bridges ever seen reports
  * {"coordinators":[]}. Unauthenticated, like every GET in this file
  * (devices_send_chunked()'s comment above). */
@@ -5140,11 +5139,9 @@ static esp_err_t zigbee_get(httpd_req_t *req)
     cJSON *local = coordinator_json_local();
     if (local) cJSON_AddItemToArray(coordinators, local);
 
-    if (swarm_bridge_snapshot(&s_api_bridge_snap)) {
-        for (int i = 0; i < BRIDGE_MAX_NODES; i++) {
-            if (s_api_bridge_snap.n[i].in_use) {
-                cJSON_AddItemToArray(coordinators, coordinator_json_bridge(&s_api_bridge_snap.n[i]));
-            }
+    for (int i = 0; i < BRIDGE_MAX_NODES; i++) {
+        if (swarm_bridge_node_at(i, &s_api_bridge_node)) {
+            cJSON_AddItemToArray(coordinators, coordinator_json_bridge(&s_api_bridge_node));
         }
     }
 
@@ -5286,20 +5283,15 @@ static bool zb_devices_parse_id(httpd_req_t *req, const char *tail, uint8_t eui6
 /* Shared by zigbee_devices_post()/zigbee_devices_delete() below (Task 9):
  * once the local zigbee store has already said "no such device" (or
  * disabled/not started -- both read the same), looks eui64 up across
- * every bridge node's own announced devices via a fresh
- * swarm_bridge_snapshot() + bridge_table_find_device(). Returns NULL (no
- * bridge owns it either -- the caller's existing 404 stands) or the owning
- * node, whose ->mac the caller passes straight to swarm_bridge_rename/
- * remove(). The returned pointer aliases s_api_bridge_snap -- valid until
- * this file-static buffer is next written (the caller's own
- * swarm_bridge_rename/remove() call never touches it), same one-handler-
- * at-a-time safety s_api_bridge_snap's own declaration comment relies on. */
-static const bridge_node_t *zb_devices_find_bridge_owner(const uint8_t eui64[8])
+ * every bridge node's own announced devices via swarm_bridge_find_owner().
+ * Returns false (no bridge owns it either -- the caller's existing 404
+ * stands) or true with the owning node's mac in mac_out, which the caller
+ * passes straight to swarm_bridge_rename/remove(). */
+static bool zb_devices_find_bridge_owner(const uint8_t eui64[8], uint8_t mac_out[6])
 {
     swarm_dev_addr_t d = { .kind = DEV_KIND_ZIGBEE };
     memcpy(d.addr, eui64, 8);
-    if (!swarm_bridge_snapshot(&s_api_bridge_snap)) return NULL;
-    return bridge_table_find_device(&s_api_bridge_snap, &d);
+    return swarm_bridge_find_owner(&d, mac_out);
 }
 
 /* Maps a swarm_bridge_permit/remove/rename() result to the response this
@@ -5435,13 +5427,13 @@ static esp_err_t zigbee_devices_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    const bridge_node_t *b = zb_devices_find_bridge_owner(eui64);
-    if (!b) {
+    uint8_t owner[6];
+    if (!zb_devices_find_bridge_owner(eui64, owner)) {
         cJSON_Delete(json);
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown zigbee device");
         return ESP_OK;
     }
-    esp_err_t err = swarm_bridge_rename(b->mac, eui64, name->valuestring);
+    esp_err_t err = swarm_bridge_rename(owner, eui64, name->valuestring);
     cJSON_Delete(json);
     return zb_bridge_cmd_respond(req, err, "rename failed");
 }
@@ -5465,12 +5457,12 @@ static esp_err_t zigbee_devices_delete(httpd_req_t *req)
         return ESP_OK;
     }
 
-    const bridge_node_t *b = zb_devices_find_bridge_owner(eui64);
-    if (!b) {
+    uint8_t owner[6];
+    if (!zb_devices_find_bridge_owner(eui64, owner)) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown zigbee device");
         return ESP_OK;
     }
-    esp_err_t err = swarm_bridge_remove(b->mac, eui64);
+    esp_err_t err = swarm_bridge_remove(owner, eui64);
     return zb_bridge_cmd_respond(req, err, "remove failed");
 }
 

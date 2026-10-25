@@ -129,7 +129,12 @@ const cap_slot_t *registry_get_cap_ep(const registry_t *r, const device_id_t *id
     if (cap_id >= CAPABILITY_COUNT) return NULL;
     int idx = registry_find(r, id);
     if (idx < 0) return NULL;
-    const device_entry_t *d = &r->devices[idx];
+    return device_entry_get_cap_ep(&r->devices[idx], cap_id, endpoint);
+}
+
+const cap_slot_t *device_entry_get_cap_ep(const device_entry_t *d, uint8_t cap_id, uint8_t endpoint)
+{
+    if (!d || cap_id >= CAPABILITY_COUNT) return NULL;
     if (endpoint == 0 || d->cap_endpoint[cap_id] == 0 || endpoint == d->cap_endpoint[cap_id])
         return &d->caps[cap_id];
     for (uint8_t i = 0; i < d->extra_ep_cap_count; i++)

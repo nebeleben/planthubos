@@ -1423,19 +1423,28 @@ esp_err_t swarm_bridge_rename(const uint8_t mac[6], const uint8_t eui64[8], cons
                            (uint8_t)(len > SWARM_DEV_NAME_MAX ? SWARM_DEV_NAME_MAX : len));
 }
 
-/* See swarm.h. A plain memberwise copy under s_bridges_mutex -- bounded and
- * cheap (BRIDGE_MAX_NODES * sizeof(bridge_node_t), the same table
- * bridge_save()/bridge_load() already move through s_bridge_io_buf a whole
- * serialised copy of), so unlike submit_and_wait() this never queues or
- * waits on bridge_task; it just takes the mutex bridge_task itself holds
- * only for the short, bounded span of one queue item's processing. */
-bool swarm_bridge_snapshot(bridge_table_t *out)
+/* See swarm.h. Bounded copies under s_bridges_mutex, so unlike
+ * submit_and_wait() these never queue or wait on bridge_task; they just
+ * take the mutex bridge_task itself holds only for the short, bounded span
+ * of one queue item's processing. */
+bool swarm_bridge_node_at(int i, bridge_node_t *out)
 {
-    if (!s_bridges_mutex) return false;
+    if (!s_bridges_mutex || !out || i < 0 || i >= BRIDGE_MAX_NODES) return false;
     xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
-    *out = s_bridges;
+    bool in_use = s_bridges.n[i].in_use;
+    if (in_use) *out = s_bridges.n[i];
     xSemaphoreGive(s_bridges_mutex);
-    return true;
+    return in_use;
+}
+
+bool swarm_bridge_find_owner(const swarm_dev_addr_t *dev, uint8_t mac_out[6])
+{
+    if (!s_bridges_mutex || !dev || !mac_out) return false;
+    xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
+    const bridge_node_t *n = bridge_table_find_device(&s_bridges, dev);
+    if (n) memcpy(mac_out, n->mac, 6);
+    xSemaphoreGive(s_bridges_mutex);
+    return n != NULL;
 }
 
 bool swarm_bridge_device_name(const device_id_t *id, char *out, size_t cap)

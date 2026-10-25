@@ -1094,6 +1094,22 @@ void plants_snapshot(plants_table_t *out)
     xSemaphoreGive(s_mutex);
 }
 
+bool plants_find_by_name(const char *name, plant_entry_t *out)
+{
+    if (!name || !out || !s_mutex) return false;   /* same guard as plants_snapshot() above */
+    bool found = false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    for (int i = 0; i < PLANTS_MAX; i++) {
+        if (s_table.p[i].in_use && strcmp(s_table.p[i].name, name) == 0) {
+            *out = s_table.p[i];
+            found = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_mutex);
+    return found;
+}
+
 size_t plants_ids(uint8_t *out, size_t max)
 {
     if (!out) return 0;

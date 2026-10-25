@@ -34,6 +34,7 @@ int main(void)
     bridge_table_t u; assert(bridge_table_deserialize(&u, buf, n));
     assert(bridge_table_node(&u, m2, false)->count == BRIDGE_MAX_DEVICES);
     assert(!bridge_table_deserialize(&u, buf, n - 1));
+    assert(bridge_table_node(&u, m2, false) == NULL);   /* failed load leaves the table empty, never partial */
     bridge_table_forget_node(&t, m2); assert(bridge_table_node(&t, m2, false) == NULL);
     printf("test_bridge_table: OK\n");
     return 0;

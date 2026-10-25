@@ -61,6 +61,13 @@ uint8_t plants_resolve_or_create(const uint8_t mac[6]);
  * empty plants_table_t rather than touching an uninitialised mutex. */
 void plants_snapshot(plants_table_t *out);
 
+/* One-plant copy for a caller that only needs the entry named `name`
+ * (rules_resolver.c) rather than the whole ~3.2 KB table. Copies it into
+ * *out under the plants mutex and returns true; false (*out untouched) if
+ * no in-use plant has that name, or before plants_init() has run (same
+ * guard as plants_snapshot()). */
+bool plants_find_by_name(const char *name, plant_entry_t *out);
+
 /* Lighter enumeration for a caller that only needs to know WHICH plant ids
  * currently exist, not their names/mac/bindings too (M2 Task 4 hardware
  * hotfix: sampler.c used to take a full plants_snapshot() -- a ~1953-byte

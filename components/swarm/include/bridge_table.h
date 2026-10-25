@@ -17,11 +17,8 @@
  * Pure C, no ESP-IDF: swarm.c owns the tmp+rename persisted write (same
  * discipline as zigbee.c's zb_store.c) and every FreeRTOS/mutex concern.
  * This file only manipulates the in-memory table -- see
- * tests/host/test_bridge_table.c. bridge_table_deserialize()'s internal
- * scratch table is a file-static (too big for a stack frame) rather than a
- * FreeRTOS/ESP-IDF primitive, so the pure-C contract still holds; callers
- * must serialise access the same way swarm.c already does via
- * s_bridge_io_mutex.
+ * tests/host/test_bridge_table.c. Callers must serialise access the same
+ * way swarm.c already does via s_bridge_io_mutex.
  *
  * BRIDGE_MAX_NODES intentionally duplicates SWARM_MAX_NODES's value (6)
  * rather than including swarm_store.h to get it: swarm_store.h pulls in
@@ -93,9 +90,13 @@ const swarm_device_announce_t *bridge_table_device(const bridge_table_t *t,
 size_t bridge_table_serialize(const bridge_table_t *t, uint8_t *buf, size_t cap);
 
 /* Loads an image written by bridge_table_serialize(). Returns false --
- * leaving *t untouched -- on a bad magic/version, an out-of-range node or
- * device count, a device that fails to decode, or a buffer with trailing or
- * missing bytes (len must account for the image exactly, same discipline
- * as zb_store_deserialize()). A partly-loaded table is worse than none: it
- * would silently drop devices/nodes the hub actually still knows about. */
+ * leaving *t EMPTY (bridge_table_init()'d) -- on a bad magic/version, an
+ * out-of-range node or device count, a device that fails to decode, or a
+ * buffer with trailing or missing bytes (len must account for the image
+ * exactly, same discipline as zb_store_deserialize()). A partly-loaded table
+ * is worse than none: it would silently drop devices/nodes the hub actually
+ * still knows about -- so a failure never leaves one behind. (Decodes
+ * straight into *t: the old "untouched on failure" contract needed a second
+ * whole-table scratch copy, ~14 KB of .bss, and its only caller --
+ * swarm.c's bridge_load() -- empties the table on failure anyway.) */
 bool bridge_table_deserialize(bridge_table_t *t, const uint8_t *buf, size_t len);

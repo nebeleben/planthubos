@@ -14,8 +14,8 @@
  * data_core_snapshot()/data_core_events_*() (registry.c/data_core.c),
  * capability_get()/capability_decode()/device_id_parse() (capability.c/
  * device_id.c) -- all real, all already host-linked elsewhere in this
- * suite. The two remaining callees -- plants_snapshot()/plants_cap_value()/
- * plants_table_action_slot() (plants.c) and app_config_get_sensor_name()
+ * suite. The two remaining callees -- plants_snapshot()/plants_find_by_name()/
+ * plants_cap_value()/plants_table_action_slot() (plants.c) and app_config_get_sensor_name()
  * (app_config.c) -- pull in NVS/esp_mac/storage.c/action.c-shaped machinery
  * this test has no use for (resolve_event_cap() never calls the
  * plant-ref or app_config-backed device-name path at all), so they're
@@ -36,6 +36,12 @@ int resolve_button_test(const device_id_t *id);
 void plants_snapshot(plants_table_t *out)
 {
     memset(out, 0, sizeof(*out));
+}
+
+bool plants_find_by_name(const char *name, plant_entry_t *out)
+{
+    (void)name; (void)out;
+    return false;
 }
 
 bool plants_cap_value(uint8_t plant_id, uint8_t cap_id, const registry_t *reg,

@@ -107,3 +107,13 @@ bool plants_table_bind_action(plants_table_t *t, uint8_t plant_id, uint8_t slot,
 /* Which slot (0..PLANT_ACTION_SLOTS-1) plant `plant_id` has bound to
  * `action_id`, or -1 if none does (including an unknown plant id). */
 int plants_table_action_slot(const plants_table_t *t, uint8_t plant_id, uint8_t action_id);
+
+/* plants_table_action_slot()'s slot scan on one already-found entry (e.g. a
+ * plants_find_by_name() copy), -1 if p has no slot bound to action_id. */
+static inline int plant_entry_action_slot(const plant_entry_t *p, uint8_t action_id)
+{
+    for (uint8_t s = 0; s < PLANT_ACTION_SLOTS; s++) {
+        if (p->act_bound[s] && p->act_id[s] == action_id) return s;
+    }
+    return -1;
+}

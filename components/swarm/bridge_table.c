@@ -170,23 +170,20 @@ bool bridge_table_deserialize(bridge_table_t *t, const uint8_t *buf, size_t len)
 {
     if (!t || !buf) return false;
 
+    /* Decoded straight into *t; every failure path below goes through `fail`
+     * so a partly-decoded table is never left behind (see the header). */
+    bridge_table_init(t);
+
     br_t r = { buf, len, 0, true };
     uint8_t m0 = br8(&r), m1 = br8(&r), ver = br8(&r);
     if (!r.ok || m0 != BRIDGE_STORE_MAGIC0 || m1 != BRIDGE_STORE_MAGIC1 || ver != BRIDGE_STORE_VERSION) {
-        return false;
+        goto fail;
     }
     uint8_t node_count = br8(&r);
-    if (!r.ok || node_count > BRIDGE_MAX_NODES) return false;
-
-    /* static: 5.3 KB is too big for a stack frame (see C1 in the whole-branch
-     * review). Safe because every caller is serialised by swarm.c's
-     * s_bridge_io_mutex (bridge_load() is the sole target call site and runs
-     * once, at boot) and the host test is single-threaded. */
-    static bridge_table_t tmp;
-    bridge_table_init(&tmp);
+    if (!r.ok || node_count > BRIDGE_MAX_NODES) goto fail;
 
     for (uint8_t i = 0; i < node_count; i++) {
-        bridge_node_t *n = &tmp.n[i];
+        bridge_node_t *n = &t->n[i];
         n->in_use = true;
         brbytes(&r, n->mac, 6);
         uint8_t status_valid = br8(&r);
@@ -198,19 +195,21 @@ bool bridge_table_deserialize(bridge_table_t *t, const uint8_t *buf, size_t len)
         n->status.permit_s = br8(&r);
         n->status.device_count = br8(&r);
         uint8_t count = br8(&r);
-        if (!r.ok || count > BRIDGE_MAX_DEVICES) return false;
+        if (!r.ok || count > BRIDGE_MAX_DEVICES) goto fail;
         n->count = count;
 
         for (uint8_t j = 0; j < count; j++) {
             uint8_t elen = br8(&r);
-            if (!r.ok || elen > r.len - r.i) return false;
-            if (!swarm_decode_device_announce(r.p + r.i, elen, &n->dev[j])) return false;
+            if (!r.ok || elen > r.len - r.i) goto fail;
+            if (!swarm_decode_device_announce(r.p + r.i, elen, &n->dev[j])) goto fail;
             r.i += elen;
         }
     }
 
-    if (!r.ok || r.i != r.len) return false;   /* reject a short or trailing-bytes buffer */
-
-    *t = tmp;
+    if (!r.ok || r.i != r.len) goto fail;   /* reject a short or trailing-bytes buffer */
     return true;
+
+fail:
+    bridge_table_init(t);
+    return false;
 }

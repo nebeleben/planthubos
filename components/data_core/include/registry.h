@@ -133,6 +133,12 @@ int  registry_set_cap_ep(registry_t *r, const device_id_t *id, uint8_t cap_id,
 const cap_slot_t *registry_get_cap_ep(const registry_t *r, const device_id_t *id,
                                       uint8_t cap_id, uint8_t endpoint);
 
+/* registry_get_cap_ep()'s slot lookup on one already-found device entry --
+ * for a caller holding a single copied entry (data_core_get_device())
+ * rather than a whole registry_t snapshot. Same endpoint rules and same
+ * NULL cases, minus "device unknown". */
+const cap_slot_t *device_entry_get_cap_ep(const device_entry_t *d, uint8_t cap_id, uint8_t endpoint);
+
 /* Finds id's registry slot, or claims a free one when id is unknown -- same
  * find-or-create primitive registry_set_cap()/registry_attribute() already
  * use internally, exposed directly for a caller that has confirmed a device

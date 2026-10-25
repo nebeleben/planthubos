@@ -327,6 +327,16 @@ bool data_core_get_device(const device_id_t *id, device_entry_t *out)
     return found;
 }
 
+bool data_core_device_at(int idx, device_entry_t *out)
+{
+    if (idx < 0 || idx >= REGISTRY_MAX_DEVICES || !out) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool in_use = s_registry.devices[idx].in_use;
+    if (in_use) memcpy(out, &s_registry.devices[idx], sizeof(*out));
+    xSemaphoreGive(s_mutex);
+    return in_use;
+}
+
 void data_core_clear_node_attribution(const uint8_t node_mac[6])
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);

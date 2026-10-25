@@ -81,6 +81,14 @@ uint32_t  data_core_snapshot_epoch(void);
  * Returns false (*out untouched) when the device isn't in the registry. */
 bool      data_core_get_device(const device_id_t *id, device_entry_t *out);
 
+/* Same one-entry copy as data_core_get_device(), but by registry slot, for a
+ * caller scanning every device (idx 0..REGISTRY_MAX_DEVICES-1) without a
+ * whole registry_t snapshot. Returns false (*out untouched) for an
+ * out-of-range idx or a slot not in_use. Consecutive calls are separate
+ * lock spans, so a scan is not one atomic view -- fine for a lookup that
+ * already tolerates a device appearing/disappearing between evaluations. */
+bool      data_core_device_at(int idx, device_entry_t *out);
+
 /* Forgetting a node must fully forget it: clears via-node attribution (see
  * registry_clear_attribution()) for every device currently attributed to
  * node_mac, under the same mutex every other registry access here uses.

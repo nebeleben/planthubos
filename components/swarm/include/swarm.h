@@ -182,18 +182,27 @@ esp_err_t swarm_bridge_remove(const uint8_t mac[6], const uint8_t eui64[8]);
  * call. See swarm_bridge_permit() above for the return contract. */
 esp_err_t swarm_bridge_rename(const uint8_t mac[6], const uint8_t eui64[8], const char *name);
 
-/* Hub (M7 Task 9): copies the hub's own bridge-node bookkeeping into *out
- * under s_bridges_mutex (swarm.c), for GET /api/v1/zigbee's coordinator
- * list and the device remove/rename routes' bridge_table_find_device()
- * lookup. Returns false (out left untouched) only when this hub has no
- * bridge machinery at all (s_bridges_mutex never created -- Zigbee
- * disabled at build time or ensure_bridge_task() never ran), the same
- * "nothing to report" posture the rest of this surface uses -- callers
- * should treat that the same as an empty/all-absent table. Safe to call
- * from any task, including bridge_task's own (unlike swarm_bridge_permit/
- * remove/rename() above, this never waits on bridge_task -- it just takes
- * the mutex bridge_task already yields whenever it isn't mid-tick). */
-bool swarm_bridge_snapshot(bridge_table_t *out);
+/* Hub (M7 Task 9): read access to the hub's own bridge-node bookkeeping,
+ * one node at a time, under s_bridges_mutex (swarm.c) -- GET
+ * /api/v1/zigbee walks i = 0..BRIDGE_MAX_NODES-1 for its coordinator list.
+ * Copies node slot i into *out and returns true when that slot is in use;
+ * false (out untouched) for an unused/out-of-range slot or when this hub has
+ * no bridge machinery at all (s_bridges_mutex never created -- Zigbee
+ * disabled at build time or ensure_bridge_task() never ran), which callers
+ * treat as "no bridge there". Replaces a whole-table snapshot so the API
+ * needs one node's scratch (~2.3 KB), not the full ~14 KB table. Safe to
+ * call from any task, including bridge_task's own (unlike
+ * swarm_bridge_permit/remove/rename() above, this never waits on
+ * bridge_task -- it just takes the mutex bridge_task already yields
+ * whenever it isn't mid-tick). Consecutive calls are separate lock spans. */
+bool swarm_bridge_node_at(int i, bridge_node_t *out);
+
+/* Same mutex and "no bridge machinery" posture as swarm_bridge_node_at():
+ * which bridge node (if any) currently has dev among its announced devices
+ * (bridge_table_find_device()), for the device remove/rename routes.
+ * Writes that node's mac to mac_out and returns true; false if no bridge
+ * node has it. */
+bool swarm_bridge_find_owner(const swarm_dev_addr_t *dev, uint8_t mac_out[6]);
 
 /* Copies the stored display name of a bridge-announced Zigbee device (by its
  * DEV_KIND_ZIGBEE device_id_t / eui64) into `out`, NUL-terminated. Returns

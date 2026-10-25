@@ -43,23 +43,20 @@ static void set_why(char *why, size_t whylen, const char *fmt, const char *arg)
     snprintf(why, whylen, fmt, arg);
 }
 
-/* Shared registry_t snapshot scratch (M1/M2 fixwave): resolve_plant() and
- * resolve_device() each used to declare their OWN `static registry_t reg`
- * (~1984 B apiece, ~3968 B total in .bss). rules_resolve() below calls
- * exactly one of the two per invocation (the r.kind == 0 ? plant : device
- * branch) -- they are never simultaneously live -- and both already
- * documented themselves as touched only from the caller's single
- * evaluation-serialized task, so nothing about sharing one file-scope
- * static changes that safety argument, only halves the static footprint. */
-static registry_t s_reg_snap;
-/* Same sharing argument as s_reg_snap just above, extended to
- * rules_resolve_action_dev() (M5b Task 10): resolve_plant() and the
- * plant-kind half of rules_resolve_action_dev() are never simultaneously
- * live either (both run inside one evaluate_real() call, sequentially --
- * "when" resolves refs first via a full psvm_run, THEN, only if it fires, a
- * second psvm_run reaches CALL_ACTION's sink), so one shared
- * ~1.8KB-at-PLANTS_MAX(16) static buffer covers both instead of two. */
-static plants_table_t s_plants_snap;
+/* One-entry scratch buffers, not whole-table snapshots (2026-10 heap
+ * reclaim): every path below only ever needs ONE device entry and ONE plant
+ * entry per resolution, so copying the full registry_t (5.5 KB) and
+ * plants_table_t (3.2 KB) each evaluation cost ~8.7 KB of .bss for nothing.
+ * data_core_get_device()/data_core_device_at() and plants_find_by_name()
+ * copy just the entry needed under the owning mutex. Static rather than
+ * stack for the same reason the old snapshots were: only touched from the
+ * caller's single evaluation-serialized task (engine task, or rules_test()
+ * under rules_engine.c's evaluation mutex), and resolve_plant()/
+ * resolve_device()/rules_resolve_action_dev() are never simultaneously live
+ * ("when" resolves refs via one psvm_run, THEN a second psvm_run reaches
+ * CALL_ACTION's sink), so one of each is shared by all three. */
+static device_entry_t s_dev_scratch;
+static plant_entry_t  s_plant_scratch;
 
 /* plant("<name>") kind: name -> plants table entry -> that capability's
  * binding -> registry value. Task 10: reads the bound device_id_t straight
@@ -76,25 +73,14 @@ static plants_table_t s_plants_snap;
 static bool resolve_plant(const char *name, uint8_t capability, uint8_t field, uint8_t endpoint,
                           uint32_t now_uptime_s, psvm_ref_val_t *out, char *why, size_t whylen)
 {
-    /* s_plants_snap (file scope, see its own comment above): only ever
-     * touched from the caller's task (engine task, or a future
-     * rules_test() caller serialized by rules_engine.c's evaluation mutex
-     * -- see rules_engine.c) -- same "big buffer off a small task stack"
-     * idiom as sampler.c's sample_once(). */
-    plants_table_t *snap = &s_plants_snap;
-    plants_snapshot(snap);
-
-    int idx = -1;
-    for (int i = 0; i < PLANTS_MAX; i++) {
-        if (snap->p[i].in_use && strcmp(snap->p[i].name, name) == 0) { idx = i; break; }
-    }
-    if (idx < 0) {
+    const plant_entry_t *p = &s_plant_scratch;
+    if (!plants_find_by_name(name, &s_plant_scratch)) {
         ref_not_ready(out);
         set_why(why, whylen, "no plant \"%s\"", name);
         return false;
     }
 
-    if (capability >= CAPABILITY_COUNT || !snap->p[idx].cap_bound[capability]) {
+    if (capability >= CAPABILITY_COUNT || !p->cap_bound[capability]) {
         ref_not_ready(out);
         if (why && whylen) {
             snprintf(why, whylen, "plant \"%s\" has no %s bound", name, rules_cap_name(capability));
@@ -109,18 +95,15 @@ static bool resolve_plant(const char *name, uint8_t capability, uint8_t field, u
      * plants_cap_value()'s internal caps[capability] indexing so a
      * plant ref's `@N` reaches the same (cap,endpoint) slot a device ref
      * would. */
-    device_id_t dev = snap->p[idx].cap_dev[capability];
+    device_id_t dev = p->cap_dev[capability];
 
-    data_core_snapshot(&s_reg_snap);
-
-    int ridx = registry_find(&s_reg_snap, &dev);
-    if (ridx < 0) {
+    if (!data_core_get_device(&dev, &s_dev_scratch)) {
         ref_not_ready(out);
         if (why && whylen) snprintf(why, whylen, "device never heard");
         return false;
     }
 
-    const cap_slot_t *slot = registry_get_cap_ep(&s_reg_snap, &dev, capability, endpoint);
+    const cap_slot_t *slot = device_entry_get_cap_ep(&s_dev_scratch, capability, endpoint);
     if (!slot || !slot->valid) {
         ref_not_ready(out);
         if (why && whylen) snprintf(why, whylen, "device never heard");
@@ -136,18 +119,19 @@ static bool resolve_plant(const char *name, uint8_t capability, uint8_t field, u
 /* Shared by resolve_device() and rules_resolve_action_dev() (M5b Task 10):
  * turns a device() ref's/action's `id` string into a device_id_t, trying
  * the sensor display-name store first (app_config's mac-keyed name store,
- * checked against every live BLE device in s_reg_snap -- the only kind
+ * checked against every live BLE device in the registry -- the only kind
  * that store can name) then falling back to device_id_parse()'s canonical
  * "kind:HEX" form (capability.h Sec.2) or M1's legacy bare
  * "AA:BB:CC:DD:EE:FF" colon-mac literal, which device_id_parse() itself
- * maps onto DEV_KIND_BLE. Caller must have already refreshed s_reg_snap
- * (data_core_snapshot()) this pass. */
+ * maps onto DEV_KIND_BLE. Scans one entry at a time via
+ * data_core_device_at() into s_dev_scratch (clobbering it). */
 static bool find_device_id(const char *id, device_id_t *out)
 {
     char nm[33];
     for (int i = 0; i < REGISTRY_MAX_DEVICES; i++) {
-        const device_entry_t *e = &s_reg_snap.devices[i];
-        if (!e->in_use || e->id.kind != DEV_KIND_BLE) continue;
+        if (!data_core_device_at(i, &s_dev_scratch)) continue;
+        const device_entry_t *e = &s_dev_scratch;
+        if (e->id.kind != DEV_KIND_BLE) continue;
         if (app_config_get_sensor_name(e->id.addr, nm) && strcmp(nm, id) == 0) {
             *out = e->id;
             return true;
@@ -164,7 +148,7 @@ static bool find_device_id(const char *id, device_id_t *out)
 /* Momentary event-cap resolution (Task 5, zigbee-button-support: button.action,
  * capability.h's cdef->event == true). Unlike every other capability, this one
  * has no stored registry slot to read -- resolve_device() below never reaches
- * the s_reg_snap slot lookup for it -- it reads data_core's LIVE pending-event
+ * the registry slot lookup for it -- it reads data_core's LIVE pending-event
  * store (data_core_events_for(), Task 4) directly, which is deliberate: the
  * engine consumes a pass's presses only once, at the END of its own
  * value-update sweep (rules_engine.c's evaluate_all()), so every rule
@@ -190,8 +174,6 @@ static bool resolve_event_cap(const device_id_t *dev, uint8_t capability, uint8_
 static bool resolve_device(const char *id, uint8_t capability, uint8_t field, uint8_t endpoint,
                            uint32_t now_uptime_s, psvm_ref_val_t *out, char *why, size_t whylen)
 {
-    data_core_snapshot(&s_reg_snap);
-
     device_id_t dev = {0};
     bool have_dev = find_device_id(id, &dev);
 
@@ -207,8 +189,7 @@ static bool resolve_device(const char *id, uint8_t capability, uint8_t field, ui
         return false;
     }
 
-    int ridx = have_dev ? registry_find(&s_reg_snap, &dev) : -1;
-    if (ridx < 0 || capability >= CAPABILITY_COUNT) {
+    if (!have_dev || !data_core_get_device(&dev, &s_dev_scratch) || capability >= CAPABILITY_COUNT) {
         ref_not_ready(out);
         set_why(why, whylen, "device \"%s\" never heard", id);
         return false;
@@ -219,7 +200,7 @@ static bool resolve_device(const char *id, uint8_t capability, uint8_t field, ui
      * entry -- endpoint 0 (a bare ref with no `@N`, or every ref in a
      * legacy v1 program) returns that same default/lowest slot, so an
      * unmodified rule resolves exactly as it always did. */
-    const cap_slot_t *slot = registry_get_cap_ep(&s_reg_snap, &dev, capability, endpoint);
+    const cap_slot_t *slot = device_entry_get_cap_ep(&s_dev_scratch, capability, endpoint);
     if (!slot || !slot->valid) {
         ref_not_ready(out);
         if (why && whylen) {
@@ -287,24 +268,17 @@ bool rules_resolve(const psvm_prog_t *prog, uint16_t ref_idx, psvm_ref_val_t *ou
 int rules_resolve_action_dev(uint8_t kind, const char *name, uint8_t action_id)
 {
     if (!name) return -1;
-    data_core_snapshot(&s_reg_snap);
 
     device_id_t dev = {0};
     if (kind == 0) {
-        plants_table_t *snap = &s_plants_snap;
-        plants_snapshot(snap);
-        int idx = -1;
-        for (int i = 0; i < PLANTS_MAX; i++) {
-            if (snap->p[i].in_use && strcmp(snap->p[i].name, name) == 0) { idx = i; break; }
-        }
-        if (idx < 0) return -1;
-        int slot = plants_table_action_slot(snap, snap->p[idx].id, action_id);
+        if (!plants_find_by_name(name, &s_plant_scratch)) return -1;
+        int slot = plant_entry_action_slot(&s_plant_scratch, action_id);
         if (slot < 0) return -1;
-        dev = snap->p[idx].act_dev[slot];
+        dev = s_plant_scratch.act_dev[slot];
     } else {
         if (!find_device_id(name, &dev)) return -1;
     }
-    return registry_find(&s_reg_snap, &dev);
+    return data_core_find_index(&dev);
 }
 
 #ifdef HOST_TEST
