@@ -3,7 +3,6 @@ menu "PlantHub Claiming"
 config PLANTHUB_FACTORY_RESET_GPIO
     int "GPIO for the 10-second factory-reset hold"
     default 9 if IDF_TARGET_ESP32C6
-    default 28 if IDF_TARGET_ESP32C5
     default 0
     help
         Pin that must be held low for 10 seconds to clear the claim key,
@@ -14,7 +13,7 @@ config PLANTHUB_FACTORY_RESET_GPIO
         has to match the BOOT button of the board actually in use.
 
         The default follows the target's own BOOT button: GPIO9 on
-        ESP32-C6 devkits, GPIO28 on ESP32-C5 ones. The trailing GPIO0 is
+        ESP32-C6 devkits. The trailing GPIO0 is
         only Kconfig's required terminal default for an unlisted target;
         no supported board uses it.
 
