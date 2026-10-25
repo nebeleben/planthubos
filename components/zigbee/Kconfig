@@ -6,7 +6,7 @@ config PLANTHUB_ZB_ENABLED
     default n
     help
         The Zigbee coordinator, which since 2026-10 runs only on the ESP32-H2
-        of the two-chip hub (h2fw/, which pulls this component in and needs
+        of the two-chip hub (planthubos/h2fw/, which pulls this component in and needs
         an 802.15.4 radio plus the zb_storage/zb_fct partitions). The C6 hub
         builds keep it off -- a C6 never runs a coordinator itself; its only
         use was the retired Zigbee bridge node -- and talk to the H2 over

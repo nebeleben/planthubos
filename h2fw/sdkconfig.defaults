@@ -1,0 +1,13 @@
+CONFIG_IDF_TARGET="esp32h2"
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_ZCZR=y
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PLANTHUB_ZB_ENABLED=y
+# app_main runs the full zigbee init (zb_store_load's ~2.5KB image buffer,
+# first-boot littlefs format) on the main task -- the 3584-byte default
+# overflows it. The C6 two-chip hub avoids this only because it builds with
+# zigbee disabled (zigbee_start is a stub there).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
