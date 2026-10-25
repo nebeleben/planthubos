@@ -154,12 +154,6 @@ cJSON *device_json(const device_entry_t *e, const plants_table_t *plants, uint32
     char name[33];
     if (e->id.kind == DEV_KIND_BLE && app_config_get_sensor_name(e->id.addr, name) && name[0] != '\0') {
         cJSON_AddStringToObject(o, "name", name);
-    } else if (e->id.kind == DEV_KIND_ZIGBEE && swarm_bridge_device_name(&e->id, name, sizeof name)) {
-        /* Zigbee names live in the bridge table (the announce's 24-byte name),
-         * not app_config's mac-keyed store -- show them the same way. Renaming
-         * still happens on the Zigbee tab (the store of record); here it is
-         * display only. */
-        cJSON_AddStringToObject(o, "name", name);
     } else {
         cJSON_AddNullToObject(o, "name");
     }

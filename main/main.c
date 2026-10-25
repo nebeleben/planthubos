@@ -13,7 +13,6 @@
 #include "webserver.h"
 #include "data_core.h"
 #include "ble_collector.h"
-#include "zigbee.h"
 #include "tuya_dp.h"
 #include "radio_role.h"
 #include "timekeeper.h"
@@ -486,26 +485,11 @@ void app_main(void)
     bool on_node = (role == SWARM_ROLE_NODE);
     radio_role_t rr = radio_role_is_set() ? radio_role_get()
                                           : (on_node ? RADIO_ROLE_BLE : radio_role_default());
-    /* Zigbee is a bridge-NODE role: only a paired node runs the coordinator;
-     * a hub runs WiFi + BLE. A hub that somehow has zigbee stored (a retired
-     * config or a leftover) falls back to BLE rather than starting a
-     * coordinator it has no supported role for. */
-    if (!on_node && rr == RADIO_ROLE_ZIGBEE) {
-        ESP_LOGW(TAG, "zigbee radio role is not valid on a hub; using BLE");
-        rr = RADIO_ROLE_BLE;
-    }
+    /* No zigbee here: radio_role_init() maps a retired `zigbee` role to BLE
+     * on every board (Zigbee bridge nodes were retired 2026-10). */
     bool want_ble    = (rr == RADIO_ROLE_BLE);
-    /* Bench finding (M7 gate 1, 2026-09-08): a node that is still sweeping
-     * channels for its hub must NOT have the 802.15.4 coordinator up -- with
-     * the Zigbee stack running, the sweep's PAIR_REQ broadcasts stopped
-     * reaching the hub entirely (one frame got through, 200 ms before the
-     * stack came up; none in the following 120 s). An unpaired node has no
-     * hub to bridge to anyway, and pairing success reboots the node
-     * (pair_watch_task), so the coordinator starts on that next boot. */
-    bool want_zigbee = (rr == RADIO_ROLE_ZIGBEE) && node_paired;  /* on_node implied by the remap above */
-    ESP_LOGW(TAG, "radio role: %s (%s)%s%s", radio_role_str(rr),
-             radio_role_is_set() ? "nvs" : "default", on_node ? " [node]" : "",
-             (rr == RADIO_ROLE_ZIGBEE && !node_paired) ? " -- coordinator deferred until paired" : "");
+    ESP_LOGW(TAG, "radio role: %s (%s)%s", radio_role_str(rr),
+             radio_role_is_set() ? "nvs" : "default", on_node ? " [node]" : "");
 
     esp_err_t ble_err = ESP_OK;
     if (want_ble) {
@@ -518,23 +502,6 @@ void app_main(void)
      * and nothing else. ble_collector.c logs two finer milestones inside it. */
     log_heap("after ble_collector_start");
 
-    /* M6b Task 1: the Zigbee coordinator's own stack task, started after
-     * ble_collector_start() so BLE is already up first (this ordering
-     * mirrors the batt_cycle_task placement just below). zigbee_start()
-     * selects the native 15.4 radio and creates the stack task -- it
-     * returns ESP_OK before any network exists, formation/restore and the
-     * WiFi/802.15.4 coexistence call all happen asynchronously through the
-     * signal handler in zigbee.c -- and it is a no-op returning ESP_OK when
-     * CONFIG_PLANTHUB_ZB_ENABLED is off, so this call is unconditional.
-     * Deliberately NOT wrapped in ESP_ERROR_CHECK: a coordinator that
-     * cannot start is a degraded hub, not a boot failure -- it still
-     * collects BLE and serves its web UI (see zigbee.h). */
-    esp_err_t zb_err = ESP_OK;
-    if (want_zigbee) {
-        zb_err = zigbee_start();
-        if (zb_err != ESP_OK) ESP_LOGE(TAG, "Zigbee coordinator failed to start (%s); running without Zigbee", esp_err_to_name(zb_err));
-    }
-
     /* M7 Task 5 (spec §4): a battery-mode paired node runs its wake cycle
      * (scan -> checkin -> sleep) instead of just sitting always-on -- see
      * batt_cycle_task()'s own comment above for why this needs its own
@@ -544,8 +511,7 @@ void app_main(void)
      * node_paired -- see node_started's own comment above: only a node
      * whose swarm_start_node() actually succeeded satisfies
      * swarm_node_battery_cycle()'s precondition. */
-    if (node_started && swarm_store_power_mode() != SWARM_PM_ALWAYS_ON
-        && rr != RADIO_ROLE_ZIGBEE /* a coordinator cannot sleep; swarm_rules enforces the pair */) {
+    if (node_started && swarm_store_power_mode() != SWARM_PM_ALWAYS_ON) {
         if (xTaskCreate(batt_cycle_task, "batt_cycle", 4096, NULL, 2, NULL) != pdPASS) {
             /* Code review fix (issue 5): without this, the node keeps
              * running (nothing else here fails), but sends no CHECKIN at

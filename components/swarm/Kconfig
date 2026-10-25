@@ -17,23 +17,4 @@ config PLANTHUB_WIFI_COUNTRY
         not actually operate in is a regulatory violation. Only set this
         to a code that matches where the hardware will really be used.
 
-config PLANTHUB_ZIGBEE_BRIDGE
-    bool "Zigbee bridge nodes (wireless Zigbee over ESP-NOW)"
-    default n
-    help
-        A Zigbee bridge node is a swarm NODE whose radio role is zigbee: it
-        runs its own Zigbee coordinator and forwards devices and readings to
-        the hub over ESP-NOW. Retired 2026-10 in favour of the two-chip hub
-        (C6 + a wired ESP32-H2 coordinator, CONFIG_PLANTHUB_H2_LINK_ENABLED),
-        which needs none of this.
-
-        When n (the default): the hub keeps no bridge table, routes no bridge
-        commands and ignores bridge frames over ESP-NOW (swarm_bridge_* are
-        "no such bridge" stubs, /api/v1/zigbee lists only the local/H2
-        coordinator); a node never starts a coordinator and boots a stored
-        `zigbee` radio role as `ble`; setting a node to `zigbee` is refused.
-        Plain BLE/wifi_only nodes and the H2 path are unaffected. Saves the
-        bridge table, its I/O buffer and the API scratch (~25 KB of static
-        RAM) on every hub. Needs CONFIG_PLANTHUB_ZB_ENABLED=y to be useful.
-
 endmenu

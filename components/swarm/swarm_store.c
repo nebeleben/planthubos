@@ -1211,13 +1211,18 @@ radio_role_t swarm_store_node_desired_radio(const uint8_t mac[6])
         if (memcmp(s_nodes.n[i].mac, mac, 6) == 0) { r = (radio_role_t)s_nodes.n[i].desired_radio; break; }
     }
     xSemaphoreGive(s_mutex);
+    /* Zigbee bridge nodes are retired (2026-10): a former bridge node's
+     * stored desired role reads as BLE -- what it now boots as anyway
+     * (radio_role_init()) -- so the hub never keeps pushing a NODE_CONFIG
+     * the node can only refuse. */
+    if (r == RADIO_ROLE_ZIGBEE) r = RADIO_ROLE_BLE;
     return r;
 }
 
 esp_err_t swarm_store_set_node_desired_radio(const uint8_t mac[6], radio_role_t r)
 {
     if (!mac) return ESP_ERR_INVALID_ARG;
-    if (r != RADIO_ROLE_BLE && r != RADIO_ROLE_ZIGBEE) return ESP_ERR_INVALID_ARG;
+    if (r != RADIO_ROLE_BLE) return ESP_ERR_INVALID_ARG;   /* zigbee retired 2026-10; wifi_only never valid on a node */
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     nodes_blob_t blob = s_nodes;

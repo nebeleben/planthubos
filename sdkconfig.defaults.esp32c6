@@ -16,7 +16,7 @@ CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 # itself (main.c remaps a hub's zigbee role to BLE); the stack was only here so
 # a C6 could serve as a Zigbee bridge NODE, and bridge nodes are retired in
 # favour of the two-chip hub (C6 + wired ESP32-H2 coordinator, whose own
-# firmware -- h2fw/ -- carries the stack). Dropping it frees the static RAM
+# firmware -- planthubos/h2fw/ -- carries the stack). Dropping it frees the static RAM
 # and heap the BLE hub was starving for. swarm Kconfig PLANTHUB_ZIGBEE_BRIDGE
 # (default n) compiles out the hub/node bridge machinery to match.
 #

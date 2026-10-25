@@ -26,7 +26,7 @@ join its setup WiFi once, and it quietly watches your plants for you:
 Grab the latest firmware from the
 [Releases](https://github.com/nebeleben/planthubos/releases) page and flash
 it to an **ESP32-C6 with 16 MB of flash** (for example a DevKitC-1 carrying an
-ESP32-C6-WROOM-1-**N16** module) or an ESP32-C5 board.
+ESP32-C6-WROOM-1-**N16** module).
 
 > **The C6 build requires the full 16 MB.** Plenty of C6 devkits ship 8 MB or
 > 4 MB parts, and flashing this image to one *appears* to work — every file
@@ -59,22 +59,29 @@ esptool --chip esp32c6 write_flash \
 ```
 
 (Swap `planthub-esp32c6-eu.bin` for the `-us`/`-jp` variant as needed —
-`bootloader`/`partition-table`/`ota_data_initial` don't vary by region,
-only by chip.)
-
-**Do not reuse these offsets for the ESP32-C5.** It is still on the older
-4 MB partition layout, and every offset in the command differs:
-
-```
-esptool --chip esp32c5 write_flash \
-  0x2000 bootloader-esp32c5.bin \
-  0x8000 partition-table-esp32c5.bin \
-  0xf000 ota_data_initial-esp32c5.bin \
-  0x20000 planthub-esp32c5-eu.bin
-```
+`bootloader`/`partition-table`/`ota_data_initial` don't vary by region.)
 
 Then connect to the `PlantHub-XXXX` WiFi it broadcasts and follow the setup
 page. Updates after that happen over the air from the hub's own web page.
+
+### Zigbee: the two-chip hub
+
+Zigbee needs a second board: an **ESP32-H2** wired to the C6 over UART, acting
+as the Zigbee coordinator (wiring: `docs/esplayout/h2-link-wiring.md` in the
+project repository). That hub runs a different C6 image —
+`planthub-esp32c6-h2hub-<region>.bin`, flashed at the same offsets as above —
+plus the H2's own firmware:
+
+```
+esptool --chip esp32h2 write_flash \
+  0x0 bootloader-esp32h2.bin \
+  0x8000 partition-table-esp32h2.bin \
+  0x10000 h2fw-esp32h2.bin
+```
+
+Flash the H2 from its own USB port with the hub's RUN/FLASH switch open. The
+C6 image updates over the air as usual (stay on the `h2hub` image); the H2
+has no over-the-air path yet.
 
 ## Troubleshooting
 

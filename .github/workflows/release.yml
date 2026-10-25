@@ -2,8 +2,11 @@ name: Release firmware
 
 # Tag-triggered firmware release on the PUBLIC mirror. The tag arrives here
 # via the private repo's mirror workflow (which pushes exactly the triggering
-# v*.*.* tag). Builds the web UI once, then the firmware for both supported
-# chips inside the official ESP-IDF container, and publishes a GitHub
+# v*.*.* tag). Builds the web UI once, then inside the official ESP-IDF
+# container: the ESP32-C6 hub firmware in two variants -- `hub` (the
+# single-chip WiFi+BLE hub) and `h2hub` (the two-chip hub's C6, which gets
+# Zigbee from a wired ESP32-H2 coordinator) -- and the H2's own firmware
+# (h2fw/), and publishes a GitHub
 # Release with the binaries.
 #
 # Runs on GitHub-hosted runners: Actions is free for public repos, and a
@@ -47,17 +50,23 @@ jobs:
           if-no-files-found: error
 
   build:
-    name: Build ${{ matrix.chip }} (${{ matrix.region }})
+    name: Build ${{ matrix.chip }} ${{ matrix.variant }} (${{ matrix.region }})
     needs: webui
     runs-on: ubuntu-latest
     container:
-      # v2 builds every chip with one IDF: v5.5+ is required by the esp32c5
-      # (preview-only before that) and by the Zigbee stack M6b adds.
+      # v5.5+ (the IDF this project develops against).
       image: espressif/idf:v5.5.5
     strategy:
       fail-fast: false
       matrix:
-        chip: [esp32c6, esp32c5]
+        # ESP32-C6 only: the C5 leg existed for the Zigbee bridge node,
+        # retired 2026-10.
+        chip: [esp32c6]
+        # hub: single-chip WiFi+BLE hub. h2hub: the two-chip hub's C6 --
+        # sdkconfig.defaults.esp32c6.h2hub on top (h2_link on, no local
+        # Zigbee stack, trimmed BLE pools, DS3231 RTC support). Zigbee only
+        # exists on h2hub, paired with the h2fw job's H2 image.
+        variant: [hub, h2hub]
         # Per-region release builds (M9): each region overlay sets its own
         # CONFIG_PLANTHUB_WIFI_COUNTRY (sdkconfig.region.<region>) -- see
         # PlanV1 8e for why this can't just be one world-safe build. Region
@@ -82,42 +91,49 @@ jobs:
         run: |
           . "$IDF_PATH/export.sh"
           # sdkconfig is not tracked (generated from sdkconfig.defaults);
-          # per-chip-per-region build dirs keep all four matrix legs
-          # independent. SDKCONFIG_DEFAULTS takes a semicolon-separated list
-          # -- sdkconfig.defaults first, the region overlay second so it
-          # wins on the one key they share (CONFIG_PLANTHUB_WIFI_COUNTRY);
-          # IDF still auto-appends each listed file's own
-          # "<file>.<target>" variant (e.g. sdkconfig.defaults.esp32c5) on top
-          # of that, unchanged from the pre-region build.
-          idf.py -B "build_${{ matrix.chip }}_${{ matrix.region }}" \
-                 -D SDKCONFIG="build_${{ matrix.chip }}_${{ matrix.region }}/sdkconfig" \
-                 -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.region.${{ matrix.region }}" \
+          # per-variant-per-region build dirs keep every matrix leg
+          # independent. SDKCONFIG_DEFAULTS takes a semicolon-separated list,
+          # applied in order (later wins): sdkconfig.defaults, the region
+          # overlay (its one key, CONFIG_PLANTHUB_WIFI_COUNTRY), then for
+          # h2hub the two-chip overlay. IDF auto-appends each listed file's
+          # own "<file>.<target>" variant right after it, so
+          # sdkconfig.defaults.esp32c6 lands after sdkconfig.defaults as
+          # before.
+          B="build_${{ matrix.chip }}_${{ matrix.variant }}_${{ matrix.region }}"
+          DEFAULTS="sdkconfig.defaults;sdkconfig.region.${{ matrix.region }}"
+          if [ "${{ matrix.variant }}" = "h2hub" ]; then
+            DEFAULTS="$DEFAULTS;sdkconfig.defaults.esp32c6.h2hub"
+          fi
+          idf.py -B "$B" -D SDKCONFIG="$B/sdkconfig" -D SDKCONFIG_DEFAULTS="$DEFAULTS" \
                  -D IDF_TARGET=${{ matrix.chip }} build 2>&1 | tee build.log
           # Size report: the partition-size check line ("planthub.bin binary
-          # size ... free") lands in the job summary so per-chip headroom is
-          # one click away on every release. The tracked risk is now the
-          # 4 MB esp32c5 leg, which had ~114 KiB free (6%) at M6a and will
-          # overflow its 1792K slot within a milestone or two -- see the
-          # roadmap spec section 9. The 16 MB esp32c6 has ≈2.4 MiB free
-          # today, ≈2.0 MiB with Zigbee.
-          echo '### ${{ matrix.chip }} (${{ matrix.region }})' >> "$GITHUB_STEP_SUMMARY"
+          # size ... free") lands in the job summary so headroom is one click
+          # away on every release. The 16 MB esp32c6 has ample headroom
+          # (≈2.4 MiB free in its app slot).
+          echo '### ${{ matrix.chip }} ${{ matrix.variant }} (${{ matrix.region }})' >> "$GITHUB_STEP_SUMMARY"
           grep -o 'planthub.bin binary size.*' build.log >> "$GITHUB_STEP_SUMMARY" || echo 'size line not found' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect artifacts
         run: |
-          B="build_${{ matrix.chip }}_${{ matrix.region }}"
+          B="build_${{ matrix.chip }}_${{ matrix.variant }}_${{ matrix.region }}"
           OUT="out"; mkdir -p "$OUT"
-          cp "$B/planthub.bin" "$OUT/planthub-${{ matrix.chip }}-${{ matrix.region }}.bin"
-          # bootloader/partition-table/ota_data are region-independent (the
-          # region overlay only touches CONFIG_PLANTHUB_WIFI_COUNTRY, which
-          # affects app.bin's embedded Kconfig value, not these three) --
-          # their filenames deliberately carry no region suffix. Emitting
-          # them from every region leg would make two same-chip legs upload
-          # identically-named files (e.g. bootloader-esp32c6.bin from both the
-          # eu and us legs); the release job's merge-multiple download
-          # writes all artifacts into one flat directory, so that would
-          # collide. Emit them from exactly one region per chip (eu) instead.
-          if [ "${{ matrix.region }}" = "eu" ]; then
+          # hub keeps the historic name (planthub-esp32c6-<region>.bin), so an
+          # existing hub's OTA upload is unchanged; the two-chip image carries
+          # its variant in the name.
+          if [ "${{ matrix.variant }}" = "hub" ]; then
+            APP="planthub-${{ matrix.chip }}-${{ matrix.region }}.bin"
+          else
+            APP="planthub-${{ matrix.chip }}-${{ matrix.variant }}-${{ matrix.region }}.bin"
+          fi
+          cp "$B/planthub.bin" "$OUT/$APP"
+          # bootloader/partition-table/ota_data are region- AND variant-
+          # independent: same partitions_16m.csv, same bootloader config (the
+          # two variants' bootloaders differ only in their embedded build time
+          # and image hash). Their filenames carry no region/variant suffix,
+          # and emitting them from several legs would make identically-named
+          # uploads collide in the release job's merge-multiple download -- so
+          # emit them from exactly one leg (hub, eu).
+          if [ "${{ matrix.variant }}" = "hub" ] && [ "${{ matrix.region }}" = "eu" ]; then
             cp "$B/bootloader/bootloader.bin"           "$OUT/bootloader-${{ matrix.chip }}.bin"
             cp "$B/partition_table/partition-table.bin" "$OUT/partition-table-${{ matrix.chip }}.bin"
             cp "$B/ota_data_initial.bin"                "$OUT/ota_data_initial-${{ matrix.chip }}.bin"
@@ -127,13 +143,53 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ matrix.chip }}-${{ matrix.region }}
+          name: firmware-${{ matrix.chip }}-${{ matrix.variant }}-${{ matrix.region }}
+          path: out/
+          if-no-files-found: error
+
+  h2fw:
+    # The two-chip hub's ESP32-H2 Zigbee coordinator (h2fw/). Built once: the
+    # H2 runs no WiFi, so there is no region variant. It reuses the planthubos
+    # components (zigbee, data_core, ...) via EXTRA_COMPONENT_DIRS, and its
+    # Zigbee libraries come from the IDF component manager (h2fw/main/
+    # idf_component.yml), fetched at build time.
+    name: Build esp32h2 h2fw
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.5
+    steps:
+      - name: Checkout firmware at tag
+        uses: actions/checkout@v4
+
+      - name: Mark workspace safe (container UID mismatch)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build
+        run: |
+          . "$IDF_PATH/export.sh"
+          cd h2fw
+          idf.py -B build_h2 -D SDKCONFIG=build_h2/sdkconfig -D IDF_TARGET=esp32h2 build 2>&1 | tee build.log
+          echo '### esp32h2 h2fw' >> "$GITHUB_STEP_SUMMARY"
+          grep -o 'h2fw.bin binary size.*' build.log >> "$GITHUB_STEP_SUMMARY" || echo 'size line not found' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect artifacts
+        run: |
+          OUT="out"; mkdir -p "$OUT"
+          cp h2fw/build_h2/h2fw.bin                          "$OUT/h2fw-esp32h2.bin"
+          cp h2fw/build_h2/bootloader/bootloader.bin           "$OUT/bootloader-esp32h2.bin"
+          cp h2fw/build_h2/partition_table/partition-table.bin "$OUT/partition-table-esp32h2.bin"
+          ls -la "$OUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-esp32h2-h2fw
           path: out/
           if-no-files-found: error
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, h2fw]
     runs-on: ubuntu-latest
     steps:
       - name: Download all firmware artifacts
@@ -149,23 +205,27 @@ jobs:
           cat > notes.md <<'NOTES'
           ## Which file do I need?
 
-          | You are in | App image |
-          |---|---|
-          | Europe / UK / most of the world (channels 1-13) | `planthub-<chip>-eu.bin` |
-          | United States / Canada (channels 1-11) | `planthub-<chip>-us.bin` |
-          | Japan (channels 1-14) | `planthub-<chip>-jp.bin` |
+          | Your hub | C6 app image | Also flash |
+          |---|---|---|
+          | Single-chip C6 hub (WiFi + BLE) | `planthub-esp32c6-<region>.bin` | — |
+          | Two-chip hub (C6 + ESP32-H2, adds Zigbee) | `planthub-esp32c6-h2hub-<region>.bin` | `h2fw-esp32h2.bin` on the H2 |
 
-          `<chip>` is `esp32c6` or `esp32c5`, matching your board. The region can
-          also be changed later on the hub's Config page. Using a build for a
-          region you are not in is a regulatory violation.
+          | You are in | `<region>` |
+          |---|---|
+          | Europe / UK / most of the world (channels 1-13) | `eu` |
+          | United States / Canada (channels 1-11) | `us` |
+          | Japan (channels 1-14) | `jp` |
+
+          The region can also be changed later on the hub's Config page. Using a
+          build for a region you are not in is a regulatory violation.
 
           The `bootloader-*`, `partition-table-*` and `ota_data_initial-*`
-          files are the same for every region and only needed for a first
-          install over USB.
+          files don't vary by region (or, on the C6, by variant) and are only
+          needed for a first install over USB.
 
           ## First install (USB)
 
-          ESP32-C6 (16 MB, the reference hub):
+          ESP32-C6 (16 MB) -- either variant, swap the app image as needed:
           ```
           esptool --chip esp32c6 write_flash \
             0x0 bootloader-esp32c6.bin \
@@ -174,14 +234,13 @@ jobs:
             0x30000 planthub-esp32c6-eu.bin
           ```
 
-          ESP32-C5 (4 MB, and every offset differs — it is still on the
-          older 4 MB layout):
+          ESP32-H2 (two-chip hub only). With the hub's RUN/FLASH switch open
+          (FLASH), plug the H2's own USB:
           ```
-          esptool --chip esp32c5 write_flash \
-            0x2000 bootloader-esp32c5.bin \
-            0x8000 partition-table-esp32c5.bin \
-            0xf000 ota_data_initial-esp32c5.bin \
-            0x20000 planthub-esp32c5-eu.bin
+          esptool --chip esp32h2 write_flash \
+            0x0 bootloader-esp32h2.bin \
+            0x8000 partition-table-esp32h2.bin \
+            0x10000 h2fw-esp32h2.bin
           ```
 
           Then join the `PlantHub-XXXX` WiFi the device broadcasts and follow
@@ -189,9 +248,12 @@ jobs:
 
           ## Updating an existing hub
 
-          No cables needed: open the hub's web page, Config tab, "Choose
-          firmware..." and upload just the `planthub-<chip>-<region>.bin`.
-          Paired nodes are then updated over the air from the Nodes tab.
+          No cables needed for the C6: open the hub's web page, Config tab,
+          "Choose firmware..." and upload the same variant you run now
+          (`planthub-esp32c6-<region>.bin` or `planthub-esp32c6-h2hub-<region>.bin`).
+          Paired nodes are then updated over the air from the Nodes tab. The
+          H2 has no over-the-air path yet: update it over USB as above, and
+          only when the release notes say its firmware changed.
           NOTES
           gh release create "${{ github.ref_name }}" assets/* \
             --repo "${{ github.repository }}" \

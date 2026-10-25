@@ -2,7 +2,6 @@ menu "PlantHub Wrappers"
 
 config PLANTHUB_WRAPPER_ARENA
     int "Wrapper bytecode arena size (bytes)"
-    default 4096 if IDF_TARGET_ESP32C5
     default 4096 if IDF_TARGET_ESP32C6
     default 2048
     help
@@ -16,8 +15,7 @@ config PLANTHUB_WRAPPER_ARENA
         several of them resident at once; only a pathological near-2 KB
         wrapper fills it alone.
 
-        Both supported targets take 4096 (the C6 has 512 KB SRAM, the C5
-        384 KB). The trailing 2048 is Kconfig's terminal default for an
+        The C6 (512 KB SRAM) takes 4096. The trailing 2048 is Kconfig's terminal default for an
         unlisted target, and is also the value tests/host/test_wrapper_arena.c
         exercises -- deliberately the tighter number, so packing and
         eviction are actually stressed by the host test rather than being

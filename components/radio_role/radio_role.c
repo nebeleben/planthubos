@@ -16,8 +16,6 @@ radio_role_t radio_role_default(void)
 {
 #if CONFIG_PLANTHUB_RADIO_ROLE_BLE
     return RADIO_ROLE_BLE;
-#elif CONFIG_PLANTHUB_RADIO_ROLE_ZIGBEE
-    return RADIO_ROLE_ZIGBEE;
 #else
     return RADIO_ROLE_WIFI_ONLY;
 #endif
@@ -57,20 +55,16 @@ esp_err_t radio_role_init(void)
         ESP_LOGW(TAG, "nvs_get_str(\"%s\") failed (%s); treating as unset (default %s)",
                  KEY, esp_err_to_name(err), radio_role_str(s_role));
     }
-#if !CONFIG_PLANTHUB_ZIGBEE_BRIDGE
-    /* Zigbee bridge nodes are compiled out (swarm Kconfig
-     * PLANTHUB_ZIGBEE_BRIDGE): no board in this build may run a coordinator
-     * as its radio role, so a `zigbee` left in NVS (a former bridge node) or
-     * a zigbee build default runs as BLE instead. Done here, at the source,
-     * so every radio_role_get() caller -- main.c's radio bring-up and
-     * swarm.c's node-side bridge paths alike -- sees BLE and nothing starts
-     * a coordinator. NVS is left untouched: re-enabling bridges restores
-     * the stored role. (A hub already remapped zigbee -> BLE in main.c.) */
+    /* No board runs a zigbee radio role any more: Zigbee bridge nodes were
+     * retired 2026-10 (Zigbee now comes from the two-chip hub's wired H2).
+     * A `zigbee` left in NVS by a former bridge node runs as BLE instead --
+     * done here, at the source, so every radio_role_get() caller sees BLE
+     * and nothing ever starts a coordinator. NVS is left as it was; the next
+     * radio_role_set() (onboarding, or the hub's NODE_CONFIG) overwrites it. */
     if (s_role == RADIO_ROLE_ZIGBEE) {
-        ESP_LOGW(TAG, "radio_role zigbee: Zigbee bridge support is not in this build; running as ble");
+        ESP_LOGW(TAG, "radio_role zigbee is retired (no Zigbee bridge nodes); running as ble");
         s_role = RADIO_ROLE_BLE;
     }
-#endif
     ESP_LOGI(TAG, "radio_role=%s (%s)", radio_role_str(s_role), s_set ? "nvs" : "default");
     return ESP_OK;
 }
@@ -81,10 +75,8 @@ bool         radio_role_is_set(void) { return s_set; }
 esp_err_t radio_role_set(radio_role_t role)
 {
     if ((int)role < 0 || (int)role > (int)RADIO_ROLE_ZIGBEE) return ESP_ERR_INVALID_ARG;
-#if !CONFIG_PLANTHUB_ZIGBEE_BRIDGE
-    /* See radio_role_init(): no zigbee radio role without bridge support. */
+    /* See radio_role_init(): zigbee is retired as a radio role. */
     if (role == RADIO_ROLE_ZIGBEE) return ESP_ERR_NOT_SUPPORTED;
-#endif
     s_role = role;
     s_set = true;
 

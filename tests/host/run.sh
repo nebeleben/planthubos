@@ -336,22 +336,6 @@ $CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/sw
     test_swarm_rules.c ../../components/swarm/swarm_rules.c -o test_swarm_rules
 ./test_swarm_rules
 
-# Hub-side bridge table (M7 Task 7): upsert/remove/find/serialize round
-# trip. Pure C, links swarm_frame.c for the device-announce codec its
-# serialize/deserialize reuse.
-$CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/swarm_codec/include \
-    test_bridge_table.c ../../components/swarm/bridge_table.c ../../components/swarm_codec/swarm_frame.c -o test_bridge_table
-./test_bridge_table
-
-# Hub-side command router (M7 Task 8): per-node submit/in-flight refusal,
-# retry timing, ack correlation (ACCEPTED/DONE/FAILED, duplicate/unknown
-# seq ignored) and TTL expiry. Pure C -- links swarm_frame.c for
-# swarm_command_ack_t's SWARM_ACK_* values only (no encode/decode needed
-# here, bridge_cmd.c never touches the wire format itself).
-$CC -Wall -Wextra -Werror -I../../components/swarm/include -I../../components/swarm_codec/include \
-    test_bridge_cmd.c ../../components/swarm/bridge_cmd.c -o test_bridge_cmd
-./test_bridge_cmd
-
 # Hub-side Tuya EF00 observed-datapoint + mapping store (Task 4): RAM store
 # find-or-insert/LRU (registry.c-shaped) plus a CRC-16 persisted mapping
 # table (wrapper_bind.c-shaped). Links capability.c+device_id.c for

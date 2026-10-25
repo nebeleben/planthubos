@@ -1,21 +1,14 @@
-/* swarm_ingest.h -- the transport-neutral ingest of the four Zigbee bridge
+/* swarm_ingest.h -- the transport-neutral ingest of the four Zigbee device
  * frames (announce / device-gone / measurement / tuya-dp) into data_core +
  * the actor table + the dev_profiles mapping engine.
  *
- * Lifted VERBATIM from swarm.c's bridge_task switch so the ESP-NOW path and
- * the wired-UART (H2) path cannot diverge: whatever the hub does with a frame
- * arriving over ESP-NOW from a wireless bridge, it does identically with the
- * same frame arriving over the UART from the local H2 coordinator. The only
- * difference is attribution: `via_mac` is the forwarding node's MAC for the
- * ESP-NOW path, or NULL for the LOCAL radio (the H2) -- NULL means "this hub's
- * own coordinator", so no data_core_set_via() node attribution is recorded.
- *
- * Pure of transport and of swarm's own bridge-table/persist state: the
- * bridge_table upsert/remove and mark_bridge_dirty() stay in swarm.c (they are
- * ESP-NOW routing/persistence state the local radio has no equivalent of).
- * These functions take data_core's / the actor table's own locks as the
- * original bodies did; callers may hold swarm's s_bridges_mutex across them
- * (the ESP-NOW path does) or no lock at all (the UART path). */
+ * Originally lifted from the (since retired, 2026-10) wireless Zigbee bridge
+ * node's hub-side task; today its one caller is h2_link.c, which feeds it the
+ * frames the two-chip hub's wired H2 coordinator sends over the UART.
+ * `via_mac` is the forwarding node's MAC, or NULL for the hub's own (local)
+ * radio -- the H2 -- in which case no data_core_set_via() node attribution is
+ * recorded. These functions take data_core's / the actor table's own locks;
+ * callers need hold no lock. */
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>

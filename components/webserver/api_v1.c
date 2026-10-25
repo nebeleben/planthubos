@@ -14,7 +14,6 @@
 #include "h2_link.h"
 #endif
 #include "swarm_store.h"
-#include "bridge_table.h"
 #include "ble_collector.h"
 #include "node_ota.h"
 #include "pairing.h"
@@ -73,17 +72,6 @@ static plants_table_t s_api_plant_snap;
  * rather than joining that pair's comment. */
 static zb_device_t s_api_zb_snap[ZB_STORE_MAX_DEVICES];
 
-#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
-/* Task 9: zigbee_get()'s one-node scratch for swarm_bridge_node_at() (the
- * hub's bridge-node bookkeeping, bridge_table.h). One bridge_node_t (up to
- * BRIDGE_MAX_DEVICES(16) swarm_device_announce_t records, ~2.3 KB) rather
- * than the whole BRIDGE_MAX_NODES table (~14 KB) it used to copy -- the
- * coordinator list is built one node at a time anyway (2026-10 heap
- * reclaim). Still too big for the httpd task stack alongside cJSON work,
- * and safe as a file-static for the same reason as s_api_zb_snap above:
- * esp_http_server serialises every handler on one task. */
-static bridge_node_t s_api_bridge_node;
-#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
 
 /* Task 8 (device-mapping-profiles): shared by profiles_list_get()/
  * profiles_key_get()/profiles_key_put()/profiles_key_delete()/
@@ -91,7 +79,7 @@ static bridge_node_t s_api_bridge_node;
  * (32) * sizeof(dev_profile_t) is close to 12KB, far past the httpd task's
  * 8KB stack (cfg.stack_size, webserver.c), same file-static-because-
  * one-handler-at-a-time reasoning as s_api_reg_snap/s_api_plant_snap/
- * s_api_zb_snap/s_api_bridge_node above. Every reader calls
+ * s_api_zb_snap above. Every reader calls
  * dev_profile_user_load() to refresh it before use -- there is no cross-
  * request caching here, just a shared scratch buffer. */
 static dev_profile_store_t s_api_profile_store;
@@ -247,15 +235,6 @@ static esp_err_t status_get(httpd_req_t *req)
      * is what app.jsx keys its onboarding radio picker on. */
     cJSON_AddStringToObject(root, "radio_role", radio_role_str(radio_role_get()));
     cJSON_AddBoolToObject(root, "radio_role_set", radio_role_is_set());
-    /* Whether this firmware supports Zigbee bridge nodes at all (swarm
-     * Kconfig PLANTHUB_ZIGBEE_BRIDGE) -- the webUI hides the "Zigbee bridge"
-     * onboarding choice and the zigbee option of a node's radio-role select
-     * when false. */
-#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
-    cJSON_AddBoolToObject(root, "zigbee_bridge", true);
-#else
-    cJSON_AddBoolToObject(root, "zigbee_bridge", false);
-#endif
     /* Node: paired to a hub. Unset/main: has at least one node paired to it. */
     bool paired = (role == SWARM_ROLE_NODE) ? swarm_store_hub(NULL, NULL, NULL)
                                              : swarm_store_node_count() > 0;
@@ -1247,16 +1226,14 @@ static esp_err_t node_update_post(httpd_req_t *req, const uint8_t mac[6])
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad radio_role");
             return ESP_OK;
         }
-#if !CONFIG_PLANTHUB_ZIGBEE_BRIDGE
-        /* Zigbee bridge nodes are not supported by this build (swarm Kconfig
-         * PLANTHUB_ZIGBEE_BRIDGE) -- a node told to go zigbee would refuse
-         * it anyway (radio_role_set()), so say so here instead. */
+        /* Zigbee bridge nodes are retired (2026-10; Zigbee comes from the
+         * two-chip hub's wired H2): a node told to go zigbee would refuse it
+         * anyway (radio_role_set()), so say so here instead. */
         if (rr == RADIO_ROLE_ZIGBEE) {
             cJSON_Delete(json);
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "zigbee radio role is not supported by this firmware");
             return ESP_OK;
         }
-#endif
         have_radio = true;
     }
     /* Symmetric with power_mode/radio_role above: a PRESENT-but-wrong-type
@@ -1855,10 +1832,9 @@ static esp_err_t config_post(httpd_req_t *req)
             httpd_resp_sendstr(req, "{\"error\":\"bad radio_role\"}");
             return ESP_OK;
         }
-#if !CONFIG_PLANTHUB_ZIGBEE_BRIDGE
-        /* No zigbee radio role without bridge support (swarm Kconfig
-         * PLANTHUB_ZIGBEE_BRIDGE): radio_role_set() would refuse it, and this
-         * handler would otherwise just log that and reboot into the old role. */
+        /* No board runs a zigbee radio role any more (bridge nodes retired
+         * 2026-10): radio_role_set() refuses it, and this handler would
+         * otherwise just log that and reboot into the old role. */
         if (rr == RADIO_ROLE_ZIGBEE) {
             cJSON_Delete(json);
             httpd_resp_set_status(req, "400 Bad Request");
@@ -1866,7 +1842,6 @@ static esp_err_t config_post(httpd_req_t *req)
             httpd_resp_sendstr(req, "{\"error\":\"zigbee radio role is not supported by this firmware\"}");
             return ESP_OK;
         }
-#endif
         bool unchanged = (rr == radio_role_get());
         esp_err_t rr_err = radio_role_set(rr);
         if (rr_err != ESP_OK) {
@@ -4975,90 +4950,6 @@ static cJSON *zb_device_json(const zb_device_t *d)
     return o;
 }
 
-#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
-/* Renders one bridge-announced end device (swarm_device_announce_t,
- * swarm_frame.h) close to the shape zb_device_json() above renders a
- * locally-joined one -- same id (via device_id_format(), reused directly:
- * a DEV_KIND_ZIGBEE id over the 8-byte eui64 is identical whether the
- * device joined the hub's own coordinator or a bridge node's), same
- * caps/actions name lookup. Differs in what a bridge node's COORD_STATUS/
- * ANNOUNCE frames don't carry: short_addr (null -- the bridge never
- * forwards it) and clusters (always empty -- the auto-map's per-cluster
- * bookkeeping, zb_device_json()'s "clusters" comment above, lives on the
- * bridge node, not in what it announces upstream); and in caps/actions
- * themselves (M8 Task 9): each entry is an object carrying its own
- * "endpoint" (v5's swarm_device_announce_t has no device-wide scalar left
- * to report, see this function's body), not the bare name string
- * zb_device_json() puts in its own caps/actions arrays. name is copied
- * through name_len rather than trusted to be NUL-terminated within its
- * fixed-size array -- see swarm_device_announce_t's own field comment. */
-static cJSON *announce_device_json(const swarm_device_announce_t *a)
-{
-    device_id_t id;
-    id.kind = (uint8_t)DEV_KIND_ZIGBEE;
-    memcpy(id.addr, a->dev.addr, sizeof id.addr);
-    char idbuf[24];
-    device_id_format(&id, idbuf, sizeof(idbuf));
-
-    char namebuf[SWARM_DEV_NAME_MAX + 1];
-    uint8_t nlen = a->name_len > SWARM_DEV_NAME_MAX ? SWARM_DEV_NAME_MAX : a->name_len;
-    memcpy(namebuf, a->name, nlen);
-    namebuf[nlen] = '\0';
-
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "id", idbuf);
-    cJSON_AddStringToObject(o, "name", namebuf);
-    cJSON_AddBoolToObject(o, "interviewed", a->interviewed != 0);
-    cJSON_AddNullToObject(o, "short_addr");
-
-    /* M8 Task 9: v5's swarm_device_announce_t dropped the single scalar
-     * `endpoint` in favour of a per-cap/per-action endpoint (Task 3) --
-     * there is no device-wide scalar left to report at top level, so each
-     * cap/action entry below carries its own "endpoint" field instead,
-     * the same field name devices_json.c's device_json() (Task 9's other
-     * caller) puts on every cap/action object. A single-endpoint device
-     * simply has every entry read endpoint 1. */
-    cJSON *caps = cJSON_AddArrayToObject(o, "caps");
-    for (uint8_t i = 0; i < a->cap_count; i++) {
-        const capability_t *cap = capability_get(a->cap_ids[i]);
-        cJSON *co = cJSON_CreateObject();
-        cJSON_AddStringToObject(co, "name", cap ? cap->name : "?");
-        cJSON_AddNumberToObject(co, "endpoint", a->cap_endpoints[i]);
-        cJSON_AddItemToArray(caps, co);
-    }
-
-    cJSON *actions = cJSON_AddArrayToObject(o, "actions");
-    for (uint8_t i = 0; i < a->action_count; i++) {
-        const action_t *act = action_get(a->action_ids[i]);
-        cJSON *ao = cJSON_CreateObject();
-        cJSON_AddStringToObject(ao, "name", act ? act->name : "?");
-        cJSON_AddNumberToObject(ao, "endpoint", a->action_endpoints[i]);
-        cJSON_AddItemToArray(actions, ao);
-    }
-
-    cJSON_AddArrayToObject(o, "clusters");
-
-    /* device-mapping-profiles Task 8: fingerprint (v6 swarm_device_announce_t,
-     * length-prefixed like `name`/namebuf above) -- manuf_len/model_len are
-     * NOT guaranteed NUL-terminated when they fill the field exactly
-     * (SWARM_DEV_STR_MAX), so copy through a local buffer the same way
-     * `namebuf` above does, rather than trusting the raw array. Omitted
-     * entirely when neither has ever been announced, same as
-     * zb_device_json()'s own choice just above. */
-    if (a->manuf_len || a->model_len) {
-        char manuf[SWARM_DEV_STR_MAX + 1], model[SWARM_DEV_STR_MAX + 1];
-        uint8_t mlen = a->manuf_len > SWARM_DEV_STR_MAX ? SWARM_DEV_STR_MAX : a->manuf_len;
-        memcpy(manuf, a->manufacturer, mlen);
-        manuf[mlen] = '\0';
-        uint8_t dlen = a->model_len > SWARM_DEV_STR_MAX ? SWARM_DEV_STR_MAX : a->model_len;
-        memcpy(model, a->model, dlen);
-        model[dlen] = '\0';
-        cJSON_AddStringToObject(o, "manufacturer", manuf);
-        cJSON_AddStringToObject(o, "model", model);
-    }
-    return o;
-}
-#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
 
 /* The hub's own coordinator entry (zigbee_get() below), when this hub runs
  * the zigbee radio role -- NULL (no entry at all) otherwise, same
@@ -5126,56 +5017,13 @@ static cJSON *coordinator_json_local(void)
 #endif
 }
 
-#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
-/* One bridge node's coordinator entry -- "node" is its MAC12, "name" its
- * swarm_store_node_name() (null when unset, same as an unnamed node reads
- * everywhere else this store is surfaced), and every status field comes
- * from its last COORD_STATUS (status_valid false -- never heard one yet --
- * reads as "enabled": false with every other status field at its
- * zero-initialised default, the same "nothing to report" posture
- * coordinator_json_local() above uses for a disabled/not-started local
- * stack). "reported_role" is this bridge's own radio role as it last
- * reported it, not assumed -- a bridge node is always configured zigbee,
- * but this is what it actually told the hub. */
-static cJSON *coordinator_json_bridge(const bridge_node_t *b)
-{
-    cJSON *c = cJSON_CreateObject();
-    char mac12[13];
-    snprintf(mac12, sizeof mac12, "%02x%02x%02x%02x%02x%02x",
-             b->mac[0], b->mac[1], b->mac[2], b->mac[3], b->mac[4], b->mac[5]);
-    cJSON_AddStringToObject(c, "node", mac12);
 
-    char name[SWARM_NODE_NAME_LEN + 1];
-    if (swarm_store_node_name(b->mac, name) && name[0]) {
-        cJSON_AddStringToObject(c, "name", name);
-    } else {
-        cJSON_AddNullToObject(c, "name");
-    }
-
-    cJSON_AddBoolToObject(c, "enabled", b->status_valid);
-    cJSON_AddBoolToObject(c, "formed", b->status_valid && b->status.formed);
-    cJSON_AddNumberToObject(c, "channel", b->status_valid ? b->status.channel : 0);
-    cJSON_AddNumberToObject(c, "pan_id", b->status_valid ? b->status.pan_id : 0);
-    cJSON_AddNumberToObject(c, "permit_s", b->status_valid ? b->status.permit_s : 0);
-    cJSON_AddStringToObject(c, "reported_role",
-                            b->status_valid ? radio_role_str((radio_role_t)b->status.radio_role)
-                                            : "unknown");
-
-    cJSON *devices = cJSON_AddArrayToObject(c, "devices");
-    for (uint8_t i = 0; i < b->count; i++) {
-        cJSON_AddItemToArray(devices, announce_device_json(&b->dev[i]));
-    }
-    return c;
-}
-#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
-
-/* GET /api/v1/zigbee -- every coordinator this hub knows about (spec §5.3):
- * its own, when it runs the zigbee radio role (coordinator_json_local()),
- * followed by one entry per bridge node it has ever heard a COORD_STATUS/
- * device announce from (swarm_bridge_node_at(), in table order, skipping
- * !in_use slots). A wifi_only hub with no bridges ever seen reports
- * {"coordinators":[]}. Unauthenticated, like every GET in this file
- * (devices_send_chunked()'s comment above). */
+/* GET /api/v1/zigbee -- the hub's own coordinator, if it has one
+ * (coordinator_json_local(): on the two-chip hub, the wired H2). A hub with
+ * no coordinator reports {"coordinators":[]}. Still a list, so the shape is
+ * the same one the retired wireless bridge nodes used to append to.
+ * Unauthenticated, like every GET in this file (devices_send_chunked()'s
+ * comment above). */
 static esp_err_t zigbee_get(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
@@ -5183,14 +5031,6 @@ static esp_err_t zigbee_get(httpd_req_t *req)
 
     cJSON *local = coordinator_json_local();
     if (local) cJSON_AddItemToArray(coordinators, local);
-
-#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
-    for (int i = 0; i < BRIDGE_MAX_NODES; i++) {
-        if (swarm_bridge_node_at(i, &s_api_bridge_node)) {
-            cJSON_AddItemToArray(coordinators, coordinator_json_bridge(&s_api_bridge_node));
-        }
-    }
-#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
 
     return send_json(req, root);
 }
@@ -5203,15 +5043,10 @@ static esp_err_t zigbee_get(httpd_req_t *req)
  * on -- disabled build, stack not started, or not yet formed all read the
  * same to the caller -- reported 409, the same "state doesn't allow this
  * right now" posture node_ota_start_post()/node_ota_abort_post() above use
- * for their own single-in-flight-session conflicts. A MAC12 node instead
- * routes to that bridge node's own window via swarm_bridge_permit():
- * ESP_ERR_NOT_FOUND (never heard from this mac) -> 404; ESP_ERR_INVALID_STATE
- * (a command already in flight for it, or this hub has no bridge task at
- * all) -> 409 via send_409(), same shape as the local 409 above; anything
- * else that isn't ESP_OK is this call's own internal failure -> 500. A
- * successful bridge permit only QUEUES the PERMIT_JOIN (swarm.h's own doc
- * comment on swarm_bridge_permit()) so the answer carries "queued" rather
- * than a permit_s countdown the hub cannot yet know. */
+ * for their own single-in-flight-session conflicts. A MAC12 node used to
+ * address a wireless Zigbee bridge node's window; bridge nodes are retired
+ * (2026-10), so any MAC12 is now "unknown bridge node" (404) -- kept as a
+ * clear answer for an old client rather than a silent local permit. */
 static esp_err_t zigbee_permit_post(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
@@ -5258,26 +5093,8 @@ static esp_err_t zigbee_permit_post(httpd_req_t *req)
     }
 
     if (have_mac) {
-        esp_err_t err = swarm_bridge_permit(mac);
-        if (err == ESP_ERR_NOT_FOUND) {
-            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown bridge node");
-            return ESP_OK;
-        }
-        if (err == ESP_ERR_INVALID_STATE) {
-            return send_409(req, "a command is already in flight for this node");
-        }
-        if (err != ESP_OK) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "permit failed");
-            return ESP_OK;
-        }
-        char mac12[13];
-        snprintf(mac12, sizeof mac12, "%02x%02x%02x%02x%02x%02x",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        cJSON *root = cJSON_CreateObject();
-        cJSON_AddBoolToObject(root, "ok", true);
-        cJSON_AddBoolToObject(root, "queued", true);
-        cJSON_AddStringToObject(root, "node", mac12);
-        return send_json(req, root);
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown bridge node");
+        return ESP_OK;
     }
 
 #if CONFIG_PLANTHUB_H2_LINK_ENABLED
@@ -5333,46 +5150,40 @@ static bool zb_devices_parse_id(httpd_req_t *req, const char *tail, uint8_t eui6
     return true;
 }
 
-/* Shared by zigbee_devices_post()/zigbee_devices_delete() below (Task 9):
- * once the local zigbee store has already said "no such device" (or
- * disabled/not started -- both read the same), looks eui64 up across
- * every bridge node's own announced devices via swarm_bridge_find_owner().
- * Returns false (no bridge owns it either -- the caller's existing 404
- * stands) or true with the owning node's mac in mac_out, which the caller
- * passes straight to swarm_bridge_rename/remove(). */
-static bool zb_devices_find_bridge_owner(const uint8_t eui64[8], uint8_t mac_out[6])
+/* Shared by zigbee_devices_post()/zigbee_devices_delete() below, once the
+ * hub's own (local) zigbee store has said "no such device" -- which on the
+ * two-chip hub is always, since its Zigbee stack runs on the wired H2, not
+ * here. Routes the rename/remove to the H2 (h2_link_rename()/remove(); the
+ * H2 owns the joined-device table, and answers with a re-announce or a
+ * DEVICE_GONE over the UART) and sends exactly one response: 404 for a
+ * device this hub has never registered, 409 while the H2 is not responding
+ * (h2_link_alive()), else {"ok":true,"queued":true} -- queued, because the
+ * outcome arrives asynchronously from the H2. Without an H2 (single-chip
+ * hub) the device is simply unknown -> 404. (This used to fall back to the
+ * wireless Zigbee bridge nodes, retired 2026-10 -- and never reached the H2
+ * at all, so neither route worked on the two-chip hub before.) */
+static esp_err_t zb_devices_route_h2(httpd_req_t *req, const uint8_t eui64[8], const char *rename_to)
 {
-    swarm_dev_addr_t d = { .kind = DEV_KIND_ZIGBEE };
-    memcpy(d.addr, eui64, 8);
-    return swarm_bridge_find_owner(&d, mac_out);
-}
-
-/* Maps a swarm_bridge_permit/remove/rename() result to the response this
- * file's bridge-routed handlers share: ESP_OK -> {"ok":true,"queued":true}
- * (already sent, ESP_OK returned to the caller to return in turn);
- * ESP_ERR_NOT_FOUND -> 404 (this mac is not a bridge node this hub has
- * ever heard from -- can only mean it dropped out of s_bridges between the
- * lookup and this call, since the caller just found it there);
- * ESP_ERR_INVALID_STATE -> 409 via send_409(), same "a command is already
- * in flight" shape POST /api/v1/zigbee/permit's own bridge path uses;
- * anything else is this call's own internal failure -> 500. Every branch
- * sends exactly one response. */
-static esp_err_t zb_bridge_cmd_respond(httpd_req_t *req, esp_err_t err, const char *verb_failed_msg)
-{
-    if (err == ESP_ERR_NOT_FOUND) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown bridge node");
+#if CONFIG_PLANTHUB_H2_LINK_ENABLED
+    device_id_t id = { .kind = DEV_KIND_ZIGBEE };
+    memcpy(id.addr, eui64, 8);
+    if (data_core_find_index(&id) < 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown zigbee device");
         return ESP_OK;
     }
-    if (err == ESP_ERR_INVALID_STATE) {
-        return send_409(req, "a command is already in flight for this node");
+    if (!h2_link_alive()) {
+        return send_409(req, "Zigbee coordinator (H2) is not responding");
     }
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, verb_failed_msg);
-        return ESP_OK;
-    }
+    if (rename_to) h2_link_rename(eui64, rename_to);
+    else           h2_link_remove(eui64);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true,\"queued\":true}");
     return ESP_OK;
+#else
+    (void)eui64; (void)rename_to;
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown zigbee device");
+    return ESP_OK;
+#endif
 }
 
 /* POST /api/v1/zigbee/devices/{id}/identify -- triggers the Basic-cluster
@@ -5386,10 +5197,9 @@ static esp_err_t zb_bridge_cmd_respond(httpd_req_t *req, esp_err_t err, const ch
  * of a 202 that lied. A found device gets 202 Accepted: the read itself is
  * fire-and-forget (the answer lands asynchronously on
  * zb_handle_read_attr_resp() and re-announces the device, per zigbee.h),
- * so this handler cannot wait for it. Local-store-only, deliberately NOT
- * extended to a bridge-owned device (unlike rename/remove just below): a
- * bridge node's own on-demand identity re-read is out of this task's scope
- * (no swarm_bridge_* verb for it exists yet). */
+ * so this handler cannot wait for it. Local-store-only: unlike
+ * rename/remove just below, not yet routed to the two-chip hub's H2 (the
+ * UART link has no identify command). */
 static esp_err_t zigbee_identify_post(httpd_req_t *req, const char *idbuf)
 {
     device_id_t id;
@@ -5412,10 +5222,8 @@ static esp_err_t zigbee_identify_post(httpd_req_t *req, const char *idbuf)
  * sensors_rename_post()'s "bad name" shape above). The local zigbee store
  * (zigbee_device_rename(), Task 6) is tried first -- it collapses "unknown
  * eui64" and "Zigbee disabled/not started" into one false (zigbee.h's own
- * doc comment) -- and only on that false does Task 9's bridge-owner lookup
- * run: found -> swarm_bridge_rename() (zb_bridge_cmd_respond() above maps
- * the result); not found anywhere -> the same 404 this route always sent
- * for an unknown device.
+ * doc comment) -- and only on that false does zb_devices_route_h2() above
+ * run (the two-chip hub's H2; 404 for an unknown device either way).
  *
  * Task 8's ".../identify" suffix is checked FIRST, before
  * zb_devices_parse_id() ever runs: that helper requires the WHOLE tail (up
@@ -5480,22 +5288,16 @@ static esp_err_t zigbee_devices_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    uint8_t owner[6];
-    if (!zb_devices_find_bridge_owner(eui64, owner)) {
-        cJSON_Delete(json);
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown zigbee device");
-        return ESP_OK;
-    }
-    esp_err_t err = swarm_bridge_rename(owner, eui64, name->valuestring);
-    cJSON_Delete(json);
-    return zb_bridge_cmd_respond(req, err, "rename failed");
+    esp_err_t rr = zb_devices_route_h2(req, eui64, name->valuestring);
+    cJSON_Delete(json);   /* after the route: rename_to points into json */
+    return rr;
 }
 
 /* DELETE /api/v1/zigbee/devices/{id} -- removes a joined device. Same
- * local-store-first, then-bridge-owner posture as the rename route above:
+ * local-store-first, then-H2 posture as the rename route above:
  * zigbee_device_remove() (Task 6: drops it from the store, persists the
  * change, asks the stack to remove it from the network) tried first, and
- * only on its false does Task 9's bridge-owner lookup run. */
+ * only on its false does zb_devices_route_h2() run. */
 static esp_err_t zigbee_devices_delete(httpd_req_t *req)
 {
     if (!api_auth_ok(req)) return api_send_401(req);
@@ -5510,13 +5312,7 @@ static esp_err_t zigbee_devices_delete(httpd_req_t *req)
         return ESP_OK;
     }
 
-    uint8_t owner[6];
-    if (!zb_devices_find_bridge_owner(eui64, owner)) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown zigbee device");
-        return ESP_OK;
-    }
-    esp_err_t err = swarm_bridge_remove(owner, eui64);
-    return zb_bridge_cmd_respond(req, err, "remove failed");
+    return zb_devices_route_h2(req, eui64, NULL);
 }
 
 /* ---------------------------------------------------------------------
