@@ -4,7 +4,7 @@ import { getKey, setKey, authHeaders } from '../lib/auth.js'
 /* Shown by app.jsx instead of the tab shell whenever GET /api/v1/status
  * reports role === "unset" -- i.e. a device that has never been told what
  * kind of PlantHub device it is. */
-export function RoleTab({ onMainChosen }) {
+export function RoleTab({ onMainChosen, zigbeeBridge = true }) {
   const [busy, setBusy] = useState('')          // '' | 'main' | 'node'
   const [nodePhase, setNodePhase] = useState('') // '' | 'pairing' | 'gone'
   const [error, setError] = useState('')
@@ -127,14 +127,21 @@ export function RoleTab({ onMainChosen }) {
         <div class="role-card">
           <h2>Node</h2>
           <p>Extends range. Never joins WiFi; forwards readings to your main hub over its own radio link.</p>
-          <label class="keyrow">
-            Radio
-            <select value={radio} disabled={busy !== ''} onChange={(e) => setRadio(e.currentTarget.value)}>
-              <option value="ble">BLE relay</option>
-              <option value="zigbee">Zigbee bridge</option>
-            </select>
-          </label>
-          <p class="hint">A bridge runs its own Zigbee network and needs power; a relay can run on battery.</p>
+          {/* Zigbee bridge nodes exist only in firmware built with them
+              (status.zigbee_bridge); otherwise a node is always a BLE relay
+              and there is nothing to choose. */}
+          {zigbeeBridge && (
+            <>
+              <label class="keyrow">
+                Radio
+                <select value={radio} disabled={busy !== ''} onChange={(e) => setRadio(e.currentTarget.value)}>
+                  <option value="ble">BLE relay</option>
+                  <option value="zigbee">Zigbee bridge</option>
+                </select>
+              </label>
+              <p class="hint">A bridge runs its own Zigbee network and needs power; a relay can run on battery.</p>
+            </>
+          )}
           <p class="hint">
             Two steps: first open pairing on your main hub (Nodes &rarr; Add node),
             <em> then</em> press Continue here.

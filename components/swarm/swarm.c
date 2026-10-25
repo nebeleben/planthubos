@@ -552,6 +552,7 @@ esp_err_t swarm_request_node_config(const uint8_t mac[6])
     return ESP_OK;
 }
 
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
 /* ---------------- Hub side: bridge table + ingest (M7 Task 7) ----------------
  *
  * s_bridges is the hub's own bookkeeping of every zigbee-role node it has
@@ -1467,6 +1468,81 @@ bool swarm_bridge_device_name(const device_id_t *id, char *out, size_t cap)
     xSemaphoreGive(s_bridges_mutex);
     return ok;
 }
+#else  /* !CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
+
+/* Zigbee bridge nodes are compiled out (Kconfig PLANTHUB_ZIGBEE_BRIDGE, see
+ * its help text): no bridge table, router, bridges.bin or bridge-frame
+ * ingest. Two jobs the bridge task ALSO did are not bridge work and survive
+ * here in a small task of the same name/stack/priority:
+ *  - NODE_CONFIG flush -- a node's pending radio-role change is pushed in
+ *    the receive window its own frame just opened (post_bridge_flush() from
+ *    hub_rx_cb on CHECKIN/NODE_CONFIG_ACK), for every node, not only bridges
+ *    (bench finding, M7 gate 7);
+ *  - the actor_service() pump on a non-BLE hub, where nothing else pumps it
+ *    (e.g. a wifi_only two-chip hub actuating through the H2).
+ * The swarm_bridge_* API answers "no such bridge" (swarm.h). */
+#define BRIDGE_QUEUE_LEN 16
+typedef struct { uint8_t mac[6]; } bridge_item_t;   /* one node-config flush request */
+static QueueHandle_t s_bridge_queue;
+static TaskHandle_t  s_bridge_task;
+
+static void post_bridge_flush(const uint8_t mac[6])
+{
+    if (!s_bridge_queue) return;
+    bridge_item_t item;
+    memcpy(item.mac, mac, 6);
+    xQueueSend(s_bridge_queue, &item, 0);   /* best-effort: the node's next frame retries */
+}
+
+static void bridge_task(void *arg)
+{
+    (void)arg;
+    bridge_item_t it;
+    for (;;) {
+        if (xQueueReceive(s_bridge_queue, &it, pdMS_TO_TICKS(500)) == pdTRUE) {
+            /* Same NODE_CONFIG flush as the bridge build's BRIDGE_ITEM_FLUSH case. */
+            radio_role_t desired = swarm_store_node_desired_radio(it.mac);
+            uint8_t rep; bool have_rep = swarm_node_reported_radio(it.mac, &rep);
+            bool pending = have_rep ? ((uint8_t)desired != rep)
+                                    : ((uint8_t)desired != (uint8_t)RADIO_ROLE_BLE);
+            if (pending) {
+                esp_err_t err = swarm_send_node_config(it.mac, desired);
+                ESP_LOGI(TAG, "NODE_CONFIG flush -> " MACSTR " radio_role=%s: %s",
+                         MAC2STR(it.mac), radio_role_str(desired), esp_err_to_name(err));
+            }
+        }
+        /* Same I6 reasoning as the bridge build: a BLE hub's adv_decoder_task
+         * already pumps this; anything else needs this 500 ms tick. */
+        if (radio_role_get() != RADIO_ROLE_BLE) actor_service();
+    }
+}
+
+static esp_err_t ensure_bridge_task(void)
+{
+    if (s_bridge_task) return ESP_OK;
+    if (!s_bridge_queue) s_bridge_queue = xQueueCreate(BRIDGE_QUEUE_LEN, sizeof(bridge_item_t));
+    if (!s_bridge_queue) return ESP_ERR_NO_MEM;
+    BaseType_t ok = xTaskCreate(bridge_task, "swarm_bridge", 4096, NULL, 3, &s_bridge_task);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "ensure_bridge_task: xTaskCreate failed");
+        s_bridge_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+esp_err_t swarm_bridge_permit(const uint8_t mac[6]) { (void)mac; return ESP_ERR_NOT_FOUND; }
+esp_err_t swarm_bridge_remove(const uint8_t mac[6], const uint8_t eui64[8])
+{ (void)mac; (void)eui64; return ESP_ERR_NOT_FOUND; }
+esp_err_t swarm_bridge_rename(const uint8_t mac[6], const uint8_t eui64[8], const char *name)
+{ (void)mac; (void)eui64; (void)name; return ESP_ERR_NOT_FOUND; }
+bool swarm_bridge_node_at(int i, bridge_node_t *out) { (void)i; (void)out; return false; }
+bool swarm_bridge_find_owner(const swarm_dev_addr_t *dev, uint8_t mac_out[6])
+{ (void)dev; (void)mac_out; return false; }
+bool swarm_bridge_device_name(const device_id_t *id, char *out, size_t cap)
+{ (void)id; (void)out; (void)cap; return false; }
+
+#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
 
 static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, int rssi)
 {
@@ -1686,6 +1762,7 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
     if (type == SWARM_MSG_DEVICE_ANNOUNCE || type == SWARM_MSG_DEVICE_GONE ||
         type == SWARM_MSG_MEASUREMENT || type == SWARM_MSG_COORD_STATUS ||
         type == SWARM_MSG_COMMAND_ACK || type == SWARM_MSG_TUYA_DP) {
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
         /* Bridge -> hub, unicast, encrypted (M7 Task 7) -- same pairing/
          * spoofing reasoning as READING/CHECKIN above: is_paired_node() is
          * the gate that keeps an unpaired device from injecting a fake
@@ -1733,6 +1810,13 @@ static void hub_rx_cb(const uint8_t src_mac[6], const uint8_t *data, int len, in
         /* M7 zigbee bridge follow-up: see post_bridge_flush()'s own comment. */
         post_bridge_flush(src_mac);
         return;
+#else
+        /* Bridge frames from a node still running an old zigbee-role image:
+         * this build keeps no bridge machinery (Kconfig PLANTHUB_ZIGBEE_BRIDGE),
+         * so drop them here rather than let them fall through to the
+         * "unrecognised" path below. */
+        return;
+#endif
     }
     /* PAIR_REQ/PAIR_ACK, PING/PONG, FORGET or anything unrecognised:
      * pairing_handle_frame already filters to the types it understands and
@@ -1766,6 +1850,7 @@ static void log_effective_country(void *arg, esp_event_base_t base, int32_t id, 
     }
 }
 
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
 /* cmd->deadline_s (actor_cmd_t, actor.h) is absolute, actor_now_s()-scale
  * (== esp_timer_get_time()/1e6, the same clock this file's now_s already
  * uses throughout) -- bridge_cmd_submit() wants a duration instead, so
@@ -1851,6 +1936,7 @@ static void swarm_zb_dispatch(const actor_cmd_t *cmd)
                              "bridge command queue full", 0xfe);
     }
 }
+#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
 
 esp_err_t swarm_start_main(void)
 {
@@ -1861,8 +1947,10 @@ esp_err_t swarm_start_main(void)
      * s_bridges_mutex, which ensure_bridge_task() creates lazily further
      * down, this one has a user before that point. See s_bridge_io_buf's
      * own top comment for the lock-order/why. */
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
     if (!s_bridge_io_mutex) s_bridge_io_mutex = xSemaphoreCreateMutex();
     if (!s_bridge_io_mutex) return ESP_ERR_NO_MEM;
+#endif
 
     /* I6 fix: unconditional, not gated on radio role -- a hub in the
      * zigbee role (no ble_collector_start() call at all, main.c's
@@ -1920,6 +2008,7 @@ esp_err_t swarm_start_main(void)
      * it" ordering as zigbee.c's zb_store_load(), and for the same reason:
      * bridge_load() itself takes no lock (nothing else exists yet to race
      * it against). */
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
     bridge_load();
 
     /* M7 Task 8: claims the DEV_KIND_ZIGBEE actor dispatch hook for
@@ -1938,12 +2027,16 @@ esp_err_t swarm_start_main(void)
      * what a router-less hub would have registered directly. */
     zb_cmd_set_router_active(true);
     actor_set_dispatch_hook(DEV_KIND_ZIGBEE, swarm_zb_dispatch);
+#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE -- without bridges no hook is claimed here:
+        * zb_cmd_start() registers its own local dispatch, or h2_link_start() the H2's */
 
     err = ensure_bridge_task();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "ensure_bridge_task failed: %s -- bridge (zigbee) frames will go unanswered",
-                 esp_err_to_name(err));
-    } else if (s_bridges_mutex) {
+        ESP_LOGW(TAG, "ensure_bridge_task failed: %s -- node-config flushes (and any bridge "
+                      "frames) will go unserviced", esp_err_to_name(err));
+    }
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
+    else if (s_bridges_mutex) {
         /* A zigbee bridge only re-announces its devices on its OWN boot or
          * RESYNC (Task 5/6); if THIS hub rebooted while a bridge stayed up,
          * that bridge has no reason to re-send anything unprompted. Ask
@@ -1972,6 +2065,7 @@ esp_err_t swarm_start_main(void)
         xSemaphoreGive(s_bridges_mutex);
         for (int i = 0; i < resync_n; i++) request_resync(macs[i]);
     }
+#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
 
     ESP_LOGI(TAG, "swarm (main) started on channel %u", espnow_link_channel());
     return ESP_OK;
@@ -2190,6 +2284,7 @@ void swarm_forget_node_stats(const uint8_t mac[6])
         xSemaphoreGive(s_stats_mutex);
     }
 
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
     if (s_bridges_mutex) {
         uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
         xSemaphoreTake(s_bridges_mutex, portMAX_DELAY);
@@ -2204,6 +2299,7 @@ void swarm_forget_node_stats(const uint8_t mac[6])
         mark_bridge_dirty(now_s);
         xSemaphoreGive(s_bridges_mutex);
     }
+#endif
 }
 
 #define SWARM_FORGET_BROADCAST_COUNT 3

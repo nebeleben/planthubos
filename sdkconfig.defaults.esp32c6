@@ -12,6 +12,20 @@
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 
+# 2026-10: NO Zigbee stack on any C6 build. A C6 hub never runs a coordinator
+# itself (main.c remaps a hub's zigbee role to BLE); the stack was only here so
+# a C6 could serve as a Zigbee bridge NODE, and bridge nodes are retired in
+# favour of the two-chip hub (C6 + wired ESP32-H2 coordinator, whose own
+# firmware -- h2fw/ -- carries the stack). Dropping it frees the static RAM
+# and heap the BLE hub was starving for. swarm Kconfig PLANTHUB_ZIGBEE_BRIDGE
+# (default n) compiles out the hub/node bridge machinery to match.
+#
+# To bring bridge nodes back: CONFIG_PLANTHUB_ZIGBEE_BRIDGE=y,
+# CONFIG_PLANTHUB_ZB_ENABLED=y, CONFIG_ZB_ENABLED=y, CONFIG_ZB_ZCZR=y. The
+# history of why the last three come as a set follows.
+CONFIG_PLANTHUB_ZB_ENABLED=n
+CONFIG_ZB_ENABLED=n
+#
 # M6b Task 1: espressif__esp-zigbee-lib and espressif__esp-zboss-lib gate
 # their OWN include dirs and prebuilt libs behind their own CONFIG_ZB_ENABLED
 # (see managed_components/espressif__esp-zigbee-lib/CMakeLists.txt and
@@ -28,8 +42,7 @@ CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 # defaulting on under ZB_ZCZR. This mirrors the M0 coex spike's own
 # sdkconfig.defaults (docs/superpowers/plans/2026-08-15-planthub-v2-m0-
 # groundwork.md, Task 6), which proved this exact pair of options builds.
-CONFIG_ZB_ENABLED=y
-CONFIG_ZB_ZCZR=y
+# (CONFIG_ZB_ENABLED=y / CONFIG_ZB_ZCZR=y used to be set here.)
 
 # Whole-branch review, FIX 8: match Espressif's own esp_zigbee_gateway
 # example, which sets these OFF (see its sdkconfig.defaults) precisely

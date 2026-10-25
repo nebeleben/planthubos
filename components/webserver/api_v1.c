@@ -73,6 +73,7 @@ static plants_table_t s_api_plant_snap;
  * rather than joining that pair's comment. */
 static zb_device_t s_api_zb_snap[ZB_STORE_MAX_DEVICES];
 
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
 /* Task 9: zigbee_get()'s one-node scratch for swarm_bridge_node_at() (the
  * hub's bridge-node bookkeeping, bridge_table.h). One bridge_node_t (up to
  * BRIDGE_MAX_DEVICES(16) swarm_device_announce_t records, ~2.3 KB) rather
@@ -82,6 +83,7 @@ static zb_device_t s_api_zb_snap[ZB_STORE_MAX_DEVICES];
  * and safe as a file-static for the same reason as s_api_zb_snap above:
  * esp_http_server serialises every handler on one task. */
 static bridge_node_t s_api_bridge_node;
+#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
 
 /* Task 8 (device-mapping-profiles): shared by profiles_list_get()/
  * profiles_key_get()/profiles_key_put()/profiles_key_delete()/
@@ -245,6 +247,15 @@ static esp_err_t status_get(httpd_req_t *req)
      * is what app.jsx keys its onboarding radio picker on. */
     cJSON_AddStringToObject(root, "radio_role", radio_role_str(radio_role_get()));
     cJSON_AddBoolToObject(root, "radio_role_set", radio_role_is_set());
+    /* Whether this firmware supports Zigbee bridge nodes at all (swarm
+     * Kconfig PLANTHUB_ZIGBEE_BRIDGE) -- the webUI hides the "Zigbee bridge"
+     * onboarding choice and the zigbee option of a node's radio-role select
+     * when false. */
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
+    cJSON_AddBoolToObject(root, "zigbee_bridge", true);
+#else
+    cJSON_AddBoolToObject(root, "zigbee_bridge", false);
+#endif
     /* Node: paired to a hub. Unset/main: has at least one node paired to it. */
     bool paired = (role == SWARM_ROLE_NODE) ? swarm_store_hub(NULL, NULL, NULL)
                                              : swarm_store_node_count() > 0;
@@ -1236,6 +1247,16 @@ static esp_err_t node_update_post(httpd_req_t *req, const uint8_t mac[6])
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad radio_role");
             return ESP_OK;
         }
+#if !CONFIG_PLANTHUB_ZIGBEE_BRIDGE
+        /* Zigbee bridge nodes are not supported by this build (swarm Kconfig
+         * PLANTHUB_ZIGBEE_BRIDGE) -- a node told to go zigbee would refuse
+         * it anyway (radio_role_set()), so say so here instead. */
+        if (rr == RADIO_ROLE_ZIGBEE) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "zigbee radio role is not supported by this firmware");
+            return ESP_OK;
+        }
+#endif
         have_radio = true;
     }
     /* Symmetric with power_mode/radio_role above: a PRESENT-but-wrong-type
@@ -1834,6 +1855,18 @@ static esp_err_t config_post(httpd_req_t *req)
             httpd_resp_sendstr(req, "{\"error\":\"bad radio_role\"}");
             return ESP_OK;
         }
+#if !CONFIG_PLANTHUB_ZIGBEE_BRIDGE
+        /* No zigbee radio role without bridge support (swarm Kconfig
+         * PLANTHUB_ZIGBEE_BRIDGE): radio_role_set() would refuse it, and this
+         * handler would otherwise just log that and reboot into the old role. */
+        if (rr == RADIO_ROLE_ZIGBEE) {
+            cJSON_Delete(json);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"error\":\"zigbee radio role is not supported by this firmware\"}");
+            return ESP_OK;
+        }
+#endif
         bool unchanged = (rr == radio_role_get());
         esp_err_t rr_err = radio_role_set(rr);
         if (rr_err != ESP_OK) {
@@ -4942,6 +4975,7 @@ static cJSON *zb_device_json(const zb_device_t *d)
     return o;
 }
 
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
 /* Renders one bridge-announced end device (swarm_device_announce_t,
  * swarm_frame.h) close to the shape zb_device_json() above renders a
  * locally-joined one -- same id (via device_id_format(), reused directly:
@@ -5024,6 +5058,7 @@ static cJSON *announce_device_json(const swarm_device_announce_t *a)
     }
     return o;
 }
+#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
 
 /* The hub's own coordinator entry (zigbee_get() below), when this hub runs
  * the zigbee radio role -- NULL (no entry at all) otherwise, same
@@ -5091,6 +5126,7 @@ static cJSON *coordinator_json_local(void)
 #endif
 }
 
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
 /* One bridge node's coordinator entry -- "node" is its MAC12, "name" its
  * swarm_store_node_name() (null when unset, same as an unnamed node reads
  * everywhere else this store is surfaced), and every status field comes
@@ -5131,6 +5167,7 @@ static cJSON *coordinator_json_bridge(const bridge_node_t *b)
     }
     return c;
 }
+#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
 
 /* GET /api/v1/zigbee -- every coordinator this hub knows about (spec §5.3):
  * its own, when it runs the zigbee radio role (coordinator_json_local()),
@@ -5147,11 +5184,13 @@ static esp_err_t zigbee_get(httpd_req_t *req)
     cJSON *local = coordinator_json_local();
     if (local) cJSON_AddItemToArray(coordinators, local);
 
+#if CONFIG_PLANTHUB_ZIGBEE_BRIDGE
     for (int i = 0; i < BRIDGE_MAX_NODES; i++) {
         if (swarm_bridge_node_at(i, &s_api_bridge_node)) {
             cJSON_AddItemToArray(coordinators, coordinator_json_bridge(&s_api_bridge_node));
         }
     }
+#endif /* CONFIG_PLANTHUB_ZIGBEE_BRIDGE */
 
     return send_json(req, root);
 }
