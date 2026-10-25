@@ -5039,17 +5039,25 @@ static cJSON *coordinator_json_local(void)
      * devices live in the data_core registry (/api/v1/devices), since the
      * H2 is a local radio, not a swarm node. Returns NULL until the first
      * status arrives (same "nothing to report" posture as a not-started
-     * local stack below). */
+     * local stack below). Once the H2 has gone quiet for more than
+     * H2_LINK_STALE_S, "available" turns false and formed/permit_s stop
+     * echoing the last-known values -- otherwise a dead H2 would keep
+     * reading "formed" forever (bench 2026-10-25, gate 6 finding). The
+     * channel/pan_id stay as last reported, for context. */
     swarm_coord_status_t st;
-    if (!h2_link_coord_status(&st)) return NULL;
+    uint32_t age_s = 0;
+    if (!h2_link_coord_status(&st, &age_s)) return NULL;
+    bool alive = age_s <= H2_LINK_STALE_S;
     cJSON *hc = cJSON_CreateObject();
     cJSON_AddNullToObject(hc, "node");
     cJSON_AddNullToObject(hc, "name");
     cJSON_AddBoolToObject(hc, "enabled", true);
-    cJSON_AddBoolToObject(hc, "formed", st.formed);
+    cJSON_AddBoolToObject(hc, "available", alive);
+    cJSON_AddNumberToObject(hc, "status_age_s", age_s);
+    cJSON_AddBoolToObject(hc, "formed", alive && st.formed);
     cJSON_AddNumberToObject(hc, "channel", st.channel);
     cJSON_AddNumberToObject(hc, "pan_id", st.pan_id);
-    cJSON_AddNumberToObject(hc, "permit_s", st.permit_s);
+    cJSON_AddNumberToObject(hc, "permit_s", alive ? st.permit_s : 0);
     cJSON_AddStringToObject(hc, "reported_role", "zigbee");
     cJSON_AddArrayToObject(hc, "devices");
     return hc;
@@ -5235,7 +5243,13 @@ static esp_err_t zigbee_permit_post(httpd_req_t *req)
 
 #if CONFIG_PLANTHUB_H2_LINK_ENABLED
     /* Two-chip appliance: the "local coordinator" is the wired H2. Permit is
-     * sent over the UART; the H2 opens its own join window. */
+     * sent over the UART; the H2 opens its own join window. A silent H2
+     * (no COORD_STATUS within H2_LINK_STALE_S) would drop the command, so
+     * say so instead of answering "queued" -- same 409 "state doesn't allow
+     * this" shape as the single-chip no-formed-network case below. */
+    if (!h2_link_alive()) {
+        return send_409(req, "Zigbee coordinator (H2) is not responding");
+    }
     h2_link_permit();
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "ok", true);

@@ -24,9 +24,21 @@ esp_err_t h2_link_start(void);
  * the H2). Returns ESP_OK once queued. */
 esp_err_t h2_link_permit(void);
 
-/* Copies the H2's last reported coordinator status into *out; returns false
- * if none has arrived yet. For GET /api/v1/zigbee. */
-bool h2_link_coord_status(swarm_coord_status_t *out);
+/* The H2 sends COORD_STATUS every 2 s (uart_link's status_tx_task); after
+ * this many seconds without one, the coordinator counts as not responding
+ * (H2 unpowered, crashed, rebooting, or the UART link broken). Five missed
+ * reports, so a single dropped frame never flaps it. */
+#define H2_LINK_STALE_S 10
+
+/* Copies the H2's last reported coordinator status into *out and its age in
+ * seconds into *age_s (either may be NULL); returns false if none has
+ * arrived yet this boot. For GET /api/v1/zigbee -- a caller compares *age_s
+ * against H2_LINK_STALE_S rather than trusting a status that may be old. */
+bool h2_link_coord_status(swarm_coord_status_t *out, uint32_t *age_s);
+
+/* True when a COORD_STATUS has arrived within the last H2_LINK_STALE_S
+ * seconds, i.e. the H2 is up and the link is carrying frames. */
+bool h2_link_alive(void);
 
 /* Removes / renames an H2-owned device (sends the matching command). */
 esp_err_t h2_link_remove(const uint8_t eui64[8]);

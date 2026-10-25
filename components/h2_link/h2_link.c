@@ -27,6 +27,7 @@ static SemaphoreHandle_t s_tx_mtx;
 static SemaphoreHandle_t s_status_mtx;
 static swarm_coord_status_t s_last_status;
 static bool s_status_valid;
+static uint32_t s_status_rx_s;   /* now_s() when s_last_status arrived */
 
 static uint16_t s_seq;
 static struct { bool used; uint16_t seq; int dev_idx; uint8_t action; } s_inflight;
@@ -84,14 +85,21 @@ esp_err_t h2_link_rename(const uint8_t eui64[8], const char *name)
     return ESP_OK;
 }
 
-bool h2_link_coord_status(swarm_coord_status_t *out)
+bool h2_link_coord_status(swarm_coord_status_t *out, uint32_t *age_s)
 {
     bool valid;
     xSemaphoreTake(s_status_mtx, portMAX_DELAY);
     valid = s_status_valid;
     if (valid && out) *out = s_last_status;
+    if (valid && age_s) *age_s = now_s() - s_status_rx_s;
     xSemaphoreGive(s_status_mtx);
     return valid;
+}
+
+bool h2_link_alive(void)
+{
+    uint32_t age;
+    return h2_link_coord_status(NULL, &age) && age <= H2_LINK_STALE_S;
 }
 
 /* Zigbee actuate dispatch hook: an actor command for a DEV_KIND_ZIGBEE device
@@ -150,7 +158,7 @@ static void dispatch_frame(const uint8_t *buf, size_t len)
         swarm_coord_status_t s;
         if (swarm_decode_coord_status(buf, len, &s)) {
             xSemaphoreTake(s_status_mtx, portMAX_DELAY);
-            s_last_status = s; s_status_valid = true;
+            s_last_status = s; s_status_valid = true; s_status_rx_s = now_s();
             xSemaphoreGive(s_status_mtx);
         }
         break;

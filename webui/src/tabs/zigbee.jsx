@@ -169,6 +169,22 @@ function CoordinatorCard({ c, busyKey, onPermit, onRenamed, onRemoved, stale, pa
     )
   }
 
+  // Two-chip hub: the hub reports available=false once the wired H2 has
+  // sent no status for a while (unpowered, crashed, link broken). Its last
+  // formed/permit values are no longer trustworthy, so don't offer pairing.
+  // Absent on single-chip hubs and bridges, hence the strict === false.
+  if (isLocal && c.available === false) {
+    return (
+      <div class="panel">
+        <h2>Zigbee — this hub</h2>
+        <p class="level-badge level-alert">
+          Zigbee coordinator (H2) not responding — last heard {c.status_age_s}s ago.
+        </p>
+        <p class="hint">Check the H2's power and the UART link to it. Pairing is unavailable until it reports again.</p>
+      </div>
+    )
+  }
+
   return (
     <div class="panel">
       <h2>{isLocal ? 'Zigbee — this hub' : `Zigbee bridge — ${label}`}</h2>
