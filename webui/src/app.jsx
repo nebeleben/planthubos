@@ -85,6 +85,10 @@ export function App() {
   // status) so an old firmware never traps the UI on the picker.
   const [radioRole, setRadioRole] = useState('ble')
   const [radioRoleSet, setRadioRoleSet] = useState(true)
+  // Whether the firmware supports Zigbee bridge nodes (status.zigbee_bridge,
+  // swarm Kconfig PLANTHUB_ZIGBEE_BRIDGE). Firmware predating the field
+  // always had them, hence the "!== false".
+  const [zigbeeBridge, setZigbeeBridge] = useState(true)
 
   // Task 10: the Zigbee tab is also shown when a node bridge exists, even
   // on a hub whose own radio isn't zigbee (wifi_only hub, bridge nodes
@@ -216,6 +220,7 @@ export function App() {
         setRole(r)
         setRadioRole(st.radio_role || 'ble')
         setRadioRoleSet(st.radio_role_set !== false)
+        setZigbeeBridge(st.zigbee_bridge !== false)
         // An unpaired node reaching the webui at all means it's sitting in
         // its portal after a failed pairing attempt (a paired node runs no
         // web server, and a searching one hasn't set up webserver either)
@@ -240,6 +245,7 @@ export function App() {
     return (
       <>
         <RoleTab
+          zigbeeBridge={zigbeeBridge}
           onMainChosen={() => {
             setTab('Network')
             refreshRole()
@@ -318,7 +324,7 @@ export function App() {
          tab === 'Wrappers' ? (
            <WrappersTab prefill={wrapperPrefill} onPrefillConsumed={() => setWrapperPrefill(null)} />
          ) :
-         tab === 'Nodes' ? <NodesTab /> :
+         tab === 'Nodes' ? <NodesTab zigbeeBridge={zigbeeBridge} /> :
          tab === 'Zigbee' ? <ZigbeeTab /> :
          tab === 'Config' ? <ConfigTab /> :
          tab === 'Network' ? <NetworkTab /> :

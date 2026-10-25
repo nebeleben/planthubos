@@ -284,7 +284,7 @@ function PowerModeControl({ n, onSaved }) {
 // rules refusal (e.g. battery power mode vs zigbee, swarm_rules.h) surfaces
 // its `error` string inline rather than as an alert().
 const RADIO_LABELS = { ble: 'BLE relay', zigbee: 'Zigbee bridge' }
-function RadioRoleControl({ n, onSaved }) {
+function RadioRoleControl({ n, onSaved, zigbeeBridge = true }) {
   const [state, setState] = useState('idle') // idle | saving
   const [msg, setMsg] = useState('')
 
@@ -308,14 +308,21 @@ function RadioRoleControl({ n, onSaved }) {
     }
   }
 
+  // Without bridge support (status.zigbee_bridge false) BLE relay is the only
+  // radio a node can have, so there is nothing to pick -- unless this node is
+  // still set to zigbee from older firmware, in which case keep the select so
+  // it can be switched back to BLE.
+  const offerZigbee = zigbeeBridge || n.radio_role === 'zigbee'
+  if (!offerZigbee) return null
   const battery = n.power_mode !== 'always_on'
   return (
     <label>Radio{' '}
-      <select value={n.radio_role} disabled={state === 'saving' || battery} onChange={onChange}>
+      <select value={n.radio_role} disabled={state === 'saving' || (battery && zigbeeBridge)} onChange={onChange}>
         <option value="ble">{RADIO_LABELS.ble}</option>
-        <option value="zigbee">{RADIO_LABELS.zigbee}</option>
+        <option value="zigbee" disabled={!zigbeeBridge}>{RADIO_LABELS.zigbee}</option>
       </select>
-      {battery && <span class="hint">set the node to always-on to make it a bridge</span>}
+      {!zigbeeBridge && <span class="hint">Zigbee bridges are no longer supported — switch this node to BLE relay</span>}
+      {battery && zigbeeBridge && <span class="hint">set the node to always-on to make it a bridge</span>}
       {n.radio_role_pending && <span class="hint">reported: {n.reported_radio_role ? RADIO_LABELS[n.reported_radio_role] : 'unknown'} — reboot pending</span>}
       {msg && <span class="hint">{msg}</span>}
     </label>
@@ -327,7 +334,7 @@ function RadioRoleControl({ n, onSaved }) {
 // can be forced open from the parent without this component needing to know
 // why -- see NodesTab's `isOpen`, which ORs the operator's own toggle state
 // with the OTA poll's `active` flag (reported back up via onOtaActive below).
-function NodeCard({ n, fwVersion, open, onToggle, onSaved, onForgotten, onPowerModeSaved, onRadioRoleSaved, onOtaActive }) {
+function NodeCard({ n, fwVersion, open, onToggle, onSaved, onForgotten, onPowerModeSaved, onRadioRoleSaved, onOtaActive, zigbeeBridge }) {
   const [name, setName] = useState(n.name || '')
   const [state, setState] = useState('idle') // idle | saving | saved | error | unauth
   const [forgetting, setForgetting] = useState(false)
@@ -402,7 +409,7 @@ function NodeCard({ n, fwVersion, open, onToggle, onSaved, onForgotten, onPowerM
           <span class="hint">reported: {n.reported_mode_valid ? (REPORTED_MODE_LABELS[n.reported_mode] || n.reported_mode) : '—'}</span>
         </div>
         <div class="node-card-row">
-          <RadioRoleControl n={n} onSaved={onRadioRoleSaved} />
+          <RadioRoleControl n={n} onSaved={onRadioRoleSaved} zigbeeBridge={zigbeeBridge} />
         </div>
         <div class="node-card-row">
           <span class="hint">{n.rssi != null ? `${n.rssi} dBm` : '–'}</span>
@@ -419,7 +426,7 @@ function NodeCard({ n, fwVersion, open, onToggle, onSaved, onForgotten, onPowerM
   )
 }
 
-export function NodesTab() {
+export function NodesTab({ zigbeeBridge = true }) {
   const [nodes, setNodes] = useState(null)
   const [total, setTotal] = useState(null)
   const [fwVersion, setFwVersion] = useState(null)  // hub's own version -- what an Update push sends (node_ota.c
@@ -570,8 +577,9 @@ export function NodesTab() {
       <h2>Nodes</h2>
       {nodes.length === 0 ? (
         <p class="placeholder">
-          Nodes extend range: a BLE relay forwards Bluetooth sensors, a Zigbee bridge runs a
-          Zigbee network and forwards its devices — both over ESP-NOW.
+          {zigbeeBridge
+            ? 'Nodes extend range: a BLE relay forwards Bluetooth sensors, a Zigbee bridge runs a Zigbee network and forwards its devices — both over ESP-NOW.'
+            : 'Nodes extend range: a BLE relay forwards Bluetooth sensors to this hub over ESP-NOW.'}
         </p>
       ) : (
         <div class="node-cards">
@@ -579,7 +587,7 @@ export function NodesTab() {
             <NodeCard key={n.mac} n={n} fwVersion={fwVersion} open={isOpen(n.mac)}
                       onToggle={() => toggleNode(n.mac)} onSaved={onSaved} onForgotten={onForgotten}
                       onPowerModeSaved={onPowerModeSaved} onRadioRoleSaved={onRadioRoleSaved}
-                      onOtaActive={onOtaActive} />
+                      onOtaActive={onOtaActive} zigbeeBridge={zigbeeBridge} />
           ))}
         </div>
       )}
