@@ -542,9 +542,9 @@ export function ConfigTab() {
             </button>
           </p>
           <p class="infobox">
-            This hub runs WiFi + BLE. Zigbee is a bridge-node role: to add Zigbee sensors,
-            pair a spare board as a Zigbee bridge from the Nodes tab. Switching between
-            WiFi-only and BLE here reboots the hub.
+            Zigbee is not a radio choice here: it needs the two-chip hub (an ESP32-H2 wired to
+            this C6 as the coordinator), and then runs alongside either setting. Switching
+            between WiFi-only and BLE reboots the hub.
           </p>
           {radioMsg && <p class="hint">{radioMsg}</p>}
         </div>

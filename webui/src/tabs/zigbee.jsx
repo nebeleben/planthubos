@@ -128,8 +128,9 @@ function DeviceCard({ d, open, onToggle, onRenamed, onRemoved, onRetryPairing, r
   )
 }
 
-// Task 9's coordinator key: null for the hub's own local coordinator, the
-// bridge node's mac12 otherwise. Used both as the poll/permit request body
+// Task 9's coordinator key: null for the hub's own local coordinator (the
+// only kind left since Zigbee bridge nodes were retired, 2026-10; a mac12
+// was a bridge node). Used both as the poll/permit request body
 // value and as this tab's per-card React key / busy-tracking key (with
 // 'local' standing in for null wherever a plain string key is needed, e.g.
 // object property names and React `key`s, which can't be null).
@@ -137,30 +138,23 @@ function keyOf(node) {
   return node ?? 'local'
 }
 
-// One coordinator's card -- the local hub radio (c.node === null) or one
-// Zigbee-bridge node (c.node === mac12). Same body shape either way
-// (network line, permit control, device list); only the pairing-outage
-// countdown/stale-connection treatment is local-only, since only the
-// local coordinator shares an antenna with the hub's own WiFi (a bridge's
-// permit window is just a queued ESP-NOW command -- see radio-architecture
-// findings). `busyKey` is the tab-wide "which card's permit POST is in
-// flight" tracker; this card is busy iff busyKey === keyOf(c.node).
+// The hub's coordinator card (c.node === null): network line, permit
+// control, device list. `busyKey` is the tab-wide "which card's permit POST
+// is in flight" tracker; this card is busy iff busyKey === keyOf(c.node).
 function CoordinatorCard({ c, busyKey, onPermit, onRenamed, onRemoved, stale, pairingOutage,
                            permitLeft, pending, pendingStale }) {
   const [openMap, setOpenMap] = useState({})
-  const isLocal = c.node === null
   const busy = busyKey === keyOf(c.node)
-  const label = c.name || c.node
 
   function toggle(id) {
     setOpenMap((prev) => ({ ...prev, [id]: !prev[id] }))
   }
 
-  // Defensive only: app.jsx/ZigbeeTab gate on radioRole/hasBridges, so a
+  // Defensive only: app.jsx/ZigbeeTab gate on hasCoordinator, so a
   // local entry with enabled=false shouldn't normally reach here -- but if
   // it does (coordinator failed to start this boot), say so plainly rather
   // than rendering a permit button that can only 409.
-  if (isLocal && !c.enabled) {
+  if (!c.enabled) {
     return (
       <div class="panel">
         <h2>Zigbee — this hub</h2>
@@ -172,8 +166,8 @@ function CoordinatorCard({ c, busyKey, onPermit, onRenamed, onRemoved, stale, pa
   // Two-chip hub: the hub reports available=false once the wired H2 has
   // sent no status for a while (unpowered, crashed, link broken). Its last
   // formed/permit values are no longer trustworthy, so don't offer pairing.
-  // Absent on single-chip hubs and bridges, hence the strict === false.
-  if (isLocal && c.available === false) {
+  // Absent on firmware without an H2 link, hence the strict === false.
+  if (c.available === false) {
     return (
       <div class="panel">
         <h2>Zigbee — this hub</h2>
@@ -187,10 +181,7 @@ function CoordinatorCard({ c, busyKey, onPermit, onRenamed, onRemoved, stale, pa
 
   return (
     <div class="panel">
-      <h2>{isLocal ? 'Zigbee — this hub' : `Zigbee bridge — ${label}`}</h2>
-      {c.reported_role !== 'zigbee' && (
-        <p class="hint">bridge reports role {c.reported_role}, waiting for reboot</p>
-      )}
+      <h2>Zigbee — this hub</h2>
       <div class="node-card-row">
         <span class="hint">
           {c.formed
@@ -201,32 +192,26 @@ function CoordinatorCard({ c, busyKey, onPermit, onRenamed, onRemoved, stale, pa
       <p>
         {permitLeft > 0 ? (
           <span class="hint">
-            {isLocal
-              ? `Pairing open — put the device into pairing mode now (${permitLeft}s left).`
-              : `Pairing open on ${label} — ${permitLeft}s left`}
-            {isLocal && pairingOutage && !stale && (
+            {`Pairing open — put the device into pairing mode now (${permitLeft}s left).`}
+            {pairingOutage && !stale && (
               <span class="hint">
                 {' '}(hub briefly unreachable while pairing — this is normal)
               </span>
             )}
-            {isLocal && stale && (
+            {stale && (
               <span class="level-badge level-alert">
                 connection lost — this countdown may be stale
               </span>
             )}
           </span>
         ) : pending ? (
-          // Click registered, window not open yet: a bridge takes a few
-          // seconds to receive the queued command and start its window.
-          <span class="hint">
-            {isLocal
-              ? 'Opening pairing window — the radio will open it shortly…'
-              : `Opening pairing window on ${label} — the bridge will open it shortly…`}
-          </span>
+          // Click registered, window not open yet: on the two-chip hub the
+          // permit is a queued UART command the H2 acts on a moment later.
+          <span class="hint">Opening pairing window — the radio will open it shortly…</span>
         ) : (
           <>
             <button class="btn-primary" onClick={() => onPermit(c.node)} disabled={busy}>
-              {busy ? 'Opening…' : isLocal ? 'Pair a device' : `Pair a device on ${label}`}
+              {busy ? 'Opening…' : 'Pair a device'}
             </button>
             {pendingStale && (
               <span class="hint">{' '}last request didn’t open a window — try again</span>
@@ -282,10 +267,9 @@ export function ZigbeeTab() {
   // records (client clock) when that window closes, poll failures before
   // that instant drive a client-side countdown instead of the stale
   // marker, and pairingOutage swaps the alarming badge for a calm
-  // explanation. Only windows this tab opened on the LOCAL coordinator get
-  // the treatment -- a bridge's permit window never blocks the hub's own
-  // WiFi, and a failure outside a local window is still a real connection
-  // problem and keeps the fix-round-1 stale semantics.
+  // explanation. Only windows this tab opened get the treatment -- a
+  // failure outside such a window is still a real connection problem and
+  // keeps the fix-round-1 stale semantics.
   const windowEndRef = useRef(0)
   const [pairingOutage, setPairingOutage] = useState(false)
 
@@ -294,7 +278,7 @@ export function ZigbeeTab() {
   // driven off a per-coordinator client-clock window-end (re-anchored each
   // poll, keyed by keyOf(node)) and a 1s tick, not the 2s-stale snapshot.
   // `pending` holds, per coordinator, the client-clock ms at which a permit
-  // was requested but the window has not yet been observed open -- a bridge
+  // was requested but the window has not yet been observed open -- a queued
   // POST only returns {ok,queued}, so without this the card would snap back
   // to the button until the next poll saw permit_s > 0 (looks like nothing
   // happened). windowEndsRef is a ref (read in render, doesn't itself drive
@@ -351,8 +335,8 @@ export function ZigbeeTab() {
         const local = coordinators.find((c) => c.node === null)
         lastPermitRef.current = local ? local.permit_s || 0 : 0
         const anyOpen = coordinators.some((c) => c.permit_s > 0)
-        // Also poll fast while a queued bridge open is still pending, so its
-        // window is noticed within ~2s of the node opening it, not ~10s.
+        // Also poll fast while a queued open is still pending, so its
+        // window is noticed within ~2s of the radio opening it, not ~10s.
         const anyPending = Object.keys(pendingRef.current).length > 0
         pollTimerRef.current = setTimeout(poll, (anyOpen || anyPending) ? 2000 : 10000)
       })
@@ -406,13 +390,14 @@ export function ZigbeeTab() {
     return () => clearInterval(t)
   }, [])
 
-  // node: null for the local coordinator, mac12 for a bridge -- Task 9's
-  // POST /api/v1/zigbee/permit body shape. The response differs (local:
-  // {ok,permit_s}; bridge: {ok,queued,node}), so only the local branch can
-  // reflect the new window immediately client-side; a bridge's window
-  // shows up once the hub hears back over ESP-NOW and the next poll picks
-  // it up -- polling is restarted at the fast cadence right away either
-  // way so that's at most 2s off.
+  // node: null for the hub's coordinator -- Task 9's POST
+  // /api/v1/zigbee/permit body shape. The response is either {ok,permit_s}
+  // (the window is open now, so it can be reflected immediately) or
+  // {ok,queued} -- the two-chip hub, whose H2 opens the window a moment
+  // after the UART command lands -- in which case the card shows the
+  // pending "opening shortly…" state until a poll sees permit_s > 0.
+  // Polling is restarted at the fast cadence right away either way, so
+  // that's at most 2s off.
   async function doPermit(node) {
     setBusyKey(keyOf(node))
     try {
@@ -424,7 +409,7 @@ export function ZigbeeTab() {
       const body = await res.json().catch(() => ({}))
       if (res.ok && body.ok) {
         const key = keyOf(node)
-        if (node === null) {
+        if (!body.queued) {
           const end = Date.now() + (body.permit_s || 0) * 1000
           setData((prev) => (prev
             ? prev.map((c) => (c.node === null ? { ...c, permit_s: body.permit_s } : c))
@@ -440,9 +425,8 @@ export function ZigbeeTab() {
           consecFailsRef.current = 0
           setStale(false)
         } else {
-          // Bridge: the POST only QUEUES an ESP-NOW command ({ok,queued});
-          // the window opens seconds later when the node next polls. Show
-          // the pending state immediately so the click visibly registers --
+          // Queued ({ok,queued}): the window opens a moment later. Show the
+          // pending state immediately so the click visibly registers --
           // cleared by the first poll that sees permit_s > 0, or timed out.
           setPendingFor(key, Date.now())
         }
@@ -478,8 +462,8 @@ export function ZigbeeTab() {
       <div class="panel">
         <h2>Zigbee</h2>
         <p class="placeholder">
-          No Zigbee coordinator: switch this hub's radio to Zigbee in Config, or make a node a
-          Zigbee bridge in Nodes.
+          No Zigbee coordinator: Zigbee needs the two-chip hub (a C6 with an ESP32-H2 wired to
+          it as the coordinator).
         </p>
       </div>
     )

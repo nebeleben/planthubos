@@ -4,16 +4,16 @@ import { getKey, setKey, authHeaders } from '../lib/auth.js'
 /* Shown by app.jsx instead of the tab shell whenever GET /api/v1/status
  * reports role === "unset" -- i.e. a device that has never been told what
  * kind of PlantHub device it is. */
-export function RoleTab({ onMainChosen, zigbeeBridge = true }) {
+export function RoleTab({ onMainChosen }) {
   const [busy, setBusy] = useState('')          // '' | 'main' | 'node'
   const [nodePhase, setNodePhase] = useState('') // '' | 'pairing' | 'gone'
   const [error, setError] = useState('')
-  // M7: which radio a soon-to-be node should run -- BLE relay (default) or
-  // Zigbee bridge. Sent via POST /api/v1/config on THIS device's own portal
-  // API (same shape/endpoint as radio.jsx's hub-radio picker, but here it's
-  // the unclaimed node itself answering, not a hub) before POST /api/v1/role
-  // claims the "node" role.
-  const [radio, setRadio] = useState('ble')
+  // M7: the radio a soon-to-be node runs, sent via POST /api/v1/config on
+  // THIS device's own portal API before pairing. Always BLE relay now --
+  // Zigbee bridge nodes were retired 2026-10 (Zigbee comes from the
+  // two-chip hub's wired H2) -- but still sent explicitly, so a board that
+  // was a bridge before is reset to BLE as it becomes a node again.
+  const radio = 'ble'
   // Same latent shape as radio.jsx's picker: a claimed hub 401s this
   // screen's POST too, and until now there was no way back in short of
   // physical recovery. Offer the key here, in place, so the user can
@@ -127,21 +127,6 @@ export function RoleTab({ onMainChosen, zigbeeBridge = true }) {
         <div class="role-card">
           <h2>Node</h2>
           <p>Extends range. Never joins WiFi; forwards readings to your main hub over its own radio link.</p>
-          {/* Zigbee bridge nodes exist only in firmware built with them
-              (status.zigbee_bridge); otherwise a node is always a BLE relay
-              and there is nothing to choose. */}
-          {zigbeeBridge && (
-            <>
-              <label class="keyrow">
-                Radio
-                <select value={radio} disabled={busy !== ''} onChange={(e) => setRadio(e.currentTarget.value)}>
-                  <option value="ble">BLE relay</option>
-                  <option value="zigbee">Zigbee bridge</option>
-                </select>
-              </label>
-              <p class="hint">A bridge runs its own Zigbee network and needs power; a relay can run on battery.</p>
-            </>
-          )}
           <p class="hint">
             Two steps: first open pairing on your main hub (Nodes &rarr; Add node),
             <em> then</em> press Continue here.

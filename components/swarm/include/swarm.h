@@ -1,7 +1,6 @@
 #pragma once
 #include "esp_err.h"
 #include "radio_role_str.h"
-#include "bridge_table.h"
 #include "capability.h"   /* device_id_t */
 #include <stdbool.h>
 #include <stddef.h>
@@ -158,59 +157,6 @@ void swarm_broadcast_forget(const uint8_t mac[6]);
  * so the reverse dependency would be circular -- main.c, which depends on
  * both, does the wiring. */
 void swarm_node_set_health_cb(void (*cb)(const char *reason));
-
-/* Hub (M7 Task 8): the command router's synchronous API for Task 9's HTTP
- * handlers. Each posts one command to `mac`'s bridge node and waits (up to
- * 300 ms) for the router (swarm.c's bridge_task) to accept or refuse it --
- * see swarm.c's submit_and_wait() for the full contract. Common returns:
- * ESP_OK (queued -- the actual PERMIT_JOIN/DEVICE_REMOVE/DEVICE_RENAME
- * still completes asynchronously; watch for its SWARM_MSG_COMMAND_ACK/
- * alert the same way an ACTUATE's outcome is watched), ESP_ERR_NOT_FOUND
- * (mac is not a bridge node this hub has ever heard a COORD_STATUS/device
- * announce from), ESP_ERR_INVALID_STATE (mac already has a command in
- * flight, or this hub has no bridge task at all -- e.g. Zigbee disabled or
- * ensure_bridge_task() failed at boot). Safe to call from any task except
- * bridge_task itself (would deadlock waiting on its own answer) --
- * intended caller is an HTTP handler's task. */
-esp_err_t swarm_bridge_permit(const uint8_t mac[6]);
-/* eui64 is the target device's 8-byte IEEE address, as already surfaced by
- * GET /api/v1/nodes' zigbee device list. See swarm_bridge_permit() above
- * for the return contract. */
-esp_err_t swarm_bridge_remove(const uint8_t mac[6], const uint8_t eui64[8]);
-/* `name` is copied (truncated to SWARM_DEV_NAME_MAX bytes, swarm_frame.h)
- * before this function returns -- the caller's buffer need not outlive the
- * call. See swarm_bridge_permit() above for the return contract. */
-esp_err_t swarm_bridge_rename(const uint8_t mac[6], const uint8_t eui64[8], const char *name);
-
-/* Hub (M7 Task 9): read access to the hub's own bridge-node bookkeeping,
- * one node at a time, under s_bridges_mutex (swarm.c) -- GET
- * /api/v1/zigbee walks i = 0..BRIDGE_MAX_NODES-1 for its coordinator list.
- * Copies node slot i into *out and returns true when that slot is in use;
- * false (out untouched) for an unused/out-of-range slot or when this hub has
- * no bridge machinery at all (s_bridges_mutex never created -- Zigbee
- * disabled at build time or ensure_bridge_task() never ran), which callers
- * treat as "no bridge there". Replaces a whole-table snapshot so the API
- * needs one node's scratch (~2.3 KB), not the full ~14 KB table. Safe to
- * call from any task, including bridge_task's own (unlike
- * swarm_bridge_permit/remove/rename() above, this never waits on
- * bridge_task -- it just takes the mutex bridge_task already yields
- * whenever it isn't mid-tick). Consecutive calls are separate lock spans. */
-bool swarm_bridge_node_at(int i, bridge_node_t *out);
-
-/* Same mutex and "no bridge machinery" posture as swarm_bridge_node_at():
- * which bridge node (if any) currently has dev among its announced devices
- * (bridge_table_find_device()), for the device remove/rename routes.
- * Writes that node's mac to mac_out and returns true; false if no bridge
- * node has it. */
-bool swarm_bridge_find_owner(const swarm_dev_addr_t *dev, uint8_t mac_out[6]);
-
-/* Copies the stored display name of a bridge-announced Zigbee device (by its
- * DEV_KIND_ZIGBEE device_id_t / eui64) into `out`, NUL-terminated. Returns
- * false (out untouched) when the device is unknown to the bridge table, its
- * stored name is empty, or `out` is too small -- the caller then falls back
- * to the device id, exactly as the BLE name path does. Takes s_bridges_mutex;
- * safe from the httpd task (devices_json.c's /api/v1/devices name lookup). */
-bool swarm_bridge_device_name(const device_id_t *id, char *out, size_t cap);
 
 /* Battery-mode wake cycle (spec §4). Called from main.c's node-paired
  * branch INSTEAD OF returning to a plain always-on run, when

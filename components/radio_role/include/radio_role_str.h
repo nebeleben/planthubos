@@ -8,7 +8,10 @@
 typedef enum {
     RADIO_ROLE_WIFI_ONLY = 0,   /* neither BLE nor Zigbee */
     RADIO_ROLE_BLE       = 1,   /* NimBLE collector (the V1 hub) */
-    RADIO_ROLE_ZIGBEE    = 2,   /* 802.15.4 coordinator */
+    RADIO_ROLE_ZIGBEE    = 2,   /* retired 2026-10 (was: 802.15.4 bridge-node
+                                 * coordinator). Still parsed, so an old NVS
+                                 * value or wire byte maps cleanly to BLE --
+                                 * radio_role_init()/radio_role_set(). */
 } radio_role_t;
 
 /* "wifi_only" | "ble" | "zigbee". Out-of-range -> "wifi_only" (never NULL). */

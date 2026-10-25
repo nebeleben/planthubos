@@ -9,11 +9,12 @@
 // it stays server-accurate rather than drifting off the client clock.
 
 // How long the "opening pairing window…" pending state may stand before the
-// tab gives up waiting for a bridge to open its window and reverts to the
-// button. A bridge receives the queued permit command in its ~2 s POLL/RX
-// window, so a window that has not opened in 15 s means the command was lost
-// or the node is offline -- long enough to never trip on a healthy bridge,
-// short enough that a stuck request does not hang the UI.
+// tab gives up waiting for a queued permit (the two-chip hub's H2 opens its
+// window a moment after the UART command lands; formerly a wireless bridge
+// node did, within its ~2 s POLL window) and reverts to the button. A window
+// that has not opened in 15 s means the command was lost or the radio is
+// down -- long enough to never trip on a healthy coordinator, short enough
+// that a stuck request does not hang the UI.
 export const PAIR_PENDING_TIMEOUT_MS = 15000
 
 // Seconds left in a permit window, from a client-clock end time and the

@@ -2,14 +2,15 @@ menu "PlantHub Zigbee"
 
 config PLANTHUB_ZB_ENABLED
     bool "Enable the Zigbee coordinator"
-    default y if IDF_TARGET_ESP32C6 || IDF_TARGET_ESP32C5
+    default y if IDF_TARGET_ESP32H2
     default n
     help
-        The Zigbee coordinator needs an 802.15.4 radio AND the
-        zb_storage/zb_fct partitions that the 16 MB and 32 MB layouts
-        provide. The esp32c6 hub (partitions_16m.csv) and the esp32c5
-        bridge-node leg (partitions_32m.csv) both qualify; anything else
-        defaults off.
+        The Zigbee coordinator, which since 2026-10 runs only on the ESP32-H2
+        of the two-chip hub (h2fw/, which pulls this component in and needs
+        an 802.15.4 radio plus the zb_storage/zb_fct partitions). The C6 hub
+        builds keep it off -- a C6 never runs a coordinator itself; its only
+        use was the retired Zigbee bridge node -- and talk to the H2 over
+        h2_link instead. The component still compiles on the C6 as stubs.
 
 config PLANTHUB_ZB_PERMIT_JOIN_S
     int "Permit-join window (seconds)"

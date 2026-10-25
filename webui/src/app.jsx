@@ -85,19 +85,14 @@ export function App() {
   // status) so an old firmware never traps the UI on the picker.
   const [radioRole, setRadioRole] = useState('ble')
   const [radioRoleSet, setRadioRoleSet] = useState(true)
-  // Whether the firmware supports Zigbee bridge nodes (status.zigbee_bridge,
-  // swarm Kconfig PLANTHUB_ZIGBEE_BRIDGE). Firmware predating the field
-  // always had them, hence the "!== false".
-  const [zigbeeBridge, setZigbeeBridge] = useState(true)
-
-  // Task 10: the Zigbee tab is also shown when a node bridge exists, even
-  // on a hub whose own radio isn't zigbee (wifi_only hub, bridge nodes
-  // only). Derived from the same GET /api/v1/zigbee shape the tab itself
+  // The Zigbee tab is shown only when the hub has a Zigbee coordinator --
+  // on the two-chip hub, its wired H2 (Zigbee bridge nodes were retired
+  // 2026-10). Derived from the same GET /api/v1/zigbee shape the tab itself
   // polls -- kept as a separate cheap 30s poll here (rather than lifting
   // ZigbeeTab's own poll state up into App) so this file doesn't need to
   // know anything about ZigbeeTab's countdown/stale internals, just
   // whether the coordinators list is non-empty.
-  const [hasBridges, setHasBridges] = useState(false)
+  const [hasCoordinator, setHasCoordinator] = useState(false)
 
   // Day/night state, purely presentational (drives the toggle icon and the
   // theme state -- the actual palette is CSS, keyed off the same
@@ -168,7 +163,7 @@ export function App() {
   }, [role])
 
   // Zigbee tab-gating poll: GET /api/v1/zigbee is a hub-only route (the
-  // coordinator/bridge registry lives on the hub, same reasoning as the
+  // coordinator registry lives on the hub, same reasoning as the
   // Rules/Wrappers/Nodes tabs above), so skip it for a node or a
   // not-yet-configured device, same guard as the rulesUnseen poll.
   useEffect(() => {
@@ -177,7 +172,7 @@ export function App() {
     function poll() {
       fetch('/api/v1/zigbee', { signal: controller.signal })
         .then((r) => r.json())
-        .then((d) => setHasBridges((d.coordinators || []).length > 0))
+        .then((d) => setHasCoordinator((d.coordinators || []).length > 0))
         .catch(() => {})
     }
     poll()
@@ -220,7 +215,6 @@ export function App() {
         setRole(r)
         setRadioRole(st.radio_role || 'ble')
         setRadioRoleSet(st.radio_role_set !== false)
-        setZigbeeBridge(st.zigbee_bridge !== false)
         // An unpaired node reaching the webui at all means it's sitting in
         // its portal after a failed pairing attempt (a paired node runs no
         // web server, and a searching one hasn't set up webserver either)
@@ -245,7 +239,6 @@ export function App() {
     return (
       <>
         <RoleTab
-          zigbeeBridge={zigbeeBridge}
           onMainChosen={() => {
             setTab('Network')
             refreshRole()
@@ -278,15 +271,12 @@ export function App() {
   // whole event feed is event_log_init()/rules_init() (main.c, inside the
   // `role != SWARM_ROLE_NODE` block) -- neither ever runs on a paired node,
   // so GET /api/v1/events has nothing meaningful to serve there either.
-  // Zigbee (M6b/M7) is hub-only too: the coordinator and bridge-device
-  // registry are owned by the hub, never a paired node. Zigbee is
-  // additionally gated on either this hub's own radio role (Config →
-  // Radio) OR having at least one Zigbee-bridge node (Task 10: a
-  // wifi_only/BLE hub with a bridge node still needs somewhere to see and
-  // manage that bridge's coordinator/devices).
+  // Zigbee is hub-only too (the coordinator lives on the hub, never a
+  // paired node), and additionally gated on the hub actually having a
+  // coordinator (hasCoordinator -- the two-chip hub's H2).
   const TABS = ALL_TABS.filter((t) => {
     if (role === 'node' && (t === 'Nodes' || t === 'Rules' || t === 'Wrappers' || t === 'Alerts' || t === 'Zigbee')) return false
-    if (t === 'Zigbee' && radioRole !== 'zigbee' && !hasBridges) return false
+    if (t === 'Zigbee' && !hasCoordinator) return false
     return true
   })
 
@@ -324,7 +314,7 @@ export function App() {
          tab === 'Wrappers' ? (
            <WrappersTab prefill={wrapperPrefill} onPrefillConsumed={() => setWrapperPrefill(null)} />
          ) :
-         tab === 'Nodes' ? <NodesTab zigbeeBridge={zigbeeBridge} /> :
+         tab === 'Nodes' ? <NodesTab /> :
          tab === 'Zigbee' ? <ZigbeeTab /> :
          tab === 'Config' ? <ConfigTab /> :
          tab === 'Network' ? <NetworkTab /> :
