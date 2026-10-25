@@ -1364,11 +1364,55 @@ static void zb_iv_send_simple_desc(void)
     esp_zb_zdo_simple_desc_req(&req, zb_iv_simple_desc_cb, (void *)(uintptr_t)s_iv_generation);
 }
 
+/* Simple-descriptor retry (bench 2026-10-25, H2 gate 2): a device that has
+ * only just joined can still be busy with its own post-join traffic -- the
+ * WK35 plug answered its endpoint-1 request with ZDO TIMEOUT (0x85) ~5 s
+ * after joining, so the interview recorded 0 capabilities and only recovered
+ * when a later report happened to backfill them. Retry that one endpoint a
+ * couple of times, after a short pause, before giving up on it. Only a
+ * TIMEOUT is retried (any other status is a real answer), and only regular
+ * application endpoints: 240+ are reserved (Green Power's 242 is the usual
+ * permanent non-responder fix round 2 below already skips), so retrying them
+ * would just burn the interview's rolling ZB_IV_TIMEOUT_S. 2 x (~5 s timeout
+ * + 1 s pause) stays well inside that window. */
+#define ZB_IV_SIMPLE_DESC_RETRIES 2
+#define ZB_IV_RETRY_DELAY_MS      1000
+static uint8_t  s_iv_sd_retries;     /* retries spent on (s_iv_sd_retry_gen, s_iv_sd_retry_ep) */
+static uint8_t  s_iv_sd_retry_ep;
+static uint32_t s_iv_sd_retry_gen;
+
+static void zb_iv_simple_desc_retry_cb(uint8_t gen_lo)
+{
+    /* Same staleness guard as the ZDO callbacks: the interview may have
+     * finished, timed out or moved to another device during the pause. The
+     * scheduler only carries a uint8_t, hence the low byte of the
+     * generation -- a 256-interview wraparound inside one second is not a
+     * realistic collision. */
+    if (!s_iv_active || gen_lo != (uint8_t)s_iv_generation) return;
+    zb_iv_send_simple_desc();
+}
+
 static void zb_iv_simple_desc_cb(esp_zb_zdp_status_t status,
                                   esp_zb_af_simple_desc_1_1_t *simple_desc, void *user_ctx)
 {
     if (!s_iv_active || (uint32_t)(uintptr_t)user_ctx != s_iv_generation) {
         return;
+    }
+    if (status == ESP_ZB_ZDP_STATUS_TIMEOUT && s_iv.pending_endpoint < 240) {
+        if (s_iv_sd_retry_gen != s_iv_generation || s_iv_sd_retry_ep != s_iv.pending_endpoint) {
+            s_iv_sd_retry_gen = s_iv_generation;
+            s_iv_sd_retry_ep = s_iv.pending_endpoint;
+            s_iv_sd_retries = 0;
+        }
+        if (s_iv_sd_retries < ZB_IV_SIMPLE_DESC_RETRIES) {
+            s_iv_sd_retries++;
+            ESP_LOGW(TAG, "simple-descriptor request for endpoint %u timed out; retry %u/%u in %u ms",
+                     (unsigned)s_iv.pending_endpoint, (unsigned)s_iv_sd_retries,
+                     (unsigned)ZB_IV_SIMPLE_DESC_RETRIES, (unsigned)ZB_IV_RETRY_DELAY_MS);
+            esp_zb_scheduler_alarm(zb_iv_simple_desc_retry_cb, (uint8_t)s_iv_generation,
+                                   ZB_IV_RETRY_DELAY_MS);
+            return;   /* request_sent stays true, so the interview tick won't re-send meanwhile */
+        }
     }
     if (status != ESP_ZB_ZDP_STATUS_SUCCESS || !simple_desc) {
         /* Fix round 2: a non-responding endpoint (Green Power's 242 is the
