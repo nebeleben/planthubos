@@ -64,6 +64,25 @@ esptool --chip esp32c6 write_flash \
 Then connect to the `PlantHub-XXXX` WiFi it broadcasts and follow the setup
 page. Updates after that happen over the air from the hub's own web page.
 
+### Zigbee: the two-chip hub
+
+Zigbee needs a second board: an **ESP32-H2** wired to the C6 over UART, acting
+as the Zigbee coordinator (wiring: `docs/esplayout/h2-link-wiring.md` in the
+project repository). That hub runs a different C6 image —
+`planthub-esp32c6-h2hub-<region>.bin`, flashed at the same offsets as above —
+plus the H2's own firmware:
+
+```
+esptool --chip esp32h2 write_flash \
+  0x0 bootloader-esp32h2.bin \
+  0x8000 partition-table-esp32h2.bin \
+  0x10000 h2fw-esp32h2.bin
+```
+
+Flash the H2 from its own USB port with the hub's RUN/FLASH switch open. The
+C6 image updates over the air as usual (stay on the `h2hub` image); the H2
+has no over-the-air path yet.
+
 ## Troubleshooting
 
 **WiFi first.** Almost every setup problem is one of these:
