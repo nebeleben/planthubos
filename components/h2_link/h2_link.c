@@ -20,7 +20,16 @@
 #define HL_TX_GPIO 10
 #define HL_RX_GPIO 11
 #define HL_BAUD    921600
-#define HL_RX_BUF  512         /* frames are <256 B at a few/s; 512 is ample */
+/* The H2's boot / RESYNC replay sends a back-to-back burst of announce frames
+ * (each up to UF_MAX_PAYLOAD + framing) at 921600 baud, and the RX task runs
+ * at a low priority (below httpd) -- 1 KB rides out a burst while it is
+ * preempted. (Was trimmed to 512 in the 2026-10 heap-starved period.) */
+#define HL_RX_BUF  1024
+/* The RX task runs the whole ingest path (data_core, actors, dev_profiles,
+ * ESP_LOG float formatting) on this stack. 3072 overflowed in the 2026-10
+ * soak (stack protection fault in h2_rx every ~600 s), so the frame buffers
+ * live in statics below rather than on it. */
+#define HL_RX_STACK 4096
 
 static SemaphoreHandle_t s_tx_mtx;
 
@@ -178,15 +187,35 @@ static void dispatch_frame(const uint8_t *buf, size_t len)
     }
 }
 
+/* Static, not on rx_task's stack: the framer alone holds a UF_MAX_PAYLOAD
+ * (512 B) frame buffer, and together with the read buffer that was ~790 B of
+ * the stack the ingest path needs (see HL_RX_STACK). Only rx_task uses them. */
+static uf_rx_t s_rx;
+static uint8_t s_rx_chunk[256];
+
 static void rx_task(void *arg)
 {
     (void)arg;
-    uf_rx_t rx; uf_rx_init(&rx);
-    uint8_t buf[256];
+    uf_rx_init(&s_rx);
+    uint32_t frames = 0;
+    bool hwm_logged = false;
     for (;;) {
-        int got = uart_read_bytes(HL_PORT, buf, sizeof buf, pdMS_TO_TICKS(100));
-        for (int i = 0; i < got; i++)
-            if (uf_rx_byte(&rx, buf[i])) dispatch_frame(rx.buf, rx.len);
+        int got = uart_read_bytes(HL_PORT, s_rx_chunk, sizeof s_rx_chunk, pdMS_TO_TICKS(100));
+        for (int i = 0; i < got; i++) {
+            if (uf_rx_byte(&s_rx, s_rx_chunk[i])) {
+                dispatch_frame(s_rx.buf, s_rx.len);
+                frames++;
+            }
+        }
+        /* One stack high-water line once the ingest path has really been
+         * exercised (boot replay + a few minutes of reports), like the
+         * sampler's and the rules engine's. */
+        if (!hwm_logged && frames >= 200) {
+            ESP_LOGI(TAG, "rx task stack high-water mark: %u B unused of %u B (after %lu frames)",
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)HL_RX_STACK,
+                     (unsigned long)frames);
+            hwm_logged = true;
+        }
     }
 }
 
@@ -227,7 +256,7 @@ esp_err_t h2_link_start(void)
     /* Priority 4: BELOW the httpd server task (tskIDLE+5) so a busy UART --
      * even a noise storm on a floating RX -- can never starve the webserver
      * or WiFi. A few frames/s at this priority drains the 512 B RX ring fine. */
-    xTaskCreate(rx_task, "h2_rx", 3072, NULL, 4, NULL);
+    xTaskCreate(rx_task, "h2_rx", HL_RX_STACK, NULL, 4, NULL);
     send_resync();   /* ask the H2 to replay its device list on our boot */
     ESP_LOGI(TAG, "h2_link up on UART%d (tx=%d rx=%d @ %d)", HL_PORT, HL_TX_GPIO, HL_RX_GPIO, HL_BAUD);
     return ESP_OK;

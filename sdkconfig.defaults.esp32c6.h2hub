@@ -5,12 +5,3 @@ CONFIG_PLANTHUB_H2_LINK_ENABLED=y
 # The appliance carries the optional DS3231 RTC on the C6's I2C (GPIO6/7).
 CONFIG_PLANTHUB_RTC_DS3231=y
 
-# The two-chip hub is heap-tight with h2_link resident, which starved lwIP/WiFi
-# of send buffers (webUI unreachable, httpd send EAGAIN). It is a BLE *scanner*
-# with only occasional single-connection GATT polling, so the default NimBLE
-# pools are oversized here -- trim them to reclaim ~3-4 KB for serving the UI.
-# (Normal hub builds keep the full pools.)
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=16
-CONFIG_BT_NIMBLE_ACL_BUF_COUNT=4
-CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=4
-CONFIG_BT_NIMBLE_HCI_EVT_HI_BUF_COUNT=18
