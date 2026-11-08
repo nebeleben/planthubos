@@ -228,6 +228,14 @@ static void dispatch_frame(const uint8_t *buf, size_t len)
          * that already overflowed once (HL_RX_STACK). Only rx_task gets here. */
         static swarm_device_announce_t a;
         if (swarm_decode_device_announce(buf, len, &a)) {
+            /* Announces are rare (join, rename, interview step, replay), so
+             * one line each: a burst of them right after a command means the
+             * H2 rebooted and replayed its list. */
+            ESP_LOGI(TAG, "announce %02X%02X%02X%02X%02X%02X%02X%02X name '%.*s' interviewed %u",
+                     a.dev.addr[0], a.dev.addr[1], a.dev.addr[2], a.dev.addr[3],
+                     a.dev.addr[4], a.dev.addr[5], a.dev.addr[6], a.dev.addr[7],
+                     (int)(a.name_len > SWARM_DEV_NAME_MAX ? SWARM_DEV_NAME_MAX : a.name_len),
+                     a.name, a.interviewed);
             swarm_ingest_announce(&a, NULL, now_s());   /* NULL via_mac = local radio */
             dev_upsert(&a);
         }
