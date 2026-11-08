@@ -40,6 +40,7 @@
 /* Task 6: the joined-device store, the interview it drives, and the
  * registry/actor-table it populates. */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -633,11 +634,20 @@ static void zb_store_save(void)
         return;
     }
 
-    uint8_t buf[ZB_STORE_IMAGE_MAX];
-    size_t len = zb_store_serialize(&s_store, buf, sizeof buf);
+    /* Heap, not stack: the image is up to ZB_STORE_IMAGE_MAX (2.5 KB), and
+     * callers include the H2's UART RX task (rename/remove commands from the
+     * C6), whose 4 KB stack overflowed with it -- the H2 rebooted before
+     * writing, so a rename or remove from the hub was silently lost. */
+    uint8_t *buf = malloc(ZB_STORE_IMAGE_MAX);
+    if (!buf) {
+        ESP_LOGE(TAG, "no memory to persist %u Zigbee device(s)", (unsigned)s_store.count);
+        return;
+    }
+    size_t len = zb_store_serialize(&s_store, buf, ZB_STORE_IMAGE_MAX);
     if (len == 0) {
         ESP_LOGE(TAG, "serialize failed for %u Zigbee device(s); not persisted",
                  (unsigned)s_store.count);
+        free(buf);
         return;
     }
 
@@ -650,9 +660,11 @@ static void zb_store_save(void)
         ESP_LOGW(TAG, "could not open %s for write (errno=%d); a reboot now would lose "
                       "%u Zigbee device(s)", ZB_STORE_TMP_PATH, errno,
                  (unsigned)s_store.count);
+        free(buf);
         return;
     }
     size_t wrote = fwrite(buf, 1, len, f);
+    free(buf);
     if (wrote != len) {
         ESP_LOGW(TAG, "short write to %s persisting %u Zigbee device(s)",
                  ZB_STORE_TMP_PATH, (unsigned)s_store.count);
