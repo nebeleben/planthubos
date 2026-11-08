@@ -38,10 +38,76 @@ static swarm_coord_status_t s_last_status;
 static bool s_status_valid;
 static uint32_t s_status_rx_s;   /* now_s() when s_last_status arrived */
 
+/* The H2's device table (h2_link_device_count()/h2_link_device_at()), written
+ * by rx_task, read by httpd. ~2.4 KB: the H2's announces are the only copy of
+ * its devices' Zigbee-side details (interview state, clusters, fingerprint)
+ * on this chip -- the data_core registry keeps capabilities and readings. */
+static SemaphoreHandle_t s_dev_mtx;
+static swarm_device_announce_t s_devs[H2_LINK_MAX_DEVICES];
+static int s_dev_count;
+
+/* Table reconciliation: a dropped ANNOUNCE or GONE frame would leave the table
+ * wrong until the next replay. COORD_STATUS carries the H2's device_count;
+ * when it disagrees with s_dev_count on HL_RECONCILE_STATUSES statuses in a
+ * row (a replay in flight disagrees only briefly), the table is cleared and a
+ * RESYNC refills it -- at most once per HL_RECONCILE_GAP_S. */
+#define HL_RECONCILE_STATUSES 3
+#define HL_RECONCILE_GAP_S    60
+static uint8_t s_count_mismatches;
+static uint32_t s_last_reconcile_s;
+
 static uint16_t s_seq;
 static struct { bool used; uint16_t seq; int dev_idx; uint8_t action; } s_inflight;
 
 static uint32_t now_s(void) { return (uint32_t)(esp_timer_get_time() / 1000000); }
+
+/* ---- Device table ------------------------------------------------------ */
+
+static int dev_find_locked(const uint8_t addr[SWARM_ADDR_LEN])
+{
+    for (int i = 0; i < s_dev_count; i++) {
+        if (memcmp(s_devs[i].dev.addr, addr, SWARM_ADDR_LEN) == 0) return i;
+    }
+    return -1;
+}
+
+static void dev_upsert(const swarm_device_announce_t *a)
+{
+    xSemaphoreTake(s_dev_mtx, portMAX_DELAY);
+    int i = dev_find_locked(a->dev.addr);
+    if (i < 0 && s_dev_count < H2_LINK_MAX_DEVICES) i = s_dev_count++;
+    if (i >= 0) s_devs[i] = *a;
+    xSemaphoreGive(s_dev_mtx);
+    if (i < 0) ESP_LOGW(TAG, "device table full (%d); announce not listed", H2_LINK_MAX_DEVICES);
+}
+
+static void dev_delete(const uint8_t addr[SWARM_ADDR_LEN])
+{
+    xSemaphoreTake(s_dev_mtx, portMAX_DELAY);
+    int i = dev_find_locked(addr);
+    if (i >= 0) {
+        s_devs[i] = s_devs[--s_dev_count];   /* order is not part of the contract */
+    }
+    xSemaphoreGive(s_dev_mtx);
+}
+
+int h2_link_device_count(void)
+{
+    xSemaphoreTake(s_dev_mtx, portMAX_DELAY);
+    int n = s_dev_count;
+    xSemaphoreGive(s_dev_mtx);
+    return n;
+}
+
+bool h2_link_device_at(int i, swarm_device_announce_t *out)
+{
+    bool ok;
+    xSemaphoreTake(s_dev_mtx, portMAX_DELAY);
+    ok = i >= 0 && i < s_dev_count;
+    if (ok) *out = s_devs[i];
+    xSemaphoreGive(s_dev_mtx);
+    return ok;
+}
 
 /* ---- TX ---------------------------------------------------------------- */
 
@@ -133,19 +199,46 @@ static void h2_link_dispatch(const actor_cmd_t *cmd)
 
 /* ---- RX ---------------------------------------------------------------- */
 
+/* See s_count_mismatches. Runs on every COORD_STATUS (every 2 s). */
+static void reconcile(uint8_t h2_count)
+{
+    if (h2_count == h2_link_device_count()) {
+        s_count_mismatches = 0;
+        return;
+    }
+    if (++s_count_mismatches < HL_RECONCILE_STATUSES) return;
+    uint32_t now = now_s();
+    if (s_last_reconcile_s && now - s_last_reconcile_s < HL_RECONCILE_GAP_S) return;
+    ESP_LOGW(TAG, "device table has %d, H2 reports %u; resyncing",
+             h2_link_device_count(), h2_count);
+    xSemaphoreTake(s_dev_mtx, portMAX_DELAY);
+    s_dev_count = 0;
+    xSemaphoreGive(s_dev_mtx);
+    s_count_mismatches = 0;
+    s_last_reconcile_s = now;
+    send_resync();
+}
+
 static void dispatch_frame(const uint8_t *buf, size_t len)
 {
     int type = swarm_frame_type(buf, len);
     switch (type) {
     case SWARM_MSG_DEVICE_ANNOUNCE: {
-        swarm_device_announce_t a;
-        if (swarm_decode_device_announce(buf, len, &a))
+        /* Static, not on the stack: ~150 B, and this runs on the h2_rx stack
+         * that already overflowed once (HL_RX_STACK). Only rx_task gets here. */
+        static swarm_device_announce_t a;
+        if (swarm_decode_device_announce(buf, len, &a)) {
             swarm_ingest_announce(&a, NULL, now_s());   /* NULL via_mac = local radio */
+            dev_upsert(&a);
+        }
         break;
     }
     case SWARM_MSG_DEVICE_GONE: {
         swarm_device_gone_t g;
-        if (swarm_decode_device_gone(buf, len, &g)) swarm_ingest_device_gone(&g);
+        if (swarm_decode_device_gone(buf, len, &g)) {
+            swarm_ingest_device_gone(&g);
+            dev_delete(g.dev.addr);
+        }
         break;
     }
     case SWARM_MSG_MEASUREMENT: {
@@ -169,6 +262,7 @@ static void dispatch_frame(const uint8_t *buf, size_t len)
             xSemaphoreTake(s_status_mtx, portMAX_DELAY);
             s_last_status = s; s_status_valid = true; s_status_rx_s = now_s();
             xSemaphoreGive(s_status_mtx);
+            reconcile(s.device_count);
         }
         break;
     }
@@ -247,6 +341,7 @@ esp_err_t h2_link_start(void)
 {
     s_tx_mtx = xSemaphoreCreateMutex();
     s_status_mtx = xSemaphoreCreateMutex();
+    s_dev_mtx = xSemaphoreCreateMutex();
     hl_uart_init();
     /* Claim the Zigbee actuate route. On the two-chip hub the local zb_cmd
      * engine is a disabled-build stub and there is no ESP-NOW bridge, so
