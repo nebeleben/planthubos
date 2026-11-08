@@ -31,6 +31,22 @@ int main(void) {
     assert(saw_soil && saw_suppress && saw_temp_scaled);
     assert(dev_profile_validate(zs));
 
+    /* --- built-in seed contains the ZS-304Z profile (Basic reports "Arteco"/"ZS-304Z"):
+     * soil/humidity/light datapoints, and 0x0405 suppressed because it carries soil
+     * moisture on this model too (bench 2026-11-08: dp 3 = 41, dp 101 = 53, 0x0405 = 41) --- */
+    const dev_profile_t *z4 = dev_profile_match("Arteco", "ZS-304Z", NULL);
+    assert(z4 != NULL);
+    bool z4_soil = false, z4_hum = false, z4_light = false, z4_suppress = false;
+    for (int i = 0; i < z4->entry_count; i++) {
+        const dev_profile_entry_t *e = &z4->entries[i];
+        if (e->kind == DEV_PROFILE_KIND_DP && e->dp_id == 3 && e->cap_id == CAP_SOIL_MOISTURE) z4_soil = true;
+        if (e->kind == DEV_PROFILE_KIND_DP && e->dp_id == 101 && e->cap_id == CAP_AIR_HUMIDITY) z4_hum = true;
+        if (e->kind == DEV_PROFILE_KIND_DP && e->dp_id == 102 && e->cap_id == CAP_LIGHT_ILLUMINANCE) z4_light = true;
+        if (e->kind == DEV_PROFILE_KIND_SUPPRESS && e->source_cluster == 0x0405) z4_suppress = true;
+    }
+    assert(z4_soil && z4_hum && z4_light && z4_suppress);
+    assert(dev_profile_validate(z4));
+
     /* --- no match returns NULL --- */
     assert(dev_profile_match("nope", "nope", NULL) == NULL);
 
