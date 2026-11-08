@@ -75,9 +75,19 @@ function DeviceCard({ d, open, onToggle, onRenamed, onRemoved, onRetryPairing, r
           {state === 'error' && <span class="error">failed</span>}
           {state === 'unauth' && <span class="error">unauthorized — set the hub key in Config</span>}
         </form>
-        <div class="node-card-row">
-          <span class="hint">short addr <span class="mono">{d.short_addr}</span> · endpoint {d.endpoint}</span>
-        </div>
+        {/* The two-chip hub's H2 announces neither (endpoints are per
+            capability there), so each part shows only when present. */}
+        {(d.short_addr != null || d.endpoint != null || d.model) && (
+          <div class="node-card-row">
+            <span class="hint">
+              {[
+                d.short_addr != null && <>short addr <span class="mono">{d.short_addr}</span></>,
+                d.endpoint != null && <>endpoint {d.endpoint}</>,
+                d.model && <>{d.manufacturer ? `${d.manufacturer} ` : ''}<span class="mono">{d.model}</span></>,
+              ].filter(Boolean).map((part, i) => <>{i > 0 && ' · '}{part}</>)}
+            </span>
+          </div>
+        )}
         {d.interviewed ? (
           <>
             <div class="node-card-row">

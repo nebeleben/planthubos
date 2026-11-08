@@ -4957,13 +4957,73 @@ static cJSON *zb_device_json(const zb_device_t *d)
  * this block's header comment. "node"/"name" are both null: this is the
  * hub itself, not a bridge node, so there is no MAC to key it by (Task 10's
  * UI tells the two apart on "node" being null vs a MAC12 string). */
+#if CONFIG_PLANTHUB_H2_LINK_ENABLED
+/* Copies a length-prefixed announce string (name/manufacturer/model: NOT
+ * NUL-terminated when it fills its field) into a NUL-terminated buffer. */
+static void announce_str(char *dst, size_t dst_sz, const char *src, uint8_t len)
+{
+    size_t n = len < dst_sz - 1 ? len : dst_sz - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+/* One H2 device (h2_link's announce table) in the shape zb_device_json()
+ * gives the Zigbee tab: caps/actions as NAME strings, clusters as numbers,
+ * manufacturer/model when known. The announce carries no short address and
+ * no device-wide endpoint (endpoints are per cap/action), so both are null. */
+static cJSON *h2_device_json(const swarm_device_announce_t *a)
+{
+    device_id_t id;
+    id.kind = (uint8_t)DEV_KIND_ZIGBEE;
+    memcpy(id.addr, a->dev.addr, sizeof id.addr);
+    char idbuf[24];
+    device_id_format(&id, idbuf, sizeof(idbuf));
+
+    char name[SWARM_DEV_NAME_MAX + 1];
+    announce_str(name, sizeof name, a->name, a->name_len);
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "id", idbuf);
+    cJSON_AddStringToObject(o, "name", name);
+    cJSON_AddBoolToObject(o, "interviewed", a->interviewed != 0);
+    cJSON_AddNullToObject(o, "short_addr");
+    cJSON_AddNullToObject(o, "endpoint");
+
+    uint8_t ncap = a->cap_count > SWARM_DEV_MAX_CAPS ? SWARM_DEV_MAX_CAPS : a->cap_count;
+    uint8_t nact = a->action_count > SWARM_DEV_MAX_ACTIONS ? SWARM_DEV_MAX_ACTIONS : a->action_count;
+    cJSON *caps = cJSON_AddArrayToObject(o, "caps");
+    for (uint8_t i = 0; i < ncap; i++) {
+        const capability_t *cap = capability_get(a->cap_ids[i]);
+        cJSON_AddItemToArray(caps, cJSON_CreateString(cap ? cap->name : "?"));
+    }
+    cJSON *actions = cJSON_AddArrayToObject(o, "actions");
+    for (uint8_t i = 0; i < nact; i++) {
+        const action_t *act = action_get(a->action_ids[i]);
+        cJSON_AddItemToArray(actions, cJSON_CreateString(act ? act->name : "?"));
+    }
+    cJSON *clusters = cJSON_AddArrayToObject(o, "clusters");
+    for (uint8_t i = 0; i < ncap; i++) {
+        cJSON_AddItemToArray(clusters, cJSON_CreateNumber(a->cap_clusters[i]));
+    }
+
+    if (a->manuf_len || a->model_len) {
+        char manuf[SWARM_DEV_STR_MAX + 1], model[SWARM_DEV_STR_MAX + 1];
+        announce_str(manuf, sizeof manuf, a->manufacturer, a->manuf_len);
+        announce_str(model, sizeof model, a->model, a->model_len);
+        cJSON_AddStringToObject(o, "manufacturer", manuf);
+        cJSON_AddStringToObject(o, "model", model);
+    }
+    return o;
+}
+#endif
+
 static cJSON *coordinator_json_local(void)
 {
 #if CONFIG_PLANTHUB_H2_LINK_ENABLED
     /* Two-chip appliance: the "local coordinator" is the wired H2. Its
      * network state comes from the last COORD_STATUS over the UART; its
-     * devices live in the data_core registry (/api/v1/devices), since the
-     * H2 is a local radio, not a swarm node. Returns NULL until the first
+     * device list from h2_link's announce table (their readings live in the
+     * data_core registry, /api/v1/devices). Returns NULL until the first
      * status arrives (same "nothing to report" posture as a not-started
      * local stack below). Once the H2 has gone quiet for more than
      * H2_LINK_STALE_S, "available" turns false and formed/permit_s stop
@@ -4985,7 +5045,14 @@ static cJSON *coordinator_json_local(void)
     cJSON_AddNumberToObject(hc, "pan_id", st.pan_id);
     cJSON_AddNumberToObject(hc, "permit_s", alive ? st.permit_s : 0);
     cJSON_AddStringToObject(hc, "reported_role", "zigbee");
-    cJSON_AddArrayToObject(hc, "devices");
+    /* The H2's devices as it announced them (h2_link's table) -- the Zigbee
+     * tab's list. Their readings stay in /api/v1/devices. One ~150 B copy
+     * at a time on the httpd stack. */
+    cJSON *devices = cJSON_AddArrayToObject(hc, "devices");
+    swarm_device_announce_t a;
+    for (int i = 0; h2_link_device_at(i, &a); i++) {
+        cJSON_AddItemToArray(devices, h2_device_json(&a));
+    }
     return hc;
 #else
     uint8_t channel = 0;

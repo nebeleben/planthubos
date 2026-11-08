@@ -40,6 +40,20 @@ bool h2_link_coord_status(swarm_coord_status_t *out, uint32_t *age_s);
  * seconds, i.e. the H2 is up and the link is carrying frames. */
 bool h2_link_alive(void);
 
+/* The H2's joined devices, as it last announced them (for the device list in
+ * GET /api/v1/zigbee). Kept from DEVICE_ANNOUNCE (upsert; a rename
+ * re-announces) and DEVICE_GONE (delete); the H2 replays the whole list on
+ * RESYNC and at its own boot. Sized to the H2's zb_store
+ * (ZB_STORE_MAX_DEVICES). */
+#define H2_LINK_MAX_DEVICES 16
+
+/* Number of devices in the table. */
+int h2_link_device_count(void);
+
+/* Copies table entry i into *out; false when i is out of range (the table can
+ * shrink between a count and this call -- a caller just stops there). */
+bool h2_link_device_at(int i, swarm_device_announce_t *out);
+
 /* Removes / renames an H2-owned device (sends the matching command). */
 esp_err_t h2_link_remove(const uint8_t eui64[8]);
 esp_err_t h2_link_rename(const uint8_t eui64[8], const char *name);
